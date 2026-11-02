@@ -1,0 +1,45 @@
+[package]
+name = "legado-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "legado-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = "9"
+bcrypt = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+futures = "0.3"
+once_cell = "1"
+
+# ---- 规则引擎 ----
+scraper = "0.20"            # CSS 选择器 / JSoup 等价
+jsonpath-rust = "0.7"       # JsonPath
+sxd-xpath = "0.4"           # XPath（XML 响应）
+sxd-document = "0.3"        # sxd-xpath 的 XML 文档模型
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "rustls-tls"] }
+boa_engine = "0.19"         # JS 引擎（Rhino 等价，纯 Rust 便于交叉编译）
+regex = "1"
+url = "2"
+base64 = "0.22"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+
+[profile.release]
+opt-level = "z"      # 体积/内存优先
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,6 @@
+/server/target/
+/server/data/
+/server/web/node_modules/
+/server/web/dist/
+*.log
+*.err
