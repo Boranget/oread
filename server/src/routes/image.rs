@@ -393,7 +393,8 @@ async fn images_meta(
 }
 
 fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Option<&str>) -> HashMap<String, String> {
-    let mut h = req::parse_headers(&source.header);
+    // 与正文请求一致：支持 JSON / 多行 / `@js:` 三种 header 形式
+    let mut h = req::source_headers(source, &source.book_source_url);
     let referer = chapter_url
         .map(str::trim)
         .filter(|s| !s.is_empty() && (s.starts_with("http://") || s.starts_with("https://")))
@@ -609,6 +610,9 @@ async fn proxy(
     };
     let key = q.url.clone();
     let ct_for_cache = ct_base.clone();
+    // 上游给了 Content-Length 时，hyper 读完正好这么多字节就结束，不会再 poll 到 `None`，
+    // 导致原本只在流结束才写入的 LRU 永远为空。这里在累计字节数到达已知长度时也落缓存。
+    let cache_len = known_len;
     let stream = futures::stream::unfold(
         (upstream, Vec::<u8>::new(), 0usize, true),
         move |(mut up, mut buf, mut total, mut keep)| {
@@ -630,6 +634,10 @@ async fn proxy(
                         }
                         if keep && buf.len() + chunk.len() <= CACHE_ITEM_MAX {
                             buf.extend_from_slice(&chunk);
+                            if keep && cache_len == Some(total as u64) {
+                                image_cache::put(&key, std::mem::take(&mut buf), ct);
+                                keep = false;
+                            }
                         } else {
                             keep = false;
                             buf.clear();
