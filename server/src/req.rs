@@ -194,6 +194,19 @@ async fn read_body_limited(
     Ok(buf)
 }
 
+/// 书源侧故障标记：连接失败/超时/HTTP 非成功等“站点不可用”。
+/// 与规则引擎故障（选择器/JSONPath/JS）区分，供书源健康状态判定使用。
+#[derive(Debug)]
+pub struct SourceUnavailable(pub String);
+
+impl std::fmt::Display for SourceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SourceUnavailable {}
+
 /// 发送错误分类：决定是否值得重试。
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SendKind {
@@ -573,7 +586,17 @@ async fn execute_request(
         )
         .send()
         .await
-        .map_err(|e| send_failure(e, current.as_str()))?;
+        .map_err(|e| {
+            let (kind, err) = send_failure(e, current.as_str());
+            // 非法 URL/请求构造属于书源配置问题，不算“站点不可达”；
+            // 连接失败、超时与其他发送错误则标记为站点侧故障，供冷却判定使用。
+            let err = if matches!(kind, SendKind::Builder) {
+                err
+            } else {
+                anyhow::Error::new(SourceUnavailable(err.to_string()))
+            };
+            (kind, err)
+        })?;
         record_response_cookies(cookie_key, resp.headers());
         // 同步镜像到目标 host 桶：JS/AJAX 与图片代理是按 host 发起的子请求，
         // 需要复用同一站点的会话 Cookie（否则登录态在 java.ajax 里丢失）。
@@ -660,7 +683,10 @@ async fn fetch_text(
                     continue;
                 }
                 if !resp.status.is_success() {
-                    return Err(anyhow!("http status {}", resp.status));
+                    return Err(anyhow::Error::new(SourceUnavailable(format!(
+                        "http status {}",
+                        resp.status
+                    ))));
                 }
                 return decode_body(&resp.body, resp.content_type.as_deref());
             }

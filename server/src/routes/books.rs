@@ -18,6 +18,8 @@ use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
 use crate::routes::replace;
 use crate::routes::sources::{load_source, load_sources};
+use crate::source_health;
+use crate::source_ledger;
 use crate::web_book;
 
 pub fn routes() -> Router<AppState> {
@@ -47,8 +49,19 @@ pub struct SearchQ {
     /// 逗号分隔的书源 id：支持 `book_source_url`（书源主键）或列表顺序的 1-based 序号。
     #[serde(default)]
     source_ids: Option<String>,
+    /// 显式越权：为 `1`/`true` 时冷却中的源也参与搜索（排查用）。
+    #[serde(default)]
+    include_cooled: Option<String>,
     page: Option<i32>,
     page_size: Option<usize>,
+}
+
+/// 宽松布尔：`1`/`true`/`yes`/`on` 视为真。
+fn truthy(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 impl SearchQ {
@@ -165,6 +178,10 @@ struct SearchJob {
     /// 启用中的书源快照：用于去重/按权重排序，保证与 aggregate 的排序规则一致
     sources: Vec<crate::entities::BookSource>,
     source_total: usize,
+    /// 因冷却被跳过的源数（本次请求）
+    skipped_cooldown: usize,
+    /// 候选集合中当前处于冷却的源总数（前端提示“另有 N 个源处于冷却”）
+    cooldown_total: usize,
     state: Mutex<SearchJobState>,
 }
 
@@ -263,37 +280,80 @@ fn job_view(
     (full, errors, pending == 0, finished, pending)
 }
 
-async fn run_search_job(job: Arc<SearchJob>, sources: Vec<crate::entities::BookSource>, key: String) {
+async fn run_search_job(
+    job: Arc<SearchJob>,
+    sources: Vec<crate::entities::BookSource>,
+    key: String,
+    pool: SqlitePool,
+    cooldown_secs: u64,
+) {
     let budget = crate::req::search_budget();
     let mut pending = futures::stream::FuturesUnordered::new();
     for src in sources {
         let s = src.clone();
         let k = key.clone();
         pending.push(async move {
+            let started = Instant::now();
             let r = tokio::time::timeout(budget, web_book::search(&s, &k, 1)).await;
-            (src, r)
+            let latency_ms = started.elapsed().as_millis() as i64;
+            (src, r, latency_ms)
         });
     }
-    while let Some((src, r)) = pending.next().await {
+    // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
+    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
+    while let Some((src, r, latency_ms)) = pending.next().await {
         let mut st = job.state.lock().unwrap();
-        match r {
+        let outcome = match r {
             Ok(Ok(mut books)) => {
                 books.truncate(SEARCH_PER_SOURCE_MAX);
                 st.books.append(&mut books);
+                source_health::Outcome {
+                    source_url: src.book_source_url.clone(),
+                    status: source_health::STATUS_OK,
+                    latency_ms,
+                    error: None,
+                }
             }
-            Ok(Err(e)) => st.errors.push(web_book::SourceFailure {
-                source: src.book_source_url.clone(),
-                source_name: src.book_source_name.clone(),
-                error: format!("{e}"),
-            }),
-            Err(_) => st.errors.push(web_book::SourceFailure {
-                source: src.book_source_url.clone(),
-                source_name: src.book_source_name.clone(),
-                error: format!("搜索超时（单源 {}s 预算）", budget.as_secs()),
-            }),
-        }
+            Ok(Err(e)) => {
+                // 站点故障（连接/超时/HTTP 非成功）才计入失败；引擎故障记 partial，不冷却。
+                let status = match source_health::classify(&e) {
+                    source_health::FailureKind::Site => source_health::STATUS_FAIL,
+                    source_health::FailureKind::Engine => source_health::STATUS_PARTIAL,
+                };
+                st.errors.push(web_book::SourceFailure {
+                    source: src.book_source_url.clone(),
+                    source_name: src.book_source_name.clone(),
+                    error: format!("{e}"),
+                });
+                source_health::Outcome {
+                    source_url: src.book_source_url.clone(),
+                    status,
+                    latency_ms,
+                    error: Some(format!("{e}")),
+                }
+            }
+            Err(_) => {
+                let err = format!("搜索超时（单源 {}s 预算）", budget.as_secs());
+                st.errors.push(web_book::SourceFailure {
+                    source: src.book_source_url.clone(),
+                    source_name: src.book_source_name.clone(),
+                    error: err.clone(),
+                });
+                source_health::Outcome {
+                    source_url: src.book_source_url.clone(),
+                    status: source_health::STATUS_FAIL,
+                    latency_ms,
+                    error: Some(err),
+                }
+            }
+        };
         st.finished += 1;
         st.pending = st.pending.saturating_sub(1);
+        outcomes.push(outcome);
+        drop(st);
+    }
+    if let Err(e) = source_health::record_outcomes(&pool, &outcomes, cooldown_secs).await {
+        tracing::warn!(error = %e, "record source health after search failed");
     }
 }
 
@@ -357,6 +417,9 @@ async fn search_start(
     }
     let mut sources = load_sources(&s.shared).await?;
     crate::routes::sources::sort_sources(&mut sources);
+    let quarantined = source_ledger::quarantined_set(&s.shared)
+        .await
+        .unwrap_or_default();
     let enabled_all: Vec<crate::entities::BookSource> = sources
         .into_iter()
         .filter(|x| {
@@ -364,10 +427,21 @@ async fn search_start(
                 && crate::entities::is_supported_source_type(x.book_source_type)
                 && x.rule_search.is_some()
                 && x.search_url.is_some()
+                && !quarantined.contains(&x.book_source_url)
         })
         .collect();
     let requested = parse_source_ids(q.source_ids.as_deref());
-    let (enabled, ignored) = select_sources(&enabled_all, &requested);
+    let (selected, ignored) = select_sources(&enabled_all, &requested);
+    let include_cooled = truthy(q.include_cooled.as_deref());
+    let health = source_health::load_map(&s.shared).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
+        std::collections::HashMap::new()
+    });
+    let now = source_health::now_ms();
+    let cooldown_total = source_health::cooled_count(&enabled_all, &health, now);
+    let partition = source_health::partition_cooldown(selected, &health, include_cooled, now);
+    let skipped_cooldown = partition.skipped;
+    let enabled = partition.active;
     let source_total = enabled.len();
     let id = next_job_id();
     let job = Arc::new(SearchJob {
@@ -377,6 +451,8 @@ async fn search_start(
         created_unix_ms: unix_ms(),
         sources: enabled.clone(),
         source_total,
+        skipped_cooldown,
+        cooldown_total,
         state: Mutex::new(SearchJobState {
             pending: source_total,
             ..Default::default()
@@ -395,7 +471,13 @@ async fn search_start(
             "create search job"
         );
     }
-    tokio::spawn(run_search_job(job, enabled, key));
+    tokio::spawn(run_search_job(
+        job,
+        enabled,
+        key,
+        s.shared.clone(),
+        s.cfg.source_cooldown_secs,
+    ));
     Ok(Json(json!({
         "job_id": id,
         "source_total": source_total,
@@ -405,6 +487,10 @@ async fn search_start(
         "ignored_source_ids": ignored,
         "warning": (!ignored.is_empty())
             .then(|| format!("已忽略无效书源 id：{}", ignored.join(", "))),
+        // 冷却：默认跳过冷却中的源；include_cooled=1 时全部参与
+        "include_cooled": include_cooled,
+        "skipped_cooldown": skipped_cooldown,
+        "cooldown_total": cooldown_total,
     })))
 }
 
@@ -452,6 +538,9 @@ async fn search_result(
         "source_total": job.source_total,
         "source_failed": source_failed,
         "deadline_ms": crate::req::search_budget().as_millis() as u64,
+        // 冷却统计随 job 固化，轮询期间不会变化
+        "skipped_cooldown": job.skipped_cooldown,
+        "cooldown_total": job.cooldown_total,
     })))
 }
 
@@ -462,7 +551,9 @@ async fn search(
 ) -> AppResult<Json<Vec<SearchBook>>> {
     let sources = load_sources(&s.shared).await?;
     let page = q.page.unwrap_or(1).max(1);
-    let (full, _) = aggregated(&sources, &q.keyword()).await;
+    let include_cooled = truthy(q.include_cooled.as_deref());
+    let (active, _, _) = searchable_without_cooled(&s.shared, &sources, include_cooled).await;
+    let (full, _) = aggregated(&active, &q.keyword(), include_cooled).await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
 
@@ -471,12 +562,19 @@ async fn search(
 async fn aggregated(
     sources: &[crate::entities::BookSource],
     key: &str,
+    include_cooled: bool,
 ) -> (Vec<SearchBook>, Vec<web_book::SourceFailure>) {
+    // 冷却过滤会改变参与源集合，缓存键必须区分两种模式，避免 60s 内串用。
+    let cache_key = if include_cooled {
+        format!("{key}\u{1f}cooled")
+    } else {
+        key.to_string()
+    };
     let hit = {
         let mut g = agg_cache().lock().unwrap();
         prune_cache(&mut g);
         g.iter()
-            .find(|e| e.key == key)
+            .find(|e| e.key == cache_key)
             .map(|e| (e.books.clone(), e.errors.clone()))
     };
     if let Some(v) = hit {
@@ -490,7 +588,7 @@ async fn aggregated(
         let mut g = agg_cache().lock().unwrap();
         prune_cache(&mut g);
         g.push(AggEntry {
-            key: key.to_string(),
+            key: cache_key,
             at: Instant::now(),
             books: books.clone(),
             errors: errors.clone(),
@@ -498,6 +596,34 @@ async fn aggregated(
         prune_cache(&mut g);
     }
     (books, errors)
+}
+
+/// 过滤出可参与搜索的源，并按健康状态剔除冷却中的源。
+async fn searchable_without_cooled(
+    pool: &SqlitePool,
+    sources: &[crate::entities::BookSource],
+    include_cooled: bool,
+) -> (Vec<crate::entities::BookSource>, usize, usize) {
+    let quarantined = source_ledger::quarantined_set(pool).await.unwrap_or_default();
+    let eligible: Vec<crate::entities::BookSource> = sources
+        .iter()
+        .filter(|x| {
+            x.enabled
+                && crate::entities::is_supported_source_type(x.book_source_type)
+                && x.rule_search.is_some()
+                && x.search_url.is_some()
+                && !quarantined.contains(&x.book_source_url)
+        })
+        .cloned()
+        .collect();
+    let health = source_health::load_map(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
+        std::collections::HashMap::new()
+    });
+    let now = source_health::now_ms();
+    let cooldown_total = source_health::cooled_count(&eligible, &health, now);
+    let partition = source_health::partition_cooldown(eligible, &health, include_cooled, now);
+    (partition.active, partition.skipped, cooldown_total)
 }
 
 /// 聚合搜索明细：书籍 + 成功/失败书源统计（单源失败不影响整体返回）。
@@ -510,7 +636,10 @@ async fn search_aggregate(
     let sources = load_sources(&s.shared).await?;
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
-    let (full, errors) = aggregated(&sources, &q.keyword()).await;
+    let include_cooled = truthy(q.include_cooled.as_deref());
+    let (active, skipped_cooldown, cooldown_total) =
+        searchable_without_cooled(&s.shared, &sources, include_cooled).await;
+    let (full, errors) = aggregated(&active, &q.keyword(), include_cooled).await;
 
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;
@@ -524,10 +653,10 @@ async fn search_aggregate(
         "total": total,
         "has_more": skip + page_size < total,
         "source_failed": source_failed,
-        "source_total": sources
-            .iter()
-            .filter(|x| x.enabled && crate::entities::is_supported_source_type(x.book_source_type))
-            .count(),
+        "source_total": active.len(),
+        "include_cooled": include_cooled,
+        "skipped_cooldown": skipped_cooldown,
+        "cooldown_total": cooldown_total,
         "cache_ttl_secs": AGG_TTL_SECS,
     })))
 }
@@ -2122,6 +2251,8 @@ mod tests {
             created_unix_ms: 0,
             sources: vec![hi, lo],
             source_total: 2,
+            skipped_cooldown: 0,
+            cooldown_total: 0,
             state: Mutex::new(SearchJobState {
                 books: vec![a, b],
                 errors: vec![],
@@ -2156,6 +2287,8 @@ mod tests {
             created_unix_ms: 0,
             sources: Vec::new(),
             source_total: pending,
+            skipped_cooldown: 0,
+            cooldown_total: 0,
             state: Mutex::new(SearchJobState {
                 pending,
                 ..Default::default()
@@ -2232,6 +2365,7 @@ mod tests {
             key: None,
             q: Some(" 剑来 ".into()),
             source_ids: None,
+            include_cooled: None,
             page: None,
             page_size: None,
         };
@@ -2241,6 +2375,7 @@ mod tests {
             key: Some("斗破".into()),
             q: Some("剑来".into()),
             source_ids: None,
+            include_cooled: None,
             page: None,
             page_size: None,
         };
@@ -2250,6 +2385,7 @@ mod tests {
             key: None,
             q: None,
             source_ids: None,
+            include_cooled: None,
             page: None,
             page_size: None,
         };

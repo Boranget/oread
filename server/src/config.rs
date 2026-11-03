@@ -65,6 +65,10 @@ pub struct Config {
     pub db_max_open_users: usize,
     /// 是否允许把已有库一次性 `VACUUM` 转成增量回收模式（默认关闭，避免启动期长事务）
     pub db_vacuum_convert: bool,
+    /// 迁移前自动备份的保留份数（`data/backups` 下最多保留几份，默认 5）
+    pub db_backup_keep: usize,
+    /// 书源连续失败进入冷却的时长（秒，默认 24h）
+    pub source_cooldown_secs: u64,
     /// 规则试跑预览是否允许访问回环/私网/链路本地地址（默认拒绝，防 SSRF）。
     /// 本地调试书源时可用 `PREVIEW_ALLOW_PRIVATE=true` 放行。
     pub preview_allow_private: bool,
@@ -99,6 +103,9 @@ impl Config {
             content_ttl_secs: env_u64("CONTENT_TTL_SECS", 7 * 86400).clamp(60, 30 * 86400) as i64,
             db_max_open_users: env_u64("DB_MAX_OPEN_USERS", 8).clamp(1, 32) as usize,
             db_vacuum_convert: env_bool("DB_VACUUM_CONVERT", false),
+            db_backup_keep: env_u64("DB_BACKUP_KEEP", 5).clamp(1, 50) as usize,
+            source_cooldown_secs: env_u64("SOURCE_COOLDOWN_SECS", 24 * 3600)
+                .clamp(60, 30 * 86400),
             preview_allow_private: env_bool("PREVIEW_ALLOW_PRIVATE", false),
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())

@@ -5,13 +5,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
+use std::time::Instant;
 
 use crate::auth::AuthUser;
 use crate::entities::BookSource;
 use crate::error::{AppError, AppResult};
 use crate::models::BookSourceListItem;
 use crate::routes::AppState;
+use crate::source_health;
+use crate::source_ledger::{self, LibraryState};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -23,6 +26,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sources/detail", get(get_one))
         .route("/api/sources/validate", post(validate))
         .route("/api/sources/delete", delete(delete_one))
+        .route("/api/sources/health", get(health_summary))
+        .route("/api/sources/health/check", post(health_check))
+        .route("/api/sources/health/reset", post(health_reset))
+        .route("/api/sources/prune", post(prune))
+        .route("/api/sources/quarantine", post(quarantine_sources))
 }
 
 #[derive(Deserialize)]
@@ -160,32 +168,241 @@ fn prepare_import(src: &mut BookSource) -> bool {
     supported
 }
 
+#[derive(Deserialize, Default)]
+pub struct ProbeQ {
+    /// `probe=0` 可关闭导入体检；默认对“新增 + 规则变化 + 隔离区复活检查”的源自动体检。
+    probe: Option<String>,
+    /// 导入来源标识（合集 URL / 文件名）；用于同来源 diff 与 raw_sha 去重。
+    source: Option<String>,
+    /// collection | file | api | inline
+    source_kind: Option<String>,
+    /// `force=1`：人工确认后强制覆盖 `update_rejected` / `conflict`。
+    force: Option<String>,
+    /// 体检关键词（默认“测试”）。
+    key: Option<String>,
+}
+
+impl ProbeQ {
+    fn truthy(&self, raw: Option<&String>) -> bool {
+        matches!(
+            raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    }
+
+    fn on(&self) -> bool {
+        self.truthy(self.probe.as_ref())
+    }
+
+    fn probe_disabled(&self) -> bool {
+        matches!(
+            self.probe
+                .as_deref()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "no" | "off")
+        )
+    }
+
+    fn force(&self) -> bool {
+        self.truthy(self.force.as_ref())
+    }
+
+    fn source_label(&self, default: &str) -> String {
+        self.source
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    }
+
+    fn kind_label(&self, default: &str) -> String {
+        self.source_kind
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    }
+}
+
+/// 只有“支持的类型 + 有搜索规则与搜索地址”的源才能做搜索体检。
+fn is_probeable(src: &BookSource) -> bool {
+    crate::entities::is_supported_source_type(src.book_source_type)
+        && src.rule_search.is_some()
+        && src.search_url.is_some()
+}
+
+/// 导入/单条保存后的体检：逐条结果 + 汇总。失败源**不会自动禁用**，
+/// 只通过 `suggested_enabled` 给出建议；引擎性失败（partial）建议保持启用。
+async fn probe_report(
+    pool: &SqlitePool,
+    cooldown_secs: u64,
+    list: &[BookSource],
+    key: &str,
+) -> (Vec<Value>, Value) {
+    let started = Instant::now();
+    let ineligible = list.iter().filter(|s| !is_probeable(s)).count();
+    let targets: Vec<BookSource> = list.iter().filter(|s| is_probeable(s)).cloned().collect();
+    let probes = source_health::probe_many(targets, key).await;
+    if let Err(e) = source_health::record_outcomes(
+        pool,
+        &source_health::outcomes_from_probes(&probes),
+        cooldown_secs,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "record import probe health failed");
+    }
+    let health = source_health::load_map(pool).await.unwrap_or_default();
+
+    let mut probed = 0usize;
+    let mut ok = 0usize;
+    let mut fail_site = 0usize;
+    let mut engine_limited = 0usize;
+    let mut kept_enabled = 0usize;
+    let mut disable_suggested = 0usize;
+    let mut results = Vec::with_capacity(list.len());
+    for src in list {
+        let p = probes.iter().find(|p| p.source_url == src.book_source_url);
+        let (probe_status, engine, suggested) = match p {
+            Some(p) if p.probed => {
+                if p.status == source_health::STATUS_OK {
+                    ("ok", false, true)
+                } else if p.status == source_health::STATUS_PARTIAL {
+                    // 站点能连上、只是规则跑不通：绝不能因为引擎缺陷把源标成废源
+                    ("fail", true, true)
+                } else {
+                    ("fail", false, false)
+                }
+            }
+            _ => ("never", false, src.enabled),
+        };
+        if p.map(|p| p.probed).unwrap_or(false) {
+            probed += 1;
+            if probe_status == "ok" {
+                ok += 1;
+            } else if engine {
+                engine_limited += 1;
+            } else {
+                fail_site += 1;
+            }
+            if suggested {
+                kept_enabled += 1;
+            } else {
+                disable_suggested += 1;
+            }
+        }
+        let h = health.get(&src.book_source_url);
+        results.push(json!({
+            "book_source_url": src.book_source_url.clone(),
+            "name": src.book_source_name.clone(),
+            "probe_status": probe_status,
+            "engine_limited": engine,
+            "latency_ms": p.map(|p| p.latency_ms).unwrap_or(0),
+            "error": p.and_then(|p| p.error.clone()),
+            "suggested_enabled": suggested,
+            "consecutive_failures": h.map(|x| x.consecutive_failures).unwrap_or(0),
+            "cooldown_until": h.and_then(|x| x.cooldown_until),
+        }));
+    }
+    let total = list.len();
+    let unprobed = total - probed;
+    let timed_out = unprobed.saturating_sub(ineligible);
+    let summary = json!({
+        "probe_total": total,
+        "probed": probed,
+        "unprobed": unprobed,
+        "ineligible": ineligible,
+        "probe_timed_out": timed_out > 0,
+        "ok": ok,
+        "fail_site": fail_site,
+        "engine_limited": engine_limited,
+        "kept_enabled": kept_enabled,
+        "disable_suggested": disable_suggested,
+        "probe_elapsed_ms": started.elapsed().as_millis() as u64,
+        "probe_budget_secs": source_health::PROBE_TOTAL_BUDGET_SECS,
+    });
+    (results, summary)
+}
+
+fn merge_probe(out: &mut Value, results: Vec<Value>, summary: Value) {
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("probe_results".into(), Value::Array(results));
+        if let Some(obj2) = summary.as_object() {
+            for (k, v) in obj2 {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
 pub async fn upsert(
     State(s): State<AppState>,
     u: AuthUser,
+    Query(pq): Query<ProbeQ>,
     Json(body): Json<Value>,
 ) -> AppResult<Json<serde_json::Value>> {
     crate::auth::ensure_admin(&u)?;
     let mut src = normalize_source(body)?;
     prepare_import(&mut src);
     store_source(&s.shared, &src).await?;
-    Ok(Json(json!({
+    let mut out = json!({
         "ok": true,
         "type": src.book_source_type,
         "type_name": crate::entities::source_type_name(src.book_source_type),
         "unsupported_type": src.unsupported_type,
         "enabled": src.enabled,
-    })))
+    });
+    if pq.on() {
+        let (results, summary) = probe_report(
+            &s.shared,
+            s.cfg.source_cooldown_secs,
+            std::slice::from_ref(&src),
+            source_health::DEFAULT_PROBE_KEY,
+        )
+        .await;
+        merge_probe(&mut out, results, summary);
+    }
+    Ok(Json(out))
 }
 
 /// 批量导入：同一批内按 book_source_url 去重（后者覆盖前者），并区分新增/更新数量。
+/// 旧版本是否仍“可用”：未被隔离、用户未禁用、最近健康记录不是站点失败。
+fn local_still_usable(
+    existing: Option<&BookSource>,
+    state: Option<&LibraryState>,
+    health: Option<&source_health::HealthRow>,
+) -> bool {
+    let Some(e) = existing else {
+        return false;
+    };
+    e.enabled
+        && state.map(|st| !st.is_quarantined()).unwrap_or(true)
+        && health
+            .map(|h| h.last_status != source_health::STATUS_FAIL)
+            .unwrap_or(true)
+}
+
+/// 批量导入：三层模型（本地源库 + 导入账本 + 隔离区）+ 覆盖三态。
+///
+/// 1. 先算整份合集的规范化哈希：与同来源上一批相同 → 不发起任何探测（隔离区复活检查除外）。
+/// 2. 只探测“新增 + 规则哈希变化 + 隔离区待复活”的条目，未变化的沿用历史健康记录。
+/// 3. 覆盖前做质量判断：
+///    - 新版站点体检通过 / 引擎性失败 → 覆盖（引擎性失败只标记 engine_limited，绝不隔离）
+///    - 新版站点体检失败且本地旧版仍可用 → `update_rejected`，保留旧版
+///    - 本地规则与账本快照哈希不一致（人工改过） → `conflict`，不自动覆盖
+/// 4. 隔离区只移出活跃库，原始定义仍保留在 `book_sources` 与账本中，后续可复活。
 pub async fn import(
     State(s): State<AppState>,
     u: AuthUser,
+    Query(pq): Query<ProbeQ>,
     Json(body): Json<Value>,
 ) -> AppResult<Json<serde_json::Value>> {
     crate::auth::ensure_admin(&u)?;
-    let items: Vec<Value> = match body {
+    let raw = body;
+    let items: Vec<Value> = match raw.clone() {
         Value::Array(arr) => arr,
         single => vec![single],
     };
@@ -204,32 +421,349 @@ pub async fn import(
         }
         list.push(src);
     }
-    let mut inserted = 0usize;
-    let mut updated = 0usize;
     let mut disabled_unsupported = 0usize;
     for src in &mut list {
         if !prepare_import(src) {
             disabled_unsupported += 1;
         }
-        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_sources WHERE id = ?")
-            .bind(&src.book_source_url)
-            .fetch_one(&s.shared)
-            .await?;
-        store_source(&s.shared, src).await?;
-        if exists > 0 {
-            updated += 1;
-        } else {
-            inserted += 1;
+    }
+
+    let now = source_health::now_ms();
+    let raw_sha = source_ledger::sha256_hex(&source_ledger::canonical_json(&raw));
+    let source = pq.source_label("inline");
+    let source_kind = pq.kind_label("inline");
+    let force = pq.force();
+    let probe_disabled = pq.probe_disabled();
+    let batch_id = format!("{}-{}", now, &raw_sha[..raw_sha.len().min(8)]);
+
+    let same_collection = source_ledger::last_batch_sha(&s.shared, &source)
+        .await?
+        .map(|x| x == raw_sha)
+        .unwrap_or(false);
+    let previous_urls = source_ledger::last_batch_urls(&s.shared, &source)
+        .await
+        .unwrap_or_default();
+
+    let existing_list = load_sources(&s.shared).await?;
+    let existing_map: std::collections::HashMap<String, BookSource> = existing_list
+        .into_iter()
+        .map(|x| (x.book_source_url.clone(), x))
+        .collect();
+    let states = source_ledger::load_states(&s.shared).await?;
+    let health_before = source_health::load_map(&s.shared).await?;
+
+    // ---- 只探测必要条目：新增 / 规则变化 / 隔离区待复活 ----
+    let mut targets: Vec<BookSource> = Vec::new();
+    if !probe_disabled {
+        for src in &list {
+            let url = &src.book_source_url;
+            let existing = existing_map.get(url);
+            let quarantined = states.get(url).map(|st| st.is_quarantined()).unwrap_or(false);
+            let changed = existing
+                .map(|e| source_ledger::rule_hash(e) != source_ledger::rule_hash(src))
+                .unwrap_or(true);
+            let need = quarantined || (changed && (!same_collection || existing.is_none()));
+            if need {
+                targets.push(src.clone());
+            }
         }
     }
+    let probe_key = pq
+        .key
+        .as_deref()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .unwrap_or(source_health::DEFAULT_PROBE_KEY);
+    let probe_started = Instant::now();
+    let probes = if targets.is_empty() {
+        Vec::new()
+    } else {
+        source_health::probe_many(targets, probe_key).await
+    };
+    if let Err(e) = source_health::record_outcomes(
+        &s.shared,
+        &source_health::outcomes_from_probes(&probes),
+        s.cfg.source_cooldown_secs,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "record import probe health failed");
+    }
+    let health_after = source_health::load_map(&s.shared).await.unwrap_or_default();
+    let probe_map: std::collections::HashMap<String, source_health::Probe> = probes
+        .into_iter()
+        .map(|p| (p.source_url.clone(), p))
+        .collect();
+
+    let mut ledger_items: Vec<source_ledger::ItemRecord> = Vec::with_capacity(list.len());
+    let mut results: Vec<Value> = Vec::with_capacity(list.len());
+    let (mut added, mut updated, mut unchanged, mut update_rejected, mut conflict, mut resurrected) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut newly_quarantined = 0usize;
+    let mut probed_count = 0usize;
+    let mut probe_ok = 0usize;
+    let mut probe_fail_site = 0usize;
+    let mut probe_engine_limited = 0usize;
+    let mut kept_enabled = 0usize;
+    let mut disable_suggested = 0usize;
+
+    for src in &list {
+        let url = src.book_source_url.clone();
+        let existing = existing_map.get(&url);
+        let state = states.get(&url);
+        let incoming_hash = source_ledger::rule_hash(src);
+        let existing_hash = existing.map(source_ledger::rule_hash);
+        let recorded = state.and_then(|st| st.content_sha.as_deref());
+        let local_modified = match (existing, recorded) {
+            (Some(_), Some(rec)) => existing_hash.as_deref().map(|h| h != rec).unwrap_or(false),
+            _ => false,
+        };
+        let changed = existing_hash.as_deref() != Some(incoming_hash.as_str());
+        let was_quarantined = state.map(|st| st.is_quarantined()).unwrap_or(false);
+
+        let probe = probe_map.get(&url);
+        let probed = probe.map(|p| p.probed).unwrap_or(false);
+        let probe_status = match probe {
+            Some(p) if p.probed => p.status,
+            _ => source_health::STATUS_NEVER,
+        };
+        let historical = health_after.get(&url).map(|h| h.last_status.as_str());
+        let engine_limited = probe_status == source_health::STATUS_PARTIAL
+            || (!probed && historical == Some(source_health::STATUS_PARTIAL));
+
+        let mut accepted = true;
+        let mut decision = state
+            .map(|st| st.decision.clone())
+            .unwrap_or_else(|| source_ledger::DECISION_ACTIVE.to_string());
+        let mut category = "unchanged";
+        let mut reason: Option<String> = None;
+
+        if local_modified && changed && !force {
+            // 人工改过的本地规则优先：不自动覆盖，等待确认
+            accepted = false;
+            category = "conflict";
+            reason = Some("本地规则与账本快照不一致，已保留本地版本".into());
+        } else if existing.is_none() {
+            category = "added";
+            decision = if probed && probe_status == source_health::STATUS_FAIL
+                && !engine_limited
+            {
+                source_ledger::DECISION_QUARANTINED.to_string()
+            } else {
+                source_ledger::DECISION_ACTIVE.to_string()
+            };
+        } else if changed {
+            if force {
+                decision = if probe_status == source_health::STATUS_FAIL && !engine_limited {
+                    source_ledger::DECISION_QUARANTINED.to_string()
+                } else {
+                    source_ledger::DECISION_ACTIVE.to_string()
+                };
+                category = if was_quarantined
+                    && decision == source_ledger::DECISION_ACTIVE
+                {
+                    "resurrected"
+                } else {
+                    "updated"
+                };
+            } else if !probed {
+                accepted = false;
+                category = "update_rejected";
+                reason = Some("新版体检未完成，暂不覆盖本地版本".into());
+            } else if probe_status == source_health::STATUS_FAIL
+                && !engine_limited
+                && local_still_usable(existing, state, health_before.get(&url))
+            {
+                accepted = false;
+                category = "update_rejected";
+                reason = Some("新版站点体检失败，本地旧版仍可用，已保留旧版".into());
+            } else if local_still_usable(existing, state, health_before.get(&url))
+                && src.last_update_time <= existing.map(|e| e.last_update_time).unwrap_or(0)
+            {
+                // 上游规则变更但版本没有更晚（含时间相同）：保留本地，避免每次导入都抖动换版本。
+                accepted = false;
+                category = "unchanged";
+                reason = Some("本地版本不旧于上游，保留本地版本".into());
+            } else {
+                decision = if probe_status == source_health::STATUS_FAIL && !engine_limited {
+                    source_ledger::DECISION_QUARANTINED.to_string()
+                } else {
+                    source_ledger::DECISION_ACTIVE.to_string()
+                };
+                category = if was_quarantined
+                    && decision == source_ledger::DECISION_ACTIVE
+                {
+                    "resurrected"
+                } else {
+                    "updated"
+                };
+            }
+        } else if was_quarantined && probed && probe_status != source_health::STATUS_FAIL {
+            // 规则未变、但隔离区这次体检通过 → 复活
+            decision = source_ledger::DECISION_ACTIVE.to_string();
+            category = "resurrected";
+            reason = Some("隔离区复检通过，已回到活跃库".into());
+        }
+
+        if decision == source_ledger::DECISION_QUARANTINED
+            && !was_quarantined
+            && (category == "added" || category == "updated")
+        {
+            newly_quarantined += 1;
+        }
+        if decision == source_ledger::DECISION_QUARANTINED && reason.is_none() {
+            reason = Some(match probe.and_then(|p| p.error.clone()) {
+                Some(e) => format!("site_unreachable: {e}"),
+                None => "site_unreachable".into(),
+            });
+        } else if engine_limited && reason.is_none() {
+            reason = Some(match probe.and_then(|p| p.error.clone()) {
+                Some(e) => format!("engine_limited: {e}"),
+                None => "engine_limited".into(),
+            });
+        }
+
+        if accepted {
+            store_source(&s.shared, src).await?;
+            source_ledger::upsert_state(
+                &s.shared,
+                &url,
+                &decision,
+                reason.as_deref(),
+                Some(&incoming_hash),
+                &batch_id,
+                now,
+            )
+            .await?;
+            source_ledger::clear_review(&s.shared, &url).await?;
+        } else if category == "unchanged" {
+            // 上游版本没有更晚：保留本地版本，不写 review、不覆盖。
+        } else {
+            let review = if category == "conflict" {
+                source_ledger::REVIEW_CONFLICT
+            } else {
+                source_ledger::REVIEW_UPDATE_REJECTED
+            };
+            source_ledger::set_review(&s.shared, &url, review, reason.as_deref(), now).await?;
+        }
+
+        match category {
+            "added" => added += 1,
+            "updated" => updated += 1,
+            "update_rejected" => update_rejected += 1,
+            "conflict" => conflict += 1,
+            "resurrected" => resurrected += 1,
+            _ => unchanged += 1,
+        }
+        if probed {
+            probed_count += 1;
+            match probe_status {
+                source_health::STATUS_OK => probe_ok += 1,
+                source_health::STATUS_PARTIAL => probe_engine_limited += 1,
+                _ => probe_fail_site += 1,
+            }
+            if decision == source_ledger::DECISION_ACTIVE {
+                kept_enabled += 1;
+            } else {
+                disable_suggested += 1;
+            }
+        }
+
+        let ledger_probe = match probe_status {
+            source_health::STATUS_OK => "ok",
+            source_health::STATUS_PARTIAL => "fail",
+            source_health::STATUS_FAIL => "fail",
+            _ => "never",
+        };
+        let h = health_after.get(&url);
+        ledger_items.push(source_ledger::ItemRecord {
+            source_url: url.clone(),
+            definition: source_ledger::snapshot_json(src),
+            content_sha: incoming_hash.clone(),
+            probe_status: ledger_probe.into(),
+            decision: decision.clone(),
+            reason: Some(match &reason {
+                Some(r) => format!("{category}: {r}"),
+                None => category.to_string(),
+            }),
+        });
+        results.push(json!({
+            "book_source_url": url,
+            "name": src.book_source_name.clone(),
+            "probe_status": if probed {
+                if probe_status == source_health::STATUS_OK { "ok" } else { "fail" }
+            } else { "never" },
+            "engine_limited": engine_limited,
+            "latency_ms": probe.map(|p| p.latency_ms).unwrap_or(0),
+            "error": probe.and_then(|p| p.error.clone()),
+            "suggested_enabled": decision == source_ledger::DECISION_ACTIVE,
+            "decision": decision,
+            "category": category,
+            "reason": reason,
+            "consecutive_failures": h.map(|x| x.consecutive_failures).unwrap_or(0),
+            "cooldown_until": h.and_then(|x| x.cooldown_until),
+        }));
+    }
+
+    let current_urls: std::collections::HashSet<&str> =
+        list.iter().map(|x| x.book_source_url.as_str()).collect();
+    let local_only: Vec<String> = previous_urls
+        .iter()
+        .filter(|u| !current_urls.contains(u.as_str()))
+        .cloned()
+        .collect();
+
+    let probe_summary = json!({
+        "probed": probed_count,
+        "unprobed": list.len().saturating_sub(probed_count),
+        "ok": probe_ok,
+        "fail_site": probe_fail_site,
+        "engine_limited": probe_engine_limited,
+        "kept_enabled": kept_enabled,
+        "disable_suggested": disable_suggested,
+        "probe_elapsed_ms": probe_started.elapsed().as_millis() as u64,
+        "probe_budget_secs": source_health::PROBE_TOTAL_BUDGET_SECS,
+        "probe_skipped_same_collection": same_collection,
+    });
+    let probe_summary_str = serde_json::to_string(&probe_summary).ok();
+    source_ledger::record_batch(
+        &s.shared,
+        &source_ledger::BatchRecord {
+            id: batch_id.clone(),
+            source: source.clone(),
+            source_kind: source_kind.clone(),
+            imported_at: now,
+            item_count: list.len(),
+            raw_sha: Some(raw_sha.clone()),
+            probe_summary: probe_summary_str,
+        },
+        &ledger_items,
+    )
+    .await?;
+
     Ok(Json(json!({
         "ok": true,
+        "batch_id": batch_id,
+        "source": source,
+        "source_kind": source_kind,
+        "collection_unchanged": same_collection,
         "count": list.len(),
-        "inserted": inserted,
-        "updated": updated,
-        // 契约变更：导入统计，明确有多少条因类型不受支持被默认禁用
         "imported": list.len(),
+        "inserted": added,
+        "added": added,
+        "updated": updated,
+        "unchanged": unchanged,
+        "update_rejected": update_rejected,
+        "conflict": conflict,
+        "resurrected": resurrected,
+        "local_only": local_only.len(),
+        "local_only_urls": local_only,
+        "newly_quarantined": newly_quarantined,
+        "force": force,
         "disabled_unsupported": disabled_unsupported,
+        "distinct_hosts": source_health::distinct_host_count(&list),
+        "probe_summary": probe_summary,
+        "probe_results": results,
     })))
 }
 
@@ -238,7 +772,15 @@ pub async fn export_all(
     State(s): State<AppState>,
     _u: AuthUser,
 ) -> AppResult<Json<Vec<Value>>> {
-    let list = load_sources(&s.shared).await?;
+    // 安全口径：导出本地源库时排除隔离区条目，避免把源里自带的认证头再分发出去。
+    let quarantined = source_ledger::quarantined_set(&s.shared)
+        .await
+        .unwrap_or_default();
+    let list: Vec<BookSource> = load_sources(&s.shared)
+        .await?
+        .into_iter()
+        .filter(|x| !quarantined.contains(&x.book_source_url))
+        .collect();
     let out = list
         .into_iter()
         .filter_map(|src| serde_json::to_value(src).ok())
@@ -506,6 +1048,427 @@ pub async fn check_updates(
         obj.insert("errors".into(), json!(errors));
     }
     Ok(Json(out))
+}
+
+fn split_ids(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn truthy(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[derive(Deserialize, Default)]
+pub struct HealthCheckQ {
+    /// 逗号分隔的 bookSourceUrl；为空则检查全部“启用且可搜索”的源。
+    source_ids: Option<String>,
+    /// `1` 时只测“未测过 / 冷却到期 / 距上次超过冷却时长”的源。
+    only_due: Option<String>,
+    key: Option<String>,
+}
+
+/// `POST /api/sources/health/check`：只跑一次“搜索”探测，并发 ≤8，整批 ≤90s。
+pub async fn health_check(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    Query(q): Query<HealthCheckQ>,
+) -> AppResult<Json<Value>> {
+    let sources = load_sources(&s.shared).await?;
+    let quarantined = source_ledger::quarantined_set(&s.shared)
+        .await
+        .unwrap_or_default();
+    let ids = split_ids(q.source_ids.as_deref());
+    let mut selected: Vec<BookSource> = sources
+        .into_iter()
+        .filter(|x| {
+            is_probeable(x)
+                && if ids.is_empty() {
+                    // 默认巡检不消耗隔离区；显式 source_ids 可用于复查复活。
+                    x.enabled && !quarantined.contains(&x.book_source_url)
+                } else {
+                    ids.iter().any(|id| id == &x.book_source_url)
+                }
+        })
+        .collect();
+    if truthy(q.only_due.as_deref()) {
+        let health = source_health::load_map(&s.shared).await.unwrap_or_default();
+        let recheck_ms = (s.cfg.source_cooldown_secs as i64).saturating_mul(1000);
+        let now = source_health::now_ms();
+        selected.retain(|x| {
+            health
+                .get(&x.book_source_url)
+                .map(|h| h.due(now, recheck_ms))
+                .unwrap_or(true)
+                // 同时满足“无记录 → 该测”
+        });
+        // retain 的 unwrap_or 已覆盖“无记录”，这里保持简单明确
+    }
+    selected.sort_by(|a, b| a.book_source_name.cmp(&b.book_source_name));
+
+    let key = q
+        .key
+        .as_deref()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .unwrap_or(source_health::DEFAULT_PROBE_KEY);
+    let started = Instant::now();
+    let probes = source_health::probe_many(selected.clone(), key).await;
+    if let Err(e) = source_health::record_outcomes(
+        &s.shared,
+        &source_health::outcomes_from_probes(&probes),
+        s.cfg.source_cooldown_secs,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "record health check failed");
+    }
+    let health = source_health::load_map(&s.shared).await.unwrap_or_default();
+    let results: Vec<Value> = probes
+        .iter()
+        .map(|p| {
+            let h = health.get(&p.source_url);
+            json!({
+                "source_url": p.source_url.clone(),
+                "name": p.name.clone(),
+                "status": p.status,
+                "engine_limited": p.status == source_health::STATUS_PARTIAL,
+                "latency_ms": p.latency_ms,
+                "error": p.error.clone(),
+                "consecutive_failures": h.map(|x| x.consecutive_failures).unwrap_or(0),
+                "cooldown_until": h.and_then(|x| x.cooldown_until),
+            })
+        })
+        .collect();
+    let checked = probes.iter().filter(|p| p.probed).count();
+    Ok(Json(json!({
+        "ok": true,
+        "selected": selected.len(),
+        "checked": checked,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "budget_secs": source_health::PROBE_TOTAL_BUDGET_SECS,
+        "cooldown_secs": s.cfg.source_cooldown_secs,
+        "fail_threshold": source_health::FAIL_THRESHOLD,
+        "results": results,
+    })))
+}
+
+#[derive(Deserialize, Default)]
+pub struct HealthSummaryQ {
+    /// `detail=1` 时返回逐源明细。
+    detail: Option<String>,
+}
+
+/// `GET /api/sources/health`：汇总（源数 / 去重站点数 / ok / partial / fail / 冷却 / 未测）。
+pub async fn health_summary(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    Query(q): Query<HealthSummaryQ>,
+) -> AppResult<Json<Value>> {
+    let rows = sqlx::query(
+        "SELECT s.id AS id, s.name AS name, s.enabled AS enabled, \
+         h.last_status AS last_status, h.last_checked_at AS last_checked_at, \
+         h.last_error AS last_error, h.consecutive_failures AS consecutive_failures, \
+         h.last_ok_at AS last_ok_at, h.cooldown_until AS cooldown_until, \
+         h.avg_latency_ms AS avg_latency_ms, \
+         l.decision AS decision, l.review_state AS review_state \
+         FROM book_sources s LEFT JOIN source_health h ON h.source_url = s.id \
+         LEFT JOIN source_library_state l ON l.source_url = s.id \
+         ORDER BY s.name",
+    )
+    .fetch_all(&s.shared)
+    .await?;
+
+    let now = source_health::now_ms();
+    let detail_on = truthy(q.detail.as_deref());
+    let (mut total, mut ok, mut partial, mut fail, mut cooling, mut never) = (
+        0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
+    );
+    let (mut active, mut quarantined) = (0usize, 0usize);
+    let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut details: Vec<Value> = Vec::new();
+    for r in rows {
+        total += 1;
+        let id: String = r.get("id");
+        if let Some(h) = source_health::host_of(&id) {
+            hosts.insert(h);
+        }
+        let status: Option<String> = r.try_get("last_status").ok().flatten();
+        let status = status.unwrap_or_else(|| source_health::STATUS_NEVER.to_string());
+        match status.as_str() {
+            source_health::STATUS_OK => ok += 1,
+            source_health::STATUS_PARTIAL => partial += 1,
+            source_health::STATUS_FAIL => fail += 1,
+            _ => never += 1,
+        }
+        let cooldown_until: Option<i64> = r.try_get("cooldown_until").ok().flatten();
+        let cooling_now = cooldown_until.map(|t| t > now).unwrap_or(false);
+        if cooling_now {
+            cooling += 1;
+        }
+        let decision: Option<String> = r.try_get("decision").ok().flatten();
+        let decision =
+            decision.unwrap_or_else(|| source_ledger::DECISION_ACTIVE.to_string());
+        if decision == source_ledger::DECISION_QUARANTINED {
+            quarantined += 1;
+        } else {
+            active += 1;
+        }
+        if detail_on {
+            details.push(json!({
+                "book_source_url": id,
+                "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                "enabled": r.try_get::<i64, _>("enabled").unwrap_or(0) != 0,
+                "last_status": status,
+                "last_checked_at": r.try_get::<Option<i64>, _>("last_checked_at").ok().flatten(),
+                "last_error": r.try_get::<Option<String>, _>("last_error").ok().flatten(),
+                "consecutive_failures": r.try_get::<i64, _>("consecutive_failures").unwrap_or(0),
+                "last_ok_at": r.try_get::<Option<i64>, _>("last_ok_at").ok().flatten(),
+                "cooldown_until": cooldown_until,
+                "avg_latency_ms": r.try_get::<Option<i64>, _>("avg_latency_ms").ok().flatten(),
+                "cooling": cooling_now,
+                "decision": decision,
+                "review_state": r.try_get::<Option<String>, _>("review_state").ok().flatten(),
+            }));
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "total": total,
+        "distinct_hosts": hosts.len(),
+        "active": active,
+        "quarantined": quarantined,
+        "ok": ok,
+        "partial": partial,
+        "fail": fail,
+        "cooling": cooling,
+        "never": never,
+        "cooldown_secs": s.cfg.source_cooldown_secs,
+        "fail_threshold": source_health::FAIL_THRESHOLD,
+        "now": now,
+        "detail": detail_on,
+        "sources": if detail_on { Value::Array(details) } else { Value::Null },
+    })))
+}
+
+#[derive(Deserialize, Default)]
+pub struct ResetReq {
+    source_ids: Option<Vec<String>>,
+    url: Option<String>,
+}
+
+/// `POST /api/sources/health/reset`：清空某源或全部健康记录（手动“重新信任”）。
+pub async fn health_reset(
+    State(s): State<AppState>,
+    u: AuthUser,
+    body: Option<Json<ResetReq>>,
+) -> AppResult<Json<Value>> {
+    crate::auth::ensure_admin(&u)?;
+    let mut ids = body
+        .as_ref()
+        .and_then(|b| b.source_ids.clone())
+        .unwrap_or_default();
+    if let Some(url) = body.as_ref().and_then(|b| b.url.clone()) {
+        ids.push(url);
+    }
+    ids.retain(|x| !x.trim().is_empty());
+    let cleared = source_health::reset(&s.shared, &ids).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "cleared": cleared,
+        "scope": if ids.is_empty() { "all" } else { "selected" },
+    })))
+}
+
+#[derive(Deserialize, Default)]
+pub struct PruneQ {
+    within_days: Option<i64>,
+    action: Option<String>,
+    confirm: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct PruneReq {
+    within_days: Option<i64>,
+    action: Option<String>,
+    confirm: Option<bool>,
+}
+
+/// `POST /api/sources/prune`：按“站点性失败 + 最近 N 天”筛出源条目，先预览、确认后禁用/删除。
+/// 引擎性失败（`partial`）永远不在候选内；只按 `bookSourceUrl` 操作，不按域名批量。
+pub async fn prune(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<PruneQ>,
+    body: Option<Json<PruneReq>>,
+) -> AppResult<Json<Value>> {
+    crate::auth::ensure_admin(&u)?;
+    let days = body
+        .as_ref()
+        .and_then(|b| b.within_days)
+        .or(q.within_days)
+        .unwrap_or(7)
+        .clamp(1, 365);
+    let action = body
+        .as_ref()
+        .and_then(|b| b.action.clone())
+        .or(q.action.clone())
+        .unwrap_or_else(|| "quarantine".to_string())
+        .to_ascii_lowercase();
+    if !matches!(action.as_str(), "quarantine" | "disable") {
+        return Err(AppError::BadRequest(
+            "action 仅支持 quarantine（默认）或 disable；隔离保留原始定义，不提供物理删除".into(),
+        ));
+    }
+    let confirm = truthy(q.confirm.as_deref())
+        || body.as_ref().and_then(|b| b.confirm).unwrap_or(false);
+
+    let now = source_health::now_ms();
+    let since = now.saturating_sub((days as i64).saturating_mul(86_400_000));
+    let rows = sqlx::query(
+        "SELECT s.id AS id, s.name AS name, s.enabled AS enabled, \
+         h.last_status AS last_status, h.last_checked_at AS last_checked_at, \
+         h.consecutive_failures AS consecutive_failures, h.last_error AS last_error, \
+         h.cooldown_until AS cooldown_until \
+         FROM book_sources s JOIN source_health h ON h.source_url = s.id \
+         LEFT JOIN source_library_state l ON l.source_url = s.id \
+         WHERE h.last_status = 'fail' AND h.last_checked_at IS NOT NULL AND h.last_checked_at >= ? \
+           AND (l.decision IS NULL OR l.decision <> 'quarantined') \
+         ORDER BY s.name",
+    )
+    .bind(since)
+    .fetch_all(&s.shared)
+    .await?;
+
+    let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let candidates: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let id: String = r.get("id");
+            if let Some(h) = source_health::host_of(&id) {
+                hosts.insert(h);
+            }
+            json!({
+                "book_source_url": id,
+                "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                "enabled": r.try_get::<i64, _>("enabled").unwrap_or(0) != 0,
+                "probe_status": "fail_site",
+                "last_status": r.try_get::<Option<String>, _>("last_status").ok().flatten(),
+                "last_checked_at": r.try_get::<Option<i64>, _>("last_checked_at").ok().flatten(),
+                "consecutive_failures": r.try_get::<i64, _>("consecutive_failures").unwrap_or(0),
+                "last_error": r.try_get::<Option<String>, _>("last_error").ok().flatten(),
+                "cooldown_until": r.try_get::<Option<i64>, _>("cooldown_until").ok().flatten(),
+            })
+        })
+        .collect();
+
+    if !confirm {
+        return Ok(Json(json!({
+            "ok": true,
+            "confirm_required": true,
+            "within_days": days,
+            "action": action,
+            "would_affect": candidates.len(),
+            "affected_hosts": hosts.len(),
+            "engine_limited_excluded": true,
+            "sources": candidates,
+        })));
+    }
+
+    let mut affected = 0usize;
+    let mut failed = 0usize;
+    for c in &candidates {
+        let id = c.get("book_source_url").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        if let Err(e) =
+            source_ledger::quarantine(&s.shared, id, Some("pruned_site_fail"), now).await
+        {
+            failed += 1;
+            tracing::warn!(source = id, error = %e, "prune quarantine failed");
+            continue;
+        }
+        if action == "disable" {
+            match load_source(&s.shared, id).await {
+                Ok(mut src) => {
+                    src.enabled = false;
+                    if let Err(e) = store_source(&s.shared, &src).await {
+                        failed += 1;
+                        tracing::warn!(source = id, error = %e, "prune disable failed");
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(source = id, error = %e, "prune disable load failed");
+                    continue;
+                }
+            }
+        }
+        affected += 1;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "confirm_required": false,
+        "within_days": days,
+        "action": action,
+        "affected": affected,
+        "failed": failed,
+        "affected_hosts": hosts.len(),
+        "engine_limited_excluded": true,
+        "physical_delete": false,
+        "sources": candidates,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct QuarantineReq {
+    source_ids: Vec<String>,
+    reason: Option<String>,
+}
+
+/// `POST /api/sources/quarantine`：手动把指定源移入隔离区（保留定义，不物理删除）。
+pub async fn quarantine_sources(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Json(req): Json<QuarantineReq>,
+) -> AppResult<Json<Value>> {
+    crate::auth::ensure_admin(&u)?;
+    let mut affected = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    let now = source_health::now_ms();
+    let reason = req
+        .reason
+        .as_deref()
+        .unwrap_or("manual_quarantine")
+        .to_string();
+    for id in &req.source_ids {
+        if load_source(&s.shared, id).await.is_err() {
+            missing.push(id.clone());
+            continue;
+        }
+        if let Err(e) = source_ledger::quarantine(&s.shared, id, Some(&reason), now).await {
+            tracing::warn!(source = %id, error = %e, "manual quarantine failed");
+            missing.push(id.clone());
+            continue;
+        }
+        affected += 1;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "affected": affected,
+        "missing": missing,
+        "reason": reason,
+    })))
 }
 
 #[cfg(test)]
