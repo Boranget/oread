@@ -375,6 +375,9 @@ export const api = {
     }),
   validateSource: (source, checkUrl = false) =>
     request('POST', '/sources/validate', { source, check_url: !!checkUrl }),
+  // 只读比对：入参为 Legado 书源数组（或 {sources:[]}），返回 updated/new/local_newer/same
+  checkSourceUpdates: (list) =>
+    request('POST', '/sources/check-updates', list, { timeout: 60000 }),
 
   // ---- discovery / reading ----
   search: (key, page = 1, pageSize = 30) =>

@@ -56,8 +56,28 @@
   let scopeOpen = false;
   let requestSourceCount = 0; // 本次实际带上的 source_ids 数（0=未传）
   let ignoredSourceIds = []; // 后端回显的 ignored_source_ids
+  let groupFilter = 'all';
+
+  // 搜索历史：本地持久化（localStorage），最多 12 条
+  const HISTORY_KEY = 'oread_search_history';
+  const HISTORY_MAX = 12;
+  let history = [];
+
+  // 本次搜索的固定快照（用于结果页“只搜这些源重试”）
+  let lastSearchKey = '';
+  let lastSearchScopeIds = [];
+  let resultScopeMode = 'all';
+  let resultRequested = 0;
+
+  // 失败源重试：独立 job，只带上次失败源的 source_ids，结果合并进当前页
+  let retrying = false;
+  let retrySeq = 0;
+  let retryNote = '';
+  let retryExtra = []; // 重试新增的结果，翻页时重新附加，避免翻页丢失
 
   $: enabledSources = sources.filter((s) => s.enabled);
+  $: groupOptions = [...new Set(sources.map((s) => s.book_source_group).filter(Boolean))];
+  $: pickSources = groupFilter === 'all' ? sources : sources.filter((s) => (s.book_source_group || '') === groupFilter);
 
   // 书架状态（用于“已加入”标记）
   let shelfIds = new Set();
@@ -66,6 +86,7 @@
   $: completedSources = Math.max(0, finishedSources - failedCount);
 
   onMount(async () => {
+    history = readHistory();
     try {
       sources = await api.sources();
       if (sources.length) {
@@ -86,8 +107,46 @@
   onDestroy(() => {
     clearInterval(searchTimer);
     jobSeq += 1;
+    retrySeq += 1;
     cancelPolling();
   });
+
+  function readHistory() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+      if (!Array.isArray(arr)) return [];
+      return arr.filter((x) => typeof x === 'string' && x.trim()).slice(0, HISTORY_MAX);
+    } catch {
+      return [];
+    }
+  }
+
+  function writeHistory(list) {
+    history = list.slice(0, HISTORY_MAX);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch {
+      /* 本地存储不可用时只作用于当前会话 */
+    }
+  }
+
+  function rememberKey(q) {
+    writeHistory([q, ...history.filter((x) => x !== q)]);
+  }
+
+  function removeHistory(q) {
+    writeHistory(history.filter((x) => x !== q));
+  }
+
+  function clearHistory() {
+    writeHistory([]);
+  }
+
+  function useHistory(q) {
+    if (starting || searching) return;
+    key = q;
+    doSearch(q);
+  }
 
   function startSearchClock() {
     clearInterval(searchTimer);
@@ -130,7 +189,8 @@
 
   function applyResult(r) {
     // 同一 job 同一页的最新快照：轮询期间只替换数组内容，不清空，避免闪回空态
-    results = dedupe(r.books || []);
+    // 失败源重试的新增结果按 book_url 去重后附在列表尾部，翻页时也会重新附加
+    results = dedupeByUrl((r.books || []).concat(retryExtra));
     resultsPage = page;
     total = Number.isFinite(Number(r.total)) ? Number(r.total) : results.length;
     hasMore = !!r.has_more;
@@ -148,6 +208,7 @@
     failedSources = rawFailed.map((e) => ({
       name: e.source_name || e.source || '未知书源',
       reason: describeSourceError(e.error),
+      url: e.source || '',
     }));
     failedCount = Number.isFinite(Number(r.source_failed))
       ? Math.max(0, Number(r.source_failed))
@@ -230,6 +291,15 @@
     pickedSourceIds = enabledSources.map((s) => s.book_source_url);
   }
 
+  // 按分组选择：只并入该分组下的启用书源，保留已选的其他源
+  function pickGroup() {
+    if (groupFilter === 'all') return;
+    const add = enabledSources
+      .filter((s) => (s.book_source_group || '') === groupFilter)
+      .map((s) => s.book_source_url);
+    pickedSourceIds = [...new Set(pickedSourceIds.concat(add))];
+  }
+
   function clearPicked() {
     pickedSourceIds = [];
   }
@@ -244,8 +314,8 @@
     return /^\d+$/.test(id) ? `第 ${id} 个源（序号）` : id;
   }
 
-  async function doSearch() {
-    const q = key.trim();
+  async function doSearch(preset) {
+    const q = String(typeof preset === 'string' ? preset : key).trim();
     if (!q || starting) return;
     if (sourceScope === 'custom' && !pickedSourceIds.length) {
       error = '请至少选择一个书源，或把搜索范围切回「全部启用源」';
@@ -253,6 +323,7 @@
     }
     const requestedIds = sourceScope === 'custom' ? pickedSourceIds.slice() : [];
     const seq = ++jobSeq;
+    retrySeq += 1; // 作废仍在进行的失败源重试
     cancelPolling();
     jobId = '';
     jobExpired = false;
@@ -261,6 +332,9 @@
     searchDone = false;
     paging = false;
     searched = true;
+    retrying = false;
+    retryNote = '';
+    retryExtra = [];
     page = 1;
     resultsPage = 1;
     results = []; // 新 job 属于新查询，清空旧结果
@@ -277,6 +351,11 @@
     notice = '';
     requestSourceCount = requestedIds.length;
     ignoredSourceIds = [];
+    rememberKey(q);
+    lastSearchKey = q;
+    lastSearchScopeIds = requestedIds.slice();
+    resultScopeMode = sourceScope;
+    resultRequested = requestedIds.length;
     startSearchClock();
     try {
       const r = await api.searchStart(q, requestedIds);
@@ -297,6 +376,101 @@
       searching = false;
       stopSearchClock();
       error = describeFailure(e, '发起搜索');
+    }
+  }
+
+  // 结果页“只搜这些源重试”：沿用本次关键词与本次范围
+  function retryScope() {
+    if (starting || searching) return;
+    if (!lastSearchKey) return;
+    if (resultScopeMode === 'custom') {
+      if (!lastSearchScopeIds.length) {
+        notice = '本次范围没有记录到具体书源，无法按范围重试；请重新选择书源后再搜。';
+        return;
+      }
+      sourceScope = 'custom';
+      pickedSourceIds = lastSearchScopeIds.slice();
+      scopeOpen = true;
+    } else {
+      sourceScope = 'all';
+    }
+    key = lastSearchKey;
+    doSearch();
+  }
+
+  // 仅重试失败源：用上次关键词 + 失败源的 source_ids 新建 job，
+  // 轮询完成后按 book_url 去重并入当前列表，并把新增项标记为“重试命中”。
+  async function retryFailedSources() {
+    if (retrying || starting || searching) return;
+    const ids = failedSources.map((f) => f.url).filter(Boolean);
+    if (!ids.length) {
+      retryNote = '后端未返回失败源地址，无法只重试这些源；可整次重试，或到「书源管理」检查后再试。';
+      return;
+    }
+    const q = lastSearchKey || key.trim();
+    if (!q) return;
+    const seq = ++retrySeq;
+    retrying = true;
+    retryNote = '';
+    let collected = [];
+    let lastErrors = [];
+    try {
+      const r = await api.searchStart(q, ids);
+      if (seq !== retrySeq) return;
+      const jid = String(r.job_id || '');
+      if (!jid) throw new Error('后端未返回 job_id');
+      let p = 1;
+      let pages = 0;
+      while (seq === retrySeq) {
+        const rr = await api.searchResult(jid, p, PER_PAGE);
+        if (seq !== retrySeq) return;
+        collected = collected.concat((rr.books || []).map((b) => ({ ...b, retry: true })));
+        lastErrors = Array.isArray(rr.errors)
+          ? rr.errors.map((e) => ({
+              name: e.source_name || e.source || '未知书源',
+              reason: describeSourceError(e.error),
+              url: e.source || '',
+            }))
+          : [];
+        pages += 1;
+        if (rr.done) {
+          // 失败源也可能返回多页；最多再取 4 页，避免异常源拖住界面
+          if (rr.has_more && pages < 5) {
+            p += 1;
+            continue;
+          }
+          break;
+        }
+        await new Promise((res) => setTimeout(res, 500));
+      }
+      if (seq !== retrySeq) return;
+      const seen = new Set(results.map((b) => b.book_url));
+      const fresh = [];
+      for (const b of collected) {
+        if (seen.has(b.book_url)) continue;
+        seen.add(b.book_url);
+        fresh.push(b);
+      }
+      retryExtra = dedupeByUrl(retryExtra.concat(fresh));
+      results = dedupeByUrl(results.concat(fresh));
+      total = Math.max(total, results.length);
+      failedSources = lastErrors;
+      failedCount = lastErrors.length;
+      if (fresh.length) {
+        notice = `仅重试失败源：新增 ${fresh.length} 本（已按 book_url 去重）`;
+      } else {
+        retryNote = `仅重试 ${ids.length} 个失败源：没有新增结果` +
+          (lastErrors.length ? `，仍有 ${lastErrors.length} 个源失败，原因见上方列表。` : '，这些源均已正常返回但无匹配。');
+      }
+    } catch (e) {
+      if (seq !== retrySeq) return;
+      if (e && e.status === 404) {
+        retryNote = '失败源重试任务已过期（后端 job 只保留 60 秒），请整次重试。';
+      } else {
+        retryNote = describeFailure(e, '仅重试失败源');
+      }
+    } finally {
+      if (seq === retrySeq) retrying = false;
     }
   }
 
@@ -358,6 +532,7 @@
   function switchMode(m) {
     if (mode === m) return;
     jobSeq += 1;
+    retrySeq += 1;
     cancelPolling();
     jobId = '';
     starting = false;
@@ -384,6 +559,16 @@
       const k = `${b.book_url}|${b.origin || ''}`;
       if (seen.has(k)) return false;
       seen.add(k);
+      return true;
+    });
+  }
+
+  // 失败源重试合并用：严格按 book_url 去重（跨源重复也保留先到的）
+  function dedupeByUrl(list) {
+    const seen = new Set();
+    return list.filter((b) => {
+      if (seen.has(b.book_url)) return false;
+      seen.add(b.book_url);
       return true;
     });
   }
@@ -472,11 +657,28 @@
     <button on:click={doSearch} disabled={starting || (sourceScope === 'custom' && !pickedSourceIds.length)}>搜索</button>
   </div>
 
+  {#if history.length}
+    <div class="hist" aria-label="搜索历史">
+      <div class="hist-head">
+        <span class="muted">最近搜索（{history.length}）</span>
+        <button class="link-btn" on:click={clearHistory}>清空历史</button>
+      </div>
+      <div class="hist-list">
+        {#each history as h (h)}
+          <span class="hist-item">
+            <button class="hist-word" title={h} on:click={() => useHistory(h)} disabled={starting || searching}>{h}</button>
+            <button class="hist-del" aria-label="删除搜索历史 {h}" on:click={() => removeHistory(h)}>×</button>
+          </span>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
   <div class="search-scope">
     <div class="row">
       <select bind:value={sourceScope} on:change={() => (error = '')} style="flex:1;min-width:0" aria-label="搜索范围">
-        <option value="all">全部启用源（{enabledSources.length} 个）</option>
-        <option value="custom">指定书源（已选 {pickedSourceIds.length} 个）</option>
+        <option value="all">全部可搜索源</option>
+        <option value="custom">指定分类 / 书源（已选 {pickedSourceIds.length} 个）</option>
       </select>
       {#if sourceScope === 'custom'}
         <button class="ghost" on:click={() => (scopeOpen = !scopeOpen)} aria-expanded={scopeOpen}>
@@ -486,8 +688,19 @@
     </div>
 
     {#if sourceScope === 'custom' && scopeOpen}
+      {#if groupOptions.length}
+        <div class="row" style="margin-top:8px">
+          <select bind:value={groupFilter} style="width:100%;min-width:0" aria-label="按分类筛选书源">
+            <option value="all">全部分类</option>
+            {#each groupOptions as g}
+              <option value={g}>{g}</option>
+            {/each}
+          </select>
+          <button class="ghost" on:click={pickGroup} disabled={groupFilter === 'all'}>选入本分类</button>
+        </div>
+      {/if}
       <div class="src-list" role="group" aria-label="选择参与搜索的书源">
-        {#each sources as s (s.book_source_url)}
+        {#each pickSources as s (s.book_source_url)}
           <label class="src-item" class:off={!s.enabled}>
             <input
               type="checkbox"
@@ -496,11 +709,12 @@
               on:change={() => togglePick(s.book_source_url)}
             />
             <span class="src-name">{sname(s)}</span>
+            {#if s.book_source_group}<span class="src-type">{s.book_source_group}</span>{/if}
             {#if typeOf(s)}<span class="src-type">{typeOf(s)}</span>{/if}
             {#if !s.enabled}<span class="src-off">已禁用</span>{/if}
           </label>
         {/each}
-        {#if !sources.length}<p class="muted" style="margin:6px 0">还没有书源，请先到「书源管理」添加。</p>{/if}
+        {#if !sources.length}<p class="muted" style="margin:6px 0">还没有书源，请先到「书源管理」添加。</p>{:else if !pickSources.length}<p class="muted" style="margin:6px 0">该分类下没有书源。</p>{/if}
       </div>
       <div class="row" style="margin-top:6px">
         <button class="ghost" on:click={selectAllEnabled} disabled={!enabledSources.length}>全选启用源</button>
@@ -554,8 +768,13 @@
       <div class="warn-item">没有可搜索的源，请到「书源管理」启用书源并补全搜索规则后重试。</div>
     {/if}
   </div>
-{:else if mode === 'search' && sourceTotal && !error}
-  <p class="scope-report">本次搜索 <b>{sourceTotal}</b> 个源{#if sourceScope === 'custom'}（请求 {requestSourceCount} 个）{/if}</p>
+{/if}
+
+{#if mode === 'search' && sourceTotal && !error}
+  <p class="scope-report">
+    本次范围：<b>{sourceTotal}</b> 个源{resultScopeMode === 'custom' ? `（指定 ${resultRequested} 个）` : '（全部可搜索源）'}
+    <button class="link-btn" on:click={retryScope} disabled={starting || searching || !lastSearchKey}>只搜这些源重试</button>
+  </p>
 {/if}
 
 {#if mode === 'search' && jobExpired}
@@ -638,9 +857,17 @@
         <div class="warn-item">后端未返回失败明细，可重试或到「书源管理」检查这些书源。</div>
       {/if}
       <div class="warn-item muted">可先换个关键词或稍后重试；长期失败请到「书源管理」检查这些源的地址与启用状态。</div>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" on:click={retryFailedSources} disabled={retrying || starting || searching || !failedSources.some((f) => f.url)}>
+          {retrying ? '正在仅重试失败源…' : '仅重试失败源'}
+        </button>
+        {#if !failedSources.some((f) => f.url)}<span class="muted">后端未返回失败源地址，无法按源重试</span>{/if}
+      </div>
     </div>
   </details>
 {/if}
+
+{#if retryNote}<p class="retry-note" role="status">{retryNote}</p>{/if}
 
 {#if results.length}
   <div class="grid auto" style="margin-top:12px">
@@ -655,7 +882,7 @@
           </div>
         </button>
         <div class="title" on:click={() => open(r)}>{r.name || r.book_url}</div>
-        <div class="author">{r.author || '未知作者'}{#if r.origin_name} · {r.origin_name}{/if}</div>
+        <div class="author">{r.author || '未知作者'}{#if r.origin_name} · {r.origin_name}{/if}{#if r.retry} <span class="retry-tag">重试命中</span>{/if}</div>
         {#if r.latest_chapter_title}<div class="author muted clamp1">{r.latest_chapter_title}</div>{/if}
         <div class="row" style="margin-top:8px">
           <button style="flex:1" on:click={() => open(r)}>阅读</button>
@@ -706,6 +933,77 @@
     margin: 8px 0;
     font-size: 13px;
     font-variant-numeric: tabular-nums;
+  }
+  /* 搜索历史：块级 + 行内块，墨水屏不依赖 flex/grid */
+  .hist {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border, #e3e3e6);
+    border-radius: 8px;
+    background: var(--card, #fff);
+  }
+  .hist-head {
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .hist-head .link-btn {
+    float: right;
+  }
+  .hist-item {
+    display: inline-block;
+    margin: 0 6px 6px 0;
+    border: 1px solid var(--border, #e3e3e6);
+    border-radius: 6px;
+    background: var(--card, #fff);
+  }
+  .hist-word {
+    background: transparent;
+    color: var(--fg, #1d1d1f);
+    border: 0;
+    padding: 5px 8px;
+    font-size: 12px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hist-word:hover {
+    background: rgba(179, 57, 47, 0.08);
+  }
+  .hist-del {
+    background: transparent;
+    color: var(--muted, #666);
+    border: 0;
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+  .link-btn {
+    background: transparent;
+    color: var(--accent);
+    border: 0;
+    padding: 2px 6px;
+    font-size: 12px;
+    text-decoration: underline;
+  }
+  .link-btn:hover {
+    background: transparent;
+  }
+  .retry-note {
+    margin: 8px 0;
+    padding: 8px 10px;
+    border: 1px solid #e8c7a7;
+    border-radius: 8px;
+    background: #fdf6ec;
+    color: #8a5a1f;
+    font-size: 12px;
+  }
+  .retry-tag {
+    display: inline-block;
+    padding: 0 6px;
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--accent);
   }
   .src-list {
     margin-top: 8px;

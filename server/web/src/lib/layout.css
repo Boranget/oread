@@ -314,8 +314,75 @@ html[data-device='eink'] .rd-state,
 html[data-device='eink'] .toc-drawer,
 html[data-device='eink'] .toc-head,
 html[data-device='eink'] .toc-tools,
-html[data-device='eink'] .toc-row {
+html[data-device='eink'] .toc-row,
+html[data-device='eink'] .batch-bar,
+html[data-device='eink'] .modal-mask {
   display: block !important;
+}
+/* 搜索页/书源页的既有 flex 容器：墨水屏一律退化为块级（新组件同样只用块级/行内块） */
+html[data-device='eink'] .seg,
+html[data-device='eink'] .chips,
+html[data-device='eink'] .sw-line,
+html[data-device='eink'] .src-item {
+  display: block !important;
+}
+html[data-device='eink'] .seg button,
+html[data-device='eink'] .chip {
+  display: inline-block;
+}
+html[data-device='eink'] .src-item input {
+  display: inline-block;
+  margin-right: 8px;
+}
+html[data-device='eink'] .src-name,
+html[data-device='eink'] .src-type,
+html[data-device='eink'] .src-off {
+  display: inline;
+}
+html[data-device='eink'] .batch-bar {
+  position: static;
+}
+html[data-device='eink'] .detail-grid,
+html[data-device='eink'] .detail-grid > div {
+  display: block;
+}
+html[data-device='eink'] .detail-grid > div {
+  margin-bottom: 4px;
+}
+html[data-device='eink'] .modal-mask {
+  position: static;
+  background: #fff;
+}
+html[data-device='eink'] .modal {
+  margin: 12px auto;
+  width: 96%;
+  max-width: 96%;
+  max-height: none;
+}
+html[data-device='eink'] .hist,
+html[data-device='eink'] .retry-note,
+html[data-device='eink'] .check-panel,
+html[data-device='eink'] .val-box {
+  background: #fff;
+  border: 1px solid #000;
+  color: #000;
+}
+html[data-device='eink'] .retry-tag,
+html[data-device='eink'] .check-row,
+html[data-device='eink'] .val-box {
+  color: #000;
+}
+html[data-device='eink'] .link-btn {
+  display: inline-block;
+  color: #000;
+  text-decoration: underline;
+  background: transparent !important;
+}
+html[data-device='eink'] .hist-word,
+html[data-device='eink'] .hist-del {
+  background: transparent !important;
+  color: #000 !important;
+  border: 0 !important;
 }
 html[data-device='eink'] .cover-ph {
   display: block !important;
