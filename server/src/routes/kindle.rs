@@ -49,40 +49,61 @@ use crate::web_book;
 const PAGE_W: usize = 1000;
 /// 版心左右留白
 const SIDE_PAD: usize = 36;
-/// 正文区高度 = 1268 − 96（顶栏）= 1172；底部固定栏覆盖在正文区之上，
-/// 靠正文容器的底部 padding 把最后一行托到栏上方（不再用文档流底栏占位）。
+/// 带顶栏页面（书架/目录/搜索）的正文区高度 = 1268 − 96（顶栏）= 1172
 const STAGE_H: usize = 1172;
+/// 阅读页无顶栏：整页 1268 全部给正文（WeRead Kindle 阅读页同样没有顶栏）
+const READ_STAGE_H: usize = 1268;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
 /// 正文容器底部留白 = 栏高 + 8px，保证固定栏不遮正文最后一行
 const STAGE_PAD_BOTTOM: usize = BAR_H + 8;
-/// 正文可用高度 = 1172 − 72 = 1100（分页字符数按这个高度核算）
-const STAGE_CONTENT_H: usize = STAGE_H - STAGE_PAD_BOTTOM;
+/// 阅读页正文可用高度 = 1268 − 72 = 1196
+const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - STAGE_PAD_BOTTOM;
+
+/// 阅读页每页目标行数：≈26 行（WeRead 整页阅读观感）
+const READ_TARGET_LINES: usize = 26;
+
+/// 阅读页每页行数预算：目标 26 行，但不超过 1196px 物理可容纳的行数
+/// （32/52 最多 23 行，38/62 最多 19 行；26 行只在 28/46 与 22/38 档成立）
+const fn line_budget(line: usize) -> usize {
+    let fit = READ_STAGE_CONTENT_H / line;
+    if fit < READ_TARGET_LINES {
+        fit
+    } else {
+        READ_TARGET_LINES
+    }
+}
 /// 目录每页章节数：20 行 × 52px = 1040，一屏装得下（正文区 1108）
 const K_TOC_PAGE: usize = 20;
 /// /k 渲染前对正文纯文本的硬截断（防御超大章节把分页临时索引撑爆内存）
-const K_MAX_TEXT_CHARS: usize = 200_000;
+const K_MAX_TEXT_CHARS: usize = 800_000;
+/// 超长章节分块：每块最多 20 万字符，按块分页，避免一次性按 80 万字构建全量页表
+const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
+/// 版心固定 1072（1000 + 左右各 36），必须 1:1 不缩放；Silk 等会缩放设备也按 1072 排版
+const K_VIEWPORT: &str = "width=1072,initial-scale=1,maximum-scale=1,user-scalable=0";
 
-/// 三档字号。`chars` = 每页字符数，由“正文区 1108px ÷ 行高 = 行数”和
-/// “版心 1000 − 左右 36 = 928px ÷ 字号 = 每行字数”推得，并用 kindle-sim 实测校准。
+/// 四档字号。`lines` = 每页行数预算（min(26, 正文区能装下的行数)），
+/// 每页字符数 = `行数 × 每行字数`（由测试按版心宽度换算校验）。
 struct FsSpec {
     size: usize,
     line: usize,
-    chars: usize,
+    lines: usize,
     label: &'static str,
 }
 
-const FS_SPECS: [FsSpec; 3] = [
-    // 928/28 ≈ 33 字/行，1100/46 = 23 行 → 759 字；留一行余量取 750。
-    FsSpec { size: 28, line: 46, chars: 750, label: "小" },
-    // 928/32 = 29 字/行，1100/52 = 21 行 → 609 字；实测 580 字占 20 行，取 600。
+const FS_SPECS: [FsSpec; 4] = [
+    // 928/28 ≈ 33 字/行，1196/46 = 26 行 → 858 字（正好是 26 行目标档）。
+    FsSpec { size: 28, line: 46, lines: line_budget(46), label: "小" },
+    // 928/32 = 29 字/行，1196/52 = 23 行（26 行需 1352px，物理装不下）→ 667 字。
     // 字号口径：真机实测 32px/52px，保留 32px。此处显式写死 32，且全局
     // `-webkit-text-size-adjust:none` 已关闭老引擎的字号自动放大——实测 32/52，勿低于 30。
-    FsSpec { size: 32, line: 52, chars: 600, label: "标准" },
-    // 928/38 ≈ 24 字/行，1100/62 = 17 行 → 408 字；实测 390 字占 16 行，取 400。
-    FsSpec { size: 38, line: 62, chars: 400, label: "大" },
+    FsSpec { size: 32, line: 52, lines: line_budget(52), label: "标准" },
+    // 928/38 ≈ 24 字/行，1196/62 = 19 行（26 行需 1612px，物理装不下）→ 475 字。
+    FsSpec { size: 38, line: 62, lines: line_budget(62), label: "大" },
+    // 928/20 ≈ 46 字/行，1196/36 = 33 行 → 仍取 26 行，26×36=936px 装下 → 1196 字。
+    FsSpec { size: 20, line: 36, lines: line_budget(36), label: "超小" },
 ];
 
 pub fn routes() -> Router<AppState> {
@@ -162,11 +183,12 @@ fn with_fs(url: &str, fs: usize) -> String {
     }
 }
 
-/// 解析字号：显式 `?fs=1..3` 优先，其次 `k_fs` Cookie，缺省标准档（2）。
+/// 解析字号：显式 `?fs=1..4` 优先，其次 `k_fs` Cookie，缺省标准档（2）。
+/// 档位 1/2/3 为既有小/标准/大，4 为新增超小档。
 /// 返回 (档位, 是否需要回写 Cookie)。
 fn resolve_fs(headers: &HeaderMap, q: Option<i64>) -> (usize, bool) {
     if let Some(v) = q {
-        if (1..=3).contains(&v) {
+        if (1..=4).contains(&v) {
             return (v as usize, true);
         }
     }
@@ -177,7 +199,7 @@ fn resolve_fs(headers: &HeaderMap, q: Option<i64>) -> (usize, bool) {
         for kv in cookie.split(';') {
             if let Some(rest) = kv.trim().strip_prefix(&format!("{K_FS_COOKIE}=")) {
                 if let Ok(v) = rest.trim().parse::<i64>() {
-                    if (1..=3).contains(&v) {
+                    if (1..=4).contains(&v) {
                         return (v as usize, false);
                     }
                 }
@@ -185,6 +207,16 @@ fn resolve_fs(headers: &HeaderMap, q: Option<i64>) -> (usize, bool) {
         }
     }
     (2, false)
+}
+
+/// 字号轮换：按字号从小到大 4→1→2→3，避免“大→超小”以外的乱跳
+fn cycle_fs(fs: usize) -> usize {
+    match fs {
+        4 => 1,
+        1 => 2,
+        2 => 3,
+        _ => 4,
+    }
 }
 
 /// 显式切换字号时把档位写进 30 天 Cookie
@@ -195,11 +227,13 @@ fn remember_fs(res: &mut Response, fs: usize) {
     }
 }
 
-/// 统一页面骨架：无脚本、固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大
-fn page(title: &str, fs: usize, body: &str) -> Response {
+/// 统一页面骨架：无脚本、固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大。
+/// viewport 固定 1072（与版心一致）；不写 initial-scale=1 时 Silk 会按 device-width 缩放。
+fn page_html(title: &str, fs: usize, body: &str) -> String {
     let spec = &FS_SPECS[fs - 1];
-    let html = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title><style>\
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
 html{{-webkit-text-size-adjust:none}}\
 html,body{{margin:0;padding:0;background:#fff;color:#000;overflow-x:hidden}}\
 body{{font-family:serif;font-size:{size}px;line-height:{line}px}}\
@@ -208,13 +242,18 @@ h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 </style></head><body><div class=\"wrap\">{body}</div></body></html>",
+        viewport = K_VIEWPORT,
         title = esc(title),
         size = spec.size,
         line = spec.line,
         pw = PAGE_W,
         pad = SIDE_PAD,
         body = body
-    );
+    )
+}
+
+fn page(title: &str, fs: usize, body: &str) -> Response {
+    let html = page_html(title, fs, body);
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
@@ -253,15 +292,19 @@ fn fixed_bar(row: &str) -> String {
     )
 }
 
-/// 正文/列表末尾的占位，保证固定栏不遮住最后一行内容（= 栏高 + 8px）
-fn bar_spacer() -> String {
-    format!("<div style=\"height:{STAGE_PAD_BOTTOM}px\"></div>")
-}
-
 fn bottom_cell(href: &str, label: &str, width: usize) -> String {
     format!(
         "<td width=\"{width}%\" height=\"64\" align=\"center\">\
          <a href=\"{href}\" style=\"display:block;height:64px;line-height:64px;font-size:28px\">{label}</a></td>"
+    )
+}
+
+/// 底栏格：主标签一行 + 16px 进度小字一行（阅读页页码/分块进度，零脚本可见）
+fn bottom_cell_meta(href: &str, label: &str, meta: &str, width: usize) -> String {
+    format!(
+        "<td width=\"{width}%\" height=\"64\" align=\"center\">\
+         <a href=\"{href}\" style=\"display:block;height:64px;line-height:42px;font-size:28px\">{label}\
+         <span style=\"display:block;line-height:20px;font-size:16px;color:#333\">{meta}</span></a></td>"
     )
 }
 
@@ -334,19 +377,175 @@ fn html_to_text(html: &str) -> String {
     s.trim().to_string()
 }
 
-/// 按字符数等分：返回每页的 (起, 止) 字节区间，页边界落在字符边界上，结果稳定可复现
-fn paginate(text: &str, per: usize) -> Vec<&str> {
-    let mut bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    bounds.push(text.len());
-    let n_chars = bounds.len() - 1;
-    let n_pages = ((n_chars + per - 1) / per).max(1); // div_ceil 需 Rust 1.73+，手写兼容旧工具链
-    let mut pages = Vec::with_capacity(n_pages);
-    for p in 0..n_pages {
-        let s = bounds[p * per];
-        let e = bounds[((p + 1) * per).min(n_chars)];
-        pages.push(&text[s..e]);
+/// 单字宽度（em）：ASCII/数字/半角标点 0.5，其余（汉字、全角标点）1.0
+fn char_em(c: char) -> f64 {
+    if c.is_ascii() {
+        0.5
+    } else {
+        1.0
+    }
+}
+
+/// 每行可用 em 数（版心宽度 ÷ 字号）
+fn line_em(spec: &FsSpec) -> f64 {
+    (PAGE_W - SIDE_PAD * 2) as f64 / spec.size as f64
+}
+
+/// 段落占用行数：首行缩进 2em，续行不缩进（与渲染的 text-indent:2em 一致）
+fn para_lines(s: &str, em: f64) -> usize {
+    let mut lines = 1usize;
+    let mut used = 2.0f64;
+    for c in s.chars() {
+        let w = char_em(c);
+        if used + w > em {
+            lines += 1;
+            used = w;
+        } else {
+            used += w;
+        }
+    }
+    lines
+}
+
+/// 从段落头部取不超过 cap 行的一段，返回 (该段字节长度, 实际行数)
+fn split_para(s: &str, cap: usize, em: f64) -> (usize, usize) {
+    let mut lines = 1usize;
+    let mut used = 2.0f64;
+    for (i, c) in s.char_indices() {
+        let w = char_em(c);
+        if used + w > em {
+            if lines == cap {
+                return (i, lines);
+            }
+            lines += 1;
+            used = w;
+        } else {
+            used += w;
+        }
+    }
+    (s.len(), lines)
+}
+
+/// 按行数预算分页：优先在段落边界断页，单段超预算时按行边界切分。
+/// 返回每页的字节区间（相对 `text`），页边界只落在字符边界上。
+fn paginate_lines(text: &str, spec: &FsSpec) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return vec![(0, 0)];
+    }
+    let em = line_em(spec);
+    let budget = spec.lines.max(1);
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    let mut page_start: Option<usize> = None;
+    let mut page_lines = 0usize;
+    let mut page_end = 0usize;
+    let mut offset = 0usize;
+    for raw in text.split('\n') {
+        let p_start = offset;
+        let p_end = offset + raw.len();
+        offset = p_end + 1;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let trim_start = p_start + (raw.len() - raw.trim_start().len());
+        let trim_end = trim_start + trimmed.len();
+        let mut rem_start = trim_start;
+        while rem_start < trim_end {
+            if page_lines >= budget {
+                if let Some(ps) = page_start.take() {
+                    pages.push((ps, page_end));
+                }
+                page_lines = 0;
+            }
+            let remaining = &text[rem_start..trim_end];
+            let need = para_lines(remaining, em);
+            let cap = budget - page_lines;
+            if need <= cap {
+                if page_start.is_none() {
+                    page_start = Some(rem_start);
+                }
+                page_lines += need;
+                page_end = trim_end;
+                rem_start = trim_end;
+            } else {
+                let (head, used) = split_para(remaining, cap, em);
+                debug_assert!(head > 0 && used > 0);
+                if head == 0 {
+                    break;
+                }
+                if page_start.is_none() {
+                    page_start = Some(rem_start);
+                }
+                pages.push((page_start.take().unwrap(), rem_start + head));
+                page_lines = 0;
+                page_end = rem_start + head;
+                rem_start += head;
+            }
+        }
+    }
+    if let Some(ps) = page_start.take() {
+        pages.push((ps, page_end));
+    }
+    if pages.is_empty() {
+        pages.push((0, 0));
     }
     pages
+}
+
+/// 按字符数切块：返回每个块的字节区间，每块 ≤ per 个字符
+fn chunk_ranges(text: &str, per: usize) -> Vec<(usize, usize)> {
+    if text.is_empty() || per == 0 {
+        return vec![(0, 0)];
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut n = 0usize;
+    for (i, _) in text.char_indices() {
+        if n == per {
+            out.push((start, i));
+            start = i;
+            n = 0;
+        }
+        n += 1;
+    }
+    out.push((start, text.len()));
+    out
+}
+
+/// 分页计划：正文按 20 万字符分块，逐块分页；不额外复制正文，页表只存字节区间。
+struct PagePlan {
+    /// 每块的全局字节区间
+    chunks: Vec<(usize, usize)>,
+    /// 每页 (块下标, 起, 止)，起止为全局字节偏移
+    pages: Vec<(usize, usize, usize)>,
+}
+
+fn plan_pages(text: &str, spec: &FsSpec) -> PagePlan {
+    let chunks = chunk_ranges(text, K_CHUNK_CHARS);
+    let mut pages = Vec::new();
+    for (ci, &(cs, ce)) in chunks.iter().enumerate() {
+        for (s, e) in paginate_lines(&text[cs..ce], spec) {
+            pages.push((ci, cs + s, cs + e));
+        }
+    }
+    if pages.is_empty() {
+        pages.push((0, 0, 0));
+    }
+    PagePlan { chunks, pages }
+}
+
+/// 超过 `max` 字符时按字符边界截断（不额外复制整段文本），返回是否发生截断
+fn truncate_to_chars(text: &mut String, max: usize) -> bool {
+    if text.chars().count() <= max {
+        return false;
+    }
+    let cut = text
+        .char_indices()
+        .nth(max)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.truncate(cut);
+    true
 }
 
 // ---------------- 查询参数 ----------------
@@ -529,7 +728,7 @@ async fn shelf(
         Err(e) => return err_to_page(AppError::Sqlx(e)),
     };
 
-    let next_fs = if fs < 3 { fs + 1 } else { 1 };
+    let next_fs = cycle_fs(fs);
     let fs_url = format!("/k?fs={next_fs}");
     let nav = format!(
         "{}{}{}",
@@ -589,7 +788,12 @@ async fn shelf(
     let mut res = page(
         "书架",
         fs,
-        &format!("{top}{list}{spacer}{bottom}", spacer = bar_spacer()),
+        &format!("{top}{spacer}{bottom}", spacer = format!(
+            "<div id=\"k-stage\" style=\"height:{h}px;padding:0 0 {pb}px;box-sizing:border-box;overflow:auto\">{list}</div>",
+            h = STAGE_H,
+            pb = STAGE_PAD_BOTTOM,
+            list = list
+        )),
     );
     if explicit {
         remember_fs(&mut res, fs);
@@ -626,7 +830,7 @@ async fn toc(
         .and_then(|b| b.name)
         .unwrap_or_else(|| "目录".into());
 
-    let next_fs = if fs < 3 { fs + 1 } else { 1 };
+    let next_fs = cycle_fs(fs);
     let fs_href = with_fs(
         &format!(
             "/k/toc?book={}&source={}&tp={}",
@@ -699,7 +903,12 @@ async fn toc(
     let mut res = page(
         &name,
         fs,
-        &format!("{top}{list}{spacer}{bottom}", spacer = bar_spacer()),
+        &format!("{top}{stage}{bottom}", stage = format!(
+            "<div id=\"k-stage\" style=\"height:{h}px;padding:0 0 {pb}px;box-sizing:border-box;overflow:auto\">{list}</div>",
+            h = STAGE_H,
+            pb = STAGE_PAD_BOTTOM,
+            list = list
+        )),
     );
     if explicit {
         remember_fs(&mut res, fs);
@@ -762,15 +971,14 @@ async fn read(
     let (title, body_html) =
         replace::purify(&db.0, &book_name, &q.source, c.title.clone(), c.content.clone()).await;
     let mut text = html_to_text(body_html.as_deref().unwrap_or(""));
-    if text.chars().count() > K_MAX_TEXT_CHARS {
-        text = text.chars().take(K_MAX_TEXT_CHARS).collect();
-        text.push_str("\n\n[章节过长，已截断]");
-    }
+    let truncated = truncate_to_chars(&mut text, K_MAX_TEXT_CHARS);
     let spec = &FS_SPECS[fs - 1];
-    let pages = paginate(&text, spec.chars);
-    let n = pages.len() as i64;
+    let plan = plan_pages(&text, spec);
+    let n = plan.pages.len() as i64;
     let p = q.p.unwrap_or(1).clamp(1, n);
-    let cur = pages[(p - 1) as usize];
+    let (block_idx, cur_start, cur_end) = plan.pages[(p - 1) as usize];
+    let cur = &text[cur_start..cur_end];
+    let blocks = plan.chunks.len();
 
     let ch_title = title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
     // 不带 fs 的原始链接：切档时要换成目标档位，不能被当前档位拼成重复参数
@@ -809,14 +1017,17 @@ async fn read(
     } else {
         (toc_url.clone(), "目录")
     };
-    let next_fs = if fs < 3 { fs + 1 } else { 1 };
-    let fs_href = with_fs(&raw_link(ch, p), next_fs);
-
-    let title_line = format!(
-        "{} <span style=\"font-size:22px;color:#555\">第 {p}/{n} 页</span>",
-        esc(&ch_title)
-    );
-    // 进度提交：零 JS 的原生 form（位于顶栏第 4 格，章末同样可见）
+    let mut meta = if blocks > 1 {
+        // 超长章节按 20 万字符分块：底栏“目录”格下方同时给出页内进度、页码与分块号
+        let pct = ((p as f64 * 100.0 / n as f64).round() as usize).clamp(1, 100);
+        format!("加载中{pct}%·{p}/{n}·{}/{}块", block_idx + 1, blocks)
+    } else {
+        format!("{p}/{n}")
+    };
+    if truncated {
+        meta.push_str("·已截断");
+    }
+    // 进度提交：零 JS 的原生 form，放在底栏第 5 格（阅读页无顶栏）
     let progress_form = format!(
         "<form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
          <input type=\"hidden\" name=\"book\" value=\"{book}\">\
@@ -826,7 +1037,7 @@ async fn read(
          <input type=\"hidden\" name=\"n\" value=\"{n}\">\
          <input type=\"hidden\" name=\"total\" value=\"{total}\">\
          <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
-         <input type=\"submit\" value=\"记录进度\" style=\"font-size:24px;height:60px;width:200px\"></form>",
+         <input type=\"submit\" value=\"记录\" style=\"font-size:26px;height:64px;width:100%;border:0;background:transparent\"></form>",
         book = esc(&q.book),
         source = esc(&q.source),
         ch = ch,
@@ -835,14 +1046,8 @@ async fn read(
         total = chapters.len(),
         fs = fs
     );
-    let nav = format!(
-        "{}{}{}<td width=\"25%\" height=\"58\" align=\"center\">{progress_form}</td>",
-        nav_cell(&toc_url, "目录", 25),
-        nav_cell(&with_fs("/k", fs), "书架", 25),
-        nav_cell(&fs_href, FS_SPECS[next_fs - 1].label, 25),
-        progress_form = progress_form
-    );
-    let top = top_bar(&title_line, &nav);
+    let next_fs = cycle_fs(fs);
+    let fs_href = with_fs(&raw_link(ch, p), next_fs);
 
     let mut paras = String::new();
     for para in cur.split('\n') {
@@ -857,24 +1062,26 @@ async fn read(
             para = esc(para)
         ));
     }
+    // 阅读页无顶栏：整页 1268 全给正文；底栏固定覆盖，靠 padding-bottom 托住最后一行
     let stage = format!(
         "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;box-sizing:border-box;overflow:hidden\">{paras}</div>",
-        h = STAGE_H,
+        h = READ_STAGE_H,
         w = PAGE_W,
         pad = SIDE_PAD,
         pb = STAGE_PAD_BOTTOM,
         paras = paras
     );
-    // 贴底固定栏：上一页 / 下一页 / 目录 / 书架（等宽 25% 单元格，整块可点）
+    // 贴底固定栏 5 格：上一页 / 下一页 / 目录(页码+分块进度，略宽) / 字号 / 记录进度
     let bottom = fixed_bar(&format!(
-        "{}{}{}{}",
-        bottom_cell(&prev, prev_label, 25),
-        bottom_cell(&next, next_label, 25),
-        bottom_cell(&toc_url, "目录", 25),
-        bottom_cell(&with_fs("/k", fs), "书架", 25),
+        "{}{}{}{}<td width=\"18%\" height=\"64\" align=\"center\">{progress}</td>",
+        bottom_cell(&prev, prev_label, 18),
+        bottom_cell(&next, next_label, 18),
+        bottom_cell_meta(&toc_url, "目录", &meta, 28),
+        bottom_cell(&fs_href, FS_SPECS[next_fs - 1].label, 18),
+        progress = progress_form
     ));
 
-    let mut res = page(&ch_title, fs, &format!("{top}{stage}{bottom}"));
+    let mut res = page(&ch_title, fs, &format!("{stage}{bottom}"));
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -940,7 +1147,7 @@ async fn progress(
     .await;
 
     let fs = match q.fs {
-        Some(v) if (1..=3).contains(&v) => v as usize,
+        Some(v) if (1..=4).contains(&v) => v as usize,
         _ => 2,
     };
     let loc = with_fs(
@@ -972,7 +1179,7 @@ async fn search(
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let key = q.key.unwrap_or_default().trim().to_string();
-    let next_fs = if fs < 3 { fs + 1 } else { 1 };
+    let next_fs = cycle_fs(fs);
     let fs_url = format!("/k/search?fs={next_fs}");
     let nav = format!(
         "{}{}",
@@ -1082,19 +1289,128 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paginate_respects_char_boundaries() {
-        let text: String = "字".repeat(1500);
-        let pages = paginate(&text, 580);
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0].chars().count(), 580);
-        assert_eq!(pages[2].chars().count(), 340);
-        // 同一文本同一页长 → 分页结果恒定
-        assert_eq!(paginate(&text, 580), pages);
+    fn paginate_lines_respects_budget_and_char_boundaries() {
+        // 26 行预算（32px 档实际物理上限 23 行）：前 5 段占 20 行，第 6 段用余下 3 行切在行边界，余文进第 2 页。
+        let text = "字".repeat(100)
+            + "\n"
+            + &"字".repeat(100)
+            + "\n"
+            + &"字".repeat(100)
+            + "\n"
+            + &"字".repeat(100)
+            + "\n"
+            + &"字".repeat(100)
+            + "\n"
+            + &"字".repeat(100);
+        let spec = &FS_SPECS[1];
+        let pages = paginate_lines(&text, spec);
+        assert_eq!(pages.len(), 2, "行数预算下 6 段应分 2 页");
+        let p1 = &text[pages[0].0..pages[0].1];
+        let p2 = &text[pages[1].0..pages[1].1];
+        assert_eq!(
+            p1.matches('字').count() + p2.matches('字').count(),
+            600,
+            "分页不应丢字"
+        );
+        // 第 1 页装满预算；两页都不超预算
+        let em = line_em(spec);
+        let l1: usize = p1
+            .split('\n')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| para_lines(p, em))
+            .sum();
+        let l2: usize = p2
+            .split('\n')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| para_lines(p, em))
+            .sum();
+        assert_eq!(l1, spec.lines, "第 1 页应刚好用满行数预算");
+        assert!(l2 <= spec.lines);
+        assert!(pages.windows(2).all(|w| w[0].1 <= w[1].0), "页区间不重叠");
+        // 同一文本同一档位 → 分页结果恒定
+        assert_eq!(paginate_lines(&text, spec), pages);
     }
 
     #[test]
     fn paginate_empty_is_one_blank_page() {
-        assert_eq!(paginate("", 580), vec![""]);
+        assert_eq!(paginate_lines("", &FS_SPECS[1]), vec![(0, 0)]);
+    }
+
+    /// 任意正文（含 ASCII/长英文词/全角标点）分页后，每页估算行数不得超过该档预算。
+    #[test]
+    fn no_page_exceeds_line_budget() {
+        let mut text = String::new();
+        for i in 0..80 {
+            if i % 7 == 0 {
+                text.push_str(&"A".repeat(120)); // 无空格长串，按 0.5em 折行
+            } else if i % 5 == 0 {
+                text.push_str(&format!("第{i}段，短句。"));
+            } else {
+                text.push_str(&"正文句子。".repeat(12));
+            }
+            text.push('\n');
+        }
+        for spec in &FS_SPECS {
+            let em = line_em(spec);
+            let pages = paginate_lines(&text, spec);
+            for &(s, e) in &pages {
+                let piece = &text[s..e];
+                let lines: usize = piece
+                    .split('\n')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| para_lines(p, em))
+                    .sum();
+                assert!(
+                    lines <= spec.lines,
+                    "fs={} 页内 {} 行超过预算 {}",
+                    spec.size,
+                    lines,
+                    spec.lines
+                );
+                assert!(piece.chars().count() > 0, "不应产生空页");
+                assert!(text.is_char_boundary(s) && text.is_char_boundary(e));
+            }
+            // 页首尾相接（去掉间隔换行），不丢字
+            let joined: String = pages
+                .iter()
+                .map(|&(s, e)| text[s..e].replace('\n', ""))
+                .collect();
+            assert_eq!(joined, text.replace('\n', ""), "fs={} 分页丢字", spec.size);
+        }
+    }
+
+    #[test]
+    fn chunk_ranges_split_at_200k_chars() {
+        let text = "字".repeat(300_000);
+        let chunks = chunk_ranges(&text, K_CHUNK_CHARS);
+        assert_eq!(chunks.len(), 2, "30 万字应切成 2 块");
+        assert_eq!(&text[chunks[0].0..chunks[0].1].chars().count(), &200_000);
+        assert_eq!(&text[chunks[1].0..chunks[1].1].chars().count(), &100_000);
+
+        let plan = plan_pages(&text, &FS_SPECS[1]);
+        assert_eq!(plan.chunks.len(), 2);
+        assert!(plan.pages.len() > 2);
+        assert_eq!(plan.pages[0].0, 0);
+        assert_eq!(plan.pages.last().unwrap().0, 1, "末页应属于第 2 块");
+        assert!(plan
+            .pages
+            .iter()
+            .all(|&(ci, s, e)| ci < 2 && s <= e && e <= text.len()));
+    }
+
+    #[test]
+    fn truncate_to_chars_is_in_place_and_char_safe() {
+        let mut text = "字".repeat(900_000);
+        assert!(truncate_to_chars(&mut text, K_MAX_TEXT_CHARS), "90 万字应触发截断");
+        assert_eq!(text.chars().count(), K_MAX_TEXT_CHARS);
+        assert!(text.is_char_boundary(text.len()));
+
+        let mut short = "短".repeat(100);
+        assert!(!truncate_to_chars(&mut short, K_MAX_TEXT_CHARS));
+        assert_eq!(short.chars().count(), 100);
     }
 
     /// 目录含分卷行：总数只算非分卷章节，分页按过滤后的列表，链接 index 保持原始值。
@@ -1166,24 +1482,59 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 三档字号的每页字符数必须严格递减，且「行数 × 每行字数」不超过正文可用高度
-    /// （STAGE_CONTENT_H = 1172 − 72，已扣除贴底固定栏的底部留白）。
+    /// 阅读页整页 1268、可用 1196；四档行预算 = min(26, 物理可容纳行数)。
     #[test]
-    fn font_specs_fit_stage() {
-        for spec in &FS_SPECS {
-            let lines = STAGE_CONTENT_H / spec.line;
-            let per_line = (PAGE_W - SIDE_PAD * 2) / spec.size;
+    fn font_specs_fit_read_stage() {
+        assert_eq!(READ_STAGE_H, 1268);
+        assert_eq!(READ_STAGE_CONTENT_H, 1196);
+        let expect = [(28, 46, 26), (32, 52, 23), (38, 62, 19), (20, 36, 26)];
+        assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
+        for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
+            assert_eq!((spec.size, spec.line), (size, line));
+            assert_eq!(spec.lines, lines, "fs={size} 行预算错误");
+            let per_line = (PAGE_W - SIDE_PAD * 2) / size;
+            let chars = spec.lines * per_line;
             assert!(
-                spec.chars <= lines * per_line,
-                "fs={} 的 {} 字超过 {} 行 × {} 字",
-                spec.size,
-                spec.chars,
-                lines,
-                per_line
+                spec.lines * spec.line <= READ_STAGE_CONTENT_H,
+                "fs={size} 行高总和 {} 超过正文区 {}",
+                spec.lines * spec.line,
+                READ_STAGE_CONTENT_H
             );
+            assert!(chars >= 450, "fs={size} 每页字数 {chars} 少于 450");
         }
-        assert!(FS_SPECS[0].chars > FS_SPECS[1].chars);
-        assert!(FS_SPECS[1].chars > FS_SPECS[2].chars);
+        let std_chars = FS_SPECS[1].lines * (PAGE_W - SIDE_PAD * 2) / FS_SPECS[1].size;
+        assert_eq!(std_chars, 667);
+        assert!(
+            (500..=800).contains(&std_chars),
+            "标准档每页字数应在 500–800"
+        );
+        // 小字档 26 行 × 33 字 = 858，正好落在参考目标
+        let small_chars = FS_SPECS[0].lines * ((PAGE_W - SIDE_PAD * 2) / FS_SPECS[0].size);
+        assert_eq!(small_chars, 858);
+    }
+
+    /// 字号轮换按物理大小 超小(4)→小(1)→标准(2)→大(3)→超小(4)，旧档位语义不变。
+    #[test]
+    fn font_cycle_keeps_existing_tiers() {
+        assert_eq!(resolve_fs(&HeaderMap::new(), Some(4)).0, 4);
+        assert_eq!(resolve_fs(&HeaderMap::new(), Some(9)).0, 2, "越界回落标准档");
+        assert_eq!(cycle_fs(4), 1);
+        assert_eq!(cycle_fs(1), 2);
+        assert_eq!(cycle_fs(2), 3);
+        assert_eq!(cycle_fs(3), 4);
+    }
+
+    /// 三个 /k 页面共用同一骨架：必须带固定 1072 viewport，且零脚本、零子资源。
+    #[test]
+    fn viewport_is_fixed_and_page_is_self_contained() {
+        let html = page_html("测试", 2, "<div>正文</div>");
+        assert!(
+            html.contains("<meta name=\"viewport\" content=\"width=1072,initial-scale=1"),
+            "缺少 viewport meta"
+        );
+        assert!(!html.contains("<script"), "不允许脚本");
+        assert!(!html.contains("<link"), "不允许子资源");
+        assert!(!html.contains("<img"), "不允许子资源");
     }
 
     /// 入口门禁只看 HTTP UA：真机 Kindle/3.0+ 命中；页面内 JS 的 534.26+ 不命中。
@@ -1225,13 +1576,13 @@ mod tests {
         let spec = &FS_SPECS[1];
         assert_eq!(spec.size, 32, "标准档必须显式 32px（实测 32/52，勿低于 30）");
         assert_eq!(spec.line, 52);
-        assert!(
-            (500..=800).contains(&spec.chars),
-            "默认档每页字数应在 500–800，实际 {}",
-            spec.chars
-        );
         let per_line = (PAGE_W - SIDE_PAD * 2) / spec.size;
-        let lines = STAGE_CONTENT_H / spec.line;
-        assert!(spec.chars <= lines * per_line);
+        let chars = spec.lines * per_line;
+        assert!(
+            (500..=800).contains(&chars),
+            "默认档每页字数应在 500–800，实际 {}",
+            chars
+        );
+        assert!(spec.lines <= READ_STAGE_CONTENT_H / spec.line);
     }
 }
