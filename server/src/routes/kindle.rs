@@ -122,7 +122,7 @@ pub fn routes() -> Router<AppState> {
 
 /// Kindle/Silk 判定只看 HTTP 头：真机 UA 是 `AppleWebKit/531.2+ ... Kindle/3.0+`，
 /// 页面内 JS 的 UA 是 `534.26+` 且不含 Kindle 字样，所以不能在页面里判。
-fn is_kindle_ua(ua: &str) -> bool {
+pub(crate) fn is_kindle_ua(ua: &str) -> bool {
     let ua = ua.to_ascii_lowercase();
     ua.contains("kindle") || ua.contains("silk")
 }

@@ -34,6 +34,9 @@ regex = "1"
 url = "2"
 encoding_rs = "0.8"         # 响应体解码：UTF-8 / GBK / GB18030 / Big5
 base64 = "0.22"
+# 图片解码/编码：仅开 WebP + JPEG（纯 Rust 实现，不含 libwebp 的 C 绑定，
+# musl 交叉编译不需要 C 工具链）。用于把 WebP 漫画页在服务端转成 JPEG 供墨水屏显示。
+image = { version = "0.25", default-features = false, features = ["webp", "jpeg"] }
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
