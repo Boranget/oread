@@ -406,6 +406,13 @@ fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Opti
     if let Some(r) = referer {
         h.insert("Referer".to_string(), r.to_string());
     }
+    // 墨水屏只认 JPEG/PNG/GIF：显式声明偏好，部分 CDN 会据此返回 JPEG 而不是 WebP
+    if !h.keys().any(|k| k.eq_ignore_ascii_case("accept")) {
+        h.insert(
+            "Accept".to_string(),
+            "image/jpeg,image/png,image/gif,image/*;q=0.8,*/*;q=0.1".to_string(),
+        );
+    }
     h
 }
 

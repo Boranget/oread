@@ -225,11 +225,40 @@ function __utf8(s){
   return s.replace(/%([0-9A-Fa-f]{2})/g, function(_, h){ return String.fromCharCode(parseInt(h, 16)); });
 }
 function __fromUtf8(bin){
-  var pct = "";
-  for (var i = 0; i < bin.length; i++) {
-    pct += "%" + ("0" + bin.charCodeAt(i).toString(16)).slice(-2);
+  // 等价于 Java 的 new String(bytes, UTF_8)：非法字节用 U+FFFD 替换，绝不抛异常。
+  // 之前用 decodeURIComponent 拼接 %xx，遇到脏字节会抛错并返回空串，
+  // 导致 base64Decode/hexDecode 对“局部损坏但 ASCII 部分完好”的内容整段丢失。
+  var out = "", i = 0, n = bin.length;
+  while (i < n) {
+    var c = bin.charCodeAt(i);
+    if (c < 0x80) { out += String.fromCharCode(c); i += 1; continue; }
+    var need, cp;
+    if (c >= 0xC2 && c <= 0xDF) { need = 1; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { need = 2; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { need = 3; cp = c & 0x07; }
+    else { out += "\uFFFD"; i += 1; continue; }
+    if (i + need >= n) { out += "\uFFFD"; i += 1; continue; }
+    var ok = true;
+    for (var k = 1; k <= need; k++) {
+      var cc = bin.charCodeAt(i + k);
+      if ((cc & 0xC0) !== 0x80) { ok = false; break; }
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    if (!ok) { out += "\uFFFD"; i += 1; continue; }
+    if ((need === 1 && cp < 0x80) || (need === 2 && cp < 0x800) ||
+        (need === 3 && cp < 0x10000) || cp > 0x10FFFF ||
+        (cp >= 0xD800 && cp <= 0xDFFF)) {
+      out += "\uFFFD"; i += 1; continue;
+    }
+    if (cp > 0xFFFF) {
+      cp -= 0x10000;
+      out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+    } else {
+      out += String.fromCharCode(cp);
+    }
+    i += need + 1;
   }
-  try { return decodeURIComponent(pct); } catch (e) { return ""; }
+  return out;
 }
 // 纯 JS base64，避免依赖宿主是否提供 btoa/atob（boa 0.19 默认不带）
 var __B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -615,11 +644,11 @@ impl AnalyzeRule {
         self.variables.borrow_mut().extend(m);
     }
 
-    /// 变量/JSONPath 模板展开：支持 `${var}`、`{{var}}`，以及 `{{$.field}}` / `${$.field}`
+    /// 变量/JSONPath 模板展开：支持 `${var}`、`{{var}}`，以及 `{{$.field}}` / `${$.field}` / `{$.field}`
     /// （JSONPath 形式按**当前规则输入** `content` 求值，用于书源里
-    /// `.../read?bid={{$.id}}` 这类“列表项字段拼进 URL/POST body”的写法）。
+    /// `.../read?bid={{$.id}}`、`https://api.x/topics/{$.id}` 这类“列表项字段拼进 URL/POST body”的写法）。
     fn expand_vars(&self, rule: &str, content: &str) -> String {
-        let re = Regex::new(r"\$\{([^}]+)\}|\{\{([^}]+)\}\}").unwrap();
+        let re = Regex::new(r"\$\{([^}]+)\}|\{\{([^}]+)\}\}|\{(\$[^}]+)\}").unwrap();
         let json: Option<Value> = if rule.contains("$.") || rule.contains("$[") {
             serde_json::from_str(content).ok()
         } else {
@@ -629,6 +658,7 @@ impl AnalyzeRule {
             let key = caps
                 .get(1)
                 .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
                 .map(|m| m.as_str())
                 .unwrap_or("");
             let key = key.trim();
@@ -900,17 +930,13 @@ impl AnalyzeRule {
     fn apply_json(&self, json: &str, rule: &str) -> Result<String, RuleError> {
         let v: Value =
             serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
-        let mut vals = json_query(&v, rule)?;
-        let val = match vals.pop() {
-            Some(v) => v,
-            None => return Ok(String::new()),
-        };
-        match val {
-            Value::String(s) => Ok(s),
-            Value::Number(n) => Ok(n.to_string()),
-            Value::Bool(b) => Ok(b.to_string()),
-            other => Ok(other.to_string()),
+        let vals = json_query(&v, rule)?;
+        // Legado 的 getString 对多值结果按 `\n` 拼接（`$..image` 这类递归路径会命中多个节点）。
+        // 此前只取最后一个，导致「章节多图」被压成 1 张，源规则里 `@js:result.split("\n")` 也只剩一行。
+        if vals.is_empty() {
+            return Ok(String::new());
         }
+        Ok(vals.into_iter().map(value_to_string).collect::<Vec<_>>().join("\n"))
     }
 
     fn apply_regex(&self, input: &str, rule: &str) -> Result<String, RuleError> {
@@ -1046,18 +1072,15 @@ impl AnalyzeRule {
             doms = doms_js,
             code = js_string_literal(code),
         );
-        let start = Instant::now();
-        let (tx, rx) = channel::<(Result<String, String>, u64)>();
+        let (tx, rx) = channel::<(Result<String, String>, u64, u64)>();
         js_sender()
             .send(JsJob { script, reply: tx })
             .map_err(|_| RuleError::Other("js worker unavailable".into()))?;
-        let (result, net_ms) = rx
+        let (result, net_ms, js_elapsed) = rx
             .recv()
             .map_err(|_| RuleError::Other("js worker dropped".into()))?;
         let (result, net_ms) = (result.map_err(RuleError::Other), net_ms);
-        let elapsed = start.elapsed().as_millis() as u64;
-        // java.ajax 的网络等待不计入纯 JS 预算（否则一次正常联网就会触发 200ms 超时）
-        let js_elapsed = elapsed.saturating_sub(net_ms);
+        // 排队等单一 JS 线程的时间不计入预算：并发测试/并发请求下同一规则仍应通过。
         JS_LAST_MS.store(js_elapsed, Ordering::Relaxed);
         JS_MAX_MS.fetch_max(js_elapsed, Ordering::Relaxed);
         if js_elapsed > conf.timeout_ms {
@@ -1078,6 +1101,12 @@ impl AnalyzeRule {
     /// 列表：返回多个元素的字符串（HTML 取 inner_html；JSON 取数组元素字符串）
     pub fn get_string_list(&self, content: &str, rule: &str) -> Result<Vec<String>, RuleError> {
         let rule = self.expand_vars(rule, content);
+        // Legado 约定：规则以 `-` 开头表示「结果倒序」（多见于章节列表，如 `-$..comics.*`）。
+        if let Some(rest) = rule.trim_start().strip_prefix('-') {
+            let mut v = self.get_string_list(content, rest.trim_start())?;
+            v.reverse();
+            return Ok(v);
+        }
         // 列表级 `||` 回退：第一个非空列表胜出（如 `$..list[*]||$.books[*]`）
         if let Some(parts) = split_outside_js(&rule, "||") {
             for p in &parts {
@@ -1218,10 +1247,17 @@ impl AnalyzeRule {
     fn json_list(&self, json: &str, rule: &str) -> Result<Vec<String>, RuleError> {
         let v: Value =
             serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
-        Ok(json_query(&v, rule)?
-            .into_iter()
-            .map(value_to_string)
-            .collect())
+        let mut out = Vec::new();
+        // JSONPath 直接命中数组时（`$['hits']` / `$.data.topics`）按数组元素展开：
+        // Legado 的 getElements 会把 List 的每个元素当作列表项，不把整个数组当成一项。
+        for val in json_query(&v, rule)? {
+            match val {
+                Value::Array(a) => out.extend(a.into_iter().filter(|x| !x.is_null()).map(value_to_string)),
+                Value::Null => {}
+                other => out.push(value_to_string(other)),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1730,8 +1766,55 @@ fn eval_json_path(root: &Value, segs: &[JpSeg]) -> Vec<Value> {
 
 /// 对 JSON 执行 JSONPath：先走本地子集解析，含过滤表达式等复杂写法再退回 jsonpath-rust；
 /// 两条路径的语法错误都统一成“JSONPath 语法不受支持：…”，不暴露 PestError。
+/// 按顶层 `&&` 切分（跳过引号与 [] / () 内部，过滤表达式里的 && 不拆）。
+fn split_top_level_and(rule: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut last = 0usize;
+    let bytes = rule.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == q && (i == 0 || bytes[i - 1] != b'\\') {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'[' | b'(' => depth += 1,
+                b']' | b')' => depth -= 1,
+                b'&' if depth == 0 && bytes.get(i + 1) == Some(&b'&') => {
+                    parts.push(rule[last..i].trim());
+                    last = i + 2;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        parts.push(rule[last..].trim());
+        Some(parts)
+    }
+}
+
 fn json_query(v: &Value, rule: &str) -> Result<Vec<Value>, RuleError> {
     let rule = rule.trim();
+    // Legado 的 JSONPath `&&` 表示多个路径结果合并（`$.a.*&&$.b.*`）
+    if let Some(parts) = split_top_level_and(rule) {
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend(json_query(v, p)?);
+        }
+        return Ok(out);
+    }
     match parse_json_path(rule) {
         Ok(segs) => Ok(eval_json_path(v, &segs)),
         Err(local_err) => {
@@ -1932,6 +2015,55 @@ fn split_css_rule<'a>(rule: &'a str) -> (String, Vec<&'a str>) {
     let selector = parts[0].trim().to_string();
     let tokens: Vec<&str> = parts[1..].iter().map(|s| s.trim()).collect();
     (selector, tokens)
+}
+
+/// 拆出 Legado 末尾的 `[n]` / `[n,m]` / `[a:b]` 下标表达式。
+fn split_bracket_indices(selector: &str) -> (String, Option<String>) {
+    let s = selector.trim();
+    if !s.ends_with(']') {
+        return (s.to_string(), None);
+    }
+    if let Some(open) = s.rfind('[') {
+        let inner = &s[open + 1..s.len() - 1];
+        if inner
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | ':' | '-' | ' '))
+        {
+            return (s[..open].trim().to_string(), Some(inner.to_string()));
+        }
+    }
+    (s.to_string(), None)
+}
+
+/// 对已选元素应用 Legado 下标表达式：`[3,4]` 取第 3/4 个，`[0:2]` 切片，`[-1:0]` 倒序。
+fn apply_index_expr<'a>(
+    els: Vec<scraper::ElementRef<'a>>,
+    expr: &str,
+) -> Vec<scraper::ElementRef<'a>> {
+    let expr = expr.trim();
+    if let Some((a, b)) = expr.split_once(':') {
+        let start: i64 = a.trim().parse().unwrap_or(0);
+        let end: i64 = b.trim().parse().unwrap_or(0);
+        // Legado 语义：`[-1:0]` 表示倒序
+        if start < 0 && end == 0 {
+            let mut v = els;
+            v.reverse();
+            return v;
+        }
+        let n = els.len() as i64;
+        let s = if start < 0 { (n + start).max(0) } else { start.max(0) }.min(n) as usize;
+        let e = if end < 0 { (n + end).max(0) } else { end }.min(n) as usize;
+        return els.into_iter().skip(s).take(e.saturating_sub(s)).collect();
+    }
+    let idxs: Vec<usize> = expr
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    els.into_iter()
+        .enumerate()
+        .filter(|(i, _)| idxs.contains(i))
+        .map(|(_, e)| e)
+        .collect()
 }
 
 /// 解析 `name` 或 `name.0` 形式的规格，返回 (名称, 可选索引)。
@@ -2143,7 +2275,9 @@ fn apply_jq_filters<'a>(
 /// `!下标`（Legado 语义是**排除**这些下标，如 `li!0:1:2:3:4` 去掉前 5 个 li），
 /// 以及 jQuery 伪类（`:first/:last/:eq(n)/:lt(n)/:gt(n)/:contains(...)`）。
 fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::ElementRef<'a>> {
-    let selector = selector.trim();
+    // Legado 末尾下标：class.x[3,4] / tag.li[0:2] / class.x[-1:0]（倒序）
+    let (selector, index_expr) = split_bracket_indices(selector.trim());
+    let selector = selector.as_str();
     let (core, excluded) = match selector.find('!') {
         Some(pos) => (&selector[..pos], parse_indices(&selector[pos + 1..])),
         None => (selector, Vec::new()),
@@ -2174,6 +2308,10 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
     };
     let els: Vec<scraper::ElementRef<'a>> = doc.select(&sel).collect();
     let els = filter_indices(els, &excluded, true);
+    let els = match &index_expr {
+        Some(expr) => apply_index_expr(els, expr),
+        None => els,
+    };
     let els = apply_jq_filters(els, &jq);
     if let Some(i) = idx {
         if i < els.len() {
@@ -2437,13 +2575,10 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
                 }
             }
             if s.starts_with("@js:") {
-                if start < i {
-                    parts.push(&rule[start..i]);
-                }
-                parts.push(&rule[i..]);
-                // 整条规则就是 `@js:…` 时不能返回单元素切分：否则调用方会把该段
-                // 再喂回 get_string，造成无限递归（小栈 worker 上直接栈溢出）。
-                return if parts.len() > 1 { Some(parts) } else { None };
+                // `@js:` 一直延伸到规则末尾：其内部的分隔符不能被当成分割点。
+                // 这里只结束扫描（尾巴留在最后一个 part 里），而不是把 `@js:` 也拆成一个 part——
+                // 否则 `##` 分支会把 `@js:...` 当成“替换正则”，把带 JS 尾段的规则静默吞掉。
+                break;
             }
             if depth == 0 && s.starts_with(sep) {
                 parts.push(&rule[start..i]);
@@ -2467,7 +2602,6 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn css_extracts_text() {
         let ar = AnalyzeRule::new();
@@ -2937,8 +3071,11 @@ nodes.filter(function (node) {
             .get_string_list(json, "$.booklist[*].book_name")
             .unwrap();
         assert_eq!(names, vec!["书C"]);
-        // 单值：递归下降取最后一项（与既有单值语义一致）
-        assert_eq!(ar.get_string(json, "$..book_name", false, "").unwrap(), "书B");
+        // 单值：递归下降命中多个值时，与 Legado 一致按 `\n` 拼接（源规则常据此 `split("\n")`）
+        assert_eq!(
+            ar.get_string(json, "$..book_name", false, "").unwrap(),
+            "书C\n书A\n书B"
+        );
         // 下标（含负下标）
         assert_eq!(ar.get_string(json, "$.data.books[1].id", false, "").unwrap(), "b2");
         assert_eq!(ar.get_string(json, "$.data.books[-1].id", false, "").unwrap(), "b2");

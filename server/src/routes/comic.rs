@@ -246,28 +246,32 @@ async fn chapter_images(
                 .map_err(fetch_error)?;
             let images = parsed.images;
             let truncated = parsed.truncated;
-            let payload = serde_json::to_string(&web_book::ChapterImages {
-                images: images.clone(),
-                truncated,
-            })
-            .unwrap_or_default();
-            let c = BookContent {
-                url: chapter.url.clone(),
-                book_url: book_url.clone(),
-                title: chapter.title.clone(),
-                content: Some(String::new()),
-                chapter_index: chapter.index,
-                content_type: "image".into(),
-                images_json: Some(payload),
-                ..Default::default()
-            };
-            // 缓存上限与小说正文同源（用户设置优先，否则全局配置）
-            let limit = match crate::routes::replace::user_cache_limit_mb(&db.0).await {
-                Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                None => s.cfg.cache_limit_bytes(),
-            };
-            if let Err(e) = save_content_cached(&db.0, &c, limit).await {
-                tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
+            // 空图片列表不回写缓存：腾讯等源的章节数据带随机 nonce，偶发的解析失败会得到 0 张图，
+            // 一旦缓存就会在 TTL 内「永久」返回空列表，用户需清缓存才能恢复。空结果按失败处理即可。
+            if !images.is_empty() {
+                let payload = serde_json::to_string(&web_book::ChapterImages {
+                    images: images.clone(),
+                    truncated,
+                })
+                .unwrap_or_default();
+                let c = BookContent {
+                    url: chapter.url.clone(),
+                    book_url: book_url.clone(),
+                    title: chapter.title.clone(),
+                    content: Some(String::new()),
+                    chapter_index: chapter.index,
+                    content_type: "image".into(),
+                    images_json: Some(payload),
+                    ..Default::default()
+                };
+                // 缓存上限与小说正文同源（用户设置优先，否则全局配置）
+                let limit = match crate::routes::replace::user_cache_limit_mb(&db.0).await {
+                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
+                    None => s.cfg.cache_limit_bytes(),
+                };
+                if let Err(e) = save_content_cached(&db.0, &c, limit).await {
+                    tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
+                }
             }
             (images, truncated, false)
         }

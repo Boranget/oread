@@ -907,20 +907,29 @@ pub fn parse_headers(header: &Option<String>) -> HashMap<String, String> {
 /// 按书源解析请求头：普通 JSON/多行形式直接解析；`@js:` 形式先求值再解析。
 /// JS 求值失败时回退为空表（沿用浏览器 UA 兜底），不阻断整源请求。
 pub fn source_headers(source: &BookSource, base_url: &str) -> HashMap<String, String> {
-    let Some(raw) = source.header.as_deref() else {
-        return HashMap::new();
+    let mut headers = match source.header.as_deref() {
+        Some(raw) if raw.trim().starts_with("@js:") => {
+            let mut ar = crate::rule_engine::AnalyzeRule::new();
+            ar.js_lib = source.js_lib.clone().unwrap_or_default();
+            // 保留 `@js:` 前缀交给规则引擎识别（它负责把 JS 段拆出来执行）
+            match ar.get_string("", raw.trim(), false, base_url) {
+                Ok(s) if !s.trim().is_empty() => parse_headers(&Some(s)),
+                _ => HashMap::new(),
+            }
+        }
+        Some(raw) => parse_headers(&Some(raw.to_string())),
+        None => HashMap::new(),
     };
-    let trimmed = raw.trim();
-    if trimmed.starts_with("@js:") {
-        let mut ar = crate::rule_engine::AnalyzeRule::new();
-        ar.js_lib = source.js_lib.clone().unwrap_or_default();
-        // 保留 `@js:` 前缀交给规则引擎识别（它负责把 JS 段拆出来执行）
-        return match ar.get_string("", trimmed, false, base_url) {
-            Ok(s) if !s.trim().is_empty() => parse_headers(&Some(s)),
-            _ => HashMap::new(),
-        };
+    // 漫画源大多是移动站：未显式声明 UA 时补移动端 UA，避免只拿到桌面 JS 框架页
+    if source.book_source_type == 2
+        && !headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent"))
+    {
+        headers.insert(
+            "User-Agent".to_string(),
+            "Mozilla/5.0 (Linux; Android 10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/78.0.3904.108 Mobile Safari/537.36".to_string(),
+        );
     }
-    parse_headers(&Some(raw.to_string()))
+    headers
 }
 
 #[cfg(test)]

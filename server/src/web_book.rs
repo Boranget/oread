@@ -558,18 +558,50 @@ fn push_raw(out: &mut Vec<RawImage>, url: &str, width: Option<u32>, height: Opti
     });
 }
 
+fn is_usable_src(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && !t.starts_with("data:")
+        && !t.starts_with("javascript:")
+        && !t.starts_with('#')
+        && !t.eq_ignore_ascii_case("about:blank")
+}
+
+/// 选图片地址：懒加载属性优先（src 常是 1px 占位图），再退回 src / srcset。
+fn pick_img_src(attrs: &HashMap<String, String>) -> &str {
+    for key in [
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-original-src",
+        "data-echo",
+        "data-url",
+    ] {
+        if let Some(v) = attrs.get(key).filter(|s| is_usable_src(s)) {
+            return v;
+        }
+    }
+    if let Some(v) = attrs.get("src").filter(|s| is_usable_src(s)) {
+        return v;
+    }
+    for key in ["srcset", "data-srcset"] {
+        if let Some(v) = attrs.get(key) {
+            let first = v.split(',').next().unwrap_or("").trim();
+            let url = first.split_whitespace().next().unwrap_or("");
+            if is_usable_src(url) {
+                return url;
+            }
+        }
+    }
+    ""
+}
+
 /// 从一段 HTML 里按页面顺序提取 `<img src>`（含懒加载 `data-src`/`data-original` 兜底）。
 fn images_from_html(html: &str) -> Vec<RawImage> {
     let mut out = Vec::new();
     for tag in img_tag_re().find_iter(html) {
         let attrs = parse_attrs(tag.as_str());
-        let src = attrs
-            .get("src")
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| attrs.get("data-src"))
-            .or_else(|| attrs.get("data-original"))
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let src = pick_img_src(&attrs);
         if is_placeholder_size(&attrs) {
             continue;
         }
