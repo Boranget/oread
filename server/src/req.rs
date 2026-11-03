@@ -928,6 +928,16 @@ mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
+    // 生产代码的 Cookie 存储是进程级全局单例（COOKIE_JAR），三个 cookie 测试
+    // 都会先 cookie_reset() 再断言桶内容/桶数量。并发执行时一个测试的清空
+    // 会抹掉另一个测试刚写入的桶，导致“LRU 淘汰后桶数应等于上限”随机失败。
+    // 这里给共享单例加锁串行访问；测试 panic 后仍能继续（从 poison 恢复）。
+    static COOKIE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_cookie_jar() -> std::sync::MutexGuard<'static, ()> {
+        COOKIE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // B2：`method: POST` 且书源未声明 header 时，必须默认补表单 Content-Type
     #[test]
     fn post_body_defaults_to_form_content_type() {
@@ -1173,6 +1183,7 @@ mod tests {
 
     #[test]
     fn cookie_set_and_overwrite_roundtrip() {
+        let _guard = lock_cookie_jar();
         cookie_reset();
         let scope = "source:https://cookie-test.example";
         record_set_cookie(scope, "sid=abc; Path=/; HttpOnly");
@@ -1192,6 +1203,7 @@ mod tests {
 
     #[test]
     fn cookie_bucket_evicts_lru_bucket() {
+        let _guard = lock_cookie_jar();
         cookie_reset();
         for i in 0..COOKIE_MAX_BUCKETS {
             record_set_cookie(&format!("source:lru-{i}"), &format!("c{i}=v{i}"));
@@ -1211,6 +1223,7 @@ mod tests {
 
     #[test]
     fn cookie_bucket_respects_8kb_limit() {
+        let _guard = lock_cookie_jar();
         cookie_reset();
         let scope = "source:https://cookie-bytes.example";
         for i in 0..12 {

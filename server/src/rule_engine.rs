@@ -71,8 +71,9 @@ pub fn js_metrics() -> (u64, u64) {
 /// JS 执行任务：脚本文本 + 回传通道。
 struct JsJob {
     script: String,
-    /// (求值结果, 其中 java.ajax 的网络耗时毫秒)
-    reply: Sender<(Result<String, String>, u64)>,
+    /// (求值结果, java.ajax 的网络耗时毫秒, 实际脚本执行耗时毫秒)
+    /// 执行耗时由 worker 自己计时，不包含等待单一 JS 线程排队的墙钟时间。
+    reply: Sender<(Result<String, String>, u64, u64)>,
 }
 
 /// 全局唯一的 JS 执行线程入口（容量 8，避免无界排队）。
@@ -111,6 +112,7 @@ fn js_worker(rx: Receiver<JsJob>) {
     );
     while let Ok(job) = rx.recv() {
         JS_AJAX_NET_MS.store(0, Ordering::Relaxed);
+        let started = Instant::now();
         let res = ctx
             .eval(boa_engine::Source::from_bytes(job.script.as_bytes()))
             // `{e:?}` 对 opaque Error 只会打印 ErrorObject 地址，书源作者看不懂。
@@ -122,7 +124,9 @@ fn js_worker(rx: Receiver<JsJob>) {
             })
             .map(|s| s.to_std_string().unwrap_or_default());
         let net_ms = JS_AJAX_NET_MS.load(Ordering::Relaxed);
-        let _ = job.reply.send((res, net_ms));
+        // 只统计真正花在这条规则上的时间；排队等 Context 的时间不计入预算。
+        let js_ms = (started.elapsed().as_millis() as u64).saturating_sub(net_ms);
+        let _ = job.reply.send((res, net_ms, js_ms));
     }
 }
 

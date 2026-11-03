@@ -4,11 +4,6 @@
   import Bookshelf from './pages/Bookshelf.svelte';
   import Discover from './pages/Discover.svelte';
   import Reader from './pages/Reader.svelte';
-  import ComicReader from './pages/ComicReader.svelte';
-  import Sources from './pages/Sources.svelte';
-  import ReplaceRules from './pages/ReplaceRules.svelte';
-  import Settings from './pages/Settings.svelte';
-  import Stats from './pages/Stats.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
   import { DEVICE_MODES, deviceLabels, devicePref, setDeviceMode } from './lib/device.js';
 
@@ -17,6 +12,21 @@
   let tab = 'bookshelf';
   // 阅读器通过 {bookUrl, sourceId, name, author, coverUrl, intro} 打开；后四项是详情 seed
   let reader = null;
+
+  // 首屏只留 搜索/书架/阅读器壳子。漫画阅读器（含 blob 图片缓存）与管理页按需 import()，
+  // 不进首屏包；失败时给出可见错误与重试，不静默吞掉。
+  let ComicReader = null;
+  let comicError = '';
+  let comicLoading = null;
+
+  const LAZY_TABS = {
+    stats: () => import('./pages/Stats.svelte'),
+    sources: () => import('./pages/Sources.svelte'),
+    replace: () => import('./pages/ReplaceRules.svelte'),
+    settings: () => import('./pages/Settings.svelte'),
+  };
+  let lazyComps = {};
+  let lazyErrs = {};
 
   const TABS = [
     { id: 'bookshelf', label: '书架' },
@@ -47,6 +57,37 @@
     reader = null;
     tab = 'bookshelf';
   }
+
+  function selectTab(id) {
+    tab = id;
+    const load = LAZY_TABS[id];
+    if (!load || lazyComps[id]) return;
+    lazyErrs[id] = '';
+    load()
+      .then((mod) => {
+        lazyComps[id] = mod.default;
+      })
+      .catch((e) => {
+        lazyErrs[id] = `页面加载失败：${e && e.message ? e.message : e}`;
+      });
+  }
+
+  function loadComicReader() {
+    if (ComicReader || comicLoading) return comicLoading;
+    comicError = '';
+    comicLoading = import('./pages/ComicReader.svelte')
+      .then((mod) => {
+        ComicReader = mod.default;
+      })
+      .catch((e) => {
+        comicError = `漫画阅读器加载失败：${e && e.message ? e.message : e}`;
+      })
+      .finally(() => {
+        comicLoading = null;
+      });
+    return comicLoading;
+  }
+
   let openSeq = 0;
   // 漫画与小说共用入口：搜索结果已带 type；书架条目没有类型时，
   // 用 /api/comic/source 轻量探测书源类型（不发回源请求），失败则按小说打开。
@@ -56,6 +97,7 @@
     const known = book.bookType || book.type;
     if (known === 'image' || known === 'text') {
       reader = { ...book, bookType: known };
+      if (known === 'image') loadComicReader();
       return;
     }
     if (book.sourceId) {
@@ -64,6 +106,7 @@
         if (my !== openSeq) return;
         if (st && st.comic) {
           reader = { ...book, bookType: 'image' };
+          loadComicReader();
           return;
         }
       } catch {
@@ -82,7 +125,17 @@
   <!-- 换源后 bookUrl/sourceId 变化，用 key 强制重建 Reader，避免沿用旧目录与缓存 -->
   {#key reader.sourceId + '|' + reader.bookUrl + '|' + reader.bookType}
     {#if reader.bookType === 'image'}
-      <ComicReader book={reader} on:close={closeReader} />
+      {#if ComicReader}
+        <svelte:component this={ComicReader} book={reader} on:close={closeReader} />
+      {:else if comicError}
+        <div class="load-fail">
+          <p class="err">{comicError}</p>
+          <button class="ghost" on:click={loadComicReader}>重试</button>
+          <button class="ghost" on:click={closeReader}>返回</button>
+        </div>
+      {:else}
+        <p class="empty">正在加载漫画阅读器…</p>
+      {/if}
     {:else}
       <Reader
         book={reader}
@@ -97,7 +150,7 @@
     <div class="brand">Boranlib</div>
     <div class="tabs">
       {#each TABS as t}
-        <div class="tab" class:active={tab === t.id} on:click={() => (tab = t.id)}>{t.label}</div>
+        <div class="tab" class:active={tab === t.id} on:click={() => selectTab(t.id)}>{t.label}</div>
       {/each}
     </div>
     <div class="right">
@@ -120,14 +173,28 @@
       <Bookshelf on:open={ (e) => openReader(e.detail) } />
     {:else if tab === 'discover'}
       <Discover on:open={ (e) => openReader(e.detail) } />
-    {:else if tab === 'sources'}
-      <Sources />
-    {:else if tab === 'stats'}
-      <Stats on:go={(e) => (tab = e.detail.tab)} />
-    {:else if tab === 'replace'}
-      <ReplaceRules />
-    {:else if tab === 'settings'}
-      <Settings />
+    {:else if LAZY_TABS[tab]}
+      {#if lazyComps[tab]}
+        <svelte:component this={lazyComps[tab]} on:go={(e) => selectTab(e.detail.tab)} />
+      {:else if lazyErrs[tab]}
+        <div class="load-fail">
+          <p class="err">{lazyErrs[tab]}</p>
+          <button class="ghost" on:click={() => selectTab(tab)}>重试</button>
+        </div>
+      {:else}
+        <p class="empty">正在加载…</p>
+      {/if}
     {/if}
   </div>
 {/if}
+
+<style>
+  .load-fail {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--card);
+    margin: 16px;
+  }
+  .load-fail button { margin-right: 8px; margin-top: 4px; }
+</style>
