@@ -917,25 +917,36 @@ impl AnalyzeRule {
                     } else {
                         mode
                     };
-                    self.apply_by_mode(&input, m, t)?
+                    self.apply_by_mode(&input, m, t, is_url)?
                 }
             };
         }
         Ok(input)
     }
 
-    fn apply_by_mode(&self, input: &str, mode: Mode, rule: &str) -> Result<String, RuleError> {
+    fn apply_by_mode(
+        &self,
+        input: &str,
+        mode: Mode,
+        rule: &str,
+        first_only: bool,
+    ) -> Result<String, RuleError> {
         match mode {
             Mode::XPath => self.apply_xpath(input, Self::strip_prefix(rule, "@xpath:")),
             Mode::Json => self.apply_json(input, Self::strip_prefix(rule, "@json:")),
             Mode::Regex => self.apply_regex(input, rule),
-            _ => self.apply_css(input, Self::strip_prefix(rule, "@css:")),
+            _ => self.apply_css(input, Self::strip_prefix(rule, "@css:"), first_only),
         }
     }
 
-    fn apply_css(&self, html: &str, rule: &str) -> Result<String, RuleError> {
+    fn apply_css(
+        &self,
+        html: &str,
+        rule: &str,
+        first_only: bool,
+    ) -> Result<String, RuleError> {
         let (selector, tokens) = split_css_rule(rule);
-        let doc = scraper::Html::parse_document(html);
+        let doc = parse_css_document(html);
         let mut els = select_initial(&doc, &selector);
         // 依次处理遍历标记（@tag.x / @children / 裸标签 / !下标），遇到末端抽取标记即停止
         let mut terminal: Option<String> = None;
@@ -964,16 +975,17 @@ impl AnalyzeRule {
                 }
             }
         }
-        // 单值抽取：Legado getString 只取首个匹配元素（getString 返回 list.get(0)）
+        // 单值抽取：Legado `JSoup 规则.getString` = getResultLast 收集**全部**匹配
+        // 元素的值（空值/重复属性跳过），多值再按 `\n` 合并；isUrl 走 getString 只取首个。
         match terminal {
-            Some(t) if t == "textNodes" => Ok(els
-                .first()
-                .map(|e| text_nodes(e))
-                .unwrap_or_default()),
-            Some(t) => Ok(els
-                .first()
-                .map(|e| extract_token(*e, &t))
-                .unwrap_or_default()),
+            Some(t) => {
+                let vals = terminal_values(&els, &t);
+                Ok(if first_only {
+                    vals.into_iter().next().unwrap_or_default()
+                } else {
+                    vals.join("\n")
+                })
+            }
             None => Ok(els
                 .first()
                 .map(|e| e.inner_html())
@@ -1993,10 +2005,217 @@ fn json_query(v: &Value, rule: &str) -> Result<Vec<Value>, RuleError> {
     }
 }
 
+/// jsoup `Tag.blockTags`（1.16.2，含 `br` 之外的块级元素）。
+fn is_jsoup_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "html"
+            | "head"
+            | "body"
+            | "frameset"
+            | "script"
+            | "noscript"
+            | "style"
+            | "meta"
+            | "link"
+            | "title"
+            | "frame"
+            | "noframes"
+            | "section"
+            | "nav"
+            | "aside"
+            | "hgroup"
+            | "header"
+            | "footer"
+            | "p"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "pre"
+            | "div"
+            | "blockquote"
+            | "hr"
+            | "address"
+            | "figure"
+            | "figcaption"
+            | "form"
+            | "fieldset"
+            | "ins"
+            | "del"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "li"
+            | "table"
+            | "caption"
+            | "thead"
+            | "tfoot"
+            | "tbody"
+            | "colgroup"
+            | "col"
+            | "tr"
+            | "th"
+            | "td"
+            | "video"
+            | "audio"
+            | "canvas"
+            | "details"
+            | "menu"
+            | "plaintext"
+            | "template"
+            | "article"
+            | "main"
+            | "svg"
+            | "math"
+            | "center"
+            | "dir"
+            | "applet"
+            | "marquee"
+            | "listing"
+    )
+}
+
+/// jsoup `Tag.preserveWhitespaceTags`（1.16.2）。
+fn is_jsoup_preserve_ws_tag(name: &str) -> bool {
+    matches!(name, "pre" | "plaintext" | "title" | "textarea")
+}
+
+/// jsoup `Tag.formatAsInlineTags`（1.16.2）：块级标签但按行内方式排版，
+/// `Element.text()` 的 tail 阶段不会在这些元素前补空格。
+fn is_jsoup_format_inline_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "title"
+            | "a"
+            | "p"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "pre"
+            | "address"
+            | "li"
+            | "th"
+            | "td"
+            | "script"
+            | "style"
+            | "ins"
+            | "del"
+            | "s"
+    )
+}
+
+/// jsoup 的 `isActuallyWhitespace`（只认这几个 ASCII 空白，不把 NBSP/全角空格算进去）。
+fn is_jsoup_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0C')
+}
+
+fn jsoup_last_char_is_ws(accum: &str) -> bool {
+    accum.chars().last().map(is_jsoup_ws).unwrap_or(false)
+}
+
+/// jsoup `TextNode.appendNormalisedWhitespace`：连续空白折叠成一个空格，
+/// `accum` 已以空白结尾时跳过前导空白。
+fn append_jsoup_normalised(accum: &mut String, text: &str) {
+    let strip_leading = jsoup_last_char_is_ws(accum);
+    let mut last_white = false;
+    let mut reached_non_white = false;
+    for c in text.chars() {
+        if is_jsoup_ws(c) {
+            if strip_leading && !reached_non_white {
+                continue;
+            }
+            if last_white {
+                continue;
+            }
+            accum.push(' ');
+            last_white = true;
+        } else {
+            accum.push(c);
+            reached_non_white = true;
+            last_white = false;
+        }
+    }
+}
+
+/// jsoup `Element.text()`（1.16.2）的等价实现：块级元素/`br` 前后补空格、
+/// 空白按 `appendNormalisedWhitespace` 折叠、`pre/plaintext/title/textarea` 保留原样。
+fn jsoup_text(el: scraper::ElementRef<'_>) -> String {
+    let mut accum = String::new();
+    // (节点, 是否出栈, 是否处于 preserveWhitespace 子树)
+    let mut stack = vec![(*el, false, is_jsoup_preserve_ws_tag(el.value().name()))];
+    while let Some((node, exiting, preserve)) = stack.pop() {
+        if exiting {
+            // jsoup tail：块级元素结束且下一个兄弟是文本或行内元素时补空格
+            if let Some(e) = node.value().as_element() {
+                if is_jsoup_block_tag(e.name()) && !accum.is_empty() && !jsoup_last_char_is_ws(&accum)
+                {
+                    let need_space = match node.next_sibling() {
+                        Some(n) => match n.value() {
+                            scraper::node::Node::Text(_) => true,
+                            scraper::node::Node::Element(ne) => {
+                                !is_jsoup_format_inline_tag(ne.name())
+                            }
+                            _ => false,
+                        },
+                        None => false,
+                    };
+                    if need_space {
+                        accum.push(' ');
+                    }
+                }
+            }
+            continue;
+        }
+        match node.value() {
+            scraper::node::Node::Text(t) => {
+                let s = t.text.to_string();
+                if preserve {
+                    accum.push_str(&s);
+                } else {
+                    append_jsoup_normalised(&mut accum, &s);
+                }
+            }
+            scraper::node::Node::Element(e) => {
+                let name = e.name();
+                // jsoup head：进入块级元素（或 br）时，若已有内容且不以空白结尾则补空格
+                if !accum.is_empty()
+                    && (is_jsoup_block_tag(name) || name == "br")
+                    && !jsoup_last_char_is_ws(&accum)
+                {
+                    accum.push(' ');
+                }
+                stack.push((node, true, preserve));
+                let kids: Vec<_> = node.children().collect();
+                let child_preserve = preserve || is_jsoup_preserve_ws_tag(name);
+                for child in kids.into_iter().rev() {
+                    stack.push((child, false, child_preserve));
+                }
+            }
+            _ => {
+                stack.push((node, true, preserve));
+                let kids: Vec<_> = node.children().collect();
+                for child in kids.into_iter().rev() {
+                    stack.push((child, false, preserve));
+                }
+            }
+        }
+    }
+    accum.trim().to_string()
+}
+
 /// 对单个元素按抽取标记取值（@text/@href/@content/@src/@html/@ownText/@all 等）。
 fn extract_token(el: scraper::ElementRef, tok: &str) -> String {
     match tok {
-        "text" | "ownText" => el.text().collect::<Vec<_>>().join(""),
+        "text" => jsoup_text(el),
+        "ownText" => el.text().collect::<Vec<_>>().join(""),
         "html" => el.inner_html(),
         "all" => el.html(),
         "href" | "src" | "alt" | "content" | "id" | "value" | "class" | "style" | "title"
@@ -2004,6 +2223,112 @@ fn extract_token(el: scraper::ElementRef, tok: &str) -> String {
         // 任意属性（@data-id / @data-src 等）：属性不存在返回空串，不回退成整节点文本
         _ => el.value().attr(tok).unwrap_or("").to_string(),
     }
+}
+
+/// CSS 单值解析用的文档构造：表格行/单元格片段要带回 `<table>` 上下文，
+/// 否则 html5ever 会按 “in body” 规则丢弃 tr/td，`p:nth-of-type` 等结构选择器会失真。
+fn parse_css_document(html: &str) -> scraper::Html {
+    let head: String = html
+        .trim_start()
+        .chars()
+        .take(9)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let table_fragment = ["<tr", "<td", "<th", "<tbody", "<thead", "<tfoot", "<caption"]
+        .iter()
+        .any(|p| head.starts_with(p));
+    if table_fragment {
+        scraper::Html::parse_document(&format!("<table>{}</table>", html.trim_start()))
+    } else {
+        scraper::Html::parse_document(html)
+    }
+}
+
+/// 单值抽取的集合级实现：对应上游 `JSoup 规则.getResultLast`。
+/// - text / ownText：逐元素取值，空值跳过；
+/// - textNodes：逐元素把直接文本节点 trim 后按 `\n` 合并，空元素跳过；
+/// - html：先删 script/style，再取整组元素的 outerHtml（合并为一个值）；
+/// - all：整组元素 outerHtml（合并为一个值）；
+/// - 其余按属性名逐个取值，空值与重复值跳过。
+fn terminal_values(els: &[scraper::ElementRef], tok: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match tok {
+        "text" => {
+            for el in els {
+                let v = extract_token(*el, "text");
+                if !v.is_empty() {
+                    out.push(v);
+                }
+            }
+        }
+        "ownText" => {
+            for el in els {
+                let v: String = el
+                    .children()
+                    .filter_map(|n| n.value().as_text().map(|t| t.to_string()))
+                    .collect();
+                if !v.is_empty() {
+                    out.push(v);
+                }
+            }
+        }
+        "textNodes" => {
+            for el in els {
+                let mut tn: Vec<String> = Vec::new();
+                for n in el.children() {
+                    if let Some(t) = n.value().as_text() {
+                        let s = t.trim();
+                        if !s.is_empty() {
+                            tn.push(s.to_string());
+                        }
+                    }
+                }
+                if !tn.is_empty() {
+                    out.push(tn.join("\n"));
+                }
+            }
+        }
+        "html" => {
+            let joined: String = els
+                .iter()
+                .map(|e| outer_html_without_script_style(*e))
+                .collect();
+            if !joined.is_empty() {
+                out.push(joined);
+            }
+        }
+        "all" => {
+            let joined: String = els.iter().map(|e| e.html()).collect();
+            out.push(joined);
+        }
+        _ => {
+            for el in els {
+                let v = el.value().attr(tok).unwrap_or("").to_string();
+                if v.trim().is_empty() || out.contains(&v) {
+                    continue;
+                }
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// 上游 `getResultLast("html")` 的取法：剔除元素内的 script/style 后取 outerHtml。
+fn outer_html_without_script_style(el: scraper::ElementRef) -> String {
+    if matches!(el.value().name(), "script" | "style") {
+        return String::new();
+    }
+    static STRIP: OnceLock<(Regex, Regex)> = OnceLock::new();
+    let (script, style) = STRIP.get_or_init(|| {
+        (
+            Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>").unwrap(),
+            Regex::new(r"(?is)<style\b[^>]*>.*?</style\s*>").unwrap(),
+        )
+    });
+    let outer = el.html();
+    let html = script.replace_all(&outer, "");
+    style.replace_all(&html, "").to_string()
 }
 
 /// 抽取/遍历 token 解析结果。
@@ -2064,7 +2389,7 @@ fn parse_token(tok: &str) -> Token {
     if let Some(rest) = tok.strip_prefix("tag.") {
         let (name, index) = split_name_index(rest);
         return Token::Tag {
-            name,
+            name: shorthand_segment(&name).to_string(),
             index,
             indices: vec![],
             exclude: false,
@@ -2076,9 +2401,9 @@ fn parse_token(tok: &str) -> Token {
     let (raw_name, index) = split_name_index(tok);
     // Legado 的 `class.xxx` / `id.xxx` 是类/ID 选择器简写，不是末端抽取标记
     let name = if let Some(rest) = raw_name.strip_prefix("class.") {
-        format!(".{rest}")
+        class_name_css(shorthand_segment(rest))
     } else if let Some(rest) = raw_name.strip_prefix("id.") {
-        format!("#{rest}")
+        format!("#{}", shorthand_segment(rest))
     } else {
         raw_name
     };
@@ -2292,6 +2617,23 @@ fn split_name_index(s: &str) -> (String, Option<i64>) {
     (s.to_string(), None)
 }
 
+/// Legado 的 `class.a b` 表示「同时具备 a 和 b 两个类」（AND），
+/// 但 CSS 里空格是后代选择器，必须归一化成 `.a.b`。
+fn class_name_css(rest: &str) -> String {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(".{}", parts.join("."))
+}
+
+/// `class.x.y` / `id.x.y` / `tag.x.y` 只取第一个点分段：上游 `JSoup 规则`
+/// 对 `beforeRule.split(".")` 的结果只用 `rules[1]`，其余分段被忽略
+/// （`class.list.ul` 等价 `class.list`）。
+fn shorthand_segment(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
 /// jQuery 扩展伪类（scraper/CSS 不认，需要先剥离再对结果集做过滤）。
 #[derive(Debug, Clone, PartialEq)]
 enum JqFilter {
@@ -2500,16 +2842,30 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
     let (core, jq) = split_jquery_filters(core.trim());
     let (css, idx) = if let Some(rest) = core.trim().strip_prefix("class.") {
         let (name, i) = split_name_index(rest);
-        (format!(".{name}"), i)
+        (class_name_css(shorthand_segment(&name)), i)
     } else if let Some(rest) = core.trim().strip_prefix("id.") {
         let (name, i) = split_name_index(rest);
-        (format!("#{name}"), i)
+        (format!("#{}", shorthand_segment(&name)), i)
     } else if let Some(rest) = core.trim().strip_prefix("tag.") {
         // Legado 常用 `tag.a@href`：`tag.` 前缀表示标签名，不是合法 CSS 选择器
         let (name, i) = split_name_index(rest);
-        (name, i)
+        (shorthand_segment(&name).to_string(), i)
     } else {
-        (core.trim().to_string(), None)
+        // 裸 `tag.N` / `tag.-N`（如 `a.0`、`li.-1`）与 `.class.N`（如 `.author.0`）：
+        // 上游 `findIndexSet` 先把尾部 `.N` 拆成下标，剩余部分才是选择器；
+        // 否则 CSS 会把 `a.0` / `.author.0` 判为非法选择器而返回空。
+        let (name, i) = split_name_index(core.trim());
+        let bare_tag_index = i.is_some()
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric());
+        let indexed_selector = i.is_some()
+            && !name.is_empty()
+            && scraper::Selector::parse(&name).is_ok();
+        if bare_tag_index || indexed_selector {
+            (name, i)
+        } else {
+            (core.trim().to_string(), None)
+        }
     };
     // 只有伪类（如 `:first`）时按全部元素处理
     let css = if css.trim().is_empty() {
@@ -2852,19 +3208,43 @@ fn resolve_index(i: i64, len: usize) -> Option<usize> {
 /// `##` 替换的三种形态（Legado `AnalyzeRule.replaceRegex`）：
 /// - `##pat`：删除所有匹配（replacement 为空）；
 /// - `##pat##repl`：替换所有匹配；
-/// - `##pat##repl###`：只取第一个匹配再替换（无匹配时返回空串）。
+/// - `##pat##repl###`：只替换第一个匹配（无匹配时原样返回）。
 fn apply_replace_regex(value: &str, pattern: &str, replacement: &str, replace_first: bool) -> String {
     let re = match Regex::new(pattern) {
         Ok(r) => r,
         Err(_) => return value.replace(pattern, replacement),
     };
+    // Java Matcher 的 `$1s` = 第 1 组 + 字面量 s（数字序列到非数字即结束），
+    // regex crate 会把 `$1s` 当作命名组，需规范成 `${1}s`。
+    let replacement = java_replacement_to_rust(replacement);
     if replace_first {
-        return match re.find(value) {
-            Some(m) => re.replace_all(m.as_str(), replacement).to_string(),
-            None => String::new(),
-        };
+        return re.replacen(value, 1, &replacement).to_string();
     }
-    re.replace_all(value, replacement).to_string()
+    re.replace_all(value, &replacement).to_string()
+}
+
+/// 把 Java 风格的 `$<数字>` 分组引用规范化为 regex crate 的 `${<数字>}`。
+fn java_replacement_to_rust(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len() + 2);
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+            let mut digits = String::new();
+            while let Some(&d) = chars.peek() {
+                if !d.is_ascii_digit() {
+                    break;
+                }
+                digits.push(d);
+                chars.next();
+            }
+            out.push_str("${");
+            out.push_str(&digits);
+            out.push('}');
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// HTML4 实体反转义（只在最终输出做一次，避免重复反转义）。
@@ -2958,6 +3338,84 @@ mod tests {
             .get_string(html, ".content@.book.0@.bookinfo@tag.a.1@text", false, "")
             .unwrap();
         assert_eq!(kind, "玄幻");
+    }
+
+    #[test]
+    fn single_value_rule_joins_all_matched_elements() {
+        // 上游 JSoup 规则.getString = getResultLast 收集全部匹配元素的值，
+        // 非空才保留；getString 对多值按 "\n" 合并（isUrl 才走 getString 取首个）。
+        // 夹具对应真实源 101/102/103 的 `@a@text`、`@a@href` 规则。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="book">
+            <a href="/b/1"></a>
+            <a href="/b/1">剑来</a>
+            <a href="/b/2">剑来 第84章</a>
+        </div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.book@a@text", false, "").unwrap(),
+            "剑来\n剑来 第84章"
+        );
+        // 属性：空值与重复值跳过（上游 `if (url.isBlank() || textS.contains(url)) continue`）
+        assert_eq!(
+            ar.get_string(html, "class.book@a@href", false, "").unwrap(),
+            "/b/1\n/b/2"
+        );
+        // is_url=true 走 getString：只取首个
+        assert_eq!(
+            ar.get_string(html, "class.book@a@href", true, "").unwrap(),
+            "/b/1"
+        );
+    }
+
+    #[test]
+    fn table_row_fragment_keeps_structure_for_nth_of_type() {
+        // 真实源 103 的列表项是 `<tr>`；上游拿到的是 Element（结构完整）。
+        // 片段字符串重解析若丢掉 tr/td，p:nth-of-type 会把各单元格的 p 拉平成兄弟节点。
+        let ar = AnalyzeRule::new();
+        let row = r#"<tr>
+            <td><p><a href="/book/1">书名</a></p></td>
+            <td><p><a href="/author/x">作者</a></p></td>
+            <td><p>连载</p></td>
+        </tr>"#;
+        assert_eq!(
+            ar.get_string(row, "@CSS:p:nth-of-type(1) a@text", false, "")
+                .unwrap(),
+            "书名\n作者"
+        );
+        // 每个 td 内只有一个 p，因此不存在 nth-of-type(2)
+        assert_eq!(
+            ar.get_string(row, "@CSS:p:nth-of-type(2) a@text", false, "")
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn html_terminal_returns_outer_html_without_scripts() {
+        // 上游 getResultLast("html")：先删 script/style，再取 Elements.outerHtml()。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="text"><p>第一段</p><script>alert(1)</script><style>.x{color:red}</style><p>第二段</p></div>"#;
+        let v = ar.get_string(html, "class.text@html", false, "").unwrap();
+        assert!(
+            v.starts_with("<div class=\"text\">"),
+            "应保留元素本身（outerHtml），实际: {v}"
+        );
+        assert!(v.contains("<p>第一段</p>") && v.contains("<p>第二段</p>"));
+        assert!(
+            !v.contains("alert(1)") && !v.contains(".x{"),
+            "应剔除 script/style，实际: {v}"
+        );
+    }
+
+    #[test]
+    fn regex_replacement_group_followed_by_letter() {
+        // Java Matcher 的 `$1s` = 组 1 + 字面量 s；regex crate 会把 `$1s` 当命名组名。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="n">第12章 剑来</div>"#;
+        let v = ar
+            .get_string(html, r"class.n@text##第(\d+)章##Chapter$1s", false, "")
+            .unwrap();
+        assert_eq!(v, "Chapter12s 剑来");
     }
 
     #[test]
@@ -3079,16 +3537,17 @@ nodes.filter(function (node) {
     fn children_and_textnodes() {
         let ar = AnalyzeRule::new();
         let html = r#"<ul><li><a href="/x">甲</a></li><li><a href="/y">乙</a></li></ul>"#;
-        // @children 取直接子节点（li），再取 a 的 href
+        // @children 取直接子节点（li），再取 a 的 href；上游 getString 对多值按 "\n" 合并
         let r = ar
             .get_string(html, "@CSS:ul@children@tag.a@href", false, "")
             .unwrap();
-        assert_eq!(r, "/x");
+        assert_eq!(r, "/x\n/y");
         let html2 = r#"<div>前缀<span>内</span>后缀</div>"#;
         let t = ar
             .get_string(html2, "@CSS:div@textNodes", false, "")
             .unwrap();
-        assert_eq!(t, "前缀后缀");
+        // 上游 textNodes：直接文本节点逐个 trim，非空值按 "\n" 合并
+        assert_eq!(t, "前缀\n后缀");
     }
 
     #[test]
@@ -3175,15 +3634,15 @@ nodes.filter(function (node) {
     fn bare_tag_and_excluded_indices() {
         let ar = AnalyzeRule::new();
         let html = r#"<dl id="list"><dd>第1</dd><dd>第2</dd><dd>第3</dd><dd>第4</dd><dd>第5</dd></dl>"#;
-        // 裸标签遍历（@dd）+ 单值取首个
+        // 裸标签遍历（@dd）+ 多值按 "\n" 合并（上游 getResultLast 收集全部元素）
         let t1 = ar.get_string(html, "@CSS:id.list@dd@text", false, "").unwrap();
-        assert_eq!(t1, "第1");
-        // Legado 的 `!0:1` 是“排除第 0、1 个”，剩余第 3/4/5 个，取首个 = 第3
+        assert_eq!(t1, "第1\n第2\n第3\n第4\n第5");
+        // Legado 的 `!0:1` 是“排除第 0、1 个”，剩余第 3/4/5 个
         let t2 = ar.get_string(html, "@CSS:id.list@dd!0:1@text", false, "").unwrap();
-        assert_eq!(t2, "第3");
-        // `!2` 排除第 3 个，取首个 = 第1
+        assert_eq!(t2, "第3\n第4\n第5");
+        // `!2` 排除第 3 个
         let t3 = ar.get_string(html, "@CSS:id.list@dd!2@text", false, "").unwrap();
-        assert_eq!(t3, "第1");
+        assert_eq!(t3, "第1\n第2\n第4\n第5");
     }
 
     // B3：初始选择器带 `!下标`（精华书阁真实形态 `li!0:1:2:3:4@a` / `option!0@value`）
@@ -3577,6 +4036,50 @@ nodes.filter(function (node) {
         );
     }
 
+    // ---- P1：`class.a b` 是 AND（同时具备），不是 CSS 的后代选择器 ----
+
+    #[test]
+    fn p1_class_multi_name_is_and_not_descendant() {
+        let ar = AnalyzeRule::new();
+        // 初始选择器：只有同时具备 author/extra 的节点命中
+        let html = r#"<div class="author extra"><span>甲</span></div>
+                      <div class="author"><span>乙</span></div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.author extra@text", false, "")
+                .unwrap()
+                .trim(),
+            "甲"
+        );
+        // 下标解析必须发生在归一化之前：`class.author extra.-1` 取最后一个命中
+        let html2 = r#"<div class="author extra">A</div><div class="author extra">B</div><div class="author">C</div>"#;
+        assert_eq!(
+            ar.get_string(html2, "class.author extra.-1@text", false, "")
+                .unwrap(),
+            "B"
+        );
+        // 遍历标记路径（parse_token）同样按 AND 处理
+        let html3 = r#"<div class="item"><p class="author extra">作者甲</p></div>
+                       <div class="item"><p class="author">作者乙</p></div>"#;
+        assert_eq!(
+            ar.get_string(html3, "class.item@class.author extra@text", false, "")
+                .unwrap(),
+            "作者甲"
+        );
+    }
+
+    // ---- P2：首段裸 `tag.N` / `tag.-N` ----
+
+    #[test]
+    fn p2_bare_tag_index_in_initial_selector() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list"><a href="/1">一</a><a href="/2">二</a><a href="/3">三</a></div>"#;
+        assert_eq!(ar.get_string(html, "a.0@href", true, "").unwrap(), "/1");
+        assert_eq!(ar.get_string(html, "a.-1@href", true, "").unwrap(), "/3");
+        // 等价写法不得回归
+        assert_eq!(ar.get_string(html, "tag.a.0@href", true, "").unwrap(), "/1");
+        assert_eq!(ar.get_string(html, "a[0]@href", true, "").unwrap(), "/1");
+    }
+
     // ---------------- JSONPath 谓词 / 回退链 / @json: ----------------
 
     const BOOKS_JSON: &str = r#"{"data":{"list":[
@@ -3757,11 +4260,17 @@ nodes.filter(function (node) {
                 .unwrap(),
             "第12节 甲 第34节 乙"
         );
-        // 四段（尾部 `###`）：只取第一个匹配再替换
+        // 四段（尾部 `###`）：只替换第一个匹配，替换片段之后的原文必须保留
         assert_eq!(
             ar.get_string(html, ".n@text##第(\\d+)章##第$1节###", false, "")
                 .unwrap(),
-            "第12节"
+            "第12节 甲 第34章 乙"
+        );
+        // 无匹配时原样返回（而不是丢弃整串）
+        assert_eq!(
+            ar.get_string(html, ".n@text##第(\\d+)卷##第$1节###", false, "")
+                .unwrap(),
+            "第12章 甲 第34章 乙"
         );
     }
 
@@ -3847,6 +4356,60 @@ nodes.filter(function (node) {
         assert_eq!(
             ar.get_string_list_all(html, "class.pic@tag.img[-1:0]@src", ""),
             vec!["6", "5", "4", "3", "2", "1"]
+        );
+    }
+
+    // ---- F3：`.class.N` 点前缀索引（上游 findIndexSet 把尾部 `.N` 拆成下标） ----
+
+    #[test]
+    fn f3_dot_prefix_index_in_initial_selector() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div><span class="author">作者甲</span><span class="author">字数：1.0万</span></div>"#;
+        // JSoup 规则.ElementsSingle.findIndexSet：`.author.0` -> beforeRule=`.author`、split='.'、index=[0]
+        assert_eq!(
+            ar.get_string(html, ".author.0@text", false, "").unwrap(),
+            "作者甲"
+        );
+        assert_eq!(
+            ar.get_string(html, ".author.1@text", false, "").unwrap(),
+            "字数：1.0万"
+        );
+        // 与 `##` 替换组合（case 0/99 的实际写法）
+        assert_eq!(
+            ar.get_string(html, ".author.0@text##作者：", false, "").unwrap(),
+            "作者甲"
+        );
+    }
+
+    // ---- F4：`class.x.y` 三段链只取第一个类名分段（上游 rules[1]） ----
+
+    #[test]
+    fn f4_class_chain_uses_first_segment_like_upstream() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list"><div class="list_tit">目录</div><ul>
+            <li><a href="/1">第一章</a></li><li><a href="/2">第二章</a></li></ul></div>"#;
+        // JSoup 规则.getElementsSingle：beforeRule.split(".") 后 class 分支只用 rules[1]="list"
+        let chapters = ar.get_string_list(html, "class.list.ul@li").unwrap();
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(
+            ar.get_string(&chapters[0], "a@text", false, "").unwrap(),
+            "第一章"
+        );
+        assert_eq!(
+            ar.get_string(&chapters[1], "a@href", false, "").unwrap(),
+            "/2"
+        );
+    }
+
+    // ---- F5：`@text` 块级元素之间补空格（jsoup Element.text() 行为） ----
+
+    #[test]
+    fn f5_text_inserts_space_between_block_elements() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="text"><p>二月二，龙抬头。</p><p>暮色里，小镇名叫泥瓶巷。</p></div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.text@text", false, "").unwrap(),
+            "二月二，龙抬头。 暮色里，小镇名叫泥瓶巷。"
         );
     }
 }
