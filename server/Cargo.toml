@@ -44,3 +44,4 @@ opt-level = "z"      # 体积/内存优先
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = "symbols"    # 剥掉符号表：aarch64 已由 zig 剥过，x86_64/msvc 需要显式声明

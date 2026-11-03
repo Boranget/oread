@@ -19,11 +19,11 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # 分支 push / PR：只校验与构建，不发 Release
+  # 校验与测试：分支 push / PR / tag 全部必跑。
+  # tag 也跑是为了让 Release 建立在「测试已通过」之上，而不是只有分支才测。
   # ------------------------------------------------------------------
   check:
-    name: check + build (linux x86_64)
-    if: ${{ github.ref_type != 'tag' }}
+    name: check + test (linux x86_64)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -216,7 +216,7 @@ jobs:
   # ------------------------------------------------------------------
   release:
     name: release
-    needs: [windows, linux-x64, linux-arm64]
+    needs: [check, windows, linux-x64, linux-arm64]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
