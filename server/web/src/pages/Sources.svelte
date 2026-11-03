@@ -36,6 +36,33 @@
   let editorUrl = '';
   let editorBaseline = null; // 打开时的详情快照，保存前读回比对
 
+  // 单源校验（只查规则，check_url=false，不发远端请求）
+  let validations = {}; // url -> { valid, errors, warnings }
+  let validatingUrl = '';
+
+  // 批量检查更新按需加载，避免把 diff/合并逻辑塞进首屏主包
+  let UpdateChecker = null;
+  let showUpdate = false;
+
+  async function openUpdateChecker() {
+    if (showUpdate) return;
+    if (UpdateChecker) {
+      showUpdate = true;
+      return;
+    }
+    busy = '加载检查更新模块…';
+    error = '';
+    try {
+      const mod = await import('../lib/SourceUpdateChecker.svelte');
+      UpdateChecker = mod.default;
+      showUpdate = true;
+    } catch (e) {
+      error = `加载检查更新模块失败：${e.message || e}`;
+    } finally {
+      busy = '';
+    }
+  }
+
   // 真实合集里存在没有名字的书源，列表要给出可辨认的占位
   function sname(s) { return (s && s.book_source_name) || '未命名书源'; }
 
@@ -360,6 +387,30 @@
     }
   }
 
+  async function validateOne(s) {
+    if (validatingUrl) return;
+    validatingUrl = s.book_source_url;
+    error = '';
+    try {
+      const d = await api.sourceDetail(s.book_source_url);
+      if (isEmptyDetail(d)) throw new Error('书源详情为空，无法校验规则');
+      const r = await api.validateSource(d, false);
+      validations = {
+        ...validations,
+        [s.book_source_url]: r && typeof r === 'object'
+          ? r
+          : { valid: false, errors: ['校验接口未返回结果'], warnings: [] },
+      };
+    } catch (e) {
+      validations = {
+        ...validations,
+        [s.book_source_url]: { valid: false, errors: [e.message || '校验请求失败'], warnings: [] },
+      };
+    } finally {
+      validatingUrl = '';
+    }
+  }
+
   async function remove(url) {
     if (!confirm('删除该书源？此操作不可恢复。')) return;
     try {
@@ -390,6 +441,7 @@
     <button class="ghost" on:click={() => fileInput.click()} disabled={!!busy}>导入 JSON</button>
   {/if}
   <button class="ghost" on:click={exportAll} disabled={!!busy}>导出全部</button>
+  <button class="ghost" on:click={openUpdateChecker} disabled={!!busy}>检查更新</button>
   <div class="spacer"></div>
   {#if isAdmin}
     <button on:click={openNew}>新建</button>
@@ -425,6 +477,10 @@
 {#if busy}<p class="loading">{busy}</p>{/if}
 {#if error}<p class="err">{error}</p>{/if}
 {#if notice}<p class="ok-line">{notice}</p>{/if}
+
+{#if showUpdate && UpdateChecker}
+  <svelte:component this={UpdateChecker} {sources} />
+{/if}
 
 {#if loading}
   <p class="loading">加载中…</p>
@@ -467,12 +523,40 @@
         </div>
         <div class="row" style="margin-top:10px">
           <button class="ghost" on:click={() => openDetail(s.book_source_url)}>详情</button>
+          <button class="ghost" on:click={() => validateOne(s)} disabled={validatingUrl === s.book_source_url}>
+            {validatingUrl === s.book_source_url ? '校验中…' : '校验'}
+          </button>
           {#if isAdmin}
             <button class="ghost" on:click={() => toggleOne(s)} disabled={!!busy}>{s.enabled ? '禁用' : '启用'}</button>
             <div class="spacer"></div>
             <button class="danger" on:click={() => remove(s.book_source_url)}>删除</button>
           {/if}
         </div>
+        {#if validations[s.book_source_url]}
+          {@const v = validations[s.book_source_url]}
+          <div class="val-box" class:val-bad={!v.valid}>
+            <div class="val-head">
+              校验{v.valid ? '通过' : '未通过'}
+              {#if v.errors && v.errors.length}&nbsp;· {v.errors.length} 个错误{/if}
+              {#if v.warnings && v.warnings.length}&nbsp;· {v.warnings.length} 条提示{/if}
+            </div>
+            {#if v.errors && v.errors.length}
+              <div class="val-line">{v.errors[0]}</div>
+              {#if v.errors.length > 1}
+                <details class="val-detail">
+                  <summary>其余错误（{v.errors.length - 1}）</summary>
+                  {#each v.errors.slice(1) as msg}<div class="val-line">{msg}</div>{/each}
+                </details>
+              {/if}
+            {/if}
+            {#if v.warnings && v.warnings.length}
+              <details class="val-detail">
+                <summary>提示</summary>
+                {#each v.warnings as msg}<div class="val-line">{msg}</div>{/each}
+              </details>
+            {/if}
+          </div>
+        {/if}
       </div>
     {/each}
   </div>
@@ -570,7 +654,28 @@
     font-size: 13px;
   }
   .disabled-card { opacity: 0.72; }
-  .badge-off { background: #fdecea; color: #b3392f; }
+  .val-box {
+    margin-top: 8px;
+    padding: 6px 8px;
+    border: 1px solid #cfe6d6;
+    border-radius: 8px;
+    background: #f2faf4;
+    font-size: 12px;
+  }
+  .val-bad {
+    border-color: #e8c7a7;
+    background: #fdf6ec;
+  }
+  .val-head {
+    font-weight: 600;
+  }
+  .val-detail {
+    margin-top: 4px;
+  }
+  .val-line {
+    line-height: 1.5;
+    word-break: break-word;
+  }
   .detail-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
