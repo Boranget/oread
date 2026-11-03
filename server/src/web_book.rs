@@ -113,7 +113,8 @@ fn build_search_request(
     // 相对 searchUrl（如 `search.php?kw={{key}}`、`/book/so/...`）必须按书源根地址归并，
     // 否则 reqwest 收到相对 URL 直接失败，整源搜索恒为 0 条（错层小说网、三八小说实测）。
     let base = abs(&source.book_source_url, &base);
-    let mut headers = req::parse_headers(&source.header);
+    // 逐源透传：JSON / 多行 / `@js:` header 都在这里按源求值
+    let mut headers = req::source_headers(source, &base);
     let mut method = "GET".to_string();
     let mut body: Option<String> = None;
     if let Some(cfg_str) = config {
@@ -154,7 +155,14 @@ pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result
         None => return Ok(vec![]),
     };
     let (url, method, headers, body) = build_search_request(source, key, page);
-    let html = req::fetch(&url, &method, &headers, body.as_deref()).await?;
+    let html = req::fetch_for_source(
+        &url,
+        &method,
+        &headers,
+        body.as_deref(),
+        &source.book_source_url,
+    )
+    .await?;
     let ar = make_ar(source);
     let items = ar.get_string_list(&html, rule.book_list.as_deref().unwrap_or(""))?;
     let mut books = Vec::new();
@@ -188,7 +196,8 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
         Some(r) => r,
         None => return Ok(vec![]),
     };
-    let html = req::fetch(url, "GET", &req::parse_headers(&source.header), None).await?;
+    let headers = req::source_headers(source, &source.book_source_url);
+    let html = req::fetch_for_source(url, "GET", &headers, None, &source.book_source_url).await?;
     let ar = make_ar(source);
     let items = ar.get_string_list(&html, rule.book_list.as_deref().unwrap_or(""))?;
     let mut books = Vec::new();
@@ -222,7 +231,8 @@ pub async fn book_info(source: &BookSource, book: &mut Book) -> anyhow::Result<(
         None => return Ok(()),
     };
     let url = book.book_url.clone();
-    let html = req::fetch(&url, "GET", &req::parse_headers(&source.header), None).await?;
+    let headers = req::source_headers(source, &url);
+    let html = req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
     let ar = make_ar(source);
     if let Some(init) = &rule.init {
         let _ = ar.get_string(&html, init, false, &url);
@@ -296,7 +306,7 @@ pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Ve
         Some(r) => r,
         None => return Ok(vec![]),
     };
-    let headers = req::parse_headers(&source.header);
+    let headers = req::source_headers(source, &book.book_url);
     let mut url = book
         .toc_url
         .clone()
@@ -319,8 +329,18 @@ pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Ve
         seen.insert(url.clone());
         // 让规则里的 `${page}` / `{{page}}` 拿到当前页号
         ar.set_var("page", page.to_string());
-        let html = req::fetch(&url, "GET", &headers, None).await?;
-        let items = ar.get_string_list(&html, rule.chapter_list.as_deref().unwrap_or(""))?;
+        let html =
+            req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
+        let rule_text = rule.chapter_list.as_deref().unwrap_or("");
+        // Legado 目录规则前缀 `-` 表示倒序（如 `-class.list@tag.li`）；直接当选择器会抓空。
+        let (list_rule, reverse) = match rule_text.trim().strip_prefix('-') {
+            Some(rest) => (rest.trim(), true),
+            None => (rule_text, false),
+        };
+        let mut items = ar.get_string_list(&html, list_rule)?;
+        if reverse {
+            items.reverse();
+        }
         for item in &items {
             let idx = chaps.len() as i64;
             let is_volume = flag(&ar, item, &rule.is_volume, &url);
@@ -374,7 +394,7 @@ async fn fetch_html_pages(
     chapter: &BookChapter,
     rule: &ContentRule,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let headers = req::parse_headers(&source.header);
+    let headers = req::source_headers(source, &chapter.url);
     let mut url = chapter.url.clone();
     let mut pages: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
@@ -385,7 +405,8 @@ async fn fetch_html_pages(
         }
         guard += 1;
         seen.insert(url.clone());
-        let html = req::fetch(&url, "GET", &headers, None).await?;
+        let html =
+            req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
         let ar = make_ar(source);
         let next =
             ar.get_string(&html, rule.next_content_url.as_deref().unwrap_or(""), true, &url)?;
@@ -651,7 +672,8 @@ pub async fn chapter_images(
         // 规则本身可能直接产出多条（CSS 列表 / JS 数组），逐条归一
         let ar = make_ar(source);
         let values = ar.get_string_list_all(html, content_rule, page_url);
-        let raws: Vec<RawImage> = if values.is_empty() {
+
+        let mut raws: Vec<RawImage> = if values.is_empty() {
             Vec::new()
         } else {
             values
@@ -659,6 +681,18 @@ pub async fn chapter_images(
                 .flat_map(|v| images_from_value(v))
                 .collect()
         };
+        // 兼容 `class.ComicPics@img@html`：`@html` 在图片节点上是空的内层 HTML，
+        // 换成 `@all`（outer HTML）再解析 `<img src>`；只在原规则零结果时兜底。
+        if raws.is_empty() {
+            if let Some(head) = content_rule.strip_suffix("@html") {
+                let alt_rule = format!("{}@all", head.trim());
+                let alt_values = ar.get_string_list_all(html, &alt_rule, page_url);
+                raws = alt_values
+                    .iter()
+                    .flat_map(|v| images_from_value(v))
+                    .collect();
+            }
+        }
         per_page.push((page_url.clone(), raws));
     }
     Ok(build_images(&per_page, MAX_CHAPTER_IMAGES))
@@ -943,6 +977,21 @@ fn _unused(_: HashMap<String, String>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comic_img_html_falls_back_to_outer_html() {
+        // `class.X@img@html` 在图片节点上得到空的内层 HTML；`@all` 才是 outer HTML。
+        // 真实书源（如快看）用 `@html` 取 <img>，因此零结果时必须回退到 `@all`。
+        let src = BookSource::default();
+        let ar = make_ar(&src);
+        let html = r#"<div class="ComicPics comic-pics"><img src="https://cdn/a.jpg"><img src="https://cdn/b.jpg"></div>"#;
+        let inner = ar.get_string_list_all(html, "class.ComicPics@img@html", "https://x/");
+        assert_eq!(inner, vec!["", ""], "内层 HTML 为空，不能直接当图片列表");
+        let outer = ar.get_string_list_all(html, "class.ComicPics@img@all", "https://x/");
+        assert_eq!(outer.len(), 2);
+        assert!(outer[0].contains("a.jpg"));
+        assert!(outer[1].contains("b.jpg"));
+    }
 
     // B1：相对 searchUrl 必须按 bookSourceUrl 归并（真实源最小形态）
     #[test]

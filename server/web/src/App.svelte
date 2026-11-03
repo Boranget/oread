@@ -4,11 +4,12 @@
   import Bookshelf from './pages/Bookshelf.svelte';
   import Discover from './pages/Discover.svelte';
   import Reader from './pages/Reader.svelte';
+  import ComicReader from './pages/ComicReader.svelte';
   import Sources from './pages/Sources.svelte';
   import ReplaceRules from './pages/ReplaceRules.svelte';
   import Settings from './pages/Settings.svelte';
   import Stats from './pages/Stats.svelte';
-  import { getToken, getRole, clearToken } from './lib/api.js';
+  import { api, getToken, getRole, clearToken } from './lib/api.js';
   import { DEVICE_MODES, deviceLabels, devicePref, setDeviceMode } from './lib/device.js';
 
   let loggedIn = false;
@@ -46,8 +47,31 @@
     reader = null;
     tab = 'bookshelf';
   }
-  function openReader(book) {
-    reader = book;
+  let openSeq = 0;
+  // 漫画与小说共用入口：搜索结果已带 type；书架条目没有类型时，
+  // 用 /api/comic/source 轻量探测书源类型（不发回源请求），失败则按小说打开。
+  async function openReader(book) {
+    if (!book) return;
+    const my = ++openSeq;
+    const known = book.bookType || book.type;
+    if (known === 'image' || known === 'text') {
+      reader = { ...book, bookType: known };
+      return;
+    }
+    if (book.sourceId) {
+      try {
+        const st = await api.comicSource(book.sourceId, book.bookUrl);
+        if (my !== openSeq) return;
+        if (st && st.comic) {
+          reader = { ...book, bookType: 'image' };
+          return;
+        }
+      } catch {
+        /* 探测失败按小说打开，Reader 仍可正常报错 */
+      }
+    }
+    if (my !== openSeq) return;
+    reader = { ...book, bookType: 'text' };
   }
   function closeReader() { reader = null; }
 </script>
@@ -56,13 +80,17 @@
   <Login on:loggedin={(e) => onLogin(e.detail)} />
 {:else if reader}
   <!-- 换源后 bookUrl/sourceId 变化，用 key 强制重建 Reader，避免沿用旧目录与缓存 -->
-  {#key reader.sourceId + '|' + reader.bookUrl}
-    <Reader
-      book={reader}
-      on:close={closeReader}
-      on:logout={onLogout}
-      on:switch={(e) => openReader(e.detail)}
-    />
+  {#key reader.sourceId + '|' + reader.bookUrl + '|' + reader.bookType}
+    {#if reader.bookType === 'image'}
+      <ComicReader book={reader} on:close={closeReader} />
+    {:else}
+      <Reader
+        book={reader}
+        on:close={closeReader}
+        on:logout={onLogout}
+        on:switch={(e) => openReader(e.detail)}
+      />
+    {/if}
   {/key}
 {:else}
   <div class="nav">
