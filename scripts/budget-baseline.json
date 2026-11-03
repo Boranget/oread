@@ -1,0 +1,10 @@
+{
+  "$comment": "最近一次通过的实测值（v0.3.1 / 2026-11-03），仅供报告对照，不参与判定。",
+  "version": "v0.3.1",
+  "measuredAt": "2026-11-03",
+  "binaries": {
+    "boranlib-linux-aarch64": 9527352,
+    "boranlib-linux-x86_64": 12271272,
+    "boranlib-windows-x86_64.exe": 10056192
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "$comment": "资源预算门禁的唯一阈值来源。CI 与本地脚本都读这里，改这一处即可。",
+  "binaries": {
+    "boranlib-linux-aarch64": 12,
+    "boranlib-linux-x86_64": 15,
+    "boranlib-windows-x86_64.exe": 12
+  },
+  "frontend": {
+    "entryJsGzipKb": 90,
+    "entryCssGzipKb": 12
+  }
+}
