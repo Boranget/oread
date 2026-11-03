@@ -2,16 +2,29 @@ name: ci
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-jobs:
-  rust:
-    name: cargo check + test (linux)
-    runs-on: ubuntu-latest
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------
+  # 分支 push / PR：只校验与构建，不发 Release
+  # ------------------------------------------------------------------
+  check:
+    name: check + build (linux x86_64)
+    if: ${{ github.ref_type != 'tag' }}
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: server
@@ -19,14 +32,223 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml 在仓库根，rustup 会自动向上查找并用它装 stable + musl 目标
-      - name: Install toolchain (from rust-toolchain.toml)
-        run: |
-          rustup show
-          rustc -vV
+      - name: Cache cargo (linux-gnu)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: linux-gnu
 
-      - name: cargo check
-        run: cargo check --all-targets
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: server/web/package-lock.json
+
+      # 前端先构建：ServeDir 是运行期相对路径（web/dist），不在编译期内嵌，
+      # 但保持「先出 dist 再编 Rust」的现场顺序，便于排查。
+      - name: Install frontend deps
+        working-directory: server/web
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: server/web
+        run: npm run build
+
+      - name: cargo build --release
+        run: cargo build --release --locked
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --locked
+
+  # ------------------------------------------------------------------
+  # tag v* / 手动触发：三平台产物
+  # ------------------------------------------------------------------
+  windows:
+    name: build (windows x86_64 msvc)
+    if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (windows-msvc)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: windows-msvc
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/boranlib.exe dist/boranlib-windows-x86_64.exe
+          $hash = (Get-FileHash dist/boranlib-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  boranlib-windows-x86_64.exe" | Set-Content -Encoding ascii dist/boranlib-windows-x86_64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boranlib-windows-x86_64
+          path: |
+            server/dist/boranlib-windows-x86_64.exe
+            server/dist/boranlib-windows-x86_64.sha256
+          if-no-files-found: error
+
+  linux-x64:
+    name: build (linux x86_64 musl)
+    if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (x86_64-musl)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: x86_64-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add rust target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: cargo build --release (musl)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Verify static ELF + package
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/boranlib
+          test -f "$BIN"
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error::$BIN 不是静态 ELF（存在 PT_INTERP）"
+            exit 1
+          fi
+          readelf -h "$BIN" | grep Machine
+          mkdir -p dist
+          cp "$BIN" dist/boranlib-linux-x86_64
+          sha256sum dist/boranlib-linux-x86_64 | sed 's#  dist/#  #' > dist/boranlib-linux-x86_64.sha256
+          cat dist/boranlib-linux-x86_64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boranlib-linux-x86_64
+          path: |
+            server/dist/boranlib-linux-x86_64
+            server/dist/boranlib-linux-x86_64.sha256
+          if-no-files-found: error
+
+  linux-arm64:
+    name: build (linux aarch64 musl / OpenStick)
+    if: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (aarch64-musl)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: aarch64-musl
+
+      - name: Add rust target
+        run: rustup target add aarch64-unknown-linux-musl
+
+      # aarch64-unknown-linux-musl 没有现成的 musl 交叉 gcc（musl-tools 只提供
+      # x86_64 的 musl-gcc），依赖里的 C 代码（libsqlite3-sys）必须有可用的交叉
+      # 编译器；Zig 在这里是必需项，不是偏好。
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.13.0'
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: cargo zigbuild --release (aarch64 musl)
+        run: cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Verify static ELF + package
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-unknown-linux-musl/release/boranlib
+          test -f "$BIN"
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error::$BIN 不是静态 ELF（存在 PT_INTERP）"
+            exit 1
+          fi
+          readelf -h "$BIN" | grep Machine
+          mkdir -p dist
+          cp "$BIN" dist/boranlib-linux-aarch64
+          sha256sum dist/boranlib-linux-aarch64 | sed 's#  dist/#  #' > dist/boranlib-linux-aarch64.sha256
+          cat dist/boranlib-linux-aarch64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boranlib-linux-aarch64
+          path: |
+            server/dist/boranlib-linux-aarch64
+            server/dist/boranlib-linux-aarch64.sha256
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # 仅 v* tag：汇总三平台产物 + 校验清单，创建 Release
+  # ------------------------------------------------------------------
+  release:
+    name: release
+    needs: [windows, linux-x64, linux-arm64]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build checksum manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum boranlib-windows-x86_64.exe boranlib-linux-x86_64 boranlib-linux-aarch64 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/boranlib-windows-x86_64.exe
+            dist/boranlib-linux-x86_64
+            dist/boranlib-linux-aarch64
+            dist/SHA256SUMS.txt
+          body: |
+            版本 ${{ github.ref_name }}
+
+            Linux 两个包均为静态 musl 二进制（无 PT_INTERP 依赖），其中 `boranlib-linux-aarch64` 适用于 OpenStick。
+            Windows 包为 x86_64 msvc 构建。
+
+            校验：`sha256sum -c SHA256SUMS.txt`
