@@ -80,6 +80,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 防回归：checkout 落到磁盘的换行必须与 .gitattributes 一致。
+      # 若出现 i/crlf 或 w/crlf，sqlx::migrate! 就会把 CRLF 字节内嵌进 Windows 产物，
+      # 导致与 Linux/仓库的 LF 校验和不一致（v0.3.1 事故：0003 len 414 vs 410）。
+      - name: Assert migrations are LF
+        shell: pwsh
+        run: |
+          $out = git -C "$env:GITHUB_WORKSPACE" ls-files --eol server/migrations
+          $out
+          $bad = $out | Select-String -Pattern 'i/crlf|w/crlf'
+          if ($bad) {
+            Write-Error "server/migrations 出现 CRLF（.gitattributes 未生效）：`n$($bad -join "`n")"
+            exit 1
+          }
+
       - name: Cache cargo (windows-msvc)
         uses: Swatinem/rust-cache@v2
         with:
@@ -88,6 +102,10 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --locked
+
+      # 核心证据：打出 Windows 侧 sqlx::migrate! 内嵌的每条迁移字节数（0003 必须是 410）。
+      - name: cargo test (migrations LF)
+        run: cargo test --locked --test migrations_lf -- --nocapture
 
       - name: Package
         shell: pwsh

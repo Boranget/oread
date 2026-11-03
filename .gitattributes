@@ -1,0 +1,10 @@
+# 强制 LF：sqlx::migrate! 把文件字节内嵌进二进制，换行差异会导致校验和不一致
+# （Windows CRLF 产物 len=414 vs Linux/仓库 410 → VersionMismatch 拒绝启动）
+server/migrations/** text eol=lf
+docs/** text eol=lf
+
+# 二进制文件不做任何文本属性（后面的规则覆盖上面的 docs/**）
+docs/**/*.png -text
+docs/**/*.jpg -text
+
+*.sh text eol=lf
