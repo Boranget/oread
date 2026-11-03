@@ -57,7 +57,9 @@ jobs:
 
       # 首屏体积门禁：口径 = 入口 chunk + 其静态 import 的 chunk（gzip），
       # 不是 dist/*.js 总量。阈值在 scripts/budget.json。
+      # 脚本与 budget.json 在仓库根目录的 scripts/，必须显式覆盖 job 级的 server/。
       - name: Budget gate (frontend)
+        working-directory: .
         run: node scripts/check-budget.mjs --frontend-only
 
       - name: cargo build --release
