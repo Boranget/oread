@@ -377,8 +377,16 @@ pub async fn validate(
     }
 
     if parsed.check_url && errors.is_empty() {
-        let headers = crate::req::parse_headers(&src.header);
-        match crate::req::fetch(&src.book_source_url, "GET", &headers, None).await {
+        let headers = crate::req::source_headers(&src, &src.book_source_url);
+        match crate::req::fetch_for_source(
+            &src.book_source_url,
+            "GET",
+            &headers,
+            None,
+            &src.book_source_url,
+        )
+        .await
+        {
             Ok(_) => warnings.push("bookSourceUrl 可访问".into()),
             Err(e) => warnings.push(format!("bookSourceUrl 不可访问: {e}")),
         }

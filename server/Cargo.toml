@@ -32,6 +32,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 boa_engine = "0.19"         # JS 引擎（Rhino 等价，纯 Rust 便于交叉编译）
 regex = "1"
 url = "2"
+encoding_rs = "0.8"         # 响应体解码：UTF-8 / GBK / GB18030 / Big5
 base64 = "0.22"
 md-5 = "0.10"
 sha1 = "0.10"

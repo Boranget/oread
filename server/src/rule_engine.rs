@@ -805,6 +805,15 @@ impl AnalyzeRule {
         if !self.is_json && is_extract_keyword(bare) {
             return Ok(extract_first(content, bare));
         }
+        // `@text` / `@href` / `@src` / `@html` 与裸标记等价：都作用于“当前节点”，
+        // 属性不存在时返回空串（不能当 CSS 标签选择器解析成空）。
+        if !self.is_json {
+            if let Some(k) = bare.strip_prefix('@') {
+                if is_extract_keyword(k) {
+                    return Ok(extract_first(content, k));
+                }
+            }
+        }
         // 默认：<js> / @js: 段切分管道
         let mut input = content.to_string();
         for (mode, text) in Self::split_js(&rule) {
@@ -1238,6 +1247,221 @@ enum JpSeg {
     Wildcard,
     RecursiveKey(String),
     RecursiveWildcard,
+    /// 过滤谓词 `[?(@.field=='x' && @.n>1)]` / `[?(@.a=='x' || @.b=='y')]`
+    Filter { conds: Vec<JpCond>, any: bool },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum JpOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct JpCond {
+    path: Vec<String>,
+    op: JpOp,
+    value: Value,
+}
+
+/// 找到与 `open` 处 `[` 配对的 `]`：跳过引号与内层方括号（谓词里可能有 `@['k']`）。
+fn find_close_bracket(cs: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, &c) in cs.iter().enumerate().skip(open) {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 按顶层 `&&` 或 `||` 切分谓词；两种混用视为不支持（需要括号优先级）。
+fn split_predicate(body: &str) -> Result<(Vec<String>, bool), String> {
+    let cs: Vec<char> = body.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut op: Option<bool> = None; // Some(true)=||, Some(false)=&&
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        if (c == '&' || c == '|') && i + 1 < cs.len() && cs[i + 1] == c {
+            let is_any = c == '|';
+            if op.map(|o| o != is_any).unwrap_or(false) {
+                return Err("谓词不支持混用 && 与 ||".to_string());
+            }
+            op = Some(is_any);
+            parts.push(cur.trim().to_string());
+            cur.clear();
+            i += 2;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    parts.push(cur.trim().to_string());
+    Ok((parts, op.unwrap_or(false)))
+}
+
+/// 解析 `@.a.b` / `@['a']` 形式的字段路径。
+fn parse_cond_path(raw: &str) -> Result<Vec<String>, String> {
+    let s = raw.trim();
+    let mut rest = s
+        .strip_prefix('@')
+        .ok_or_else(|| format!("谓词字段必须以 @ 开头：{s}"))?;
+    let mut out = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(r) = rest.strip_prefix('.') {
+            let end = r
+                .find(|c: char| c == '.' || c == '[')
+                .unwrap_or(r.len());
+            let key = r[..end].trim();
+            if key.is_empty() {
+                return Err(format!("谓词字段名为空：{s}"));
+            }
+            out.push(key.to_string());
+            rest = &r[end..];
+        } else if let Some(r) = rest.strip_prefix('[') {
+            let end = r
+                .find(']')
+                .ok_or_else(|| format!("谓词字段方括号未闭合：{s}"))?;
+            let key = unquote_arg(&r[..end]);
+            if key.is_empty() {
+                return Err(format!("谓词字段名为空：{s}"));
+            }
+            out.push(key);
+            rest = &r[end + 1..];
+        } else {
+            return Err(format!("谓词字段无法解析：{s}"));
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("谓词字段为空：{s}"));
+    }
+    Ok(out)
+}
+
+/// 解析谓词比较值：字符串 / 数字 / true / false / null。
+fn parse_pred_value(raw: &str) -> Result<Value, String> {
+    let s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('\'') && s.ends_with('\''))
+            || (s.starts_with('"') && s.ends_with('"')))
+    {
+        return Ok(Value::String(unquote_arg(s)));
+    }
+    match s {
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        "null" => return Ok(Value::Null),
+        _ => {}
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(Value::from(n));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Ok(Value::Number(n));
+        }
+    }
+    Err(format!("不支持的谓词比较值：{s}"))
+}
+
+/// 解析单条谓词：`@.field == 'x'` / `@.price>=10`（空格可选）。
+fn parse_cond(raw: &str) -> Result<JpCond, String> {
+    let s = raw.trim();
+    let ops = ["==", "!=", ">=", "<=", ">", "<"];
+    let mut found: Option<(usize, &str)> = None;
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            continue;
+        }
+        for op in ops {
+            if s[i..].starts_with(op) {
+                found = Some((i, op));
+                break;
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let (pos, op) = found.ok_or_else(|| format!("谓词缺少比较运算符：{s}"))?;
+    let path = parse_cond_path(s[..pos].trim())?;
+    let rhs = &s[pos + op.len()..];
+    let value = parse_pred_value(rhs)?;
+    let op = match op {
+        "==" => JpOp::Eq,
+        "!=" => JpOp::Ne,
+        ">=" => JpOp::Ge,
+        "<=" => JpOp::Le,
+        ">" => JpOp::Gt,
+        _ => JpOp::Lt,
+    };
+    Ok(JpCond { path, op, value })
+}
+
+/// 解析 `?(...)` 里的全部谓词。
+fn parse_filter(body: &str) -> Result<(Vec<JpCond>, bool), String> {
+    let inner = body.trim();
+    if !(inner.starts_with("?(") && inner.ends_with(')')) {
+        return Err(format!("谓词必须以 ?(...) 包裹：{body}"));
+    }
+    let expr = &inner[2..inner.len() - 1];
+    let (parts, any) = split_predicate(expr)?;
+    let conds = parts
+        .iter()
+        .map(|p| parse_cond(p))
+        .collect::<Result<Vec<_>, _>>()?;
+    if conds.is_empty() {
+        return Err("谓词表达式为空".to_string());
+    }
+    Ok((conds, any))
 }
 
 /// 解析 JSONPath 子集；不支持的语法返回可读中文原因（不再把 PestError 原样抛给用户）。
@@ -1289,17 +1513,16 @@ fn parse_json_path(path: &str) -> Result<Vec<JpSeg>, String> {
                 }
             }
             '[' => {
-                let end = cs[i..]
-                    .iter()
-                    .position(|c| *c == ']')
-                    .map(|p| i + p)
-                    .ok_or_else(|| format!("方括号未闭合：{s}"))?;
+                let end = find_close_bracket(&cs, i).ok_or_else(|| format!("方括号未闭合：{s}"))?;
                 let inner: String = cs[i + 1..end].iter().collect();
                 let inner = inner.trim();
                 if inner == "*" {
                     segs.push(JpSeg::Wildcard);
                 } else if let Ok(n) = inner.parse::<i64>() {
                     segs.push(JpSeg::Index(n));
+                } else if inner.starts_with("?(") {
+                    let (conds, any) = parse_filter(inner)?;
+                    segs.push(JpSeg::Filter { conds, any });
                 } else if (inner.starts_with('\'') && inner.ends_with('\''))
                     || (inner.starts_with('"') && inner.ends_with('"'))
                 {
@@ -1356,6 +1579,78 @@ fn jp_recursive_all(v: &Value, out: &mut Vec<Value>) {
     }
 }
 
+fn jp_num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn jp_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 谓词比较：两侧都能转数字时按数值比较，否则按字符串（只支持 ==/!=）。
+fn jp_compare(a: &Value, b: &Value, op: &JpOp) -> bool {
+    let nums = jp_num(a).zip(jp_num(b));
+    match op {
+        JpOp::Eq | JpOp::Ne => {
+            let eq = match nums {
+                Some((x, y)) => x == y,
+                None => jp_text(a) == jp_text(b),
+            };
+            if *op == JpOp::Eq {
+                eq
+            } else {
+                !eq
+            }
+        }
+        _ => {
+            let (x, y) = match nums {
+                Some(v) => v,
+                None => return false,
+            };
+            match op {
+                JpOp::Gt => x > y,
+                JpOp::Ge => x >= y,
+                JpOp::Lt => x < y,
+                JpOp::Le => x <= y,
+                _ => false,
+            }
+        }
+    }
+}
+
+fn jp_matches(cond: &JpCond, el: &Value) -> bool {
+    let mut cur = el;
+    for k in &cond.path {
+        cur = match cur {
+            Value::Object(m) => match m.get(k) {
+                Some(v) => v,
+                None => return false,
+            },
+            Value::Array(a) => match k.parse::<usize>().ok().and_then(|i| a.get(i)) {
+                Some(v) => v,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    jp_compare(cur, &cond.value, &cond.op)
+}
+
+fn jp_filter_match(conds: &[JpCond], any: bool, el: &Value) -> bool {
+    if any {
+        conds.iter().any(|c| jp_matches(c, el))
+    } else {
+        conds.iter().all(|c| jp_matches(c, el))
+    }
+}
+
 fn eval_json_path(root: &Value, segs: &[JpSeg]) -> Vec<Value> {
     let mut cur = vec![root.clone()];
     for seg in segs {
@@ -1403,6 +1698,26 @@ fn eval_json_path(root: &Value, segs: &[JpSeg]) -> Vec<Value> {
                     jp_recursive_all(v, &mut next);
                 }
             }
+            JpSeg::Filter { conds, any } => {
+                for v in &cur {
+                    match v {
+                        Value::Array(a) => {
+                            for el in a {
+                                if jp_filter_match(conds, *any, el) {
+                                    next.push(el.clone());
+                                }
+                            }
+                        }
+                        // 对象也允许过滤（命中则保留对象本身），与部分 JSONPath 实现一致
+                        Value::Object(_) => {
+                            if jp_filter_match(conds, *any, v) {
+                                next.push(v.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         cur = next;
     }
@@ -1442,7 +1757,8 @@ fn extract_token(el: scraper::ElementRef, tok: &str) -> String {
         "all" => el.html(),
         "href" | "src" | "alt" | "content" | "id" | "value" | "class" | "style" | "title"
         | "name" => el.value().attr(tok).unwrap_or("").to_string(),
-        _ => String::new(),
+        // 任意属性（@data-id / @data-src 等）：属性不存在返回空串，不回退成整节点文本
+        _ => el.value().attr(tok).unwrap_or("").to_string(),
     }
 }
 
@@ -1513,11 +1829,24 @@ fn parse_token(tok: &str) -> Token {
     if is_extract_keyword(tok) {
         return Token::Terminal(tok.to_string());
     }
-    let (name, index) = split_name_index(tok);
+    let (raw_name, index) = split_name_index(tok);
+    // Legado 的 `class.xxx` / `id.xxx` 是类/ID 选择器简写，不是末端抽取标记
+    let name = if let Some(rest) = raw_name.strip_prefix("class.") {
+        format!(".{rest}")
+    } else if let Some(rest) = raw_name.strip_prefix("id.") {
+        format!("#{rest}")
+    } else {
+        raw_name
+    };
     // `@.book.0` / `@#id` 是 Legado 默认规则里的 class/id 简写；此前被当成末端抽取
     // 标记，选择器结果直接丢弃（错层小说网详情 cover/kind 全 null 的原因）。
     let css_shorthand = (name.starts_with('.') || name.starts_with('#')) && name.len() > 1;
-    if css_shorthand || (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic())) {
+    // jQuery 伪类 / 属性选择器同样属于选择器（`@li:eq(0)`、`@a[href]`），不能当抽取标记
+    let pseudo_selector = name.contains(':') || name.contains('[');
+    if css_shorthand
+        || pseudo_selector
+        || (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic()))
+    {
         return Token::Tag {
             name,
             index,
@@ -1612,14 +1941,210 @@ fn split_name_index(s: &str) -> (String, Option<usize>) {
     (s.to_string(), None)
 }
 
+/// jQuery 扩展伪类（scraper/CSS 不认，需要先剥离再对结果集做过滤）。
+#[derive(Debug, Clone, PartialEq)]
+enum JqFilter {
+    First,
+    Last,
+    Eq(i64),
+    Lt(i64),
+    Gt(i64),
+    Contains(String),
+}
+
+fn starts_at(cs: &[char], i: usize, pat: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    cs.len() >= i + p.len() && cs[i..i + p.len()] == p[..]
+}
+
+/// 找到与 `open` 处 `(` 配对的 `)`；跳过引号内的括号。
+fn find_close_paren(cs: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, &c) in cs.iter().enumerate().skip(open) {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn unquote_arg(raw: &str) -> String {
+    let s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 把 jQuery 伪类从选择器里剥离，返回 (基础 CSS 选择器, 过滤链)。
+/// 只识别 BookSource 常用的 `:first/:last/:eq(n)/:lt(n)/:gt(n)/:contains(文本)`；
+/// `:first-child`、`:nth-child(...)` 等原生 CSS 伪类原样留给 scraper。
+fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
+    let cs: Vec<char> = selector.chars().collect();
+    let mut base = String::new();
+    let mut filters = Vec::new();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    let mut bracket = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        if let Some(q) = quote {
+            base.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                base.push(c);
+                i += 1;
+            }
+            '[' => {
+                bracket += 1;
+                base.push(c);
+                i += 1;
+            }
+            ']' => {
+                bracket = bracket.saturating_sub(1);
+                base.push(c);
+                i += 1;
+            }
+            ':' if bracket == 0 => {
+                let boundary = |n: usize| {
+                    cs.get(i + n)
+                        .map(|ch| !(ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_'))
+                        .unwrap_or(true)
+                };
+                if starts_at(&cs, i, ":first") && boundary(6) {
+                    filters.push(JqFilter::First);
+                    i += 6;
+                } else if starts_at(&cs, i, ":last") && boundary(5) {
+                    filters.push(JqFilter::Last);
+                    i += 5;
+                } else if (starts_at(&cs, i, ":eq(")
+                    || starts_at(&cs, i, ":lt(")
+                    || starts_at(&cs, i, ":gt("))
+                {
+                    let open = i + 3;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        if let Ok(n) = unquote_arg(&arg).parse::<i64>() {
+                            let f = if starts_at(&cs, i, ":eq(") {
+                                JqFilter::Eq(n)
+                            } else if starts_at(&cs, i, ":lt(") {
+                                JqFilter::Lt(n)
+                            } else {
+                                JqFilter::Gt(n)
+                            };
+                            filters.push(f);
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    base.push(c);
+                    i += 1;
+                } else if starts_at(&cs, i, ":contains(") {
+                    let open = i + 9;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::Contains(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
+                } else {
+                    base.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                base.push(c);
+                i += 1;
+            }
+        }
+    }
+    (base.trim().to_string(), filters)
+}
+
+/// jQuery 负下标：`-1` 表示最后一个，越界返回 None。
+fn jq_index(n: i64, len: usize) -> Option<usize> {
+    let idx = if n < 0 { len as i64 + n } else { n };
+    if idx >= 0 && (idx as usize) < len {
+        Some(idx as usize)
+    } else {
+        None
+    }
+}
+
+/// 按出现顺序依次套用 jQuery 过滤（与 jQuery 对结果集链式过滤的语义一致）。
+fn apply_jq_filters<'a>(
+    mut els: Vec<scraper::ElementRef<'a>>,
+    filters: &[JqFilter],
+) -> Vec<scraper::ElementRef<'a>> {
+    for f in filters {
+        let len = els.len();
+        els = match f {
+            JqFilter::First => els.into_iter().take(1).collect(),
+            JqFilter::Last => els.pop().into_iter().collect(),
+            JqFilter::Eq(n) => match jq_index(*n, len) {
+                Some(i) => els.into_iter().skip(i).take(1).collect(),
+                None => Vec::new(),
+            },
+            JqFilter::Lt(n) => {
+                let bound = if *n < 0 { len as i64 + *n } else { *n };
+                let take = bound.max(0) as usize;
+                els.into_iter().take(take).collect()
+            }
+            JqFilter::Gt(n) => {
+                let bound = if *n < 0 { len as i64 + *n } else { *n };
+                if bound < 0 {
+                    els
+                } else {
+                    els.into_iter().skip((bound + 1) as usize).collect()
+                }
+            }
+            JqFilter::Contains(text) => els
+                .into_iter()
+                .filter(|e| e.text().collect::<String>().contains(text))
+                .collect(),
+        };
+    }
+    els
+}
+
 /// 初始选择器：支持 Legado 的 `class.x` / `id.x` / `tag.x`、可选索引（取第 i 个），
-/// 以及 `!下标`（Legado 语义是**排除**这些下标，如 `li!0:1:2:3:4` 去掉前 5 个 li）。
+/// `!下标`（Legado 语义是**排除**这些下标，如 `li!0:1:2:3:4` 去掉前 5 个 li），
+/// 以及 jQuery 伪类（`:first/:last/:eq(n)/:lt(n)/:gt(n)/:contains(...)`）。
 fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::ElementRef<'a>> {
     let selector = selector.trim();
     let (core, excluded) = match selector.find('!') {
         Some(pos) => (&selector[..pos], parse_indices(&selector[pos + 1..])),
         None => (selector, Vec::new()),
     };
+    let (core, jq) = split_jquery_filters(core.trim());
     let (css, idx) = if let Some(rest) = core.trim().strip_prefix("class.") {
         let (name, i) = split_name_index(rest);
         (format!(".{name}"), i)
@@ -1633,12 +2158,19 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
     } else {
         (core.trim().to_string(), None)
     };
+    // 只有伪类（如 `:first`）时按全部元素处理
+    let css = if css.trim().is_empty() {
+        "*".to_string()
+    } else {
+        css
+    };
     let sel = match scraper::Selector::parse(&css) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
     let els: Vec<scraper::ElementRef<'a>> = doc.select(&sel).collect();
     let els = filter_indices(els, &excluded, true);
+    let els = apply_jq_filters(els, &jq);
     if let Some(i) = idx {
         if i < els.len() {
             vec![els[i]]
@@ -1660,7 +2192,13 @@ fn child_elements<'a>(el: scraper::ElementRef<'a>) -> Vec<scraper::ElementRef<'a
 /// 需要直接子元素时用 `@children`。
 fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::ElementRef<'a>> {
     let (tag, idx) = split_name_index(spec);
-    let sel = match scraper::Selector::parse(&tag) {
+    let (tag, jq) = split_jquery_filters(tag.trim());
+    let css = if tag.trim().is_empty() {
+        "*".to_string()
+    } else {
+        tag
+    };
+    let sel = match scraper::Selector::parse(&css) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -1668,6 +2206,7 @@ fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::
     for e in &els {
         matched.extend(e.select(&sel));
     }
+    let matched = apply_jq_filters(matched, &jq);
     if let Some(i) = idx {
         if i < matched.len() {
             vec![matched[i]]
@@ -1854,8 +2393,36 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
     let n = bytes.len();
     let mut start = 0usize;
     let mut i = 0usize;
+    // 方括号/圆括号/引号内的分隔符属于表达式内部（如 JSONPath 谓词的 `||/&&`），不能切分
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
     while i < n {
         if bytes[i] < 0x80 {
+            if let Some(q) = quote {
+                if bytes[i] == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match bytes[i] {
+                b'"' | b'\'' => {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                b'[' | b'(' => {
+                    depth += 1;
+                    i += 1;
+                    continue;
+                }
+                b']' | b')' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
             let s = &rule[i..];
             if s.starts_with("<js>") {
                 if let Some(pos) = find_js_tag_end(rule, i + 4) {
@@ -1874,7 +2441,7 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
                 // 再喂回 get_string，造成无限递归（小栈 worker 上直接栈溢出）。
                 return if parts.len() > 1 { Some(parts) } else { None };
             }
-            if s.starts_with(sep) {
+            if depth == 0 && s.starts_with(sep) {
                 parts.push(&rule[start..i]);
                 i += sep.len();
                 start = i;
@@ -2462,6 +3029,187 @@ nodes.filter(function (node) {
             err.contains("拒绝访问") || err.contains("java.ajax"),
             "unexpected error: {err}"
         );
+    }
+
+    // ---------------- 选择器扩展 ----------------
+
+    const NEWS_HTML: &str = r#"<ul class="news-list">
+          <li class="item"><a href="/1.html">第一章</a></li>
+          <li class="item"><a href="/2.html">第二章</a></li>
+          <li class="item"><a href="/3.html">第三章</a></li>
+          <li class="item"><a href="/4.html">第四章</a></li>
+        </ul>"#;
+
+    #[test]
+    fn jquery_pseudo_first_last_eq() {
+        let ar = AnalyzeRule::new();
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:first@a@text", false, "").unwrap(),
+            "第一章"
+        );
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:last@a@text", false, "").unwrap(),
+            "第四章"
+        );
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:eq(1)@a@text", false, "").unwrap(),
+            "第二章"
+        );
+        // jQuery 负下标：-1 为最后一个
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:eq(-1)@a@text", false, "").unwrap(),
+            "第四章"
+        );
+    }
+
+    #[test]
+    fn jquery_pseudo_lt_gt_and_contains() {
+        let ar = AnalyzeRule::new();
+        // get_string_list 的 CSS 模式返回元素 HTML（与既有契约一致），按 href 校验结果集
+        let lt = ar.get_string_list(NEWS_HTML, "li:lt(2)@a").unwrap();
+        assert_eq!(lt.len(), 2, "实际: {lt:?}");
+        assert!(lt[0].contains("/1.html") && lt[1].contains("/2.html"));
+        let gt = ar.get_string_list(NEWS_HTML, "li:gt(1)@a").unwrap();
+        assert_eq!(gt.len(), 2, "实际: {gt:?}");
+        assert!(gt[0].contains("/3.html") && gt[1].contains("/4.html"));
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:contains(第三章)@a@text", false, "")
+                .unwrap(),
+            "第三章"
+        );
+        // 遍历段里的伪类（@li:eq）同样生效
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "ul@li:eq(3)@a@text", false, "").unwrap(),
+            "第四章"
+        );
+    }
+
+    #[test]
+    fn attribute_tokens_and_text_are_boundary_safe() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<a class="link">链接文字</a>"#;
+        // 属性不存在 → 空串，不回退成整节点文本
+        assert_eq!(ar.get_string(html, "@href", false, "").unwrap(), "");
+        assert_eq!(ar.get_string(html, "@data-id", false, "").unwrap(), "");
+        assert_eq!(ar.get_string(html, ".link@src", false, "").unwrap(), "");
+        // text 与 @text 行为一致
+        assert_eq!(ar.get_string(html, "text", false, "").unwrap(), "链接文字");
+        assert_eq!(ar.get_string(html, "@text", false, "").unwrap(), "链接文字");
+        // 存在的任意属性正常取到
+        let with_attr = r#"<a class="link" data-id="42" href="/x">详情</a>"#;
+        assert_eq!(
+            ar.get_string(with_attr, ".link@data-id", false, "").unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn class_and_id_shorthand_are_selectors() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="item"><span class="title">测试书名</span></div>
+                      <div id="box"><p>简介内容</p></div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.item@class.title@text", false, "")
+                .unwrap(),
+            "测试书名"
+        );
+        assert_eq!(
+            ar.get_string(html, "id.box@tag.p@text", false, "").unwrap(),
+            "简介内容"
+        );
+    }
+
+    // ---------------- JSONPath 谓词 / 回退链 / @json: ----------------
+
+    const BOOKS_JSON: &str = r#"{"data":{"list":[
+          {"title":"A","author":"天蚕土豆","price":12.5,"score":4},
+          {"title":"B","author":"天蚕土豆","price":8.0,"score":4},
+          {"title":"C","author":"我吃西红柿","price":20,"score":4},
+          {"title":"D","author":"天蚕土豆","price":12.5,"score":6}
+        ]}}"#;
+
+    #[test]
+    fn jsonpath_predicate_equality() {
+        let ar = AnalyzeRule::new();
+        let titles = ar
+            .get_string_list(BOOKS_JSON, "$.data.list[?(@.author=='天蚕土豆')].title")
+            .unwrap();
+        assert_eq!(titles, vec!["A", "B", "D"]);
+        // 方括号字段语法
+        let titles2 = ar
+            .get_string_list(BOOKS_JSON, "$.data.list[?(@['author']=='我吃西红柿')].title")
+            .unwrap();
+        assert_eq!(titles2, vec!["C"]);
+        // 数值比较
+        let cheap = ar
+            .get_string_list(BOOKS_JSON, "$.data.list[?(@.price<10)].title")
+            .unwrap();
+        assert_eq!(cheap, vec!["B"]);
+    }
+
+    #[test]
+    fn jsonpath_predicate_compare_and_and() {
+        let ar = AnalyzeRule::new();
+        let hit = ar
+            .get_string_list(
+                BOOKS_JSON,
+                "$.data.list[?(@.author=='天蚕土豆' && @.price>=10)].title",
+            )
+            .unwrap();
+        assert_eq!(hit, vec!["A", "D"]);
+        let none = ar
+            .get_string_list(
+                BOOKS_JSON,
+                "$.data.list[?(@.author=='我吃西红柿' && @.price<10)].title",
+            )
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn jsonpath_predicate_or() {
+        let ar = AnalyzeRule::new();
+        let hit = ar
+            .get_string_list(
+                BOOKS_JSON,
+                "$.data.list[?(@.author=='我吃西红柿' || @.score>=6)].title",
+            )
+            .unwrap();
+        assert_eq!(hit, vec!["C", "D"]);
+    }
+
+    #[test]
+    fn jsonpath_fallback_chain_and_at_json_prefix() {
+        let ar = AnalyzeRule::new();
+        let chain = ar
+            .get_string_list(
+                BOOKS_JSON,
+                "$.missing.list[*]||$.data.missing[*]||$.data.list[*].title",
+            )
+            .unwrap();
+        assert_eq!(chain, vec!["A", "B", "C", "D"]);
+        // @json: 前缀与裸 JSONPath 等价
+        let prefixed = ar
+            .get_string_list(
+                BOOKS_JSON,
+                "@json:$.data.list[?(@.author=='天蚕土豆')].title",
+            )
+            .unwrap();
+        assert_eq!(prefixed, vec!["A", "B", "D"]);
+    }
+
+    #[test]
+    fn jsonpath_unsupported_predicate_has_named_error() {
+        let ar = AnalyzeRule::new();
+        let err = ar
+            .get_string_list(BOOKS_JSON, "$.data.list[?(@.title==)].title")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("JSONPath 语法不受支持"),
+            "unexpected error: {err}"
+        );
+        assert!(!err.contains("PestError"), "不应暴露 PestError: {err}");
     }
 }
 
