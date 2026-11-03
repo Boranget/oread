@@ -28,7 +28,7 @@
 
 <div class="container">
   <div class="card" style="max-width:380px;margin:8vh auto 0">
-    <h2>{mode === 'login' ? '登录 Legado Web' : '注册新账号'}</h2>
+    <h2>{mode === 'login' ? '登录 Boranlib' : '注册新账号'}</h2>
     <p class="muted">普通用户与管理员共用入口；书源仅管理员可管理。</p>
     <input placeholder="用户名" bind:value={username} />
     <div style="height:8px"></div>

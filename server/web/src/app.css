@@ -79,7 +79,10 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
 .grid { display: grid; gap: 12px; }
 .grid.cols2 { grid-template-columns: repeat(2, 1fr); }
 .grid.cols3 { grid-template-columns: repeat(3, 1fr); }
-@media (max-width: 680px) { .grid.cols2, .grid.cols3 { grid-template-columns: 1fr; } }
+.grid.auto { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.tiny-note { font-size: 11px; margin: 2px 0 10px; }
+.shelf-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; font-size: 12px; }
+.prog-line { color: var(--accent); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
@@ -96,10 +99,20 @@ h3 { margin: 0 0 8px; font-size: 15px; }
 .book:hover { transform: translateY(-2px); }
 .book .cover {
   width: 100%;
-  aspect-ratio: 3 / 4;
+  height: 200px;
   object-fit: cover;
   border-radius: 8px;
   background: #eee;
+}
+/* 真实书源的封面常被防盗链拦截，失败时给可读占位而不是白块 */
+.book .cover-wrap { position: relative; height: 200px; }
+.book .cover-wrap .cover { position: absolute; inset: 0; width: 100%; height: 100%; }
+.book .cover-ph {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #eee; border-radius: 8px;
+  font-size: 26px; font-weight: 600; color: var(--muted);
+  overflow: hidden;
 }
 .book .title { margin-top: 6px; font-size: 13px; font-weight: 600; line-height: 1.3;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -116,8 +129,37 @@ h3 { margin: 0 0 8px; font-size: 15px; }
 .chapter-item.active { color: var(--accent); font-weight: 600; }
 .badge { background: #eee; border-radius: 999px; padding: 2px 10px; font-size: 12px; color: #555; }
 .modal-mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: rgba(0,0,0,0.35);
   display: flex; align-items: center; justify-content: center; z-index: 50;
 }
-.modal { background: #fff; border-radius: 12px; padding: 20px; width: min(720px, 92vw); max-height: 88vh; overflow: auto; }
+.modal { background: #fff; border-radius: 12px; padding: 20px; width: 92vw; max-width: 720px; max-height: 88vh; overflow: auto; }
 .loading { color: var(--muted); padding: 12px 0; }
+
+/* 通用移动端控件 */
+.seg { display: flex; gap: 4px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 4px; margin-bottom: 12px; }
+.seg button { flex: 1; background: transparent; color: var(--muted); padding: 8px 12px; border-radius: 8px; }
+.seg button.on { background: var(--accent); color: #fff; }
+.chips { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0 2px; -webkit-overflow-scrolling: touch; }
+.chip { flex: 0 0 auto; background: var(--card); color: var(--fg); border: 1px solid var(--border); padding: 6px 14px; border-radius: 999px; font-size: 13px; min-height: 34px; }
+.chip.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.result-meta { margin: 10px 0; font-size: 13px; color: var(--muted); }
+/* 聚合搜索等待：静态占位，不依赖动画，墨水屏也能读 */
+.search-wait { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin: 10px 0; font-size: 13px; }
+.sw-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.sw-time { color: var(--accent); font-variant-numeric: tabular-nums; }
+.sw-sub { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.5; }
+.skeleton { pointer-events: none; }
+.skeleton .sk-cover { height: 200px; border-radius: 8px; background: #eee; border: 1px dashed var(--border); }
+.skeleton .sk-line { height: 10px; margin-top: 8px; background: #eee; border-radius: 4px; }
+.skeleton .sk-line.w70 { width: 70%; }
+.skeleton .sk-line.w45 { width: 45%; }
+.ok-line { color: #2f7d4f; margin: 8px 0; font-size: 13px; }
+.warn-box { border: 1px solid #e8c7a7; background: #fdf6ec; color: #8a5a1f; border-radius: 10px; padding: 10px 12px; margin: 10px 0; font-size: 12px; }
+.warn-title { font-weight: 600; margin-bottom: 4px; }
+details.warn-box > summary { cursor: pointer; }
+.warn-items { margin-top: 6px; }
+.warn-item { line-height: 1.5; word-break: break-word; }
+.cover-btn { display: block; width: 100%; padding: 0; background: none; border: none; }
+.cover-btn:hover { background: none; }
+.clamp1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }

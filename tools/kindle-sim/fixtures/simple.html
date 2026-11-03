@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KPW3 简单静态页</title>
+<style>
+  body { margin: 0; padding: 24px; font-family: serif; font-size: 20px; line-height: 1.7; color: #111; background: #fff; }
+  h1 { font-size: 32px; margin: 0 0 16px; }
+  .box { border: 1px solid #999; padding: 16px; margin: 16px 0; }
+  ul { margin: 0; padding-left: 28px; }
+  li { margin: 8px 0; }
+</style>
+</head>
+<body>
+  <h1>KPW3 简单静态页</h1>
+  <div class="box">
+    <p>这是一个只用 HTML、少量 CSS 和 ES5 脚本构建的测试页面。它没有 flexbox、没有 grid、没有 position:fixed、没有 vw/vh，也没有 @media。</p>
+    <p>如果工具判定为“可用”，说明基础静态内容在 1072×1231 视口下能正常进入首屏。</p>
+  </div>
+  <ul>
+    <li>第一项：纯文本与表格/浮动布局。</li>
+    <li>第二项：XMLHttpRequest、localStorage 可用。</li>
+    <li>第三项：不依赖 Promise、fetch、箭头函数或模板字符串。</li>
+  </ul>
+  <p id="stamp">脚本状态：加载中</p>
+  <script>
+    var el = document.getElementById('stamp');
+    if (el) {
+      el.innerHTML = '脚本状态：ES5 内联脚本已在 ' + new Date().getFullYear() + ' 年执行';
+    }
+  </script>
+</body>
+</html>

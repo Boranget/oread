@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>iframe globals probe</title>
+<style>body{font-family:sans-serif;font-size:20px;padding:20px}iframe{width:600px;height:200px;border:1px solid #999}</style>
+</head>
+<body>
+  <h1>iframe 前置脚本探针</h1>
+  <p id="parent">父页面 Promise：<span id="p1">?</span>，fetch：<span id="p2">?</span></p>
+  <iframe id="fr" src="iframe-child.html" onload="copyChild()"></iframe>
+  <script>
+    document.getElementById('p1').innerHTML = typeof Promise;
+    document.getElementById('p2').innerHTML = typeof fetch;
+    function copyChild() {
+      var doc = document.getElementById('fr').contentDocument;
+      var child = doc.getElementById('result');
+      var box = document.createElement('p');
+      box.id = 'childCopy';
+      box.innerHTML = '子 iframe 结果：' + (child ? child.innerHTML : '(no result)');
+      var old = document.getElementById('childCopy');
+      if (old) old.parentNode.removeChild(old);
+      document.body.appendChild(box);
+    }
+  </script>
+</body>
+</html>

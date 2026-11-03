@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod entities;
 mod error;
+mod image_cache;
 mod models;
 mod routes;
 mod rule_engine;
@@ -18,27 +19,48 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     let cfg = Config::from_env();
-    // 初始化共享桶（书源/RSS/账户），缺失则自动建库并执行迁移
+
+    // 低资源预算：474 MiB 可用的 OpenStick。
+    // worker 线程固定 2 个、线程栈 512 KiB（默认 2 MiB），避免栈内存随线程数放大。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(512 * 1024)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()?;
+    rt.block_on(run(cfg))?;
+    Ok(())
+}
+
+async fn run(cfg: Config) -> anyhow::Result<()> {
+    // HTTP 抓取预算与 JS 规则预算在启动时一次性固化（进程内单例）
+    req::init(&cfg);
+    rule_engine::init_js(cfg.js_enabled, cfg.js_timeout_ms);
+    image_cache::init(cfg.image_cache_limit_bytes());
+
+    // 初始化共享桶（书源/账户），缺失则自动建库并执行迁移
     let shared = db::init_shared(&cfg).await?;
     // 首次启动自动创建管理员账号（凭据来自 ADMIN_USER/ADMIN_PASS，缺省 admin/__INITIAL_ADMIN_PASS__）
     auth::bootstrap_admin(&shared).await?;
 
     let api = routes::build_router(shared, cfg.clone());
 
-    // 前端静态资源（Svelte 构建产物 web/dist）；目录不存在时该路由返回 404，不影响 API
+    // 前端静态资源（Svelte 构建产物 web/dist）；目录不存在时该路由返回 404，不影响 API。
+    // 路径可被 WEB_DIR 覆盖（生产从 D:\tools\oread-target-win 启动，不能依赖 cwd 相对路径）。
     let app = api
-        .fallback_service(ServeDir::new("web/dist"))
+        .fallback_service(ServeDir::new(&cfg.web_dir))
+        // 入口门禁：Kindle/Silk UA 访问 `/`（及 SPA 路由入口）303 到 `/k`
+        .layer(axum::middleware::from_fn(routes::kindle::entry_redirect))
         .layer(CorsLayer::permissive()); // TODO: 生产环境收紧为具体前端来源
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    tracing::info!("legado-server listening on {addr}");
+    tracing::info!("boranlib listening on {addr}");
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

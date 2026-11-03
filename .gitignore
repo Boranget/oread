@@ -4,3 +4,24 @@
 /server/web/dist/
 *.log
 *.err
+
+# 本地数据库（含 journal/wal）绝不入库
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 构建/运行产物与本地凭据
+*.exe
+*.tmp
+*.bak
+.env
+.env.*
+/cache/
+/server/target-test/
+
+# ---- 追加（原有规则的语义不变）----
+# cargo-zigbuild 在源码树里留下的本地缓存
+/server/.zig-cache/
+*.pow
+

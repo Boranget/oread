@@ -10,6 +10,7 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::SqlitePool;
 
 use crate::config::Config;
@@ -53,14 +54,46 @@ where
     }
 }
 
-/// 取得（缓存）某用户的独立连接池
+/// 取得（缓存）某用户的独立连接池，并按 `db_max_open_users` 做 LRU 关闭。
+/// 内存预算：每个用户池 2 连接，同时最多 N 个池；淘汰时 `pool.close()` 释放文件句柄。
 async fn get_user_pool(state: &AppState, uid: i64) -> AppResult<SqlitePool> {
-    if let Some(p) = state.user_pools.lock().unwrap().get(&uid) {
-        return Ok(p.clone());
+    {
+        let mut cache = state.user_pools.lock().unwrap();
+        cache.tick += 1;
+        let tick = cache.tick;
+        if let Some((pool, last)) = cache.entries.get_mut(&uid) {
+            *last = tick;
+            return Ok(pool.clone());
+        }
     }
-    let p = db::user_pool(&state.cfg, uid).await?;
-    state.user_pools.lock().unwrap().insert(uid, p.clone());
-    Ok(p)
+    let pool = db::user_pool(&state.cfg, uid).await?;
+    let mut evicted: Vec<SqlitePool> = Vec::new();
+    {
+        let mut cache = state.user_pools.lock().unwrap();
+        cache.tick += 1;
+        let tick = cache.tick;
+        cache.entries.insert(uid, (pool.clone(), tick));
+        while cache.entries.len() > state.cfg.db_max_open_users {
+            // 找最久未使用的用户（tick 最小）
+            let lru = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k);
+            match lru {
+                Some(k) if k != uid => {
+                    if let Some((p, _)) = cache.entries.remove(&k) {
+                        evicted.push(p);
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    for p in evicted {
+        p.close().await;
+    }
+    Ok(pool)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,7 +101,33 @@ struct Claims {
     sub: i64,
     username: String,
     role: String,
+    /// 令牌版本：改密/禁用时递增，使旧 JWT 立即失效（旧令牌缺省按 0 处理）
+    #[serde(default)]
+    ver: i64,
     exp: usize,
+}
+
+/// 账号实时状态：每个已鉴权请求都从共享库读取，禁用/改密立即生效。
+struct AccountRow {
+    username: String,
+    role: String,
+    disabled: bool,
+    token_version: i64,
+}
+
+async fn lookup_account(pool: &SqlitePool, uid: i64) -> AppResult<Option<AccountRow>> {
+    let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT username, role, disabled, token_version FROM users WHERE id = ?",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(username, role, disabled, token_version)| AccountRow {
+        username,
+        role,
+        disabled: disabled != 0,
+        token_version,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -86,12 +145,25 @@ pub struct TokenRes {
     pub token: String,
 }
 
-fn create_token(id: i64, username: &str, role: &str, secret: &str) -> AppResult<String> {
-    let exp = Utc::now().timestamp() as usize + 60 * 60 * 24 * 7; // 7 天
+fn create_token(id: i64, username: &str, role: &str, ver: i64, secret: &str) -> AppResult<String> {
+    create_token_days(id, username, role, ver, secret, 7)
+}
+
+/// 指定有效天数的 token（Kindle /k 端用长寿命 Cookie，30 天）
+pub fn create_token_days(
+    id: i64,
+    username: &str,
+    role: &str,
+    ver: i64,
+    secret: &str,
+    days: usize,
+) -> AppResult<String> {
+    let exp = Utc::now().timestamp() as usize + 60 * 60 * 24 * days;
     let claims = Claims {
         sub: id,
         username: username.to_string(),
         role: role.to_string(),
+        ver,
         exp,
     };
     Ok(encode(
@@ -100,6 +172,29 @@ fn create_token(id: i64, username: &str, role: &str, secret: &str) -> AppResult<
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .map_err(AppError::Jwt)?)
+}
+
+/// 从 Cookie 头里取 k_session（Kindle /k 端会话）
+fn cookie_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';')
+                .map(str::trim)
+                .find_map(|kv| kv.strip_prefix("k_session="))
+                .map(|s| s.to_string())
+        })
+}
+
+fn redirect_login() -> Response {
+    let mut res = Response::new(axum::body::Body::empty());
+    *res.status_mut() = StatusCode::SEE_OTHER;
+    res.headers_mut().insert(
+        axum::http::header::LOCATION,
+        "/k/login".parse().expect("static location"),
+    );
+    res
 }
 
 fn verify_token(token: &str, secret: &str) -> AppResult<Claims> {
@@ -130,7 +225,7 @@ pub async fn register(
         .execute(&state.shared)
         .await?
         .last_insert_rowid();
-    let token = create_token(id, &req.username, "user", &state.cfg.jwt_secret)?;
+    let token = create_token(id, &req.username, "user", 0, &state.cfg.jwt_secret)?;
     Ok(Json(TokenRes { token }))
 }
 
@@ -138,16 +233,20 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginReq>,
 ) -> AppResult<Json<TokenRes>> {
-    let row: Option<(i64, String, String)> =
-        sqlx::query_as("SELECT id, password_hash, role FROM users WHERE username = ?")
-            .bind(&req.username)
-            .fetch_optional(&state.shared)
-            .await?;
-    let (id, pw_hash, role) = row.ok_or(AppError::Unauthorized)?;
+    let row: Option<(i64, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, password_hash, role, disabled, token_version FROM users WHERE username = ?",
+    )
+    .bind(&req.username)
+    .fetch_optional(&state.shared)
+    .await?;
+    let (id, pw_hash, role, disabled, ver) = row.ok_or(AppError::Unauthorized)?;
+    if disabled != 0 {
+        return Err(AppError::Unauthorized);
+    }
     if !verify(&req.password, &pw_hash).map_err(AppError::Bcrypt)? {
         return Err(AppError::Unauthorized);
     }
-    let token = create_token(id, &req.username, &role, &state.cfg.jwt_secret)?;
+    let token = create_token(id, &req.username, &role, ver, &state.cfg.jwt_secret)?;
     Ok(Json(TokenRes { token }))
 }
 
@@ -159,7 +258,36 @@ pub async fn auth_middleware(
 ) -> AppResult<Response> {
     // 公开路径（健康检查 + 注册/登录）无需鉴权
     let path = req.uri().path().to_string();
-    if path == "/api/health" || path == "/api/auth/login" || path == "/api/auth/register" {
+    if path == "/api/health"
+        || path == "/healthz"
+        || path == "/api/auth/login"
+        || path == "/api/auth/register"
+    {
+        return Ok(next.run(req).await);
+    }
+    // Kindle 极简端 /k：表单登录页公开，其余用 HttpOnly Cookie 会话；
+    // 校验失败不重定向 JSON 401，而是 303 回登录页（老浏览器友好）
+    if path.starts_with("/k") {
+        if path == "/k/login" {
+            return Ok(next.run(req).await);
+        }
+        let claims = cookie_token(&req).and_then(|t| verify_token(&t, &state.cfg.jwt_secret).ok());
+        let claims = match claims {
+            Some(c) => c,
+            None => return Ok(redirect_login()),
+        };
+        // 每次请求都查库：禁用/改密后旧 Cookie 立即失效
+        let account = match lookup_account(&state.shared, claims.sub).await? {
+            Some(a) if !a.disabled && a.token_version == claims.ver => a,
+            _ => return Ok(redirect_login()),
+        };
+        let pool = get_user_pool(&state, claims.sub).await?;
+        req.extensions_mut().insert(UserDb(pool));
+        req.extensions_mut().insert(AuthUser {
+            id: claims.sub,
+            username: account.username,
+            role: account.role,
+        });
         return Ok(next.run(req).await);
     }
     let bearer = req
@@ -169,12 +297,17 @@ pub async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
     let token = bearer.ok_or(AppError::Unauthorized)?;
     let claims = verify_token(token, &state.cfg.jwt_secret)?;
+    // 状态实时校验：账号被禁用或令牌版本已递增（改密/禁用）→ 401
+    let account = match lookup_account(&state.shared, claims.sub).await? {
+        Some(a) if !a.disabled && a.token_version == claims.ver => a,
+        _ => return Err(AppError::Unauthorized),
+    };
     let pool = get_user_pool(&state, claims.sub).await?;
     req.extensions_mut().insert(UserDb(pool));
     req.extensions_mut().insert(AuthUser {
         id: claims.sub,
-        username: claims.username,
-        role: claims.role,
+        username: account.username,
+        role: account.role,
     });
     Ok(next.run(req).await)
 }
@@ -186,6 +319,167 @@ pub fn ensure_admin(user: &AuthUser) -> AppResult<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+pub struct ChangePasswordReq {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+pub(crate) fn valid_password(pw: &str) -> bool {
+    let n = pw.chars().count();
+    (6..=128).contains(&n)
+}
+
+/// 用户自助改密：校验旧密码；成功后 token_version+1，所有旧 JWT 立即失效。
+pub async fn change_password(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(q): Json<ChangePasswordReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    if !valid_password(&q.new_password) {
+        return Err(AppError::BadRequest(
+            "新密码长度需在 6–128 个字符之间".into(),
+        ));
+    }
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT password_hash, token_version FROM users WHERE id = ?",
+    )
+    .bind(user.id)
+    .fetch_optional(&state.shared)
+    .await?;
+    let (pw_hash, ver) = row.ok_or(AppError::Unauthorized)?;
+    if !verify(&q.old_password, &pw_hash).map_err(AppError::Bcrypt)? {
+        return Err(AppError::BadRequest("旧密码不正确".into()));
+    }
+    let new_hash = hash(&q.new_password, DEFAULT_COST).map_err(AppError::Bcrypt)?;
+    sqlx::query(
+        "UPDATE users SET password_hash = ?, token_version = token_version + 1, \
+         password_changed_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&new_hash)
+    .bind(user.id)
+    .execute(&state.shared)
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "relogin_required": true,
+        "previous_token_version": ver,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UserStatusReq {
+    pub user_id: i64,
+    pub disabled: bool,
+}
+
+/// 禁用保护：不能禁用自己；不能把最后一个启用中的管理员禁掉。
+pub(crate) fn can_disable_user(
+    target_id: i64,
+    current_id: i64,
+    target_role: &str,
+    enabled_admins: i64,
+) -> Result<(), &'static str> {
+    if target_id == current_id {
+        return Err("不能禁用当前登录的管理员账号");
+    }
+    if target_role == "admin" && enabled_admins <= 1 {
+        return Err("不能禁用最后一个启用中的管理员");
+    }
+    Ok(())
+}
+
+pub async fn admin_list_users(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_admin(&user)?;
+    let rows: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
+        "SELECT id, username, role, disabled, created_at FROM users ORDER BY id",
+    )
+    .fetch_all(&state.shared)
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "users": rows.into_iter().map(|(id, username, role, disabled, created_at)| json!({
+            "id": id,
+            "username": username,
+            "role": role,
+            "disabled": disabled != 0,
+            "created_at": created_at,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// 管理员禁用/启用账号。禁用时同时 token_version+1，旧 JWT 永久失效。
+pub async fn admin_set_user_status(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(q): Json<UserStatusReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_admin(&user)?;
+    let target: Option<(String, i64)> =
+        sqlx::query_as("SELECT role, disabled FROM users WHERE id = ?")
+            .bind(q.user_id)
+            .fetch_optional(&state.shared)
+            .await?;
+    let (role, disabled) = target.ok_or_else(|| AppError::BadRequest("用户不存在".into()))?;
+    if q.disabled {
+        let enabled_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0",
+        )
+        .fetch_one(&state.shared)
+        .await?;
+        if let Err(msg) = can_disable_user(q.user_id, user.id, &role, enabled_admins) {
+            return Err(AppError::BadRequest(msg.into()));
+        }
+        if disabled == 0 {
+            sqlx::query(
+                "UPDATE users SET disabled = 1, token_version = token_version + 1 WHERE id = ?",
+            )
+            .bind(q.user_id)
+            .execute(&state.shared)
+            .await?;
+        }
+    } else {
+        sqlx::query("UPDATE users SET disabled = 0 WHERE id = ?")
+            .bind(q.user_id)
+            .execute(&state.shared)
+            .await?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "user_id": q.user_id,
+        "disabled": q.disabled,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{can_disable_user, valid_password};
+
+    // 禁用保护：不能禁自己，也不能禁最后一个启用中的管理员
+    #[test]
+    fn admin_disable_guard() {
+        assert!(can_disable_user(2, 1, "user", 5).is_ok());
+        assert!(can_disable_user(1, 1, "admin", 5).is_err(), "不能禁用自己");
+        assert!(
+            can_disable_user(2, 1, "admin", 1).is_err(),
+            "不能禁用最后一个管理员"
+        );
+        assert!(can_disable_user(2, 1, "admin", 2).is_ok());
+    }
+
+    // 新密码长度 6–128
+    #[test]
+    fn password_length_policy() {
+        assert!(!valid_password("12345"));
+        assert!(valid_password("123456"));
+        assert!(valid_password(&"a".repeat(128)));
+        assert!(!valid_password(&"a".repeat(129)));
+    }
+}
+
 /// 首次启动引导：若 users 表为空，则创建管理员账号。
 /// 凭据来自环境变量 ADMIN_USER / ADMIN_PASS，缺省 admin / __INITIAL_ADMIN_PASS__（仅用于首次，请尽快修改）。
 pub async fn bootstrap_admin(pool: &SqlitePool) -> AppResult<()> {
@@ -195,8 +489,8 @@ pub async fn bootstrap_admin(pool: &SqlitePool) -> AppResult<()> {
     if count > 0 {
         return Ok(());
     }
-    let user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".into());
-    let pass = std::env::var("ADMIN_PASS").unwrap_or_else(|_| "__INITIAL_ADMIN_PASS__".into());
+    let user = crate::config::env_prefixed("ADMIN_USER").unwrap_or_else(|| "admin".into());
+    let pass = crate::config::env_prefixed("ADMIN_PASS").unwrap_or_else(|| "__INITIAL_ADMIN_PASS__".into());
     let pw = hash(&pass, DEFAULT_COST).map_err(AppError::Bcrypt)?;
     sqlx::query("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')")
         .bind(&user)

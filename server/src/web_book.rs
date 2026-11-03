@@ -2,13 +2,14 @@
 //! 输入 HTML/JSON + 书源规则 -> 输出结构化书籍数据（纯函数管线）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use url::Url;
 use serde_json::Value;
 
 use crate::entities::{
-    Book, BookChapter, BookContent, BookInfoRule, BookSource, ContentRule, ExploreRule, SearchBook,
-    SearchRule, TocRule,
+    Book, BookChapter, BookContent, BookImage, BookInfoRule, BookSource, ContentRule, ExploreRule,
+    SearchBook, SearchRule, TocRule,
 };
 use crate::req;
 use crate::rule_engine::AnalyzeRule;
@@ -35,6 +36,20 @@ fn make_ar(source: &BookSource) -> AnalyzeRule {
     ar
 }
 
+/// 规则未命中时 JsonPath/JS 可能返回字面量 `"null"`/`"None"`/`"undefined"`。
+/// 这些值不是 URL，若不拦截会拼出 `/toc/null` 并重复追加同一目录（验收 P1）。
+fn blank_value(s: &str) -> bool {
+    matches!(s.trim(), "" | "null" | "None" | "none" | "undefined")
+}
+
+/// Legado 的布尔规则返回字符串，这里按常见写法判定（空/false/0/否 为假）。
+fn truthy(s: &str) -> bool {
+    !matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "" | "false" | "0" | "no" | "none" | "null" | "undefined" | "否"
+    )
+}
+
 /// 把相对 URL 归并为绝对 URL
 fn abs(base: &str, maybe: &str) -> String {
     if maybe.starts_with("http://") || maybe.starts_with("https://") {
@@ -48,11 +63,32 @@ fn abs(base: &str, maybe: &str) -> String {
     maybe.to_string()
 }
 
+/// 对可选的布尔标志子规则求值（isVolume / isVip / isPay 共用）：
+/// 规则缺省或求值失败按 false，其余交给 `truthy` 判定。
+fn flag(ar: &AnalyzeRule, item: &str, rule: &Option<String>, base: &str) -> bool {
+    rule.as_ref()
+        .map(|r| truthy(&ar.get_string(item, r, false, base).unwrap_or_default()))
+        .unwrap_or(false)
+}
+
 /// 对可选子规则求值，空结果返回 None
 fn opt(ar: &AnalyzeRule, item: &str, rule: &Option<String>, base: &str) -> Option<String> {
     rule.as_ref()
         .map(|r| ar.get_string(item, r, false, base).unwrap_or_default())
         .filter(|s| !s.is_empty())
+}
+
+/// 规则命中才覆盖：规则为空/求值失败/结果为空时保持原值（详情字段的 Legado 语义）。
+fn assign_opt(
+    target: &mut Option<String>,
+    ar: &AnalyzeRule,
+    item: &str,
+    rule: &Option<String>,
+    base: &str,
+) {
+    if let Some(v) = opt(ar, item, rule, base) {
+        *target = Some(v);
+    }
 }
 
 // ---------------- 搜索 ----------------
@@ -71,7 +107,12 @@ fn build_search_request(
     };
     let base = base
         .replace("{{key}}", key)
-        .replace("{{page}}", &page.to_string());
+        .replace("${key}", key)
+        .replace("{{page}}", &page.to_string())
+        .replace("${page}", &page.to_string());
+    // 相对 searchUrl（如 `search.php?kw={{key}}`、`/book/so/...`）必须按书源根地址归并，
+    // 否则 reqwest 收到相对 URL 直接失败，整源搜索恒为 0 条（错层小说网、三八小说实测）。
+    let base = abs(&source.book_source_url, &base);
     let mut headers = req::parse_headers(&source.header);
     let mut method = "GET".to_string();
     let mut body: Option<String> = None;
@@ -98,6 +139,15 @@ fn build_search_request(
     (base, method, headers, body)
 }
 
+/// 搜索结果里的类型标识（与 content_type 一致：text / image）
+fn type_token(t: i64) -> &'static str {
+    if t == 2 {
+        "image"
+    } else {
+        "text"
+    }
+}
+
 pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result<Vec<SearchBook>> {
     let rule: &SearchRule = match &source.rule_search {
         Some(r) => r,
@@ -118,6 +168,7 @@ pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result
             book_url,
             origin: Some(source.book_source_url.clone()),
             origin_name: Some(source.book_source_name.clone()),
+            book_type: Some(type_token(source.book_source_type).to_string()),
             name: opt(&ar, &item, &rule.name, &url),
             author: opt(&ar, &item, &rule.author, &url),
             cover_url: opt(&ar, &item, &rule.cover_url, &url),
@@ -151,6 +202,7 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
             book_url,
             origin: Some(source.book_source_url.clone()),
             origin_name: Some(source.book_source_name.clone()),
+            book_type: Some(type_token(source.book_source_type).to_string()),
             name: opt(&ar, &item, &rule.name, url),
             author: opt(&ar, &item, &rule.author, url),
             cover_url: opt(&ar, &item, &rule.cover_url, url),
@@ -175,17 +227,67 @@ pub async fn book_info(source: &BookSource, book: &mut Book) -> anyhow::Result<(
     if let Some(init) = &rule.init {
         let _ = ar.get_string(&html, init, false, &url);
     }
-    book.name = opt(&ar, &html, &rule.name, &url);
-    book.author = opt(&ar, &html, &rule.author, &url);
-    book.intro = opt(&ar, &html, &rule.intro, &url);
-    book.cover_url = opt(&ar, &html, &rule.cover_url, &url);
-    book.kind = opt(&ar, &html, &rule.kind, &url);
-    book.latest_chapter_title = opt(&ar, &html, &rule.last_chapter, &url);
+    // Legado 语义：详情规则为空或未命中时**保留调用方带入的值**（搜索/书架已有
+    // name/author），不能写成 null。错层小说网的 name/author/intro 规则就是空串。
+    assign_opt(&mut book.name, &ar, &html, &rule.name, &url);
+    assign_opt(&mut book.author, &ar, &html, &rule.author, &url);
+    assign_opt(&mut book.intro, &ar, &html, &rule.intro, &url);
+    assign_opt(&mut book.cover_url, &ar, &html, &rule.cover_url, &url);
+    assign_opt(&mut book.kind, &ar, &html, &rule.kind, &url);
+    assign_opt(&mut book.latest_chapter_title, &ar, &html, &rule.last_chapter, &url);
     let toc_url = ar.get_string(&html, rule.toc_url.as_deref().unwrap_or(""), true, &url)?;
-    if !toc_url.is_empty() {
+    // Legado 的 tocUrl 常直接写死绝对 URL（不是选择器），此时规则引擎会落空，需原样使用
+    let literal = rule.toc_url.as_deref().map(str::trim).unwrap_or("");
+    let toc_url = if toc_url.trim().is_empty()
+        && (literal.starts_with("http://") || literal.starts_with("https://"))
+    {
+        literal.to_string()
+    } else {
+        toc_url
+    };
+    if !toc_url.trim().is_empty() {
         book.toc_url = Some(abs(&url, &toc_url));
     }
     Ok(())
+}
+
+/// 计算 `nextTocUrl` 的下页候选：
+/// - 字面 URL（含 `{{page}}`/`${page}` 模板时按**下一页**页码代入）；
+/// - 纯 CSS 规则（`@href`/`@value` 等）返回**所有**匹配值（多页目录一次性给出全部页码链接）；
+/// - 其他复合规则（`&&`/`||`/`##`/`@js:`）退回单值求值。
+fn next_toc_urls(
+    ar: &AnalyzeRule,
+    html: &str,
+    rule: &str,
+    base: &str,
+    page: i32,
+) -> Vec<String> {
+    let raw = rule.trim();
+    if raw.is_empty() {
+        return vec![];
+    }
+    let next_page = (page + 1).to_string();
+    let tpl = raw
+        .replace("{{page}}", &next_page)
+        .replace("${page}", &next_page);
+    if tpl != raw
+        && (tpl.starts_with("http://") || tpl.starts_with("https://") || tpl.starts_with('/'))
+    {
+        return vec![abs(base, &tpl)];
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return vec![raw.to_string()];
+    }
+    let mut vals = ar.get_string_list_all(html, raw, base);
+    if vals.is_empty() {
+        if let Ok(s) = ar.get_string(html, raw, true, base) {
+            vals.push(s);
+        }
+    }
+    vals.into_iter()
+        .filter(|s| !blank_value(s))
+        .map(|s| abs(base, &s))
+        .collect()
 }
 
 // ---------------- 目录 ----------------
@@ -200,60 +302,81 @@ pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Ve
         .clone()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| book.book_url.clone());
+    // 目录地址本身也可以是分页模板（`.../toc_{{page}}.html`），首屏固定为第 1 页
+    url = url
+        .replace("{{page}}", "1")
+        .replace("${page}", "1");
     let ar = make_ar(source);
     let mut chaps = Vec::new();
     let mut seen = HashSet::new();
-    let mut guard = 0;
-    loop {
-        if guard >= 10 || seen.contains(&url) {
-            break;
+    let mut queue: std::collections::VecDeque<(String, i32)> = std::collections::VecDeque::new();
+    queue.push_back((url, 1));
+    // 最多抓 10 页目录，与正文多页保护一致，避免书源死链把请求数放大
+    while let Some((url, page)) = queue.pop_front() {
+        if seen.len() >= 10 || seen.contains(&url) {
+            continue;
         }
-        guard += 1;
         seen.insert(url.clone());
+        // 让规则里的 `${page}` / `{{page}}` 拿到当前页号
+        ar.set_var("page", page.to_string());
         let html = req::fetch(&url, "GET", &headers, None).await?;
         let items = ar.get_string_list(&html, rule.chapter_list.as_deref().unwrap_or(""))?;
         for item in &items {
+            let idx = chaps.len() as i64;
+            let is_volume = flag(&ar, item, &rule.is_volume, &url);
             let raw_url =
                 ar.get_string(item, rule.chapter_url.as_deref().unwrap_or(""), true, &url)?;
-            let url_final = if raw_url.is_empty() {
-                format!("{}{}", book.book_url, chaps.len())
+            // 分卷行通常没有真实链接：用稳定合成 URL 作主键，避免覆盖正文章节或产生假 URL
+            let url_final = if is_volume {
+                format!("volume:{}#{idx}", book.book_url)
+            } else if blank_value(&raw_url) {
+                format!("{}{}", book.book_url, idx)
             } else {
                 abs(&url, &raw_url)
             };
+            let is_vip = flag(&ar, item, &rule.is_vip, &url);
+            // isPay：付费章节标记，与 isVip 走同一条「书源字段映射 -> 布尔」路径
+            let is_pay = flag(&ar, item, &rule.is_pay, &url);
             chaps.push(BookChapter {
                 url: url_final,
                 title: opt(&ar, item, &rule.chapter_name, &url),
+                is_volume,
+                is_vip,
+                is_pay,
+                update_time: opt(&ar, item, &rule.update_time, &url),
                 book_url: Some(book.book_url.clone()),
                 base_url: Some(url.clone()),
-                index: chaps.len() as i64,
+                index: idx,
                 ..Default::default()
             });
         }
-        let next = ar.get_string(&html, rule.next_toc_url.as_deref().unwrap_or(""), true, &url)?;
-        if next.is_empty() {
-            break;
+        let nexts = next_toc_urls(
+            &ar,
+            &html,
+            rule.next_toc_url.as_deref().unwrap_or(""),
+            &url,
+            page,
+        );
+        for next in nexts {
+            if next != url && !seen.contains(&next) {
+                queue.push_back((next, page + 1));
+            }
         }
-        let next_abs = abs(&url, &next);
-        if next_abs == url {
-            break;
-        }
-        url = next_abs;
     }
     Ok(chaps)
 }
 
 // ---------------- 正文 ----------------
-pub async fn chapter_content(
+/// 抓取正文所有分页：返回 `(当前页 URL, 原始 HTML)`。
+/// 正文与图片章节共用同一套 nextContentUrl 多页逻辑，规则各自只应用一次。
+async fn fetch_html_pages(
     source: &BookSource,
     chapter: &BookChapter,
-) -> anyhow::Result<BookContent> {
-    let rule: &ContentRule = match &source.rule_content {
-        Some(r) => r,
-        None => return Ok(BookContent::default()),
-    };
+    rule: &ContentRule,
+) -> anyhow::Result<Vec<(String, String)>> {
     let headers = req::parse_headers(&source.header);
     let mut url = chapter.url.clone();
-    let mut parts: Vec<String> = Vec::new();
+    let mut pages: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
     let mut guard = 0;
     loop {
@@ -264,11 +387,10 @@ pub async fn chapter_content(
         seen.insert(url.clone());
         let html = req::fetch(&url, "GET", &headers, None).await?;
         let ar = make_ar(source);
-        let part = ar.get_string(&html, rule.content.as_deref().unwrap_or(""), false, &url)?;
-        parts.push(part);
         let next =
             ar.get_string(&html, rule.next_content_url.as_deref().unwrap_or(""), true, &url)?;
-        if next.is_empty() {
+        pages.push((url.clone(), html));
+        if blank_value(&next) {
             break;
         }
         let next_abs = abs(&url, &next);
@@ -277,51 +399,496 @@ pub async fn chapter_content(
         }
         url = next_abs;
     }
-    // TODO: source_regex / replace_regex 内容净化
+    Ok(pages)
+}
+
+pub async fn chapter_content(
+    source: &BookSource,
+    chapter: &BookChapter,
+) -> anyhow::Result<BookContent> {
+    let rule: &ContentRule = match &source.rule_content {
+        Some(r) => r,
+        None => return Ok(BookContent::default()),
+    };
+    let pages = fetch_html_pages(source, chapter, rule).await?;
+    let mut parts: Vec<String> = Vec::new();
+    for (page_url, html) in &pages {
+        let ar = make_ar(source);
+        let part = ar.get_string(html, rule.content.as_deref().unwrap_or(""), false, page_url)?;
+        parts.push(part);
+    }
+    // 书源自带的净化规则：先 sourceRegex（源清洗）再 replaceRegex（可读性替换）
+    let raw = parts.join("\n");
+    let cleaned_source = apply_legado_replacements(&raw, &rule.source_regex);
+    let cleaned = apply_legado_replacements(&cleaned_source, &rule.replace_regex);
     Ok(BookContent {
         book_url: chapter.book_url.clone().unwrap_or_default(),
         url: chapter.url.clone(),
         title: chapter.title.clone(),
-        content: Some(parts.join("\n")),
+        content: Some(cleaned),
         chapter_index: chapter.index,
+        content_type: "text".into(),
         ..Default::default()
     })
 }
 
-/// 多源搜索：并发请求所有启用书源，聚合结果
-pub async fn search_all(
-    sources: &[BookSource],
-    key: &str,
-    page: i32,
-) -> Vec<SearchBook> {
-    let mut tasks = Vec::new();
-    for s in sources {
-        if !s.enabled {
-            continue;
+/// 单章最多抽取的图片数（防止异常书源把一次请求放大成数百张）
+pub const MAX_CHAPTER_IMAGES: usize = 300;
+
+/// 图片章节抽取结果
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ChapterImages {
+    pub images: Vec<BookImage>,
+    pub truncated: bool,
+}
+
+/// `img` 标签与属性解析用的静态正则，避免每张图重复编译。
+fn img_tag_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?is)<img\b[^>]*>").unwrap())
+}
+
+fn attr_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#,
+        )
+        .unwrap()
+    })
+}
+
+fn parse_attrs(tag: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for c in attr_re().captures_iter(tag) {
+        let name = c.get(1).map(|m| m.as_str().to_ascii_lowercase()).unwrap_or_default();
+        let val = c
+            .get(2)
+            .or_else(|| c.get(3))
+            .or_else(|| c.get(4))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        if !name.is_empty() {
+            map.insert(name, val);
         }
-        if s.rule_search.is_none() || s.search_url.is_none() {
-            continue;
-        }
-        tasks.push(search(s, key, page));
     }
-    let results = futures::future::join_all(tasks).await;
-    let mut out = Vec::new();
-    for r in results {
-        if let Ok(mut books) = r {
-            out.append(&mut books);
+    map
+}
+
+fn parse_dim(v: Option<&String>) -> Option<u32> {
+    let s = v?.trim().trim_end_matches("px").trim();
+    s.parse::<u32>().ok()
+}
+
+/// 是否 1px（或更小）的占位图：宽/高属性或内联样式里出现 1px。
+fn is_placeholder_size(attrs: &HashMap<String, String>) -> bool {
+    let w = parse_dim(attrs.get("width"));
+    let h = parse_dim(attrs.get("height"));
+    if w.map(|n| n <= 1).unwrap_or(false) || h.map(|n| n <= 1).unwrap_or(false) {
+        return true;
+    }
+    if let Some(style) = attrs.get("style") {
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"(?i)(?:^|;)\s*(?:width|height)\s*:\s*([0-9.]+)\s*px").unwrap()
+        });
+        for c in re.captures_iter(style) {
+            if c.get(1)
+                .and_then(|m| m.as_str().parse::<f32>().ok())
+                .map(|n| n <= 1.0)
+                .unwrap_or(false)
+            {
+                return true;
+            }
         }
+    }
+    false
+}
+
+/// 一张图片的“原始”信息（尚未去重/编号）
+#[derive(Debug, Clone)]
+struct RawImage {
+    url: String,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+/// 归一图片地址：部分书源（如 1kkk/酸奶漫画）把请求头 JSON 直接拼在 `src` 里，
+/// 产出 `url,{"headers":...}`；HTML 解析只能在第一个引号处截断，会留下 `,{` 尾巴。
+/// 这里按 `,{` 切掉后缀，避免代理把无效后缀带到源站导致 404。
+fn clean_image_url(raw: &str) -> String {
+    let u = raw.trim();
+    let head = match u.find(",{") {
+        Some(pos) => u[..pos].trim(),
+        None => u,
+    };
+    head.trim_end_matches(',').trim().to_string()
+}
+
+fn push_raw(out: &mut Vec<RawImage>, url: &str, width: Option<u32>, height: Option<u32>) {
+    let u = clean_image_url(url);
+    if u.is_empty() || u.starts_with("data:") {
+        return;
+    }
+    out.push(RawImage {
+        url: u,
+        width,
+        height,
+    });
+}
+
+/// 从一段 HTML 里按页面顺序提取 `<img src>`（含懒加载 `data-src`/`data-original` 兜底）。
+fn images_from_html(html: &str) -> Vec<RawImage> {
+    let mut out = Vec::new();
+    for tag in img_tag_re().find_iter(html) {
+        let attrs = parse_attrs(tag.as_str());
+        let src = attrs
+            .get("src")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| attrs.get("data-src"))
+            .or_else(|| attrs.get("data-original"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if is_placeholder_size(&attrs) {
+            continue;
+        }
+        push_raw(
+            &mut out,
+            src,
+            parse_dim(attrs.get("width")),
+            parse_dim(attrs.get("height")),
+        );
     }
     out
 }
 
-/// 多源发现：并发请求所有启用且开启发现的书源
+/// JS 数组/JSON 结果 -> 图片项；支持 `["url"]`、`[{url,width,height}]`、
+/// `{images:[...]}` 以及 `{url:...}` 单对象。
+fn images_from_json(text: &str) -> Option<Vec<RawImage>> {
+    let t = text.trim();
+    if !(t.starts_with('[') || t.starts_with('{')) {
+        return None;
+    }
+    let v: Value = serde_json::from_str(t).ok()?;
+    let mut out = Vec::new();
+    collect_json_images(&v, &mut out);
+    Some(out)
+}
+
+fn collect_json_images(v: &Value, out: &mut Vec<RawImage>) {
+    match v {
+        Value::String(s) => push_raw(out, s, None, None),
+        Value::Array(items) => {
+            for it in items {
+                collect_json_images(it, out);
+            }
+        }
+        Value::Object(obj) => {
+            for key in ["images", "list", "data"] {
+                if let Some(inner) = obj.get(key) {
+                    collect_json_images(inner, out);
+                    return;
+                }
+            }
+            let url = obj
+                .get("url")
+                .or_else(|| obj.get("src"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let width = obj
+                .get("width")
+                .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+                .map(|n| n as u32);
+            let height = obj
+                .get("height")
+                .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+                .map(|n| n as u32);
+            push_raw(out, url, width, height);
+        }
+        _ => {}
+    }
+}
+
+/// 单条规则结果 -> 图片项。兼容 HTML 片段、纯 URL、JSON 数组三种形态。
+fn images_from_value(value: &str) -> Vec<RawImage> {
+    let t = value.trim();
+    if t.is_empty() {
+        return vec![];
+    }
+    if let Some(v) = images_from_json(t) {
+        return v;
+    }
+    let from_html = images_from_html(t);
+    if !from_html.is_empty() {
+        return from_html;
+    }
+    // 纯 URL（无标签、无空白）：content 规则常直接写 `@css:img@src` 或 `@js:` 返回单链
+    if !t.contains('<') && !t.chars().any(char::is_whitespace) {
+        let mut out = Vec::new();
+        push_raw(&mut out, t, None, None);
+        return out;
+    }
+    from_html
+}
+
+/// 图片章节正文：所有 `<img src>` 按页面顺序去重、过滤占位图，`index` 从 1 开始。
+pub async fn chapter_images(
+    source: &BookSource,
+    chapter: &BookChapter,
+) -> anyhow::Result<ChapterImages> {
+    let rule: &ContentRule = match &source.rule_content {
+        Some(r) => r,
+        None => return Ok(ChapterImages::default()),
+    };
+    // 没有 content 规则时不要退化成“整页图片”（会混入广告/图标）
+    let content_rule = rule.content.as_deref().unwrap_or("").trim();
+    if content_rule.is_empty() {
+        return Ok(ChapterImages::default());
+    }
+    let pages = fetch_html_pages(source, chapter, rule).await?;
+    let mut per_page: Vec<(String, Vec<RawImage>)> = Vec::new();
+    for (page_url, html) in &pages {
+        // 规则本身可能直接产出多条（CSS 列表 / JS 数组），逐条归一
+        let ar = make_ar(source);
+        let values = ar.get_string_list_all(html, content_rule, page_url);
+        let raws: Vec<RawImage> = if values.is_empty() {
+            Vec::new()
+        } else {
+            values
+                .iter()
+                .flat_map(|v| images_from_value(v))
+                .collect()
+        };
+        per_page.push((page_url.clone(), raws));
+    }
+    Ok(build_images(&per_page, MAX_CHAPTER_IMAGES))
+}
+
+/// 把“页面 URL + 原始图片”归一为最终列表：相对地址补全、去重、编号从 1 开始、超限截断。
+fn build_images(pages: &[(String, Vec<RawImage>)], limit: usize) -> ChapterImages {
+    let mut images: Vec<BookImage> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut truncated = false;
+    for (page_url, raws) in pages {
+        for raw in raws {
+            let absolute = abs(page_url, &raw.url);
+            if !seen.insert(absolute.clone()) {
+                continue;
+            }
+            if images.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let index = images.len() as i64 + 1;
+            images.push(BookImage {
+                index,
+                url: absolute,
+                width: raw.width,
+                height: raw.height,
+                bytes: None,
+                priority: Some(if index <= 3 { "high" } else { "normal" }.to_string()),
+            });
+        }
+        if truncated {
+            break;
+        }
+    }
+    ChapterImages { images, truncated }
+}
+
+/// 单个书源的失败信息（聚合搜索时单源失败不影响整体）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceFailure {
+    pub source: String,
+    pub source_name: String,
+    pub error: String,
+}
+
+/// 聚合搜索结果：书列表 + 各源失败明细
+#[derive(Debug, Clone, Default)]
+pub struct SearchOutcome {
+    pub books: Vec<SearchBook>,
+    pub errors: Vec<SourceFailure>,
+}
+
+/// 发现分类（由 `exploreUrl` 展开）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExploreCategory {
+    pub title: String,
+    pub url: String,
+}
+
+/// 聚合去重 + 按书源权重排序（权重降序，其次 customOrder 升序）
+pub(crate) fn dedupe_and_sort(books: Vec<SearchBook>, sources: &[BookSource]) -> Vec<SearchBook> {
+    let order: HashMap<&str, (i64, i64)> = sources
+        .iter()
+        .map(|s| (s.book_source_url.as_str(), (s.weight, s.custom_order)))
+        .collect();
+    let mut books = books;
+    books.sort_by(|a, b| {
+        let oa = a.origin.as_deref().and_then(|o| order.get(o)).copied();
+        let ob = b.origin.as_deref().and_then(|o| order.get(o)).copied();
+        let wa = oa.map(|x| x.0).unwrap_or(0);
+        let wb = ob.map(|x| x.0).unwrap_or(0);
+        wb.cmp(&wa)
+            .then_with(|| oa.map(|x| x.1).unwrap_or(0).cmp(&ob.map(|x| x.1).unwrap_or(0)))
+            .then_with(|| a.book_url.cmp(&b.book_url))
+    });
+    let mut seen = HashSet::new();
+    books.retain(|b| {
+        let name = b.name.as_deref().unwrap_or("").trim().to_lowercase();
+        let author = b.author.as_deref().unwrap_or("").trim().to_lowercase();
+        let key = if name.is_empty() {
+            b.book_url.clone()
+        } else {
+            format!("{name}|{author}")
+        };
+        seen.insert(key)
+    });
+    books
+}
+
+/// 多源搜索：并发请求所有启用书源；单源失败只记录错误，不影响整体。
+/// 每个书源有独立的搜索预算（默认 10s），超时只丢该源，避免一个慢站拖住整页。
+pub async fn search_all_with_errors(
+    sources: &[BookSource],
+    key: &str,
+    page: i32,
+) -> SearchOutcome {
+    search_all_with_errors_budgeted(sources, key, page, req::search_budget()).await
+}
+
+pub async fn search_all_with_errors_budgeted(
+    sources: &[BookSource],
+    key: &str,
+    page: i32,
+    budget: std::time::Duration,
+) -> SearchOutcome {
+    let mut tasks = Vec::new();
+    for s in sources {
+        if !s.enabled
+            || !crate::entities::is_supported_source_type(s.book_source_type)
+            || s.rule_search.is_none()
+            || s.search_url.is_none()
+        {
+            continue;
+        }
+        let src = s.clone();
+        let fut = async move {
+            match tokio::time::timeout(budget, search(&src, key, page)).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!(
+                    "搜索超时（单源 {}s 预算）",
+                    budget.as_secs()
+                )),
+            }
+        };
+        tasks.push((s.clone(), fut));
+    }
+    let results = futures::future::join_all(
+        tasks
+            .into_iter()
+            .map(|(src, fut)| async move { (src, fut.await) }),
+    )
+    .await;
+    let mut outcome = SearchOutcome::default();
+    for (src, r) in results {
+        match r {
+            Ok(mut books) => outcome.books.append(&mut books),
+            Err(e) => outcome.errors.push(SourceFailure {
+                source: src.book_source_url.clone(),
+                source_name: src.book_source_name.clone(),
+                error: e.to_string(),
+            }),
+        }
+    }
+    outcome.books = dedupe_and_sort(outcome.books, sources);
+    outcome
+}
+
+pub async fn search_all(sources: &[BookSource], key: &str, page: i32) -> Vec<SearchBook> {
+    search_all_with_errors(sources, key, page).await.books
+}
+
+/// 展开书源的 `exploreUrl`：每行 `分类名::url`（无分类名时用书源名），
+/// 支持 `{{page}}` 模板；空行/注释行忽略。
+/// `exploreUrl` 为 `@js:` / `<js>` 时交给规则引擎执行（受 JS_ENABLED 与耗时预算约束），
+/// 结果既可为 `标题::url` 多行文本，也可为 `[{title,url}]` JSON 数组。
+pub fn explore_categories(
+    source: &BookSource,
+    page: i32,
+) -> anyhow::Result<Vec<ExploreCategory>> {
+    let raw = match source.explore_url.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Ok(vec![]),
+    };
+    let raw = if raw.starts_with("@js:") || raw.contains("<js>") {
+        let ar = make_ar(source);
+        ar.get_string("", &raw, false, "")
+            .map_err(|e| anyhow::anyhow!("exploreUrl JS 执行失败: {e}"))?
+    } else {
+        raw
+    };
+    // JS 结果可能是 JSON 数组
+    if raw.trim_start().starts_with('[') {
+        if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(raw.trim()) {
+            let mut out = Vec::new();
+            for it in items {
+                let title = it
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&source.book_source_name)
+                    .to_string();
+                let url = match it.get("url").and_then(|v| v.as_str()) {
+                    Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+                    _ => continue,
+                };
+                out.push(ExploreCategory { title, url });
+            }
+            return Ok(out);
+        }
+    }
+    let mut out: Vec<ExploreCategory> = Vec::new();
+    let mut seen = HashSet::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (title, url) = match line.split_once("::") {
+            Some((t, u)) => (t.trim().to_string(), u.trim().to_string()),
+            None => (source.book_source_name.clone(), line.to_string()),
+        };
+        if url.is_empty() {
+            continue;
+        }
+        let url = url
+            .replace("{{page}}", &page.to_string())
+            .replace("{{key}}", "");
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        out.push(ExploreCategory {
+            title: if title.is_empty() {
+                source.book_source_name.clone()
+            } else {
+                title
+            },
+            url,
+        });
+    }
+    Ok(out)
+}
+
+/// 多源发现：并发请求所有启用且开启发现的书源（按同一个分类 URL）
 pub async fn explore_all(sources: &[BookSource], url: &str) -> Vec<SearchBook> {
     let mut tasks = Vec::new();
     for s in sources {
-        if !s.enabled || !s.enabled_explore {
-            continue;
-        }
-        if s.rule_explore.is_none() {
+        if !s.enabled
+            || !s.enabled_explore
+            || !crate::entities::is_supported_source_type(s.book_source_type)
+            || s.rule_explore.is_none()
+        {
             continue;
         }
         tasks.push(explore(s, url));
@@ -333,8 +900,326 @@ pub async fn explore_all(sources: &[BookSource], url: &str) -> Vec<SearchBook> {
             out.append(&mut books);
         }
     }
+    dedupe_and_sort(out, sources)
+}
+
+/// 按 Legado 约定执行 `正则##替换` 形式的净化规则（多行可多条）。
+/// 兼容 `/pat/repl/` 单条形式；无效正则跳过，不影响正文返回。
+fn apply_legado_replacements(input: &str, rules: &Option<String>) -> String {
+    let rules = match rules {
+        Some(r) if !r.trim().is_empty() => r,
+        _ => return input.to_string(),
+    };
+    let mut out = input.to_string();
+    for line in rules.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (pat, repl) = if let Some((p, r)) = line.split_once("##") {
+            (p.trim(), r)
+        } else if line.starts_with('/') && line.len() > 2 && line.ends_with('/') {
+            let inner = &line[1..line.len() - 1];
+            match inner.split_once('/') {
+                Some((p, r)) => (p, r),
+                None => (inner, ""),
+            }
+        } else {
+            (line, "")
+        };
+        if pat.is_empty() {
+            continue;
+        }
+        if let Ok(re) = regex::Regex::new(pat) {
+            out = re.replace_all(&out, repl).to_string();
+        }
+    }
     out
 }
 
 #[allow(dead_code)]
 fn _unused(_: HashMap<String, String>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B1：相对 searchUrl 必须按 bookSourceUrl 归并（真实源最小形态）
+    #[test]
+    fn relative_search_url_is_joined_with_source_url() {
+        let mut s = BookSource::default();
+        // 形态一：根路径相对的 `search.php?kw=`（三八小说）
+        s.book_source_url = "https://www.38xs.com".into();
+        s.search_url = Some("search.php?kw={{key}}".into());
+        let (url, method, _, _) = build_search_request(&s, "abc", 1);
+        assert_eq!(url, "https://www.38xs.com/search.php?kw=abc");
+        assert_eq!(method, "GET");
+
+        // 形态二：斜杠开头的模板（错层小说网）
+        s.book_source_url = "https://m.cuoceng.org/".into();
+        s.search_url = Some("/book/so/{{key}}/{{page}}.html".into());
+        let (url2, _, _, _) = build_search_request(&s, "abc", 1);
+        assert_eq!(url2, "https://m.cuoceng.org/book/so/abc/1.html");
+    }
+
+    // 绝对 searchUrl（带 POST 配置）不受归并影响
+    #[test]
+    fn absolute_search_url_with_post_config_is_kept() {
+        let mut s = BookSource::default();
+        s.book_source_url = "https://www.dingdian888.com".into();
+        s.search_url = Some(
+            r#"https://www.dingdian888.com/s.php,{"method":"POST","body":"s={{key}}&submit="}"#
+                .into(),
+        );
+        let (url, method, _, body) = build_search_request(&s, "完美世界", 1);
+        assert_eq!(url, "https://www.dingdian888.com/s.php");
+        assert_eq!(method, "POST");
+        assert_eq!(body.as_deref(), Some("s=完美世界&submit="));
+    }
+
+    // nextTocUrl：一次返回多个页码链接（多页目录链式抓取）
+    #[test]
+    fn next_toc_urls_supports_multiple_links() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="pages"><a href="/toc/2.html">2</a><a href="/toc/3.html">3</a></div>"#;
+        let v = next_toc_urls(&ar, html, "@css:.pages a@href", "https://x.com/toc/1.html", 1);
+        assert_eq!(
+            v,
+            vec![
+                "https://x.com/toc/2.html".to_string(),
+                "https://x.com/toc/3.html".to_string()
+            ]
+        );
+    }
+
+    // nextTocUrl：字面 URL 模板里的 {{page}} 取“下一页”页码，而不是当前页
+    #[test]
+    fn next_toc_urls_expands_page_template() {
+        let ar = AnalyzeRule::new();
+        let v = next_toc_urls(
+            &ar,
+            "",
+            "https://x.com/toc/list_{{page}}.html",
+            "https://x.com",
+            1,
+        );
+        assert_eq!(v, vec!["https://x.com/toc/list_2.html".to_string()]);
+        // 相对路径模板同样按当前页归并
+        let v2 = next_toc_urls(&ar, "", "/toc/list_${page}.html", "https://x.com/toc/1.html", 2);
+        assert_eq!(v2, vec!["https://x.com/toc/list_3.html".to_string()]);
+    }
+
+    // 目录页内的净化规则支持 `##正则##$1`
+    #[test]
+    fn legado_replacement_supports_capture_group() {
+        let out = apply_legado_replacements(
+            "第12章 abc",
+            &Some(r#"第(\d+)章##Chapter$1"#.to_string()),
+        );
+        assert_eq!(out, "Chapter12 abc");
+    }
+
+    // 布尔规则字符串按 Legado 常见写法判定
+    #[test]
+    fn toc_boolean_rules_are_parsed() {
+        for t in ["true", "1", "yes", "是", "TRUE"] {
+            assert!(truthy(t), "{t} 应为真");
+        }
+        for f in ["", "false", "0", "no", "null", "否"] {
+            assert!(!truthy(f), "{f:?} 应为假");
+        }
+    }
+
+    // 单源超时：慢源按预算被切断，快源结果照常返回（聚合不被拖住）
+    #[tokio::test]
+    async fn slow_source_is_cut_by_budget_and_fast_source_still_returns() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 慢源：读完请求后挂起 3s 不给响应
+        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = slow.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+
+        // 快源：返回一条可解析结果
+        let fast = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_addr = fast.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = fast.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"<div class="item"><a href="/b/1">测试书</a></div>"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let mut mk = |name: &str, base: std::net::SocketAddr| {
+            let mut s = BookSource::default();
+            s.enabled = true;
+            s.book_source_url = format!("http://{base}");
+            s.book_source_name = name.into();
+            s.search_url = Some(format!("http://{base}/s?q={{{{key}}}}"));
+            s.rule_search = Some(SearchRule {
+                book_list: Some("class.item".into()),
+                name: Some("a@text".into()),
+                book_url: Some("a@href".into()),
+                ..Default::default()
+            });
+            s
+        };
+        let sources = vec![
+            mk("slow", slow_addr),
+            mk("fast", fast_addr),
+        ];
+        let started = std::time::Instant::now();
+        let out = search_all_with_errors_budgeted(&sources, "书", 1, Duration::from_millis(300)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "慢源不应拖住整体: {:?}",
+            started.elapsed()
+        );
+        let slow_err = out
+            .errors
+            .iter()
+            .find(|e| e.source_name == "slow")
+            .expect("慢源应记一条错误");
+        assert!(
+            slow_err.error.contains("搜索超时"),
+            "超时文案应可识别: {}",
+            slow_err.error
+        );
+        assert_eq!(out.books.len(), 1, "快源结果应照常返回");
+        assert_eq!(out.books[0].name.as_deref(), Some("测试书"));
+        assert!(!out.errors.iter().any(|e| e.source_name == "fast"));
+    }
+
+    // isVip / isPay 共用布尔规则解析：真值、数字真值、假值以及规则缺省
+    #[test]
+    fn flag_rule_maps_vip_and_pay_fields() {
+        let ar = AnalyzeRule::new();
+        let item = r#"<div class="ch"><i class="vip">true</i><i class="pay">1</i><i class="free">0</i></div>"#;
+        let base = "https://x.com/toc";
+        assert!(flag(&ar, item, &Some(".vip@text".into()), base), "true 应为付费/VIP");
+        assert!(flag(&ar, item, &Some(".pay@text".into()), base), "1 应为付费");
+        assert!(!flag(&ar, item, &Some(".free@text".into()), base), "0 应为 false");
+    }
+
+    // 图片抽取：相对地址按章节页归并、去重、顺序与页面一致
+    #[test]
+    fn image_extraction_joins_relative_and_dedups() {
+        let html = r#"
+            <div class="content">
+              <img src="/img/1.jpg" width="800" height="1200">
+              <img src="img/2.png">
+              <img src="/img/1.jpg">
+            </div>"#;
+        let raws = images_from_value(html);
+        assert_eq!(raws.len(), 3, "未去重前应保留 3 条");
+        let pages = vec![(
+            "https://m.example.com/ch/12.html".to_string(),
+            raws,
+        )];
+        let out = build_images(&pages, 300);
+        assert_eq!(out.images.len(), 2, "重复地址应被去重");
+        assert_eq!(out.images[0].url, "https://m.example.com/img/1.jpg");
+        assert_eq!(out.images[1].url, "https://m.example.com/ch/img/2.png");
+        assert_eq!(out.images[0].index, 1);
+        assert_eq!(out.images[1].index, 2);
+        assert_eq!(out.images[0].width, Some(800));
+        assert_eq!(out.images[0].height, Some(1200));
+        assert!(!out.truncated);
+    }
+
+    // 去重：同一绝对地址只保留第一次出现，编号连续
+    #[test]
+    fn image_dedup_keeps_first_occurrence() {
+        let raws = images_from_html(r#"<img src="//cdn.example.com/a.jpg"><img src="https://cdn.example.com/a.jpg">"#);
+        let pages = vec![("https://x.com/1".to_string(), raws)];
+        let out = build_images(&pages, 300);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].url, "https://cdn.example.com/a.jpg");
+    }
+
+    // 上限：超过 300 张截断并标记 truncated，编号从 1 到 limit
+    #[test]
+    fn image_limit_truncates() {
+        let html: String = (0..305)
+            .map(|i| format!(r#"<img src="https://img.example/{i}.jpg">"#))
+            .collect();
+        let raws = images_from_html(&html);
+        assert_eq!(raws.len(), 305);
+        let pages = vec![("https://x.com/1".to_string(), raws)];
+        let out = build_images(&pages, 300);
+        assert_eq!(out.images.len(), 300);
+        assert!(out.truncated);
+        assert_eq!(out.images[299].index, 300);
+    }
+
+    // 占位图/空图过滤：1px 宽高、样式 1px、data: 一律丢弃
+    #[test]
+    fn image_filters_placeholder_and_data_uri() {
+        let html = r#"
+            <img src="https://img.example/real.jpg">
+            <img src="https://img.example/track.gif" width="1" height="1">
+            <img src="https://img.example/track2.gif" style="width:1px;height:1px">
+            <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+            <img src="">
+        "#;
+        let raws = images_from_html(html);
+        assert_eq!(raws.len(), 1, "只应保留真实图片");
+        assert_eq!(raws[0].url, "https://img.example/real.jpg");
+    }
+
+    // @js: 返回 JSON 数组/对象也要能解析，并保留宽高
+    #[test]
+    fn image_extraction_supports_js_json() {
+        let arr = r#"["https://img.example/1.jpg", {"url":"/2.png","width":600,"height":900}]"#;
+        let raws = images_from_value(arr);
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[1].width, Some(600));
+        let pages = vec![("https://x.com/a/1".to_string(), raws)];
+        let out = build_images(&pages, 300);
+        assert_eq!(out.images[1].url, "https://x.com/2.png");
+
+        let obj = r#"{"images":["https://img.example/3.jpg","https://img.example/4.jpg"]}"#;
+        assert_eq!(images_from_value(obj).len(), 2);
+    }
+
+    // 1kkk/酸奶漫画：@js 把请求头拼进 src，HTML 解析只截到 `url,{`，必须切掉后续 JSON 片段
+    #[test]
+    fn image_url_strips_trailing_header_json() {
+        let html = r#"<img src="https://cdn.example.com/1.jpg?cid=12&amp;type=1,{"headers":"{\"Referer\":\"https://m.1kkk.com/\"}"}">"#;
+        let raws = images_from_value(html);
+        assert_eq!(raws.len(), 1);
+        assert_eq!(
+            raws[0].url,
+            "https://cdn.example.com/1.jpg?cid=12&amp;type=1"
+        );
+        // 纯 URL 形态（无标签）同样归一
+        assert_eq!(
+            clean_image_url(r#"https://cdn.example.com/2.jpg?a=1,{"x":"y"}"#),
+            "https://cdn.example.com/2.jpg?a=1"
+        );
+        assert_eq!(clean_image_url("https://cdn.example.com/3.jpg"), "https://cdn.example.com/3.jpg");
+    }
+
+    // 搜索结果的 type 标识：0 小说 -> text，2 漫画 -> image
+    #[test]
+    fn search_type_token_distinguishes_comic() {
+        assert_eq!(type_token(0), "text");
+        assert_eq!(type_token(2), "image");
+    }
+}

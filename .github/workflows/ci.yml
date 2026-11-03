@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: cargo check + test (linux)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 在仓库根，rustup 会自动向上查找并用它装 stable + musl 目标
+      - name: Install toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc -vV
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test

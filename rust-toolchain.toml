@@ -1,0 +1,14 @@
+# rust-toolchain.toml —— 仓库级工具链约定
+# 目的：新人 clone 后直接 cargo build 即可，不需要手工记住目标/通道。
+#
+# 为什么写 "stable" 而不锁 "1.96.0"：
+#   - 本机（RUSTUP_HOME=D:\rust\rustup）已装 stable-x86_64-pc-windows-msvc = 1.96.0；
+#   - 写 "stable" 时 rustup 会直接复用「已安装的 stable（本机 host 工具链）」，不触发下载；
+#   - 若硬锁 "1.96.0"，rustup 会按版本号解析并校验/安装该版本，存在多余下载与
+#     「本机 stable 已更新到更高版本后被迫回退」的风险。
+#
+# 注意：不要在这里写 components = ["rustfmt"] 之类，否则每次 rustup show / cargo 调用
+# 都会校验并可能补装组件（本机未装时就会产生下载）。
+[toolchain]
+channel = "stable"
+targets = ["aarch64-unknown-linux-musl"]

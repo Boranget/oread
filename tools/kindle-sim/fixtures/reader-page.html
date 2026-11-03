@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>阅读页 · KPW3 版式样例</title>
+<style>
+  body { margin: 0; padding: 0; background: #fdfdfb; color: #1a1a1a; font-family: serif; font-size: 18px; line-height: 1.8; }
+  .topbar { padding: 12px 24px; border-bottom: 1px solid #ddd; }
+  .topbar .title { float: left; font-size: 22px; }
+  .topbar .meta { float: right; font-size: 16px; color: #666; }
+  .clear { clear: both; }
+  .reader { width: 720px; margin: 32px auto 48px; }
+  .chapter-title { font-size: 28px; line-height: 1.4; margin: 0 0 24px; }
+  .article p { margin: 0 0 20px; text-indent: 2em; text-align: justify; }
+  .toc { border: 1px solid #ccc; padding: 12px 16px; margin: 24px 0; }
+  .toc .row { padding: 6px 0; border-bottom: 1px solid #eee; }
+  .footer { clear: both; padding: 16px 24px; color: #777; font-size: 15px; }
+  @media (max-width: 900px) {
+    .reader { width: auto; margin: 24px; }
+  }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="title">阅读页 · 第一章</span>
+    <span class="meta">字号 18 · 行高 1.8 · 栏宽 720</span>
+    <div class="clear"></div>
+  </div>
+
+  <div class="reader">
+    <h1 class="chapter-title">第一章　山有木兮</h1>
+    <div class="toc" id="toc">
+      <div class="row">第一章　山有木兮</div>
+      <div class="row">第二章　夜雨寄北</div>
+      <div class="row">第三章　归途</div>
+    </div>
+    <div class="article" id="article">
+      <p>山有木兮木有枝，心悦君兮君不知。夜色从窗棂间慢慢沉下来，纸页上的字却比白日里更清楚。KPW3 的屏幕只有黑白灰，适合这样安静的段落，一行一行读下去，不需要颜色，也不需要动画。</p>
+      <p>这个页面用浮动与普通块级布局完成顶部栏和正文栏，没有 flexbox，也没有 grid；不依赖 vw、vh 和 clamp()。字号固定为 18 像素，行高 1.8，正文栏宽 720 像素，在 1072 像素宽的屏幕上左右各留出约 176 像素。</p>
+      <p>如果服务端把正文直接写进 HTML，那么即使浏览器完全禁用 JavaScript，这段文字仍然应该出现在首屏。这正是“断 JS 也能读”的硬指标，也是本测试台双模式对照要验证的内容。</p>
+      <p>夜间风竹敲秋韵，万叶千声皆是恨。阅读器的翻页、目录、字号调整都依赖脚本；但在墨水屏上，最重要的仍然是正文本身能否在第一时间显示出来。装饰、阴影、圆角、动画都可以退让，文字不能。</p>
+      <p>故人入我梦，明我长相忆。页面加载完成以后，内联的 ES5 脚本会把页脚状态改成“已就绪”，并为目录行绑定 click 事件；KPW3 只有 click，没有滑动和手势，所以这里的交互只用 click 验证。</p>
+      <p>行到水穷处，坐看云起时。正文继续向下延伸，用来确认整页截图与首屏截图都能正确保存，并确认“全页可见字符数”明显大于“首屏可见字符数”。</p>
+      <p>海内存知己，天涯若比邻。无线网络与 TLS 在旧设备上可能失败，但只要能拿到 HTML，正文就不应该依赖脚本去二次请求。SSR 是这条链路上最稳的一环。</p>
+      <p>落霞与孤鹜齐飞，秋水共长天一色。阅读页不需要横向滚动，不需要固定定位的悬浮按钮；所有内容都在文档流中，按 1072 像素宽、1231 像素高的窗口自然排版。</p>
+    </div>
+  </div>
+
+  <div class="footer" id="status">页脚状态：等待脚本</div>
+  <script>
+    (function () {
+      var status = document.getElementById('status');
+      if (status) status.innerHTML = '页脚状态：ES5 内联脚本已就绪（无 Promise / fetch）';
+      var rows = document.getElementById('toc').getElementsByTagName('div');
+      for (var i = 0; i < rows.length; i++) {
+        rows[i].onclick = function () {
+          this.style.background = '#eee';
+        };
+      }
+    })();
+  </script>
+</body>
+</html>

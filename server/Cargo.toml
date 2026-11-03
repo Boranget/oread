@@ -1,10 +1,10 @@
 [package]
-name = "legado-server"
+name = "boranlib"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "legado-server"
+name = "boranlib"
 path = "src/main.rs"
 
 [dependencies]
@@ -28,7 +28,7 @@ scraper = "0.20"            # CSS 选择器 / JSoup 等价
 jsonpath-rust = "0.7"       # JsonPath
 sxd-xpath = "0.4"           # XPath（XML 响应）
 sxd-document = "0.3"        # sxd-xpath 的 XML 文档模型
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "gzip", "rustls-tls", "stream"] }
 boa_engine = "0.19"         # JS 引擎（Rhino 等价，纯 Rust 便于交叉编译）
 regex = "1"
 url = "2"

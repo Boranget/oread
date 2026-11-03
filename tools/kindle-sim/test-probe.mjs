@@ -1,0 +1,14 @@
+﻿import { chromium } from 'playwright-core';
+const b = await chromium.launch({ channel: 'msedge', headless: true });
+const c = await b.newContext({ javaScriptEnabled: false, viewport: { width: 1072, height: 1231 } });
+const p = await c.newPage();
+await p.setContent('<html><body><p>hello world</p><script>document.body.appendChild(document.createElement("hr"))</script></body></html>');
+console.log('nojs eval:', await p.evaluate(() => ({ w: innerWidth, text: document.body.innerText, hr: document.querySelectorAll('hr').length })));
+await c.close();
+const c2 = await b.newContext({ viewport: { width: 1072, height: 1231 }, userAgent: 'UA-TEST' });
+await c2.addInitScript(() => { window.Promise = undefined; window.fetch = undefined; });
+const p2 = await c2.newPage();
+p2.on('pageerror', e => console.log('PAGEERR', e.message));
+await p2.setContent('<p>x</p><script>Promise.resolve(1); fetch("/x")</script>');
+console.log('missing globals eval:', await p2.evaluate(() => ({ p: typeof Promise, f: typeof fetch, ua: navigator.userAgent, w: innerWidth })));
+await b.close();

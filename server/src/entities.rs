@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::serde_util::{string_or_bool, string_or_i64};
 
@@ -14,7 +15,10 @@ pub struct BookSource {
     #[serde(default)]
     pub search_url: Option<String>, // 搜索地址（搜索类书源必填）
     #[serde(default, deserialize_with = "string_or_i64")]
-    pub book_source_type: i64, // 0=图书 1=音频
+    pub book_source_type: i64, // 0=小说 2=漫画 1=音频（仅 0/2 支持阅读）
+    /// 由数据库列写入：非 0/2 类型标记为不支持，默认禁用且不参与搜索
+    #[serde(default, skip_serializing)]
+    pub unsupported_type: bool,
     #[serde(default)]
     pub book_url_pattern: Option<String>,
     #[serde(default, deserialize_with = "string_or_i64")]
@@ -63,6 +67,12 @@ pub struct BookSource {
     pub rule_content: Option<ContentRule>,
     #[serde(default)]
     pub rule_explore: Option<ExploreRule>,
+    /// Legado 的评论/书评规则（服务端不解析，仅原样保留，避免导入导出丢字段）
+    #[serde(default)]
+    pub rule_review: Option<Value>,
+    /// 未建模的新字段（原样保存，导出时无损回写）
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 fn default_true() -> bool {
@@ -94,6 +104,8 @@ pub struct SearchRule {
     pub cover_url: Option<String>,
     #[serde(default)]
     pub word_count: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 // 发现规则与搜索规则字段相同（仅无 check_key_word）
@@ -120,6 +132,8 @@ pub struct ExploreRule {
     pub cover_url: Option<String>,
     #[serde(default)]
     pub word_count: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -149,6 +163,8 @@ pub struct BookInfoRule {
     pub can_re_name: Option<String>,
     #[serde(default)]
     pub download_urls: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -174,6 +190,8 @@ pub struct TocRule {
     pub update_time: Option<String>,
     #[serde(default)]
     pub next_toc_url: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,6 +215,8 @@ pub struct ContentRule {
     pub image_decode: Option<String>,
     #[serde(default)]
     pub pay_action: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 // ============ 核心业务实体 ============
@@ -330,6 +350,16 @@ pub struct BookChapter {
     pub start: i64,
     #[serde(default)]
     pub end: i64,
+    /// 来源站点给出的章节更新时间（原样字符串，未知为 null）
+    #[serde(default)]
+    pub update_time: Option<String>,
+    /// 正文字数（未知为 0；正文缓存落库时回填）
+    #[serde(default)]
+    pub word_count: i64,
+    /// 所属分卷标题：分卷行返回自身标题，普通章节返回最近的前置分卷（目录分组用）
+    #[sqlx(default)]
+    #[serde(default)]
+    pub volume_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
@@ -349,6 +379,73 @@ pub struct BookContent {
     pub resource_url: Option<String>,
     #[serde(default)]
     pub is_local: bool,
+    /// `text`（默认）或 `image`；老缓存行由迁移填 `text`
+    #[sqlx(default)]
+    #[serde(default)]
+    pub content_type: String,
+    /// 图片章节缓存（`{images:[...], truncated}` 的 JSON）；文本章节为 None
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub images_json: Option<String>,
+}
+
+/// 图片章节的单张图片。`index` 与页面顺序一致，从 1 开始。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BookImage {
+    pub index: i64,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// 已知的字节数（源页面通常不给，代理抓取后可补）；未知为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// 预取优先级：前三张为 `high`，其余为 `normal`（KPW3 端按此分批加载）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// 书源类型的中文名（0 小说 / 2 漫画 / 1 有声 / 其他）
+pub fn source_type_name(t: i64) -> &'static str {
+    match t {
+        0 => "小说",
+        2 => "漫画",
+        1 => "有声",
+        _ => "其他",
+    }
+}
+
+/// 阅读器支持的书源类型：仅小说(0)与漫画(2)
+pub fn is_supported_source_type(t: i64) -> bool {
+    matches!(t, 0 | 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_type_names_and_support() {
+        assert_eq!(source_type_name(0), "小说");
+        assert_eq!(source_type_name(2), "漫画");
+        assert_eq!(source_type_name(1), "有声");
+        assert_eq!(source_type_name(7), "其他");
+        assert!(is_supported_source_type(0));
+        assert!(is_supported_source_type(2));
+        assert!(!is_supported_source_type(1));
+        assert!(!is_supported_source_type(3));
+    }
+
+    #[test]
+    fn book_source_type_accepts_legado_string() {
+        let json = r#"{"book_source_url":"https://x","book_source_name":"n","book_source_type":"2"}"#;
+        let s: BookSource = serde_json::from_str(json).unwrap();
+        assert_eq!(s.book_source_type, 2);
+        let json2 = r#"{"book_source_url":"https://x","book_source_name":"n"}"#;
+        let s2: BookSource = serde_json::from_str(json2).unwrap();
+        assert_eq!(s2.book_source_type, 0, "缺失按 0（小说）");
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

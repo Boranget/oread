@@ -1,0 +1,27 @@
+{
+  "waitMs": 1500,
+  "timeoutMs": 30000,
+  "degradeCss": true,
+  "thresholds": {
+    "visibleChars": 50,
+    "firstScreenChars": 20
+  },
+  "targets": [
+    {
+      "name": "spa-home",
+      "url": "http://127.0.0.1:3000/"
+    },
+    {
+      "name": "reader-page",
+      "url": "fixture:reader-page.html"
+    },
+    {
+      "name": "simple-static",
+      "url": "fixture:simple.html"
+    },
+    {
+      "name": "js-only-es6",
+      "url": "fixture:js-only-es6.html"
+    }
+  ]
+}

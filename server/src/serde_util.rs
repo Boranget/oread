@@ -50,6 +50,37 @@ pub fn camel_to_snake_value(v: Value) -> Value {
     }
 }
 
+/// 递归把 JSON 中所有对象键从 snake_case 转回 camelCase（Legado 导出格式）。
+pub fn snake_to_camel_value(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut new = serde_json::Map::new();
+            for (k, val) in map {
+                new.insert(snake_to_camel(&k), snake_to_camel_value(val));
+            }
+            Value::Object(new)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(snake_to_camel_value).collect()),
+        other => other,
+    }
+}
+
+fn snake_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for c in s.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(c.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn camel_to_snake(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
@@ -79,5 +110,17 @@ mod tests {
         assert_eq!(v["book_source_url"], "http://x");
         assert_eq!(v["rule_search"]["book_list"], ".x");
         assert_eq!(v["rule_search"]["last_chapter"], "y");
+    }
+
+    #[test]
+    fn converts_keys_back_to_camel() {
+        let raw = serde_json::json!({
+            "book_source_url": "http://x",
+            "rule_search": { "book_list": ".x", "check_key_word": "y" }
+        });
+        let v = snake_to_camel_value(raw);
+        assert_eq!(v["bookSourceUrl"], "http://x");
+        assert_eq!(v["ruleSearch"]["bookList"], ".x");
+        assert_eq!(v["ruleSearch"]["checkKeyWord"], "y");
     }
 }

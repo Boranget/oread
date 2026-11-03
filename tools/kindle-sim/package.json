@@ -1,0 +1,21 @@
+{
+  "name": "kindle-kpw3-sim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kindle Paperwhite 3 (mesquite WebKit) 仿真测试台：ES5 门禁、CSS 能力审计、双模式对照",
+  "type": "module",
+  "bin": {
+    "kpw3-sim": "src/cli.js"
+  },
+  "scripts": {
+    "sim": "node src/cli.js",
+    "sim:batch": "node src/cli.js --config kpw3.config.json"
+  },
+  "dependencies": {
+    "acorn": "^8.19.0",
+    "playwright-core": "^1.64.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

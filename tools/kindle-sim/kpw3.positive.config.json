@@ -1,0 +1,15 @@
+{
+  "waitMs": 3000,
+  "timeoutMs": 45000,
+  "degradeCss": true,
+  "targets": [
+    {
+      "name": "positive-control-r-qq",
+      "url": "https://r.qq.com/"
+    },
+    {
+      "name": "positive-control-example",
+      "url": "https://example.com/"
+    }
+  ]
+}

@@ -15,7 +15,13 @@ pub enum AppError {
     Unauthorized,
     Forbidden,
     BadRequest(String),
+    /// 前置条件不满足（如目录尚未缓存），映射 409 供调用方区分“参数错误”
+    Conflict(String),
     NotFound(String),
+    /// 服务端超时（如书内搜索超过预算），映射 504 便于调用方区分“太慢”与“参数错误”
+    Timeout(String),
+    /// 正文请求既没带 book_url，也无法从章节缓存反查出所属书籍
+    MissingBookUrl,
 }
 
 impl std::fmt::Display for AppError {
@@ -67,10 +73,22 @@ impl From<anyhow::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
+            AppError::MissingBookUrl => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "missing_book_url",
+                        "message": "缺少书籍地址，请从书架重新打开",
+                    })),
+                )
+                    .into_response();
+            }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, m),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            AppError::Timeout(m) => (StatusCode::GATEWAY_TIMEOUT, m),
             AppError::Sqlx(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")),
             AppError::Bcrypt(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("bcrypt: {e}")),
             AppError::Jwt(e) => (StatusCode::UNAUTHORIZED, format!("jwt: {e}")),
