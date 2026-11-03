@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod db;
+mod db_guard;
 mod entities;
 mod error;
 mod image_cache;
@@ -9,6 +10,8 @@ mod routes;
 mod rule_engine;
 mod req;
 mod serde_util;
+mod source_health;
+mod source_ledger;
 mod web_book;
 
 use axum::Router;
@@ -39,13 +42,18 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cfg: Config) -> anyhow::Result<()> {
+    // 上次启动失败（例如库版本高于二进制）时先退避，避免 systemd 风暴式重启。
+    db_guard::throttle_startup(&cfg).await;
     // HTTP 抓取预算与 JS 规则预算在启动时一次性固化（进程内单例）
     req::init(&cfg);
     rule_engine::init_js(cfg.js_enabled, cfg.js_timeout_ms);
     image_cache::init(cfg.image_cache_limit_bytes());
 
-    // 初始化共享桶（书源/账户），缺失则自动建库并执行迁移
+    // 初始化共享桶（书源/账户），缺失则自动建库并执行迁移；
+    // 迁移前会自动做一致性备份，失败时输出可读原因并保持非 0 退出码。
     let shared = db::init_shared(&cfg).await?;
+    // 迁移已通过：清除失败标记，恢复正常启动速度。
+    db_guard::clear_startup_failure(&cfg);
     // 首次启动自动创建管理员账号（凭据来自 ADMIN_USER/ADMIN_PASS，缺省 admin/__INITIAL_ADMIN_PASS__）
     auth::bootstrap_admin(&shared).await?;
 

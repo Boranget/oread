@@ -6,10 +6,18 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::error::AppResult;
 
+fn shared_migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations/shared")
+}
+
+fn user_migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations/user")
+}
+
 /// 内存优先的 SQLite 调优：WAL + NORMAL 同步 + 8MB 页缓存 + 禁用 mmap，
 /// 并设置 5s busy_timeout（多连接池并发下避免立即 SQLITE_BUSY）。
 /// 8MB 是每个「打开着的数据库文件」的上限，配合用户池 LRU（≤8 个）仍受控。
-async fn apply_pragma(pool: &SqlitePool) -> AppResult<()> {
+async fn apply_pragma(pool: &SqlitePool) -> sqlx::Result<()> {
     sqlx::query(
         // 新库在首次建表前就切到增量回收；已有库需显式 `DB_VACUUM_CONVERT=1` 才做一次性转换。
         "PRAGMA auto_vacuum=INCREMENTAL; \
@@ -26,7 +34,7 @@ async fn apply_pragma(pool: &SqlitePool) -> AppResult<()> {
 
 /// 把已有库转成 `auto_vacuum=INCREMENTAL`。**会触发一次整库 `VACUUM` 重写**，
 /// 只允许在 `DB_VACUUM_CONVERT=1`（默认关闭）时、由启动/首次开库路径调用。
-async fn ensure_incremental(pool: &SqlitePool) -> AppResult<()> {
+async fn ensure_incremental(pool: &SqlitePool) -> sqlx::Result<()> {
     let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
         .fetch_one(pool)
         .await
@@ -55,7 +63,10 @@ pub async fn reclaim_pages(pool: &SqlitePool, pages: u32) -> AppResult<()> {
 }
 
 /// 初始化共享桶：建目录 + 建库 + 执行 shared 迁移。
-pub async fn init_shared(cfg: &Config) -> AppResult<SqlitePool> {
+///
+/// 返回 `anyhow::Result`：迁移阶段的错误由 [`crate::db_guard`] 翻译成可读说明
+/// （含版本号、备份路径与下一步），`main` 直接打印并保持非 0 退出码。
+pub async fn init_shared(cfg: &Config) -> anyhow::Result<SqlitePool> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     std::fs::create_dir_all(format!("{}/users", cfg.data_dir))?;
 
@@ -65,7 +76,8 @@ pub async fn init_shared(cfg: &Config) -> AppResult<SqlitePool> {
         .connect_with(opts)
         .await?;
     apply_pragma(&pool).await?;
-    sqlx::migrate!("./migrations/shared").run(&pool).await?;
+    crate::db_guard::migrate_bucket(cfg, &pool, &shared_migrator(), crate::db_guard::Scope::Shared)
+        .await?;
     if cfg.db_vacuum_convert {
         ensure_incremental(&pool).await?;
     }
@@ -82,7 +94,10 @@ pub async fn user_pool(cfg: &Config, uid: i64) -> AppResult<SqlitePool> {
         .connect_with(opts)
         .await?;
     apply_pragma(&pool).await?;
-    sqlx::migrate!("./migrations/user").run(&pool).await?;
+    let migrator = user_migrator();
+    crate::db_guard::migrate_bucket(cfg, &pool, &migrator, crate::db_guard::Scope::User(uid))
+        .await
+        .map_err(|f| crate::error::AppError::Internal(f.0))?;
     if cfg.db_vacuum_convert {
         ensure_incremental(&pool).await?;
     }

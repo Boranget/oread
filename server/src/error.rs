@@ -17,6 +17,8 @@ pub enum AppError {
     BadRequest(String),
     /// 前置条件不满足（如目录尚未缓存），映射 409 供调用方区分“参数错误”
     Conflict(String),
+    /// 服务端内部错误，携带排障用的可读说明（映射 500）
+    Internal(String),
     NotFound(String),
     /// 服务端超时（如书内搜索超过预算），映射 504 便于调用方区分“太慢”与“参数错误”
     Timeout(String),
@@ -87,6 +89,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             AppError::Timeout(m) => (StatusCode::GATEWAY_TIMEOUT, m),
             AppError::Sqlx(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")),
