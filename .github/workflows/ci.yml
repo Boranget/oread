@@ -62,6 +62,31 @@ jobs:
         working-directory: .
         run: node scripts/check-budget.mjs --frontend-only
 
+      # 迁移字节门禁（构建前）：索引/工作区全 LF，且工作区字节与索引 blob 完全一致。
+      # 内嵌字节（sqlx::migrate! 的 include_str!）由 tests/migrations_lf.rs 在 cargo test 中断言。
+      - name: Migrations LF gate
+        working-directory: .
+        run: |
+          set -euo pipefail
+          bad_eol=$(git ls-files --eol server/migrations | grep -c 'crlf' || true)
+          if [ "$bad_eol" -ne 0 ]; then
+            echo "::error::$bad_eol 个迁移文件在索引或工作区是 CRLF"
+            git ls-files --eol server/migrations | grep 'crlf' || true
+            exit 1
+          fi
+          for f in $(git ls-files server/migrations | grep '\.sql$'); do
+            cr=$(grep -c $'\r' "$f" || true)
+            if [ "$cr" -ne 0 ]; then
+              echo "::error::$f 有 $cr 行含 CR"
+              exit 1
+            fi
+            git show ":$f" | cmp -s - "$f" || {
+              echo "::error::$f 工作区字节与索引 blob 不一致"
+              exit 1
+            }
+          done
+          echo "migrations LF gate: PASS"
+
       - name: cargo build --release
         run: cargo build --release --locked
 
