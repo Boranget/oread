@@ -9,12 +9,15 @@
 //! 1. 在应用任何待执行迁移之前，用 `VACUUM INTO` 把 `shared.db` 与 `users/*.db`
 //!    做一致性快照（不是复制文件，WAL 中的内容也会包含在快照里）；
 //! 2. 把版本不匹配 / 权限 / 磁盘满 / 语法错误翻译成“原因 + 下一步”；
-//! 3. 写启动失败标记，让下一次启动至少等待 20s，避免 systemd 重启风暴。
+//! 3. 写启动失败标记，让下一次启动至少等待 20s，避免 systemd 重启风暴；
+//! 4. 自愈“换行血缘不一致”：同一份库被 CRLF/LF 两种构建写过时，校验和只差换行，
+//!    归一化记录后继续启动（真差异仍按原样拒绝）。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha384};
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection, SqlitePool};
@@ -397,6 +400,231 @@ async fn max_applied(pool: &SqlitePool) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// 换行血缘自愈（CRLF/LF 校验和）
+// ---------------------------------------------------------------------------
+
+/// 一次自愈扫描的结果。
+#[derive(Default, Debug)]
+struct RepairReport {
+    /// 实际被改写的迁移版本
+    normalized: Vec<i64>,
+    /// 本次是否执行了扫描（`MIGRATION_REPAIR=off` 时为 false）
+    attempted: bool,
+    /// 连“换行变体”也解释不了的真实不一致
+    remaining: Vec<i64>,
+}
+
+fn sha384(bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha384::new();
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
+}
+
+/// 把换行统一成 CRLF；已经是 `\r\n` 的不会变成 `\r\r\n`。
+fn crlf_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 16);
+    let mut prev = 0u8;
+    for &b in bytes {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
+async fn integrity_ok(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let verdict: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await?;
+    Ok(verdict == "ok")
+}
+
+fn repair_fatal(
+    cfg: &Config,
+    scope: Scope,
+    stage: &str,
+    detail: &str,
+    backup: Option<&Path>,
+) -> FatalStartup {
+    if scope.is_shared() {
+        record_startup_failure(cfg, &format!("{stage}: {detail}"));
+    }
+    let backup_line = match backup {
+        Some(p) => format!("\n  本次备份：{}", p.display()),
+        None => String::new(),
+    };
+    FatalStartup(format!(
+        "迁移记录自愈（换行归一化）失败：{stage}，启动已中止。\n\n  \
+         数据库文件：{path}{backup_line}\n  技术细节：{detail}\n\n\
+         下一步：确认磁盘空间/权限后重试，或从 data/backups 恢复升级前的快照。",
+        path = db_path_of(cfg, scope).display()
+    ))
+}
+
+/// 对已应用（`success=1`）的迁移做“仅换行差异”归一化。
+///
+/// 判定非常保守：只有当库中校验和恰好等于“当前内嵌字节转 CRLF 后”的 SHA-384 时才改写；
+/// 任何其它不一致都原样保留，交给 sqlx 报错（绝不掩盖真实内容差异）。
+async fn repair_newline_checksums(
+    cfg: &Config,
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    scope: Scope,
+    mut backup: Option<PathBuf>,
+) -> Result<(RepairReport, Option<PathBuf>), FatalStartup> {
+    let mut report = RepairReport {
+        attempted: true,
+        ..Default::default()
+    };
+    if !cfg.migration_repair {
+        report.attempted = false;
+        return Ok((report, backup));
+    }
+
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE success = 1 ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        repair_fatal(
+            cfg,
+            scope,
+            "读取迁移校验和失败",
+            &e.to_string(),
+            backup.as_deref(),
+        )
+    })?;
+
+    let mut fixes: Vec<(i64, Vec<u8>)> = Vec::new();
+    for (version, stored) in rows {
+        let Some(migration) = migrator.iter().find(|m| m.version == version) else {
+            continue; // 本程序不认识的迁移由 Newer 状态处理
+        };
+        let embedded = sha384(migration.sql.as_bytes());
+        if stored == embedded {
+            continue;
+        }
+        let crlf = sha384(&crlf_bytes(migration.sql.as_bytes()));
+        if crlf != embedded && stored == crlf {
+            fixes.push((version, embedded));
+        } else {
+            report.remaining.push(version);
+        }
+    }
+
+    if fixes.is_empty() {
+        return Ok((report, backup));
+    }
+
+    match integrity_ok(pool).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(repair_fatal(
+                cfg,
+                scope,
+                "归一化前 integrity_check 未通过",
+                "数据库可能已损坏，拒绝写入迁移记录",
+                backup.as_deref(),
+            ))
+        }
+        Err(e) => {
+            return Err(repair_fatal(
+                cfg,
+                scope,
+                "归一化前 integrity_check 执行失败",
+                &e.to_string(),
+                backup.as_deref(),
+            ))
+        }
+    }
+
+    if backup.is_none() {
+        backup = Some(backup_or_fail(cfg, scope).await?);
+    }
+    let backup_path = backup.clone();
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        repair_fatal(
+            cfg,
+            scope,
+            "开启归一化事务失败",
+            &e.to_string(),
+            backup_path.as_deref(),
+        )
+    })?;
+    for (version, checksum) in &fixes {
+        let affected = sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2 AND success = 1",
+        )
+        .bind(checksum.as_slice())
+        .bind(*version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            repair_fatal(
+                cfg,
+                scope,
+                "更新迁移校验和失败",
+                &e.to_string(),
+                backup_path.as_deref(),
+            )
+        })?
+        .rows_affected();
+        if affected != 1 {
+            return Err(repair_fatal(
+                cfg,
+                scope,
+                "更新迁移校验和失败",
+                &format!("version {version} 影响行数 {affected}（期望 1）"),
+                backup_path.as_deref(),
+            ));
+        }
+        tracing::info!(
+            version = *version,
+            "migration v{}: 仅换行差异，已归一化校验和（CRLF→LF）",
+            version
+        );
+    }
+    tx.commit().await.map_err(|e| {
+        repair_fatal(
+            cfg,
+            scope,
+            "提交归一化事务失败",
+            &e.to_string(),
+            backup_path.as_deref(),
+        )
+    })?;
+    report.normalized = fixes.iter().map(|(version, _)| *version).collect();
+
+    match integrity_ok(pool).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(repair_fatal(
+                cfg,
+                scope,
+                "归一化后 integrity_check 未通过",
+                "请从备份恢复该数据库",
+                backup_path.as_deref(),
+            ))
+        }
+        Err(e) => {
+            return Err(repair_fatal(
+                cfg,
+                scope,
+                "归一化后 integrity_check 执行失败",
+                &e.to_string(),
+                backup_path.as_deref(),
+            ))
+        }
+    }
+
+    Ok((report, backup))
+}
+
+// ---------------------------------------------------------------------------
 // 错误翻译
 // ---------------------------------------------------------------------------
 
@@ -500,20 +728,30 @@ fn explain(
     scope: Scope,
     db_version: i64,
     supported_max: i64,
+    repair: Option<&RepairReport>,
 ) -> String {
     let info = common_info(cfg, scope, db_version, supported_max);
     match err {
-        MigrateError::VersionMismatch(version) => format!(
-            "数据库迁移记录与当前程序不一致，无法安全启动。\n\n{info}\n  \
-             冲突迁移：第 {version} 条（校验和不同）\n\n\
-             说明：数据库里记录的迁移内容与当前程序内嵌的迁移文件不同——\
-             通常是数据库曾被“临时构建/改过迁移文件”的程序写入过。\n\
-             下一步：\n  \
-             1. 换回与数据库匹配的程序版本（或升级到能安全接管该库的新版本）；\n  \
-             2. 无法确定时，从备份目录恢复升级前的快照：停止服务后，把 backups/<时间戳>/{file} 覆盖回 {path}。",
-            file = db_file_name(scope),
-            path = db_path_of(cfg, scope).display()
-        ),
+        MigrateError::VersionMismatch(version) => {
+            let repair_note = match repair {
+                Some(r) if r.attempted && r.remaining.contains(version) => format!(
+                    "\n本次启动已尝试“换行归一化”（按 CRLF 变体哈希比对），但第 {version} 条的内容仍与程序内嵌文件不一致——\
+                     这不是换行问题（迁移文件可能被真正改过，或库被其它程序写过），已停止启动。"
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "数据库迁移记录与当前程序不一致，无法安全启动。\n\n{info}\n  \
+                 冲突迁移：第 {version} 条（校验和不同）\n\n\
+                 说明：数据库里记录的迁移内容与当前程序内嵌的迁移文件不同——\
+                 通常是数据库曾被“临时构建/改过迁移文件”的程序写入过。{repair_note}\n\
+                 下一步：\n  \
+                 1. 换回与数据库匹配的程序版本（或升级到能安全接管该库的新版本）；\n  \
+                 2. 无法确定时，从备份目录恢复升级前的快照：停止服务后，把 backups/<时间戳>/{file} 覆盖回 {path}。",
+                file = db_file_name(scope),
+                path = db_path_of(cfg, scope).display()
+            )
+        }
         MigrateError::VersionMissing(version) | MigrateError::VersionNotPresent(version) => {
             format!(
                 "数据库包含当前程序没有的迁移记录（第 {version} 条），无法安全启动。\n\n{info}\n\n\
@@ -608,6 +846,7 @@ pub async fn migrate_bucket(
     })?;
 
     let supported_max = migrator.iter().map(|m| m.version).max().unwrap_or(0);
+    let mut backup_dir: Option<PathBuf> = None;
 
     match &state {
         DbState::Fresh | DbState::UpToDate => {
@@ -620,7 +859,7 @@ pub async fn migrate_bucket(
                 pending = ?pending,
                 "检测到待应用迁移，先做一致性备份"
             );
-            backup_or_fail(cfg, scope).await?;
+            backup_dir = Some(backup_or_fail(cfg, scope).await?);
         }
         DbState::Newer {
             applied_max,
@@ -645,6 +884,7 @@ pub async fn migrate_bucket(
                 scope,
                 *version,
                 supported_max,
+                None,
             );
             tracing::error!(db = %db_path_of(cfg, scope).display(), %message, "数据库迁移处于 dirty 状态，拒绝启动");
             if scope.is_shared() {
@@ -654,11 +894,31 @@ pub async fn migrate_bucket(
         }
     }
 
+    // 执行迁移前先处理“仅换行差异”的校验和（CRLF/LF 血缘）。
+    // 需要写入时会先走同一套一致性备份；备份失败即中止。
+    let repair = if matches!(state, DbState::UpToDate | DbState::Pending { .. }) {
+        let (report, _) =
+            repair_newline_checksums(cfg, pool, migrator, scope, backup_dir.take()).await?;
+        report
+    } else {
+        RepairReport::default()
+    };
+
     match migrator.run(pool).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if !repair.normalized.is_empty() {
+                tracing::info!(
+                    count = repair.normalized.len(),
+                    versions = ?repair.normalized,
+                    "本次归一化 {} 条迁移记录",
+                    repair.normalized.len()
+                );
+            }
+            Ok(())
+        }
         Err(err) => {
             let db_version = max_applied(pool).await.unwrap_or(0);
-            let message = explain(&err, cfg, scope, db_version, supported_max);
+            let message = explain(&err, cfg, scope, db_version, supported_max, Some(&repair));
             tracing::error!(
                 db = %db_path_of(cfg, scope).display(),
                 %message,
@@ -693,7 +953,44 @@ mod tests {
         let mut cfg = Config::from_env();
         cfg.data_dir = dir.display().to_string();
         cfg.db_backup_keep = keep;
+        cfg.migration_repair = true;
         cfg
+    }
+
+    /// 用指定 SQL 构造迁移集（校验和按字节计算，和 sqlx 一致）。
+    fn migrator_with_sql(rows: &[(i64, &'static str)]) -> Migrator {
+        let migrations: Vec<Migration> = rows
+            .iter()
+            .map(|(version, sql)| {
+                Migration::new(
+                    *version,
+                    Cow::Borrowed("test migration"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(sql),
+                )
+            })
+            .collect();
+        Migrator {
+            migrations: Cow::Owned(migrations),
+            ignore_missing: false,
+            locking: true,
+        }
+    }
+
+    async fn stored_checksum(pool: &SqlitePool, version: i64) -> Vec<u8> {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT checksum FROM _sqlx_migrations WHERE version = ?1",
+        )
+        .bind(version)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn backup_dir_count(cfg: &Config) -> usize {
+        std::fs::read_dir(backup_root(cfg))
+            .map(|entries| entries.flatten().filter(|e| e.path().is_dir()).count())
+            .unwrap_or(0)
     }
 
     async fn open_pool(path: &Path) -> SqlitePool {
@@ -940,6 +1237,7 @@ mod tests {
             Scope::Shared,
             7,
             7,
+            None,
         );
         assert!(mismatch.contains("数据库迁移记录与当前程序不一致"));
         assert!(mismatch.contains("校验和"));
@@ -966,6 +1264,163 @@ mod tests {
         let msg = execute_message(&sqlx::Error::Protocol("synthetic".into()), &info);
         assert!(msg.contains("数据库迁移失败"));
         assert!(msg.contains("技术细节"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1) 库里是 CRLF 哈希、内嵌文件是 LF：启动成功、记录被改写、第二次启动无写入。
+    #[tokio::test]
+    async fn crlf_only_mismatch_is_normalized_once() {
+        let dir = tmp_dir("repair-crlf");
+        let cfg = test_cfg(&dir, 5);
+        let db = dir.join("shared.db");
+        let pool = open_pool(&db).await;
+
+        let sql = "CREATE TABLE t (x TEXT);\nINSERT INTO t (x) VALUES ('a');\n";
+        let m = migrator_with_sql(&[(1, sql)]);
+        let lf = sha384(sql.as_bytes());
+        let crlf = sha384(&crlf_bytes(sql.as_bytes()));
+        assert_ne!(lf, crlf, "测试前提：LF/CRLF 哈希应不同");
+        create_migrations_table(&pool, &[(1, true, crlf)]).await;
+
+        migrate_bucket(&cfg, &pool, &m, Scope::Shared)
+            .await
+            .unwrap();
+        assert_eq!(stored_checksum(&pool, 1).await, lf, "应改写成 LF 哈希");
+        assert_eq!(backup_dir_count(&cfg), 1, "归一化前应有一份快照");
+
+        // 第二次启动：不再改库、不再产生新备份。
+        let before = stored_checksum(&pool, 1).await;
+        migrate_bucket(&cfg, &pool, &m, Scope::Shared)
+            .await
+            .unwrap();
+        assert_eq!(stored_checksum(&pool, 1).await, before);
+        assert_eq!(backup_dir_count(&cfg), 1, "第二次启动不应新建备份");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2) 内容真被改（非换行）：仍然拒绝启动、错误可读、不写库。
+    #[tokio::test]
+    async fn real_content_change_is_still_rejected() {
+        let dir = tmp_dir("repair-tampered");
+        let cfg = test_cfg(&dir, 5);
+        let db = dir.join("shared.db");
+        let pool = open_pool(&db).await;
+
+        let sql = "CREATE TABLE t (x TEXT);\n";
+        let m = migrator_with_sql(&[(1, sql)]);
+        let tampered = sha384(b"CREATE TABLE t (x TEXT);\n-- tampered\n");
+        assert_ne!(tampered, sha384(&crlf_bytes(sql.as_bytes())));
+        create_migrations_table(&pool, &[(1, true, tampered.clone())]).await;
+
+        let err = migrate_bucket(&cfg, &pool, &m, Scope::Shared)
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("数据库迁移记录与当前程序不一致"),
+            "{}",
+            err.0
+        );
+        assert!(err.0.contains("已尝试“换行归一化”"), "{}", err.0);
+        assert_eq!(
+            stored_checksum(&pool, 1).await,
+            tampered,
+            "真差异不得写库"
+        );
+        assert_eq!(backup_dir_count(&cfg), 0, "真差异不应产生备份");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3) WAL 模式下归一化 + 迁移前备份的一致性。
+    #[tokio::test]
+    async fn repair_in_wal_keeps_backup_consistent() {
+        let dir = tmp_dir("repair-wal");
+        let cfg = test_cfg(&dir, 5);
+        let db = dir.join("shared.db");
+        let pool = open_pool(&db).await;
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE data (x TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let blob = "x".repeat(1024);
+        for _ in 0..30 {
+            sqlx::query("INSERT INTO data (x) VALUES (?1)")
+                .bind(&blob)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let wal_len = std::fs::metadata(db.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(wal_len > 0, "测试前提：WAL 中应有未合并数据");
+
+        let sql = "CREATE TABLE t (x TEXT);\n";
+        let m = migrator_with_sql(&[(1, sql)]);
+        let crlf = sha384(&crlf_bytes(sql.as_bytes()));
+        create_migrations_table(&pool, &[(1, true, crlf)]).await;
+
+        migrate_bucket(&cfg, &pool, &m, Scope::Shared)
+            .await
+            .unwrap();
+        assert_eq!(stored_checksum(&pool, 1).await, sha384(sql.as_bytes()));
+        assert_eq!(backup_dir_count(&cfg), 1);
+
+        let backups: Vec<PathBuf> = std::fs::read_dir(backup_root(&cfg))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect();
+        let copy = backups[0].join("shared.db");
+        let opts = SqliteConnectOptions::new().filename(&copy).read_only(true);
+        let mut conn = SqliteConnection::connect_with(&opts).await.unwrap();
+        let verdict: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM data")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(verdict, "ok");
+        assert_eq!(rows, 30, "WAL 中的数据必须进入一致性快照");
+        let _ = conn.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4) 开关 off：退回“只报错不修”。
+    #[tokio::test]
+    async fn repair_switch_off_only_errors() {
+        let dir = tmp_dir("repair-off");
+        let mut cfg = test_cfg(&dir, 5);
+        cfg.migration_repair = false;
+        let db = dir.join("shared.db");
+        let pool = open_pool(&db).await;
+
+        let sql = "CREATE TABLE t (x TEXT);\n";
+        let m = migrator_with_sql(&[(1, sql)]);
+        let crlf = sha384(&crlf_bytes(sql.as_bytes()));
+        create_migrations_table(&pool, &[(1, true, crlf.clone())]).await;
+
+        let err = migrate_bucket(&cfg, &pool, &m, Scope::Shared)
+            .await
+            .unwrap_err();
+        assert!(
+            err.0.contains("数据库迁移记录与当前程序不一致"),
+            "{}",
+            err.0
+        );
+        assert!(!err.0.contains("已尝试“换行归一化”"), "{}", err.0);
+        assert_eq!(stored_checksum(&pool, 1).await, crlf, "off 时不得写库");
+        assert_eq!(backup_dir_count(&cfg), 0);
+        pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
