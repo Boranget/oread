@@ -438,6 +438,8 @@
       author: r.author,
       coverUrl: r.cover_url,
       intro: r.intro,
+      // image / text：漫画与小说分流；缺省时 App 会再探测书源类型
+      bookType: r.type,
     });
   }
 

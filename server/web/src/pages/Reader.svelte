@@ -59,8 +59,40 @@
   let switchErr = '';
   let candidates = [];
   let tocQuery = '';
+  // 目录排序：URL 参数 toc_order 持久化（desc=倒序），本机 localStorage 作兜底
+  const TOC_ORDER_KEY = 'oread_toc_order';
+  function readTocOrder() {
+    try {
+      const q = new URLSearchParams(location.search).get('toc_order');
+      if (q === 'desc' || q === 'asc') return q;
+      return localStorage.getItem(TOC_ORDER_KEY) === 'desc' ? 'desc' : 'asc';
+    } catch {
+      return 'asc';
+    }
+  }
+  let tocOrder = readTocOrder();
+  function setTocOrder(v) {
+    tocOrder = v === 'desc' ? 'desc' : 'asc';
+    try {
+      localStorage.setItem(TOC_ORDER_KEY, tocOrder);
+    } catch {
+      /* 私密模式忽略 */
+    }
+    try {
+      const u = new URLSearchParams(location.search);
+      if (tocOrder === 'desc') u.set('toc_order', 'desc');
+      else u.delete('toc_order');
+      const qs = u.toString();
+      history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + (location.hash || ''));
+    } catch {
+      /* 无 history 环境忽略 */
+    }
+  }
   let controlsVisible = true;
   let toast = '';
+  // 正文替换规则：账号设置 use_replace_rule 控制的显式开关
+  let useReplaceRules = true;
+  let seenMarked = false;
 
   // 排版偏好：初始来自后端 user_settings，宽度/亮度/字形/速度仅存本机
   let font = 18;
@@ -266,6 +298,7 @@
       if (s.font_size) font = s.font_size;
       if (s.line_height) lineHeight = s.line_height;
       if (['light', 'dark', 'sepia'].includes(s.theme)) theme = s.theme;
+      if (typeof s.use_replace_rule === 'boolean') useReplaceRules = s.use_replace_rule;
       if (MODES.includes(s.read_mode) && s.read_mode !== readMode) {
         changeMode(s.read_mode, false);
       }
@@ -282,6 +315,22 @@
       }
     } catch {
       /* 离线：继续用本机缓存值 */
+    }
+  }
+
+  // 替换规则开关：写入账号设置，并立即按当前章内比例重载本章，让效果可见
+  async function setUseReplace(v) {
+    useReplaceRules = !!v;
+    try {
+      await api.saveSettings({ use_replace_rule: useReplaceRules });
+    } catch (e) {
+      toast = '设置保存失败：' + (e.message || '未知错误');
+      return;
+    }
+    toast = useReplaceRules ? '已开启替换规则' : '已关闭替换规则';
+    if (currentPos >= 0) {
+      const ratio = currentRatio();
+      await openChapter(currentPos, { ratio });
     }
   }
 
@@ -403,12 +452,12 @@
 
   async function fetchContent(chapterUrl, bookUrl, title) {
     try {
-      return await api.content(book.sourceId, chapterUrl, bookUrl, title);
+      return await api.content(book.sourceId, chapterUrl, bookUrl, title, useReplaceRules);
     } catch (e) {
       if (!isMissingBookUrl(e)) throw e;
       const localId = book.bookUrl || (info && info.book_url) || '';
       if (!localId || localId === bookUrl) throw e;
-      return api.content(book.sourceId, chapterUrl, localId, title);
+      return api.content(book.sourceId, chapterUrl, localId, title, useReplaceRules);
     }
   }
 
@@ -422,6 +471,11 @@
       pos = i;
     }
     if (!opts.initial) flushStats();
+    // 打开本书任一章节即视为已看到最新目录，清空书架新章节角标（每次阅读会话只发一次）
+    if (!seenMarked && book.bookUrl) {
+      seenMarked = true;
+      api.markShelfSeen(book.bookUrl).catch(() => {});
+    }
     const myReq = ++reqId;
     currentPos = pos;
     current = null;
@@ -594,8 +648,12 @@
   }
 
   // ---- 目录虚拟滚动 ----
-  $: tocItems = chapters
-    .map((c, i) => ({ c, i }))
+  // p 是"当前显示顺序"里的行号（倒序时与章节真实下标 i 不同），虚拟滚动的 top/定位都用 p
+  $: tocItems = (tocOrder === 'desc'
+    ? chapters.map((c, i) => ({ c, i })).reverse()
+    : chapters.map((c, i) => ({ c, i }))
+  )
+    .map((it, p) => ({ ...it, p }))
     .filter((it) => {
       const q = tocQuery.trim().toLowerCase();
       return !q || (it.c.title || '').toLowerCase().includes(q);
@@ -1366,6 +1424,10 @@
           {#if isPaged}<span class="dot">·</span><span>{pageIndex + 1} / {pageCount} 页</span>{/if}
         </div>
 
+        {#if current && current.replace_applied}
+          <div class="replace-hint" role="note">已应用替换规则 · 可在 Aa 设置中关闭</div>
+        {/if}
+
         {#if contentLoading && !current}
           <div class="rd-state slim"><div class="spinner"></div><p>加载正文…</p></div>
         {:else if contentError}
@@ -1425,15 +1487,21 @@
           on:input={() => (tocScroll = 0)}
         />
         <button class="rd-btn" on:click={locateCurrent}>当前章</button>
+        <button
+          class="rd-btn"
+          on:click={() => setTocOrder(tocOrder === 'desc' ? 'asc' : 'desc')}
+          aria-label="切换目录排序"
+          title="正序/倒序，URL 参数 toc_order 持久化"
+        >{tocOrder === 'desc' ? '倒序' : '正序'}</button>
       </div>
       <div class="toc-list" bind:this={tocEl} on:scroll={onTocScroll}>
         <div style={`height:${tocItems.length * ROW}px;position:relative`}>
-          {#each tocVisible as it (it.i)}
+          {#each tocVisible as it (it.p)}
             <button
               class="toc-row"
               class:active={it.i === currentPos}
               class:vol={it.c.is_volume}
-              style={`top:${it.i * ROW}px`}
+              style={`top:${it.p * ROW}px`}
               on:click={() => chooseChapter(it.i)}
             >
               <span class="toc-title">{it.c.title || '(无标题)'}</span>
@@ -1524,6 +1592,13 @@
               <button class:on={zhMode === m} on:click={() => setZh(m)}>{zhLabels[m]}</button>
             {/each}
           </div>
+        </div>
+
+        <div class="panel-row">
+          <span>替换规则</span>
+          <button class="rd-btn" class:solid={useReplaceRules} on:click={() => setUseReplace(!useReplaceRules)}>
+            {useReplaceRules ? '已开启' : '已关闭'}
+          </button>
         </div>
 
         {#if !isPaged}
@@ -1949,6 +2024,14 @@
     align-items: center;
   }
   .dot { opacity: 0.6; }
+  .replace-hint {
+    font-size: 12px;
+    color: var(--rd-muted);
+    border: 1px solid var(--rd-border, #ccc);
+    border-radius: 6px;
+    padding: 4px 8px;
+    margin: 0 0 14px;
+  }
   .rd-chapter-title {
     font-size: 1.25em;
     line-height: 1.5;

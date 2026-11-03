@@ -280,6 +280,73 @@ async function downloadTxt(bookUrl, opts = {}) {
   };
 }
 
+// 漫画单图：<img src> 带不上 Bearer，必须 fetch + Blob + objectURL。
+// 后端 /api/book/image 已做 SSRF、Referer、大小/超时限制与内存 LRU 缓存。
+async function fetchComicImage(source, url, chapterUrl = '', bookUrl = '') {
+  const path = `/book/image?${query({ source, book_url: bookUrl, url, chapter_url: chapterUrl })}`;
+  const headers = {};
+  const token = getToken();
+  if (token) headers.Authorization = 'Bearer ' + token;
+
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 30000) : null;
+  let res;
+  try {
+    res = await fetch('/api' + path, {
+      method: 'GET',
+      headers,
+      cache: 'no-store',
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw apiError('图片加载超时，请重试这张图', 0, e);
+    throw apiError('图片请求失败，请检查网络后重试这张图', 0, e);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    let data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+    }
+    if (res.status === 401) throw apiError('登录已失效，请重新登录', 401, data);
+    // 后端图片错误自带中文 message（404/非图片/超大/防盗链/WebP）
+    const msg =
+      data && typeof data === 'object' && (data.message || data.error)
+        ? String(data.message || data.error)
+        : errorText(res.status, data);
+    const err = apiError(msg, res.status, data);
+    err.code = data && typeof data === 'object' ? data.error : '';
+    throw err;
+  }
+
+  const ct = String(res.headers.get('content-type') || '');
+  if (!ct.toLowerCase().startsWith('image/')) {
+    throw apiError('源站返回的不是图片（已拦截 HTML 错误页）', 415, { content_type: ct });
+  }
+  let blob;
+  try {
+    blob = await res.blob();
+  } catch (e) {
+    throw apiError('图片只下载到一部分，请重试这张图', 0, e);
+  }
+  const h = (name) => Number(res.headers.get(name)) || 0;
+  return {
+    objectUrl: URL.createObjectURL(blob),
+    bytes: h('x-image-bytes') || blob.size,
+    cache: res.headers.get('x-image-cache') || '',
+    contentType: ct.split(';')[0],
+    width: h('x-image-width'),
+    height: h('x-image-height'),
+  };
+}
+
 // 空值不写进查询串，保持 /search?key=&page=1 这类请求干净
 function query(obj) {
   const qs = new URLSearchParams();
@@ -364,8 +431,33 @@ export const api = {
     ),
   // 正文：正常总带 book_url（书名圈定的替换规则才生效）；后端按 缓存 → 参数 → book_chapters 三级回填，
   // 拿不到才回 400 {"error":"missing_book_url"}
-  content: (source, chapterUrl, bookUrl = '', title = '') =>
-    request('GET', `/book/content?${query({ source, chapter_url: chapterUrl, book_url: bookUrl, title })}`),
+  // useReplace: true/false 显式覆盖账号的替换规则开关；null/undefined 沿用账号设置
+  content: (source, chapterUrl, bookUrl = '', title = '', useReplace = null) =>
+    request(
+      'GET',
+      `/book/content?${query({
+        source,
+        chapter_url: chapterUrl,
+        book_url: bookUrl,
+        title,
+        use_replace: useReplace === null || useReplace === undefined ? undefined : useReplace ? '1' : '0',
+      })}`
+    ),
+  // ---- 漫画 ----
+  // 轻量探测书源类型：comic=true 时进入漫画阅读器
+  comicSource: (source, bookUrl = '') =>
+    request('GET', `/comic/source?${query({ source, book_url: bookUrl })}`),
+  // 章节图片列表：chapterUrl 优先；index 为 1-based 目录序号（与 /book/toc 数组一致）
+  comicChapter: (source, bookUrl, chapterUrl = '', index) =>
+    request(
+      'GET',
+      `/comic/chapter?${query({ source, book_url: bookUrl, chapter_url: chapterUrl, index })}`,
+      undefined,
+      { timeout: 60000 }
+    ),
+  // 单图代理（Bearer + Blob），返回 objectUrl/bytes/cache(width,height)
+  comicImage: (source, url, chapterUrl = '', bookUrl = '') =>
+    fetchComicImage(source, url, chapterUrl, bookUrl),
   switchSource: (name, author = '', excludeSource = '') =>
     request('POST', '/book/switch-source', {
       name,
@@ -412,6 +504,24 @@ export const api = {
       ...(Array.isArray(bookIds) ? { book_ids: bookIds } : { book_id: bookIds }),
       group: group || '',
     }),
+  // 批量操作：action=remove/set_group/remove_group/set_update；返回逐项结果与 updated/failed
+  shelfBatch: (action, bookIds, opts = {}) =>
+    request('POST', '/bookshelf/batch', {
+      action,
+      book_ids: Array.isArray(bookIds) ? bookIds : [bookIds],
+      ...(opts.group !== undefined ? { group: opts.group || '' } : {}),
+      ...(opts.enabled !== undefined ? { enabled: !!opts.enabled } : {}),
+    }),
+  // 打开章节后清除新章节角标
+  markShelfSeen: (bookId) => request('POST', '/bookshelf/seen', { book_id: bookId }),
+  // 批量刷新目录：返回每本的 before/after/added/removed 与逐本状态
+  tocBatch: (bookUrls, source = '') =>
+    request(
+      'POST',
+      '/book/toc/batch',
+      { book_urls: Array.isArray(bookUrls) ? bookUrls : [bookUrls], ...(source ? { source } : {}) },
+      { timeout: 180000 }
+    ),
   shelfStats: () => request('GET', '/bookshelf/stats'),
   progress: (bookId) => request('GET', `/bookshelf/progress?book_id=${encodeURIComponent(bookId)}`),
   // keepalive=true 用于 pagehide / visibilitychange 时的兜底上报

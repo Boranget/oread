@@ -99,6 +99,8 @@ pub struct ContentQ {
     book_url: Option<String>,
     /// 章节标题兜底（章节记录里没有标题时）
     title: Option<String>,
+    /// 是否应用替换规则：`1`/`0` 显式覆盖用户设置；缺省沿用账号设置
+    use_replace: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct SwitchQ {
@@ -639,6 +641,8 @@ async fn toc(
     save_chapters(&db.0, &q.book_url, &chapters).await?;
     // 目录落库时同步总章节数，供进度百分比与书架完成度使用
     sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
+    // 记录目录总数变化（首次建基线不出角标）
+    crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64).await;
     // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
     let _ = backfill_word_counts(&db.0, &q.book_url).await;
     enrich_volumes(&mut chapters);
@@ -713,6 +717,14 @@ struct TocBatchOutcome {
     status: &'static str,
     chapters: usize,
     error: Option<String>,
+    /// 刷新前章节总数
+    before_total: i64,
+    /// 刷新后章节总数
+    after_total: i64,
+    /// 新增章节数（按章节 URL 比对）
+    added: i64,
+    /// 删除章节数（按章节 URL 比对）
+    removed: i64,
 }
 
 impl TocBatchOutcome {
@@ -721,6 +733,11 @@ impl TocBatchOutcome {
             "book_url": self.book_url,
             "status": self.status,
             "chapters": self.chapters,
+            "before_total": self.before_total,
+            "after_total": self.after_total,
+            "added": self.added,
+            "removed": self.removed,
+            "total_delta": self.after_total - self.before_total,
             "error": self.error,
         })
     }
@@ -754,6 +771,7 @@ async fn toc_batch(
                 status: "skipped",
                 chapters: 0,
                 error: Some("重复的 book_url".into()),
+                ..Default::default()
             });
             continue;
         }
@@ -783,9 +801,26 @@ async fn toc_batch(
                         status: "failed",
                         chapters: 0,
                         error: Some(format!("读取书籍元信息失败：{e}")),
+                        ..Default::default()
                     }
                 }
             };
+            // 书架上标记为"停用更新"的书不参与批量刷新（手动点单本目录仍可刷新）
+            let shelf_flag: Option<i64> =
+                sqlx::query_scalar("SELECT enable_update FROM bookshelf WHERE book_id = ?1")
+                    .bind(&book_url)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None);
+            if matches!(shelf_flag, Some(0)) {
+                return TocBatchOutcome {
+                    book_url,
+                    status: "skipped",
+                    chapters: 0,
+                    error: Some("已停用更新".into()),
+                    ..Default::default()
+                };
+            }
             let source_id = match source_override
                 .clone()
                 .or_else(|| meta.as_ref().and_then(|m| m.origin.clone()))
@@ -798,6 +833,7 @@ async fn toc_batch(
                         status: "skipped",
                         chapters: 0,
                         error: Some("缺少书源，且 book_meta 未记录 origin".into()),
+                        ..Default::default()
                     }
                 }
             };
@@ -809,6 +845,7 @@ async fn toc_batch(
                         status: "skipped",
                         chapters: 0,
                         error: Some(format!("书源不存在：{source_id}")),
+                        ..Default::default()
                     }
                 }
             };
@@ -827,6 +864,7 @@ async fn toc_batch(
                         status: "failed",
                         chapters: 0,
                         error: Some(format!("抓取目录失败：{e}")),
+                        ..Default::default()
                     }
                 }
             };
@@ -836,23 +874,57 @@ async fn toc_batch(
                     status: "failed",
                     chapters: 0,
                     error: Some("目录为空".into()),
+                    ..Default::default()
                 };
             }
+            // 保存前记录旧目录，用于计算新增/删除章节（总数变化之外的可核对增量）
+            let before_total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+                    .bind(&book_url)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or(0);
+            let old_urls: HashSet<String> =
+                sqlx::query_scalar("SELECT url FROM book_chapters WHERE book_url = ?1")
+                    .bind(&book_url)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
             if let Err(e) = save_chapters(&pool, &book_url, &chapters).await {
                 return TocBatchOutcome {
                     book_url,
                     status: "failed",
                     chapters: 0,
                     error: Some(format!("写入目录失败：{e}")),
+                    before_total,
+                    ..Default::default()
                 };
             }
             let _ = sync_total_chapter_num(&pool, &book_url, chapters.len() as i64).await;
             let _ = backfill_word_counts(&pool, &book_url).await;
+            let after_total = chapters.len() as i64;
+            let new_urls: HashSet<&str> = chapters.iter().map(|c| c.url.as_str()).collect();
+            let added = new_urls
+                .iter()
+                .filter(|u| !old_urls.contains(**u))
+                .count() as i64;
+            let removed = old_urls
+                .iter()
+                .filter(|u| !new_urls.contains(u.as_str()))
+                .count() as i64;
+            crate::routes::bookshelf::record_toc_delta(&pool, &book_url, after_total).await;
             TocBatchOutcome {
                 book_url,
                 status: "updated",
                 chapters: chapters.len(),
                 error: None,
+                before_total,
+                after_total,
+                added,
+                removed,
             }
         }
     }))
@@ -967,6 +1039,17 @@ async fn content(
     if c.book_url.trim().is_empty() {
         return Err(AppError::MissingBookUrl);
     }
+    // 替换规则开关：请求参数可显式覆盖，缺省沿用账号设置
+    let use_replace = match q
+        .use_replace
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0") | Some("false") | Some("off") => false,
+        Some("1") | Some("true") | Some("on") => true,
+        _ => replace::replace_rule_enabled(&db.0).await,
+    };
     if is_image {
         // 图片章节不做正文净化/图片样式注入，避免把 <img> 列表当富文本改写
         let (images, truncated) = decode_cached_images(c.images_json.as_deref());
@@ -990,6 +1073,7 @@ async fn content(
             "images": images,
             "truncated": truncated,
             "placeholder_suspected": placeholder_suspected,
+            "replace_applied": false,
             // 前端可按 priority 分批：前 3 张为 high，其余 normal
             "prefetch_hint": {"count": prefetch, "priority": "high"},
         })));
@@ -997,16 +1081,18 @@ async fn content(
     let book_name = book_name_of(&db.0, &c.book_url)
         .await
         .unwrap_or_default();
-    let (title, body) = replace::purify(
-        &db.0,
-        &book_name,
-        &q.source,
-        c.title.clone(),
-        c.content.clone(),
-    )
-    .await;
-    c.title = title;
-    c.content = body;
+    if use_replace {
+        let (title, body) = replace::purify(
+            &db.0,
+            &book_name,
+            &q.source,
+            c.title.clone(),
+            c.content.clone(),
+        )
+        .await;
+        c.title = title;
+        c.content = body;
+    }
     let style = replace::user_image_style(&db.0).await;
     if let Some(b) = c.content.take() {
         c.content = Some(replace::apply_image_style(&b, style));
@@ -1021,6 +1107,7 @@ async fn content(
         "images": [],
         "truncated": false,
         "placeholder_suspected": false,
+        "replace_applied": use_replace,
     })))
 }
 

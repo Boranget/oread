@@ -58,4 +58,12 @@ pub struct BookshelfItem {
     /// 最近一次阅读进度更新时间（无进度时为 null）
     #[sqlx(default)]
     pub last_read_at: Option<String>,
+    /// 是否参与目录更新（列表 SQL 不取，由 list 单独回填）
+    #[sqlx(default)]
+    #[serde(default)]
+    pub enable_update: bool,
+    /// 未读新章节数（来自 book_updates，0 表示无角标）
+    #[sqlx(default)]
+    #[serde(default)]
+    pub new_chapters: i64,
 }

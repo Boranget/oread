@@ -23,6 +23,27 @@
   let newGroupName = '';
   let renameDraft = {};
 
+  // ---- 多选 / 分页 ----
+  // 选中集合按 book_id 保存，翻页、切换分组/排序都不会丢；批量接口逐项返回成功/失败。
+  let selectMode = false;
+  let selectedIds = [];
+  const PAGE_SIZE = 24;
+  let page = 1;
+  let batchBusy = '';
+  let batchMsg = '';
+  let batchErr = '';
+  let batchFailures = [];
+  let moveTarget = '';
+
+  // ---- 批量刷新目录 ----
+  let tocBusy = false;
+  let tocDone = 0;
+  let tocTotal = 0;
+  let tocLive = [];
+  let tocResult = null;
+  let tocError = '';
+  const TOC_CLIENT_CONCURRENCY = 6; // 不超过后端上限 8
+
   const lastReadKey = (id) => `oread_lastread:${id}`;
 
   async function load() {
@@ -32,6 +53,8 @@
       // GET /api/bookshelf 已返回 group / chapter_index / position / last_read_at，
       // 不再逐本请求 /bookshelf/progress。
       books = (await api.bookshelf()) || [];
+      // 已不在书架的书从选中集合里剔除，避免批量操作打到不存在的书
+      selectedIds = selectedIds.filter((id) => books.some((b) => b.book_id === id));
     } catch (e) {
       error = e.message;
     } finally {
@@ -106,6 +129,193 @@
     act: activityOf(b),
     pct: readPct(b),
   }));
+
+  // 分页：选中集合与当前页码无关，翻页后仍保留
+  $: pageCount = Math.max(1, Math.ceil(shownView.length / PAGE_SIZE));
+  $: safePage = Math.min(page, pageCount);
+  $: pageView = shownView.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  $: pageIds = pageView.map((v) => v.b.book_id);
+  $: selectedOnPage = pageIds.filter((id) => selectedIds.includes(id)).length;
+
+  function isSelected(id) {
+    return selectedIds.includes(id);
+  }
+
+  function toggleSelect(id) {
+    selectedIds = isSelected(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id];
+  }
+
+  function selectPage() {
+    selectedIds = [...new Set([...selectedIds, ...pageIds])];
+  }
+
+  function invertPage() {
+    const rest = selectedIds.filter((id) => !pageIds.includes(id));
+    selectedIds = [...rest, ...pageIds.filter((id) => !selectedIds.includes(id))];
+  }
+
+  function clearSelection() {
+    selectedIds = [];
+    batchMsg = '';
+    batchErr = '';
+    batchFailures = [];
+  }
+
+  function toggleSelectMode() {
+    selectMode = !selectMode;
+    if (!selectMode) clearSelection();
+  }
+
+  function failureLines(results) {
+    return (results || [])
+      .filter((r) => !r.ok)
+      .map((r) => {
+        const book = books.find((b) => b.book_id === r.book_id);
+        return `${book ? book.title || book.book_id : r.book_id}：${r.error || '失败'}`;
+      });
+  }
+
+  function applyBatchResult(label, r) {
+    const ok = Number(r && r.updated) || 0;
+    const fail = Number(r && r.failed) || 0;
+    batchMsg = `${label}：成功 ${ok} 本` + (fail ? `，失败 ${fail} 本` : '');
+    batchFailures = failureLines(r && r.results).slice(0, 20);
+  }
+
+  async function batchRemove() {
+    const n = selectedIds.length;
+    if (!n) return;
+    if (!confirm(`从书架移除选中的 ${n} 本书？\n不会删除阅读记录与正文缓存；重复删除是幂等的。`)) return;
+    batchBusy = 'remove';
+    batchMsg = '';
+    batchErr = '';
+    batchFailures = [];
+    try {
+      const r = await api.shelfBatch('remove', selectedIds);
+      applyBatchResult(`移除 ${n} 本`, r);
+      if (!Number(r && r.failed)) selectedIds = [];
+      await load();
+    } catch (e) {
+      batchErr = `批量移除失败：${e.message}`;
+    } finally {
+      batchBusy = '';
+    }
+  }
+
+  async function batchMove() {
+    const n = selectedIds.length;
+    if (!n) return;
+    const target = moveTarget;
+    const label = target ? `移入「${target}」` : '移出分组';
+    if (!confirm(`将选中的 ${n} 本书${label}？`)) return;
+    batchBusy = 'move';
+    batchMsg = '';
+    batchErr = '';
+    batchFailures = [];
+    try {
+      const r = await api.shelfBatch(target ? 'set_group' : 'remove_group', selectedIds, { group: target });
+      applyBatchResult(`移动 ${n} 本`, r);
+      await load();
+    } catch (e) {
+      batchErr = `批量移动失败：${e.message}`;
+    } finally {
+      batchBusy = '';
+    }
+  }
+
+  async function batchUpdate(enabled) {
+    const n = selectedIds.length;
+    if (!n) return;
+    const word = enabled ? '启用' : '停用';
+    if (
+      !confirm(
+        `将选中的 ${n} 本书${word}目录更新？` +
+          (enabled ? '' : '\n停用后，批量「更新目录」会跳过这些书。')
+      )
+    )
+      return;
+    batchBusy = enabled ? 'enable' : 'disable';
+    batchMsg = '';
+    batchErr = '';
+    batchFailures = [];
+    try {
+      const r = await api.shelfBatch('set_update', selectedIds, { enabled });
+      applyBatchResult(`${word}更新 ${n} 本`, r);
+      await load();
+    } catch (e) {
+      batchErr = `批量${word}更新失败：${e.message}`;
+    } finally {
+      batchBusy = '';
+    }
+  }
+
+  // 前端按 6 个并发逐本调用 /book/toc/batch：每完成一本就更新进度，
+  // 避免一次性等待全部书籍导致长时间白屏。
+  async function batchToc() {
+    const n = selectedIds.length;
+    if (!n) return;
+    if (
+      !confirm(
+        `刷新选中的 ${n} 本书目录？\n并发 ${Math.min(TOC_CLIENT_CONCURRENCY, n)} 本，逐本显示新增/删除章节。`
+      )
+    )
+      return;
+    const targets = books.filter((b) => selectedIds.includes(b.book_id));
+    tocBusy = true;
+    tocResult = null;
+    tocError = '';
+    tocDone = 0;
+    tocTotal = targets.length;
+    tocLive = [];
+    const results = [];
+    let cursor = 0;
+    async function worker() {
+      while (true) {
+        const i = cursor++;
+        if (i >= targets.length) return;
+        const b = targets[i];
+        try {
+          const r = await api.tocBatch([b.book_id]);
+          const o = r && Array.isArray(r.results) ? r.results[0] : null;
+          results.push(
+            o
+              ? { ...o, title: b.title || b.book_id }
+              : { book_url: b.book_id, title: b.title || b.book_id, status: 'failed', error: '无返回' }
+          );
+        } catch (e) {
+          results.push({
+            book_url: b.book_id,
+            title: b.title || b.book_id,
+            status: 'failed',
+            error: e.message,
+          });
+        }
+        tocDone = results.length;
+        tocLive = results.slice();
+      }
+    }
+    try {
+      const workers = Array.from(
+        { length: Math.min(TOC_CLIENT_CONCURRENCY, targets.length) },
+        () => worker()
+      );
+      await Promise.all(workers);
+      const sum = (k) => results.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+      tocResult = {
+        results,
+        updated: results.filter((r) => r.status === 'updated').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+        skipped: results.filter((r) => r.status === 'skipped').length,
+        added: sum('added'),
+        removed: sum('removed'),
+      };
+      await load();
+    } catch (e) {
+      tocError = `批量更新目录失败：${e.message}`;
+    } finally {
+      tocBusy = false;
+    }
+  }
 
   function open(b) {
     localStorage.setItem(lastReadKey(b.book_id), String(Date.now()));
@@ -226,19 +436,30 @@
   <h2 style="margin:0">我的书架</h2>
   <div class="spacer"></div>
   <span class="muted" style="font-size:12px">{books.length} 本</span>
+  <button class="ghost" on:click={toggleSelectMode}>{selectMode ? '退出多选' : '批量管理'}</button>
   <button class="ghost" on:click={openGroups}>分组管理</button>
   <button class="ghost" on:click={load} disabled={loading}>刷新</button>
 </div>
 
 <div class="row" style="margin-bottom:6px">
-  <select bind:value={groupFilter} style="flex:1;min-width:0" aria-label="分组筛选">
+  <select
+    bind:value={groupFilter}
+    on:change={() => (page = 1)}
+    style="flex:1;min-width:0"
+    aria-label="分组筛选"
+  >
     <option value="all">全部书籍</option>
     <option value="ungrouped">未分组</option>
     {#each groupOptions as g}
       <option value={g}>{g}</option>
     {/each}
   </select>
-  <select bind:value={sortBy} style="flex:1;min-width:0" aria-label="排序方式">
+  <select
+    bind:value={sortBy}
+    on:change={() => (page = 1)}
+    style="flex:1;min-width:0"
+    aria-label="排序方式"
+  >
     <option value="default">默认（最近阅读）</option>
     <option value="progress">阅读进度</option>
     <option value="recent">最近阅读</option>
@@ -247,6 +468,75 @@
   </select>
 </div>
 <p class="muted tiny-note">分组与最近阅读时间来自书架接口；本机打开过的书记录会作为补充。</p>
+
+{#if selectMode}
+  <div class="batch-bar">
+    <div class="batch-line">
+      <strong>已选 {selectedIds.length} 本</strong>
+      <span class="muted">（本页 {selectedOnPage}/{pageView.length}，跨页保持）</span>
+      <button class="ghost mini" on:click={selectPage} disabled={!pageView.length}>全选本页</button>
+      <button class="ghost mini" on:click={invertPage} disabled={!pageView.length}>反选本页</button>
+      <button class="ghost mini" on:click={clearSelection} disabled={!selectedIds.length}>清空</button>
+    </div>
+    <div class="batch-line">
+      <button on:click={batchToc} disabled={!selectedIds.length || tocBusy || !!batchBusy}>
+        {tocBusy ? '目录刷新中…' : '更新目录'}
+      </button>
+      <button class="ghost mini" on:click={() => batchUpdate(true)} disabled={!selectedIds.length || !!batchBusy || tocBusy}>
+        启用更新
+      </button>
+      <button class="ghost mini" on:click={() => batchUpdate(false)} disabled={!selectedIds.length || !!batchBusy || tocBusy}>
+        停用更新
+      </button>
+      <select bind:value={moveTarget} aria-label="目标分组" class="batch-group">
+        <option value="">未分组</option>
+        {#each groupOptions as g}
+          <option value={g}>{g}</option>
+        {/each}
+      </select>
+      <button class="ghost mini" on:click={batchMove} disabled={!selectedIds.length || !!batchBusy || tocBusy}>移到分组</button>
+      <button class="danger mini" on:click={batchRemove} disabled={!selectedIds.length || !!batchBusy || tocBusy}>删除</button>
+    </div>
+  </div>
+{/if}
+
+{#if tocBusy || tocResult || tocError}
+  <div class="toc-progress">
+    {#if tocBusy}
+      <div class="batch-line">
+        <strong>更新目录：{tocDone}/{tocTotal}</strong>
+        <progress value={tocDone} max={tocTotal || 1}></progress>
+      </div>
+      <ul class="toc-list">
+        {#each tocLive as r}
+          <li>{r.title || r.book_url}：{r.status === 'updated' ? `目录 ${r.before_total}→${r.after_total} 章（+${r.added}/-${r.removed}）` : r.status === 'skipped' ? `跳过：${r.error || ''}` : `失败：${r.error || ''}`}</li>
+        {/each}
+      </ul>
+    {/if}
+    {#if tocError}<p class="err">{tocError}</p>{/if}
+    {#if tocResult}
+      <p class={tocResult.failed ? 'err' : 'ok-line'}>
+        目录刷新：成功 {tocResult.updated} 本，跳过 {tocResult.skipped} 本，失败 {tocResult.failed} 本；新增 {tocResult.added} 章，删除 {tocResult.removed} 章。
+      </p>
+      <ul class="toc-list">
+        {#each tocResult.results.slice(0, 20) as r}
+          <li>{r.title || r.book_url}：{r.status === 'updated' ? `${r.before_total}→${r.after_total} 章（+${r.added}/-${r.removed}）` : r.status === 'skipped' ? `跳过：${r.error || ''}` : `失败：${r.error || ''}`}</li>
+        {/each}
+      </ul>
+      {#if tocResult.results.length > 20}
+        <p class="muted tiny-note">仅显示前 20 本，共 {tocResult.results.length} 本。</p>
+      {/if}
+    {/if}
+  </div>
+{/if}
+
+{#if batchMsg}<p class="ok-line">{batchMsg}</p>{/if}
+{#if batchErr}<p class="err">{batchErr}</p>{/if}
+{#if batchFailures.length}
+  <ul class="fail-list">
+    {#each batchFailures as line}<li>{line}</li>{/each}
+  </ul>
+{/if}
 
 {#if error}<p class="err">{error}</p>{/if}
 {#if loading}<p class="loading">加载中…</p>{/if}
@@ -257,14 +547,23 @@
   <div class="empty">该分组下没有书籍。</div>
 {:else}
   <div class="grid auto">
-    {#each shownView as v (v.b.book_id)}
+    {#each pageView as v (v.b.book_id)}
       {@const b = v.b}
       <div class="card book">
+        {#if selectMode}
+          <label class="sel-lab">
+            <input type="checkbox" checked={isSelected(b.book_id)} on:change={() => toggleSelect(b.book_id)} />
+            <span>选择</span>
+          </label>
+        {/if}
         <button class="cover-btn" on:click={() => open(b)} aria-label="阅读《{b.title || b.book_id}》">
           <div class="cover-wrap">
             <span class="cover-ph" aria-hidden="true">{(b.title || '?').slice(0, 2)}</span>
             {#if b.cover}
               <img class="cover" src={b.cover} alt="" referrerpolicy="no-referrer" on:error={(e) => (e.target.style.visibility = 'hidden')} />
+            {/if}
+            {#if Number(b.new_chapters) > 0}
+              <span class="new-badge" title="有 {b.new_chapters} 章未读新章节">{Number(b.new_chapters) > 99 ? '99+' : b.new_chapters}</span>
             {/if}
           </div>
         </button>
@@ -279,6 +578,7 @@
             {/if}
           </span>
           {#if v.group}<span class="badge">{v.group}</span>{/if}
+          {#if b.enable_update === false}<span class="badge">停更</span>{/if}
         </div>
         {#if v.pct > 0}
           <div class="pg-track" aria-hidden="true"><div class="pg-fill" style={`width:${v.pct}%`}></div></div>
@@ -306,6 +606,13 @@
       </div>
     {/each}
   </div>
+  {#if pageCount > 1}
+    <div class="pager">
+      <button class="ghost mini" on:click={() => (page = Math.max(1, safePage - 1))} disabled={safePage <= 1}>上一页</button>
+      <span class="muted">第 {safePage} / {pageCount} 页 · 共 {shownView.length} 本</span>
+      <button class="ghost mini" on:click={() => (page = Math.min(pageCount, safePage + 1))} disabled={safePage >= pageCount}>下一页</button>
+    </div>
+  {/if}
 {/if}
 
 {#if showGroups}
@@ -372,6 +679,60 @@
     border-radius: 12px;
     padding: 16px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  }
+  /* 批量工具栏：全部用块级/行内块，墨水屏不依赖 flex/grid */
+  .batch-bar {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    padding: 10px 12px;
+    margin: 0 0 10px;
+  }
+  .batch-line { margin: 0 0 8px; line-height: 1.9; }
+  .batch-line:last-child { margin-bottom: 0; }
+  .batch-line > * { margin: 4px 6px 0 0; }
+  .batch-line strong { margin-right: 6px; }
+  .batch-line .mini { padding: 6px 10px; font-size: 12px; }
+  .batch-group { width: auto; min-width: 116px; display: inline-block; padding: 6px 8px; vertical-align: middle; }
+  .batch-line progress { width: 100%; height: 10px; margin-top: 6px; display: block; }
+  .toc-progress {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    padding: 10px 12px;
+    margin: 0 0 10px;
+  }
+  .toc-list, .fail-list { margin: 6px 0 0; padding-left: 20px; font-size: 12px; }
+  .toc-list li, .fail-list li { line-height: 1.5; word-break: break-word; }
+  .fail-list { color: #b3392f; }
+  .pager { margin: 14px 0 4px; text-align: center; }
+  .pager button { margin: 0 4px; }
+  .card.book { position: relative; }
+  .sel-lab {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 2;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 6px;
+    font-size: 11px;
+  }
+  .sel-lab input { width: auto; margin: 0 4px 0 0; vertical-align: middle; }
+  .sel-lab span { vertical-align: middle; }
+  .new-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    min-width: 20px;
+    padding: 2px 5px;
+    background: #b3392f;
+    color: #fff;
+    border-radius: 10px;
+    font-size: 11px;
+    line-height: 16px;
+    text-align: center;
   }
   .gm-row { padding: 10px 0; border-top: 1px solid var(--border); }
   .gm-name { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
