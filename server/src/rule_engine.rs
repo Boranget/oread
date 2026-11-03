@@ -672,17 +672,28 @@ impl AnalyzeRule {
                 }
                 return String::new();
             }
-            self.variables.borrow().get(key).cloned().unwrap_or_default()
+            if let Some(v) = self.variables.borrow().get(key).cloned() {
+                return v;
+            }
+            // `{{…}}`：Legado 对非规则内容一律交给 evalJS（`{{page*20}}`、`{{java.base64Encode(…)}}` 等），
+            // 变量已在 eval_js 作用域内绑定；JS 失败时退化为空串。
+            if caps.get(2).is_some() {
+                if let Ok(s) = self.eval_js(content, key, "") {
+                    return s;
+                }
+            }
+            String::new()
         })
         .to_string()
     }
 
     fn detect_mode(rule: &str, is_json: bool) -> Mode {
-        if rule.starts_with("@xpath:") {
+        // Legado 的 `@CSS:`/`@XPath:`/`@Json:` 前缀全部大小写不敏感。
+        if starts_with_ci(rule, "@xpath:") {
             Mode::XPath
-        } else if rule.starts_with("@json:") {
+        } else if starts_with_ci(rule, "@json:") {
             Mode::Json
-        } else if rule.starts_with("@css:") || rule.starts_with("@@") {
+        } else if starts_with_ci(rule, "@css:") || rule.starts_with("@@") {
             Mode::Css
         } else if rule.starts_with("$.") || rule.starts_with("$[") || is_json {
             Mode::Json
@@ -729,7 +740,7 @@ impl AnalyzeRule {
                         }
                     }
                 }
-                if s.starts_with("@js:") {
+                if starts_with_ci(s, "@js:") {
                     if i > last {
                         parts.push((Mode::Default, rule[last..i].to_string()));
                     }
@@ -745,12 +756,30 @@ impl AnalyzeRule {
         parts
     }
 
+    /// 大小写不敏感的前缀剥离（Legado `startsWith(..., ignoreCase = true)`）。
     fn strip_prefix<'a>(rule: &'a str, p: &str) -> &'a str {
-        rule.strip_prefix(p).unwrap_or(rule)
+        if starts_with_ci(rule, p) {
+            &rule[p.len()..]
+        } else {
+            rule
+        }
     }
 
-    /// 单值管道：对 content 应用一条规则串，逐段执行，上一步结果作为下一步输入
+    /// 单值入口：对应 Legado `getString(..., unescape = true)`。
+    /// HTML4 实体只在**最外层**反转义一次；内部递归走 `get_string_inner`，避免重复反转义。
     pub fn get_string(
+        &self,
+        content: &str,
+        rule: &str,
+        is_url: bool,
+        base_url: &str,
+    ) -> Result<String, RuleError> {
+        let raw = self.get_string_inner(content, rule, is_url, base_url)?;
+        Ok(unescape_html4(&raw))
+    }
+
+    /// 单值管道（不做 HTML 反转义）：对 content 应用一条规则串，逐段执行，上一步结果作为下一步输入
+    fn get_string_inner(
         &self,
         content: &str,
         rule: &str,
@@ -800,38 +829,63 @@ impl AnalyzeRule {
                     if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
                         val = &val[1..val.len() - 1];
                     }
-                    let res = self.get_string(content, val, is_url, base_url)?;
+                    let res = self.get_string_inner(content, val, is_url, base_url)?;
                     self.variables.borrow_mut().insert(key, res.clone());
                     return Ok(res);
                 }
             }
         }
-        // 顶层操作符（不在 <js>…</js> / @js: 段内）：|| 回退、&& 拼接、## 正则替换
+        // 顶层操作符（不在 <js>…</js> / @js: 段内）。
+        // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
+        if let Some(parts) = split_outside_js(&rule, "##") {
+            let sub = self.get_string_inner(content, parts[0].trim(), is_url, base_url)?;
+            let pattern = parts.get(1).copied().unwrap_or("");
+            if pattern.is_empty() {
+                return Ok(sub);
+            }
+            let replacement = parts.get(2).copied().unwrap_or("");
+            let replace_first = parts.len() > 3;
+            return Ok(apply_replace_regex(&sub, pattern, replacement, replace_first));
+        }
         if let Some(parts) = split_outside_js(&rule, "||") {
             for p in &parts {
-                let r = self.get_string(content, p, is_url, base_url)?;
-                if !r.is_empty() {
-                    return Ok(r);
+                let mut v = self.eval_list(content, p, base_url);
+                if !v.is_empty() {
+                    return Ok(if is_url { v.remove(0) } else { v.join("\n") });
                 }
             }
             return Ok(String::new());
         }
         if let Some(parts) = split_outside_js(&rule, "&&") {
-            let mut out = String::new();
+            // Legado 的 `&&` 是「列表合并」：多值用 `\n` 连接，而不是空串粘连。
+            let mut items: Vec<String> = Vec::new();
             for p in &parts {
-                out.push_str(&self.get_string(content, p, is_url, base_url)?);
+                items.extend(self.eval_list(content, p, base_url));
             }
-            return Ok(out);
+            if is_url && !items.is_empty() {
+                return Ok(items.remove(0));
+            }
+            return Ok(items.join("\n"));
         }
-        if let Some(parts) = split_outside_js(&rule, "##") {
-            let sub = self.get_string(content, parts[0], is_url, base_url)?;
-            if parts.len() >= 2 && !parts[1].trim().is_empty() {
-                if let Ok(re) = Regex::new(parts[1].trim()) {
-                    let repl = parts.get(2).map(|s| s.trim()).unwrap_or("");
-                    return Ok(re.replace_all(&sub, repl).to_string());
+        if let Some(parts) = split_outside_js(&rule, "%%") {
+            let lists: Vec<Vec<String>> = parts
+                .iter()
+                .map(|p| self.eval_list(content, p, base_url))
+                .collect();
+            let mut items: Vec<String> = Vec::new();
+            if let Some(first) = lists.first() {
+                for i in 0..first.len() {
+                    for l in &lists {
+                        if let Some(x) = l.get(i) {
+                            items.push(x.clone());
+                        }
+                    }
                 }
             }
-            return Ok(sub);
+            if is_url && !items.is_empty() {
+                return Ok(items.remove(0));
+            }
+            return Ok(items.join("\n"));
         }
         // 裸抽取标记：`text` / `href` / `src` 等没有选择器前缀时，表示“取当前节点”。
         // 不能当成 CSS 标签选择器（否则章节标题/链接会解析成空）。
@@ -1045,6 +1099,35 @@ impl AnalyzeRule {
         (lists, singles)
     }
 
+    /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
+    fn js_vars(&self) -> String {
+        const RESERVED: &[&str] = &[
+            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "java",
+        ];
+        let mut out = String::new();
+        for (k, v) in self.variables.borrow().iter() {
+            let mut chars = k.chars();
+            let ok_first = chars
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                .unwrap_or(false);
+            if !ok_first
+                || !k
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                || RESERVED.contains(&k.as_str())
+            {
+                continue;
+            }
+            out.push_str("var ");
+            out.push_str(k);
+            out.push('=');
+            out.push_str(&js_string_literal(v));
+            out.push_str(";\n");
+        }
+        out
+    }
+
     fn eval_js(&self, input: &str, code: &str, base_url: &str) -> Result<String, RuleError> {
         let conf = js_conf();
         if !conf.enabled {
@@ -1062,10 +1145,12 @@ impl AnalyzeRule {
         let (dom, doms) = self.dom_bridge(input, code, base_url);
         let dom_js = serde_json::to_string(&dom).unwrap_or_else(|_| "{}".into());
         let doms_js = serde_json::to_string(&doms).unwrap_or_else(|_| "{}".into());
+        let vars_js = self.js_vars();
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{lib}\n{shim}\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nif (Array.isArray(__r)) {{ try {{ return JSON.stringify(__r); }} catch(__e) {{}} }}\nreturn String(__r); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{lib}\n{shim}\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nif (Array.isArray(__r)) {{ try {{ return JSON.stringify(__r); }} catch(__e) {{}} }}\nreturn String(__r); }})()",
             r = js_string_literal(input),
             b = js_string_literal(base_url),
+            vars = vars_js,
             lib = self.js_lib,
             shim = shim,
             dom = dom_js,
@@ -1141,16 +1226,16 @@ impl AnalyzeRule {
                 }
                 input = match mode {
                     Mode::Js => self.eval_js(&input, t, "")?,
-                    _ => self.get_string(&input, t, false, "")?,
+                    _ => self.get_string_inner(&input, t, false, "")?,
                 };
             }
             return Ok(vec![input]);
         }
         let r = rule.trim_start();
-        if r.starts_with("@js:") || rule.contains("<js>") {
+        if starts_with_ci(r, "@js:") || contains_ci(r, "@js:") || rule.contains("<js>") {
             // 走与单值相同的分段管道：`CSS前缀<js>…</js>` 只把 JS 段交给求值器，
             // 不再把 `<js>` 标签和前缀一起塞进 boa（否则会在 `<js>` 处语法报错）。
-            let res = self.get_string(content, &rule, false, "")?;
+            let res = self.get_string_inner(content, &rule, false, "")?;
             // 整段 JS 常返回数组（如 java.getElements 的结果），序列化为 JSON 数组则拆成多项
             if res.starts_with('[') {
                 if let Ok(arr) = serde_json::from_str::<Vec<String>>(&res) {
@@ -1166,9 +1251,9 @@ impl AnalyzeRule {
         }
     }
 
-    /// 列表求值（保留末端抽取标记）：用于 `nextTocUrl` 等“可能返回多条 URL”的规则。
-    /// 纯 CSS（如 `.pages a@href` / `@css:option@value`）对每个匹配元素分别抽取；
-    /// JsonPath 返回数组；含 `&&`/`||`/`##`/`@js:` 的复合规则退回单值求值（最多 1 条）。
+    /// 列表求值（保留末端抽取标记）：用于 `nextTocUrl` / 漫画图片等“可能返回多条”的规则。
+    /// 与 Legado `getStringList` 对齐：`||` 取首个非空列表、`&&` 合并列表、`%%` 交错，
+    /// `##` 先解析出列表再**逐项**替换，`@js:` 结果按数组或换行拆项。
     pub fn get_string_list_all(
         &self,
         content: &str,
@@ -1180,14 +1265,85 @@ impl AnalyzeRule {
         if r.is_empty() {
             return vec![];
         }
-        let complex = r.contains("<js>")
-            || r.contains("@js:")
-            || r.contains("##")
-            || r.contains("&&")
-            || r.contains("||");
-        if complex {
-            return match self.get_string(content, r, true, base_url) {
-                Ok(s) if !s.trim().is_empty() => vec![s],
+        self.eval_list(content, r, base_url)
+    }
+
+    /// 列表层求值：先按 Legado 的优先级切分操作符，再调用单段解析。
+    fn eval_list(&self, content: &str, rule: &str, base_url: &str) -> Vec<String> {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            return vec![];
+        }
+        // `##` 在解析完成后逐项应用（`getStringList` 的语义，不是先把列表拼成字符串）
+        if let Some(parts) = split_outside_js(rule, "##") {
+            let mut list = self.eval_list(content, parts[0].trim(), base_url);
+            let pattern = parts.get(1).copied().unwrap_or("");
+            if !pattern.is_empty() {
+                let replacement = parts.get(2).copied().unwrap_or("");
+                let replace_first = parts.len() > 3;
+                list = list
+                    .into_iter()
+                    .map(|s| apply_replace_regex(&s, pattern, replacement, replace_first))
+                    .collect();
+            }
+            return list;
+        }
+        // `||`：第一个非空列表胜出
+        if let Some(parts) = split_outside_js(rule, "||") {
+            for p in &parts {
+                let v = self.eval_list(content, p, base_url);
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+            return vec![];
+        }
+        // `&&`：列表拼接
+        if let Some(parts) = split_outside_js(rule, "&&") {
+            let mut out = Vec::new();
+            for p in &parts {
+                out.extend(self.eval_list(content, p, base_url));
+            }
+            return out;
+        }
+        // `%%`：按首个列表的下标交错合并
+        if let Some(parts) = split_outside_js(rule, "%%") {
+            let lists: Vec<Vec<String>> = parts
+                .iter()
+                .map(|p| self.eval_list(content, p, base_url))
+                .collect();
+            let mut out = Vec::new();
+            if let Some(first) = lists.first() {
+                for i in 0..first.len() {
+                    for l in &lists {
+                        if let Some(x) = l.get(i) {
+                            out.push(x.clone());
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+        self.eval_segment_list(content, rule, base_url)
+    }
+
+    /// 不含 `&&`/`||`/`%%`/`##` 的单段列表求值。
+    fn eval_segment_list(&self, content: &str, rule: &str, base_url: &str) -> Vec<String> {
+        let r = rule.trim();
+        if r.is_empty() {
+            return vec![];
+        }
+        // JS 段：数组按 JSON 拆项，普通字符串按 `\n` 拆（Legado getStringList 对 String 的处理）
+        if starts_with_ci(r, "@js:") || contains_ci(r, "@js:") || r.contains("<js>") {
+            return match self.get_string_inner(content, r, false, base_url) {
+                Ok(s) if !s.is_empty() => {
+                    if s.starts_with('[') {
+                        if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
+                            return arr;
+                        }
+                    }
+                    s.split('\n').map(|x| x.to_string()).collect()
+                }
                 _ => vec![],
             };
         }
@@ -1195,48 +1351,49 @@ impl AnalyzeRule {
             Mode::Json => self
                 .json_list(content, Self::strip_prefix(r, "@json:"))
                 .unwrap_or_default(),
-            Mode::Css => {
-                let (selector, tokens) = split_css_rule(r);
-                let doc = scraper::Html::parse_document(content);
-                let mut els = select_initial(&doc, &selector);
-                let mut terminal: Option<String> = None;
-                for tok in &tokens {
-                    let tok = *tok;
-                    if tok.is_empty() {
-                        continue;
-                    }
-                    match parse_token(tok) {
-                        Token::Terminal(t) => {
-                            terminal = Some(t);
-                            break;
-                        }
-                        Token::Children => {
-                            els = els.into_iter().flat_map(child_elements).collect();
-                        }
-                        Token::Tag {
-                            name,
-                            index,
-                            indices,
-                            exclude,
-                        } => {
-                            let mut m = apply_tag(els, &build_spec(&name, index));
-                            m = filter_indices(m, &indices, exclude);
-                            els = m;
-                        }
-                    }
-                }
-                match terminal {
-                    Some(t) if t == "textNodes" => {
-                        els.iter().map(|e| text_nodes(e)).collect()
-                    }
-                    Some(t) => els.iter().map(|e| extract_token(*e, &t)).collect(),
-                    None => els.iter().map(|e| e.html()).collect(),
-                }
-            }
-            _ => match self.get_string(content, r, true, base_url) {
+            Mode::Css => self.css_extract_all(content, r),
+            _ => match self.get_string_inner(content, r, false, base_url) {
                 Ok(s) if !s.trim().is_empty() => vec![s],
                 _ => vec![],
             },
+        }
+    }
+
+    /// 纯 CSS 列表抽取：对每个匹配元素分别取末端标记（`@href` / `@text` / `@all` 等）。
+    fn css_extract_all(&self, html: &str, rule: &str) -> Vec<String> {
+        let (selector, tokens) = split_css_rule(rule);
+        let doc = scraper::Html::parse_document(html);
+        let mut els = select_initial(&doc, &selector);
+        let mut terminal: Option<String> = None;
+        for tok in &tokens {
+            let tok = *tok;
+            if tok.is_empty() {
+                continue;
+            }
+            match parse_token(tok) {
+                Token::Terminal(t) => {
+                    terminal = Some(t);
+                    break;
+                }
+                Token::Children => {
+                    els = els.into_iter().flat_map(child_elements).collect();
+                }
+                Token::Tag {
+                    name,
+                    index,
+                    indices,
+                    exclude,
+                } => {
+                    let mut m = apply_tag(els, &build_spec(&name, index));
+                    m = filter_indices(m, &indices, exclude);
+                    els = m;
+                }
+            }
+        }
+        match terminal {
+            Some(t) if t == "textNodes" => els.iter().map(|e| text_nodes(e)).collect(),
+            Some(t) => els.iter().map(|e| extract_token(*e, &t)).collect(),
+            None => els.iter().map(|e| e.html()).collect(),
         }
     }
 
@@ -1854,7 +2011,7 @@ enum Token {
     Children,
     Tag {
         name: String,
-        index: Option<usize>,
+        index: Option<i64>,
         indices: Vec<usize>,
         /// Legado 的 `!` 是“排除这些下标”，而不是倒序索引（`li!0:1` = 去掉前两个）。
         exclude: bool,
@@ -1945,7 +2102,7 @@ fn parse_token(tok: &str) -> Token {
 }
 
 /// 拼装 apply_tag 用的 spec（name 或 name.index）。
-fn build_spec(name: &str, index: Option<usize>) -> String {
+fn build_spec(name: &str, index: Option<i64>) -> String {
     match index {
         Some(i) => format!("{name}.{i}"),
         None => name.to_string(),
@@ -2005,10 +2162,7 @@ fn elements_html(html: &str, rule: &str) -> Vec<String> {
 
 /// 去掉 @css:/@CSS:/@@ 前缀，并按 '@' 切分为 (选择器, 抽取/遍历标记)。
 fn split_css_rule<'a>(rule: &'a str) -> (String, Vec<&'a str>) {
-    let rule = rule
-        .strip_prefix("@css:")
-        .or_else(|| rule.strip_prefix("@CSS:"))
-        .unwrap_or(rule)
+    let rule = strip_prefix_ci(rule, "@css:")
         .trim_start_matches("@@")
         .trim();
     let parts: Vec<&str> = rule.split('@').collect();
@@ -2040,38 +2194,99 @@ fn apply_index_expr<'a>(
     els: Vec<scraper::ElementRef<'a>>,
     expr: &str,
 ) -> Vec<scraper::ElementRef<'a>> {
-    let expr = expr.trim();
-    if let Some((a, b)) = expr.split_once(':') {
-        let start: i64 = a.trim().parse().unwrap_or(0);
-        let end: i64 = b.trim().parse().unwrap_or(0);
-        // Legado 语义：`[-1:0]` 表示倒序
-        if start < 0 && end == 0 {
-            let mut v = els;
-            v.reverse();
-            return v;
-        }
-        let n = els.len() as i64;
-        let s = if start < 0 { (n + start).max(0) } else { start.max(0) }.min(n) as usize;
-        let e = if end < 0 { (n + end).max(0) } else { end }.min(n) as usize;
-        return els.into_iter().skip(s).take(e.saturating_sub(s)).collect();
+    let len = els.len() as i64;
+    if len == 0 {
+        return els;
     }
-    let idxs: Vec<usize> = expr
-        .split(',')
-        .filter_map(|x| x.trim().parse().ok())
-        .collect();
-    els.into_iter()
-        .enumerate()
-        .filter(|(i, _)| idxs.contains(i))
-        .map(|(_, e)| e)
-        .collect()
+    let mut selected: Vec<usize> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    {
+        let mut push = |i: i64, selected: &mut Vec<usize>| {
+            if i >= 0 && i < len {
+                let u = i as usize;
+                if seen.insert(u) {
+                    selected.push(u);
+                }
+            }
+        };
+        for part in expr.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((start_s, rest)) = part.split_once(':') {
+                let (end_s, step_s) = match rest.split_once(':') {
+                    Some((e, st)) => (e, Some(st)),
+                    None => (rest, None),
+                };
+                let parse_opt = |s: &str| -> Option<i64> {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<i64>().ok()
+                    }
+                };
+                let start_x = parse_opt(start_s);
+                let end_x = parse_opt(end_s);
+                let step_x = parse_opt(step_s.unwrap_or("")).unwrap_or(1);
+                let mut start = start_x.unwrap_or(0);
+                if start < 0 {
+                    start += len;
+                }
+                let mut end = match end_x {
+                    Some(e) if e < 0 => e + len,
+                    Some(e) => e,
+                    None => len - 1,
+                };
+                // 两端都在同一侧越界：整段无效（上游直接跳过）
+                if (start < 0 && end < 0) || (start >= len && end >= len) {
+                    continue;
+                }
+                start = start.clamp(0, len - 1);
+                end = end.clamp(0, len - 1);
+                if start == end || step_x >= len {
+                    push(start, &mut selected);
+                    continue;
+                }
+                let step = if step_x > 0 {
+                    step_x
+                } else if -step_x < len {
+                    step_x + len
+                } else {
+                    1
+                };
+                if end > start {
+                    let mut i = start;
+                    while i <= end {
+                        push(i, &mut selected);
+                        i += step;
+                    }
+                } else {
+                    let mut i = start;
+                    while i >= end {
+                        push(i, &mut selected);
+                        i -= step;
+                    }
+                }
+            } else if let Ok(it) = part.parse::<i64>() {
+                let idx = if it < 0 { it + len } else { it };
+                push(idx, &mut selected);
+            }
+        }
+    }
+    selected.into_iter().map(|i| els[i]).collect()
 }
 
-/// 解析 `name` 或 `name.0` 形式的规格，返回 (名称, 可选索引)。
-fn split_name_index(s: &str) -> (String, Option<usize>) {
+/// 解析 `name` 或 `name.N`（N 可为负数）形式的规格，返回 (名称, 可选索引)。
+fn split_name_index(s: &str) -> (String, Option<i64>) {
     if let Some(dot) = s.rfind('.') {
         let (name, idxs) = s.split_at(dot);
-        if let Ok(i) = idxs[1..].parse::<usize>() {
-            return (name.to_string(), Some(i));
+        let raw = &idxs[1..];
+        if !raw.is_empty() && raw.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            if let Ok(i) = raw.parse::<i64>() {
+                return (name.to_string(), Some(i));
+            }
         }
     }
     (s.to_string(), None)
@@ -2314,10 +2529,9 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
     };
     let els = apply_jq_filters(els, &jq);
     if let Some(i) = idx {
-        if i < els.len() {
-            vec![els[i]]
-        } else {
-            vec![]
+        match resolve_index(i, els.len()) {
+            Some(k) => vec![els[k]],
+            None => vec![],
         }
     } else {
         els
@@ -2333,7 +2547,8 @@ fn child_elements<'a>(el: scraper::ElementRef<'a>) -> Vec<scraper::ElementRef<'a
 /// Legado 的 `@tag.x` 是**后代**查询（jsoup `getElementsByTag`），不是只看直接子元素；
 /// 需要直接子元素时用 `@children`。
 fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::ElementRef<'a>> {
-    let (tag, idx) = split_name_index(spec);
+    let (spec, index_expr) = split_bracket_indices(spec.trim());
+    let (tag, idx) = split_name_index(spec.trim());
     let (tag, jq) = split_jquery_filters(tag.trim());
     let css = if tag.trim().is_empty() {
         "*".to_string()
@@ -2349,11 +2564,14 @@ fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::
         matched.extend(e.select(&sel));
     }
     let matched = apply_jq_filters(matched, &jq);
+    let matched = match &index_expr {
+        Some(expr) => apply_index_expr(matched, expr),
+        None => matched,
+    };
     if let Some(i) = idx {
-        if i < matched.len() {
-            vec![matched[i]]
-        } else {
-            vec![]
+        match resolve_index(i, matched.len()) {
+            Some(k) => vec![matched[k]],
+            None => vec![],
         }
     } else {
         matched
@@ -2574,7 +2792,7 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
                     continue;
                 }
             }
-            if s.starts_with("@js:") {
+            if starts_with_ci(s, "@js:") {
                 // `@js:` 一直延伸到规则末尾：其内部的分隔符不能被当成分割点。
                 // 这里只结束扫描（尾巴留在最后一个 part 里），而不是把 `@js:` 也拆成一个 part——
                 // 否则 `##` 分支会把 `@js:...` 当成“替换正则”，把带 JS 尾段的规则静默吞掉。
@@ -2596,6 +2814,105 @@ fn split_outside_js<'a>(rule: &'a str, sep: &str) -> Option<Vec<&'a str>> {
         Some(parts)
     } else {
         None
+    }
+}
+
+/// ASCII 大小写不敏感前缀判断（Legado `startsWith(..., ignoreCase = true)`）。
+fn starts_with_ci(rule: &str, prefix: &str) -> bool {
+    rule.len() >= prefix.len()
+        && rule.as_bytes()[..prefix.len()]
+            .iter()
+            .zip(prefix.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn strip_prefix_ci<'a>(rule: &'a str, prefix: &str) -> &'a str {
+    if starts_with_ci(rule, prefix) {
+        &rule[prefix.len()..]
+    } else {
+        rule
+    }
+}
+
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_ascii_lowercase().contains(needle)
+}
+
+/// 把负下标解析为绝对下标；越界返回 None。
+fn resolve_index(i: i64, len: usize) -> Option<usize> {
+    let n = len as i64;
+    let k = if i < 0 { n + i } else { i };
+    if k >= 0 && k < n {
+        Some(k as usize)
+    } else {
+        None
+    }
+}
+
+/// `##` 替换的三种形态（Legado `AnalyzeRule.replaceRegex`）：
+/// - `##pat`：删除所有匹配（replacement 为空）；
+/// - `##pat##repl`：替换所有匹配；
+/// - `##pat##repl###`：只取第一个匹配再替换（无匹配时返回空串）。
+fn apply_replace_regex(value: &str, pattern: &str, replacement: &str, replace_first: bool) -> String {
+    let re = match Regex::new(pattern) {
+        Ok(r) => r,
+        Err(_) => return value.replace(pattern, replacement),
+    };
+    if replace_first {
+        return match re.find(value) {
+            Some(m) => re.replace_all(m.as_str(), replacement).to_string(),
+            None => String::new(),
+        };
+    }
+    re.replace_all(value, replacement).to_string()
+}
+
+/// HTML4 实体反转义（只在最终输出做一次，避免重复反转义）。
+fn unescape_html4(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        if let Some(semi) = tail.find(';') {
+            let ent = &tail[1..semi];
+            if ent.len() <= 32 {
+                if let Some(c) = decode_entity(ent) {
+                    out.push(c);
+                    rest = &tail[semi + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push('&');
+        rest = &tail[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(ent: &str) -> Option<char> {
+    match ent {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        _ => {
+            let num = ent
+                .strip_prefix("#x")
+                .or_else(|| ent.strip_prefix("#X"))
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| {
+                    ent.strip_prefix('#')
+                        .and_then(|d| d.parse::<u32>().ok())
+                });
+            num.and_then(char::from_u32)
+        }
     }
 }
 
@@ -3351,6 +3668,186 @@ nodes.filter(function (node) {
             "unexpected error: {err}"
         );
         assert!(!err.contains("PestError"), "不应暴露 PestError: {err}");
+    }
+
+    // ---- P0-7：模式前缀大小写不敏感 ----
+
+    #[test]
+    fn p0_7_mode_prefix_is_case_insensitive() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list">ABC</div>"#;
+        for rule in ["@CSS:div.list@text", "@Css:div.list@text", "@css:div.list@text"] {
+            assert_eq!(ar.get_string(html, rule, false, "").unwrap(), "ABC", "{rule}");
+        }
+        let json = r#"{"title":"T"}"#;
+        for rule in ["@Json:$.title", "@JSON:$.title", "@json:$.title"] {
+            assert_eq!(ar.get_string(json, rule, false, "").unwrap(), "T", "{rule}");
+        }
+        let xml = "<root><name>N</name></root>";
+        for rule in ["@XPath:/root/name/text()", "@XPATH:/root/name/text()"] {
+            assert_eq!(ar.get_string(xml, rule, false, "").unwrap(), "N", "{rule}");
+        }
+        assert_eq!(ar.get_string("", "@JS:1+1", false, "").unwrap(), "2");
+    }
+
+    // ---- P0-1：列表规则不再折叠为单值 ----
+
+    #[test]
+    fn p0_1_fallback_returns_full_list_not_first_value() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list"><li>A</li><li>B</li><li>C</li></div><div class="box"></div>"#;
+        let v = ar.get_string_list_all(html, ".list li@text||.box li@text", "");
+        assert_eq!(v, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn p0_1_regex_replace_applies_per_list_item() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list"><a href="/1?from=home">1</a><a href="/2?from=list">2</a><a href="/3?from=home">3</a></div>"#;
+        let v = ar.get_string_list_all(html, ".list a@href##\\?from=home", "");
+        assert_eq!(v, vec!["/1", "/2?from=list", "/3"]);
+    }
+
+    #[test]
+    fn p0_1_and_merges_lists_in_list_mode() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="a"><li>A1</li><li>A2</li><li>A3</li></div><div class="b"><li>B1</li><li>B2</li><li>B3</li></div>"#;
+        let v = ar.get_string_list_all(html, ".a li@text&&.b li@text", "");
+        assert_eq!(v, vec!["A1", "A2", "A3", "B1", "B2", "B3"]);
+    }
+
+    // ---- P0-2：`&&` 多值用 `\n` 分隔 ----
+
+    #[test]
+    fn p0_2_and_joins_values_with_newline() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="a">A</div><div class="b">B</div>"#;
+        assert_eq!(
+            ar.get_string(html, ".a@text&&.b@text", false, "").unwrap(),
+            "A\nB"
+        );
+        let json = r#"{"a":"A","b":"B"}"#;
+        assert_eq!(
+            ar.get_string(json, "$.a&&$.b", false, "").unwrap(),
+            "A\nB"
+        );
+    }
+
+    // ---- P0-3：`##` 三种形态 ----
+
+    #[test]
+    fn p0_3_regex_replace_delete_all() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="n">第12章 标题</div>"#;
+        assert_eq!(
+            ar.get_string(html, ".n@text##第(\\d+)章", false, "")
+                .unwrap()
+                .trim(),
+            "标题"
+        );
+    }
+
+    #[test]
+    fn p0_3_regex_replace_all_and_first_only() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="n">第12章 甲 第34章 乙</div>"#;
+        // 三段：全替换
+        assert_eq!(
+            ar.get_string(html, ".n@text##第(\\d+)章##第$1节", false, "")
+                .unwrap(),
+            "第12节 甲 第34节 乙"
+        );
+        // 四段（尾部 `###`）：只取第一个匹配再替换
+        assert_eq!(
+            ar.get_string(html, ".n@text##第(\\d+)章##第$1节###", false, "")
+                .unwrap(),
+            "第12节"
+        );
+    }
+
+    // ---- P0-4：负索引 ----
+
+    #[test]
+    fn p0_4_negative_index_forms() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="list"><li>A</li><li>B</li><li>C</li></div>"#;
+        assert_eq!(ar.get_string(html, "class.list@tag.li.-1@text", false, "").unwrap(), "C");
+        let pics = r#"<div class="pic"><img src="1.jpg"><img src="2.jpg"><img src="3.jpg"></div>"#;
+        assert_eq!(
+            ar.get_string(pics, "class.pic@tag.img[-1]@src", false, "")
+                .unwrap(),
+            "3.jpg"
+        );
+        assert_eq!(
+            ar.get_string_list_all(pics, "class.pic@tag.img[-2:]@src", ""),
+            vec!["2.jpg", "3.jpg"]
+        );
+    }
+
+    // ---- P0-5：HTML 实体反转义（只做一次） ----
+
+    #[test]
+    fn p0_5_html_entities_unescaped_once() {
+        let ar = AnalyzeRule::new();
+        let json = r#"{"title":"A &amp; B"}"#;
+        assert_eq!(ar.get_string(json, "$.title", false, "").unwrap(), "A & B");
+        // html5ever 已解一层，最终再解一层：`&amp;amp;` -> `&amp;` -> `&`
+        let html = r#"<a class="x" href="/s?q=1&amp;amp;p=2">link</a>"#;
+        assert_eq!(
+            ar.get_string(html, ".x@href", false, "").unwrap(),
+            "/s?q=1&p=2"
+        );
+    }
+
+    // ---- P0-6：`{{…}}` 支持 JS 表达式 ----
+
+    #[test]
+    fn p0_6_template_js_expression() {
+        let ar = AnalyzeRule::new();
+        ar.set_var("page", "2");
+        assert_eq!(
+            ar.get_string("", "https://x/list/{{page*20}}", true, "").unwrap(),
+            "https://x/list/40"
+        );
+        assert_eq!(
+            ar.get_string("", "https://x/list/{{(page-1)*20+10}}", true, "").unwrap(),
+            "https://x/list/30"
+        );
+        ar.set_var("key", "abc");
+        assert_eq!(
+            ar.get_string("", "https://x/{{java.base64Encode(key)}}", true, "").unwrap(),
+            "https://x/YWJj"
+        );
+    }
+
+    // ---- P0-8：CSS 区间包含端点 / 步长 ----
+
+    #[test]
+    fn p0_8_css_range_is_inclusive_with_step() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="pic">
+            <img src="1"><img src="2"><img src="3"><img src="4"><img src="5"><img src="6">
+        </div>"#;
+        // 闭区间：0..=2 共 3 个
+        assert_eq!(
+            ar.get_string_list_all(html, "class.pic@tag.img[0:2]@src", ""),
+            vec!["1", "2", "3"]
+        );
+        // 负区间：最后 3 个
+        assert_eq!(
+            ar.get_string_list_all(html, "class.pic@tag.img[-3:]@src", ""),
+            vec!["4", "5", "6"]
+        );
+        // 步长：0,2,4
+        assert_eq!(
+            ar.get_string_list_all(html, "class.pic@tag.img[::2]@src", ""),
+            vec!["1", "3", "5"]
+        );
+        // 倒序：[-1:0] 全部反转
+        assert_eq!(
+            ar.get_string_list_all(html, "class.pic@tag.img[-1:0]@src", ""),
+            vec!["6", "5", "4", "3", "2", "1"]
+        );
     }
 }
 
