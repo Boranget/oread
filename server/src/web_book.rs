@@ -830,6 +830,7 @@ pub async fn search_all_with_errors_budgeted(
     page: i32,
     budget: std::time::Duration,
 ) -> SearchOutcome {
+    let deadline = tokio::time::Instant::now() + budget;
     let mut tasks = Vec::new();
     for s in sources {
         if !s.enabled
@@ -840,8 +841,15 @@ pub async fn search_all_with_errors_budgeted(
             continue;
         }
         let src = s.clone();
+        let comic = crate::req::is_comic_source_type(src.book_source_type);
         let fut = async move {
-            match tokio::time::timeout(budget, search(&src, key, page)).await {
+            // 先排队拿源级并发槽（不计入单源预算），再开始计时。
+            let _slot = crate::req::acquire_search_slot(comic, deadline).await?;
+            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remain.is_zero() {
+                anyhow::bail!("全局搜索预算耗尽（排队未及执行）");
+            }
+            match tokio::time::timeout(remain.min(budget), search(&src, key, page)).await {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!(
                     "搜索超时（单源 {}s 预算）",

@@ -310,33 +310,77 @@ async fn run_search_job(
     cooldown_secs: u64,
 ) {
     let budget = crate::req::search_budget();
+    // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束（与旧版总耗时同量级）。
+    let deadline = tokio::time::Instant::now() + crate::req::search_total_budget();
+
+    enum TaskOutcome {
+        Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
+        /// 拿到槽后真实请求超时（或全局剩余时间不足被截断）
+        Timeout(String),
+        /// 排队到全局 deadline 仍未拿到并发槽
+        Skipped(String),
+    }
+
     let mut pending = futures::stream::FuturesUnordered::new();
     for src in sources {
         let s = src.clone();
         let k = key.clone();
         pending.push(async move {
+            let comic = crate::req::is_comic_source_type(s.book_source_type);
+            let queued_at = Instant::now();
+            let slot = match crate::req::acquire_search_slot(comic, deadline).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let waited = queued_at.elapsed().as_millis() as i64;
+                    return (s, TaskOutcome::Skipped(format!("{e}")), waited);
+                }
+            };
             let started = Instant::now();
-            let r = tokio::time::timeout(budget, web_book::search(&s, &k, 1)).await;
+            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remain.is_zero() {
+                drop(slot);
+                return (
+                    s,
+                    TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
+                    started.elapsed().as_millis() as i64,
+                );
+            }
+            let r = tokio::time::timeout(remain.min(budget), web_book::search(&s, &k, 1)).await;
             let latency_ms = started.elapsed().as_millis() as i64;
-            (src, r, latency_ms)
+            drop(slot);
+            let outcome = match r {
+                Ok(x) => TaskOutcome::Done(x),
+                Err(_) => {
+                    let err = if remain < budget {
+                        format!(
+                            "全局搜索预算耗尽（排队后仅剩 {}ms，未完成请求）",
+                            remain.as_millis()
+                        )
+                    } else {
+                        format!("搜索超时（单源 {}s 预算）", budget.as_secs())
+                    };
+                    TaskOutcome::Timeout(err)
+                }
+            };
+            (s, outcome, latency_ms)
         });
     }
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
     let mut outcomes: Vec<source_health::Outcome> = Vec::new();
-    while let Some((src, r, latency_ms)) = pending.next().await {
+    while let Some((src, outcome, latency_ms)) = pending.next().await {
         let mut st = job.state.lock().unwrap();
-        let outcome = match r {
-            Ok(Ok(mut books)) => {
+        match outcome {
+            TaskOutcome::Done(Ok(mut books)) => {
                 books.truncate(SEARCH_PER_SOURCE_MAX);
                 st.books.append(&mut books);
-                source_health::Outcome {
+                outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status: source_health::STATUS_OK,
                     latency_ms,
                     error: None,
-                }
+                });
             }
-            Ok(Err(e)) => {
+            TaskOutcome::Done(Err(e)) => {
                 // 站点故障（连接/超时/HTTP 非成功）才计入失败；引擎故障记 partial，不冷却。
                 let status = match source_health::classify(&e) {
                     source_health::FailureKind::Site => source_health::STATUS_FAIL,
@@ -347,31 +391,37 @@ async fn run_search_job(
                     source_name: src.book_source_name.clone(),
                     error: format!("{e}"),
                 });
-                source_health::Outcome {
+                outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status,
                     latency_ms,
                     error: Some(format!("{e}")),
-                }
+                });
             }
-            Err(_) => {
-                let err = format!("搜索超时（单源 {}s 预算）", budget.as_secs());
+            TaskOutcome::Timeout(err) => {
                 st.errors.push(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: err.clone(),
                 });
-                source_health::Outcome {
+                outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status: source_health::STATUS_FAIL,
                     latency_ms,
                     error: Some(err),
-                }
+                });
             }
-        };
+            TaskOutcome::Skipped(err) => {
+                // 源根本没被查询（排队耗尽），不能按源站故障冷却，只记录到本次 errors。
+                st.errors.push(web_book::SourceFailure {
+                    source: src.book_source_url.clone(),
+                    source_name: src.book_source_name.clone(),
+                    error: err,
+                });
+            }
+        }
         st.finished += 1;
         st.pending = st.pending.saturating_sub(1);
-        outcomes.push(outcome);
         drop(st);
     }
     if let Err(e) = source_health::record_outcomes(&pool, &outcomes, cooldown_secs).await {

@@ -61,6 +61,11 @@ const DEFAULT_CONF: HttpConf = HttpConf {
 static CONF: OnceCell<HttpConf> = OnceCell::new();
 static CLIENT: OnceCell<Client> = OnceCell::new();
 static SEM: OnceCell<Arc<Semaphore>> = OnceCell::new();
+/// 聚合搜索的“源级并发槽”：拿到槽之后才开始计单源预算，
+/// 排队时间不再吃掉 10s，避免几百个源里排后面的源全部报超时。
+static SEARCH_NOVEL: OnceCell<Arc<Semaphore>> = OnceCell::new();
+/// 漫画源专用小池（数量少、单源耗时长），保证不被小说源排队饿死。
+static SEARCH_COMIC: OnceCell<Arc<Semaphore>> = OnceCell::new();
 
 /// 由 main 在启动时调用一次；未初始化时使用默认预算（单测/工具函数场景）。
 pub fn init(cfg: &Config) {
@@ -79,6 +84,50 @@ fn conf() -> HttpConf {
 /// 单源搜索预算：聚合搜索按“一个书源”整体计时，超时只丢该源。
 pub fn search_budget() -> Duration {
     Duration::from_secs(conf().search_timeout_secs)
+}
+
+/// 一次聚合搜索的全局时长上限（含排队）：与单源预算同值，
+/// 保证排队不计入单源预算的同时，整次搜索总耗时不会比以前更差。
+pub fn search_total_budget() -> Duration {
+    search_budget()
+}
+
+/// 漫画源（type=2）判定；聚合搜索按此分配独立并发池。
+pub fn is_comic_source_type(t: i64) -> bool {
+    t == 2
+}
+
+fn novel_search_slots() -> &'static Arc<Semaphore> {
+    SEARCH_NOVEL.get_or_init(|| Arc::new(Semaphore::new(conf().concurrency)))
+}
+
+/// 漫画槽数量：并发的 1/4（至少 1 个）。默认 8 → 2 个。
+fn comic_slot_count() -> usize {
+    (conf().concurrency / 4).max(1)
+}
+
+fn comic_search_slots() -> &'static Arc<Semaphore> {
+    SEARCH_COMIC.get_or_init(|| Arc::new(Semaphore::new(comic_slot_count())))
+}
+
+/// 在全局 deadline 之前拿一个“源级”搜索槽：
+/// - 漫画源走独立小池，不排在小说源后面；
+/// - 排队时间不计入单源请求预算；
+/// - 到 deadline 仍未拿到 → 明确报“全局搜索预算耗尽”，不伪装成源超时。
+pub async fn acquire_search_slot(
+    comic: bool,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<tokio::sync::SemaphorePermit<'static>> {
+    let sem = if comic {
+        comic_search_slots()
+    } else {
+        novel_search_slots()
+    };
+    match tokio::time::timeout_at(deadline, sem.acquire()).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(_)) => Err(anyhow!("search semaphore closed")),
+        Err(_) => Err(anyhow!("全局搜索预算耗尽（排队未及执行）")),
+    }
 }
 
 impl HttpConf {
