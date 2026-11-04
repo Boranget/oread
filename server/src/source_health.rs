@@ -437,14 +437,34 @@ pub async fn record_outcomes(
     Ok(())
 }
 
+/// 纯评估：导入流程在写库前需要先拿到 tier/score 来决定三态与启用位。
+/// `prev_tier_override` 只用于“隔离区复检通过”的显式复活。
+pub fn evaluate_source(
+    row: Option<&HealthRow>,
+    rule_complete: f32,
+    network: Network,
+    prev_tier_override: Option<&str>,
+    cfg: &TierConfig,
+) -> Evaluation {
+    let owned = HealthRow::default();
+    let base = row.unwrap_or(&owned);
+    let mut input = score_input(base, rule_complete, network);
+    if let Some(t) = prev_tier_override {
+        input.prev_tier = t.to_string();
+    }
+    source_quality::evaluate(&input, cfg)
+}
+
 /// 对“没有新观测”的源做静态评估（导入时 network=skipped，不因测不到判坏）。
 /// 已隔离的源只有显式 `prev_tier_override=Some("observing")` 才会重评复活。
+/// `force_tier` 用于导入决策与评分结论冲突时以隔离决策为准。
 pub async fn record_evaluation(
     pool: &SqlitePool,
     source_url: &str,
     rule_complete: f32,
     network: Network,
     prev_tier_override: Option<&str>,
+    force_tier: Option<&str>,
     cfg: &TierConfig,
 ) -> AppResult<Evaluation> {
     let row: Option<HealthRow> = sqlx::query_as(
@@ -467,7 +487,13 @@ pub async fn record_evaluation(
     if let Some(t) = prev_tier_override {
         input.prev_tier = t.to_string();
     }
-    let eval = source_quality::evaluate(&input, cfg);
+    let mut eval = source_quality::evaluate(&input, cfg);
+    if let Some(t) = force_tier {
+        if eval.tier != t {
+            eval.tier = t.to_string();
+            eval.reasons.push(format!("forced_tier={t}"));
+        }
+    }
     apply_evaluation(&mut row, &eval, network, rule_complete, now_ms());
     sqlx::query(
         "INSERT INTO source_health \

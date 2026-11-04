@@ -15,6 +15,7 @@ use crate::models::BookSourceListItem;
 use crate::routes::AppState;
 use crate::source_health;
 use crate::source_ledger::{self, LibraryState};
+use crate::source_quality;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -560,6 +561,8 @@ pub async fn import(
     let mut kept_enabled = 0usize;
     let mut disable_suggested = 0usize;
     let mut type_suggestions = 0usize;
+    let (mut tier_preferred, mut tier_observing, mut tier_quarantined) =
+        (0usize, 0usize, 0usize);
 
     for src in &list {
         let url = src.book_source_url.clone();
@@ -584,6 +587,28 @@ pub async fn import(
         let historical = health_after.get(&url).map(|h| h.last_status.as_str());
         let engine_limited = probe_status == source_health::STATUS_PARTIAL
             || (!probed && historical == Some(source_health::STATUS_PARTIAL));
+
+        // ---- 同一条流水线：规则完整度 + 本次体检连通性 + 既有成功侧统计 → tier/score ----
+        let tier_cfg = crate::source_quality::TierConfig::from_config(&s.cfg);
+        let rule_complete = crate::source_quality::rule_completeness(src);
+        let incoming_network = if probed {
+            source_quality::Network::from_status(probe_status, true)
+        } else {
+            source_quality::Network::Skipped
+        };
+        let revive = was_quarantined && probed && probe_status != source_health::STATUS_FAIL;
+        let incoming_eval = source_health::evaluate_source(
+            health_after.get(&url),
+            rule_complete,
+            incoming_network,
+            if revive {
+                Some(source_quality::TIER_OBSERVING)
+            } else {
+                None
+            },
+            &tier_cfg,
+        );
+        let local_score = health_before.get(&url).map(|h| h.score).unwrap_or(50);
 
         let mut accepted = true;
         let mut decision = state
@@ -632,6 +657,16 @@ pub async fn import(
                 category = "update_rejected";
                 reason = Some("新版站点体检失败，本地旧版仍可用，已保留旧版".into());
             } else if local_still_usable(existing, state, health_before.get(&url))
+                && i64::from(incoming_eval.score + s.cfg.source_tier_update_margin) < local_score
+            {
+                // 质量闸门：新版本即使能跑通，评分明显低于本地旧版也不覆盖。
+                accepted = false;
+                category = "update_rejected";
+                reason = Some(format!(
+                    "新版评分 {} 低于本地 {}（差值 > 允许 {}），已保留旧版",
+                    incoming_eval.score, local_score, s.cfg.source_tier_update_margin
+                ));
+            } else if local_still_usable(existing, state, health_before.get(&url))
                 && src.last_update_time <= existing.map(|e| e.last_update_time).unwrap_or(0)
             {
                 // 上游规则变更但版本没有更晚（含时间相同）：保留本地，避免每次导入都抖动换版本。
@@ -659,6 +694,42 @@ pub async fn import(
             reason = Some("隔离区复检通过，已回到活跃库".into());
         }
 
+        // 三态落定后，评分与隔离决策必须一致：隔离由任一一方判定即可；
+        // 被拒绝覆盖的条目按“本地旧版”评估，避免用新版坏数据误杀旧版。
+        let mut final_eval = incoming_eval.clone();
+        let mut final_network = incoming_network;
+        let mut final_rule = rule_complete;
+        if !accepted {
+            let local_src = existing.unwrap_or(src);
+            final_rule = crate::source_quality::rule_completeness(local_src);
+            final_network = health_before
+                .get(&url)
+                .filter(|h| h.last_status != source_health::STATUS_NEVER)
+                .map(|h| source_quality::Network::from_status(&h.last_status, true))
+                .unwrap_or(source_quality::Network::Skipped);
+            final_eval = source_health::evaluate_source(
+                health_before.get(&url),
+                final_rule,
+                final_network,
+                None,
+                &tier_cfg,
+            );
+        }
+        if final_eval.tier == source_quality::TIER_QUARANTINED
+            && decision == source_ledger::DECISION_ACTIVE
+        {
+            decision = source_ledger::DECISION_QUARANTINED.to_string();
+            if reason.is_none() {
+                reason = Some(format!(
+                    "quality_quarantine: score={}",
+                    final_eval.score
+                ));
+            }
+        }
+        if decision == source_ledger::DECISION_QUARANTINED {
+            final_eval.tier = source_quality::TIER_QUARANTINED.to_string();
+        }
+
         if decision == source_ledger::DECISION_QUARANTINED
             && !was_quarantined
             && (category == "added" || category == "updated")
@@ -677,8 +748,13 @@ pub async fn import(
             });
         }
 
+        let mut stored = src.clone();
+        if decision == source_ledger::DECISION_QUARANTINED {
+            // 隔离源不仅要有 ledger decision，还必须 enabled=0，避免任何旧路径把它带进搜索。
+            stored.enabled = false;
+        }
         if accepted {
-            store_source(&s.shared, src).await?;
+            store_source(&s.shared, &stored).await?;
             source_ledger::upsert_state(
                 &s.shared,
                 &url,
@@ -699,6 +775,44 @@ pub async fn import(
                 source_ledger::REVIEW_UPDATE_REJECTED
             };
             source_ledger::set_review(&s.shared, &url, review, reason.as_deref(), now).await?;
+        }
+
+        if !accepted && decision == source_ledger::DECISION_QUARANTINED {
+            // 覆盖被拒但本地评分已跌破隔离线：保留旧规则，同时把旧行停用。
+            if let Some(mut local) = existing.cloned() {
+                local.enabled = false;
+                store_source(&s.shared, &local).await?;
+            }
+        }
+
+        // 每次导入都落一次质量评估（含未体检的源：network=skipped 只做静态评估）。
+        match source_health::record_evaluation(
+            &s.shared,
+            &url,
+            final_rule,
+            final_network,
+            if accepted && revive {
+                Some(source_quality::TIER_OBSERVING)
+            } else {
+                None
+            },
+            if decision == source_ledger::DECISION_QUARANTINED {
+                Some(source_quality::TIER_QUARANTINED)
+            } else {
+                None
+            },
+            &tier_cfg,
+        )
+        .await
+        {
+            Ok(e) => final_eval = e,
+            Err(e) => tracing::warn!(error = %e, source = %url, "record source quality failed"),
+        }
+
+        match final_eval.tier.as_str() {
+            source_quality::TIER_PREFERRED => tier_preferred += 1,
+            source_quality::TIER_QUARANTINED => tier_quarantined += 1,
+            _ => tier_observing += 1,
         }
 
         match category {
@@ -741,8 +855,14 @@ pub async fn import(
             probe_status: ledger_probe.into(),
             decision: decision.clone(),
             reason: Some(match &reason {
-                Some(r) => format!("{category}: {r}"),
-                None => category.to_string(),
+                Some(r) => format!(
+                    "{category}: {r} | tier={} score={}",
+                    final_eval.tier, final_eval.score
+                ),
+                None => format!(
+                    "{category} | tier={} score={}",
+                    final_eval.tier, final_eval.score
+                ),
             }),
         });
         results.push(json!({
@@ -760,6 +880,9 @@ pub async fn import(
             "decision": decision,
             "category": category,
             "reason": reason,
+            "tier": final_eval.tier,
+            "score": final_eval.score,
+            "reasons": final_eval.reasons,
             "consecutive_failures": h.map(|x| x.consecutive_failures).unwrap_or(0),
             "cooldown_until": h.and_then(|x| x.cooldown_until),
         }));
@@ -784,6 +907,9 @@ pub async fn import(
         "probe_elapsed_ms": probe_started.elapsed().as_millis() as u64,
         "probe_budget_secs": source_health::PROBE_TOTAL_BUDGET_SECS,
         "probe_skipped_same_collection": same_collection,
+        "tier_preferred": tier_preferred,
+        "tier_observing": tier_observing,
+        "tier_quarantined": tier_quarantined,
     });
     let probe_summary_str = serde_json::to_string(&probe_summary).ok();
     source_ledger::record_batch(
