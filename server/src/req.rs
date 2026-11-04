@@ -1641,36 +1641,36 @@ mod tests {
     // 每源在飞上限：Legado `concurrentRate` 取整数部分；缺省/0/非法回退默认；夹取 1–8
     #[test]
     fn concurrent_rate_parsing_clamps_and_defaults() {
-        assert_eq!(parse_source_concurrency(None, 2), 2, "无字段 → 默认");
-        assert_eq!(parse_source_concurrency(Some(""), 2), 2, "空串 → 默认");
-        assert_eq!(parse_source_concurrency(Some("0"), 2), 2, "0 → 默认");
-        assert_eq!(parse_source_concurrency(Some("abc"), 2), 2, "非法 → 默认");
-        assert_eq!(parse_source_concurrency(Some("-3"), 2), 2, "负数 → 默认");
-        assert_eq!(parse_source_concurrency(Some("1"), 2), 1);
+        assert_eq!(parse_source_concurrency(None, 8), 8, "无字段 → 默认");
+        assert_eq!(parse_source_concurrency(Some(""), 8), 8, "空串 → 默认");
+        assert_eq!(parse_source_concurrency(Some("0"), 8), 8, "0 → 默认");
+        assert_eq!(parse_source_concurrency(Some("abc"), 8), 8, "非法 → 默认");
+        assert_eq!(parse_source_concurrency(Some("-3"), 8), 8, "负数 → 默认");
+        assert_eq!(parse_source_concurrency(Some("1"), 8), 1);
         assert_eq!(
-            parse_source_concurrency(Some("3/1"), 2),
+            parse_source_concurrency(Some("3/1"), 8),
             3,
             "取斜杠前整数部分"
         );
         assert_eq!(
-            parse_source_concurrency(Some(" 2.5 "), 2),
+            parse_source_concurrency(Some(" 2.5 "), 8),
             2,
             "小数取整数部分"
         );
-        assert_eq!(parse_source_concurrency(Some("9"), 2), 8, "超过 8 夹回");
-        assert_eq!(parse_source_concurrency(Some("100/200"), 2), 8);
+        assert_eq!(parse_source_concurrency(Some("9"), 8), 8, "超过 8 夹回");
+        assert_eq!(parse_source_concurrency(Some("100/200"), 8), 8);
     }
 
-    // 字段缺失时使用全局默认 2；字段存在时按书源生效
+    // 字段缺失时使用全局默认 8；字段存在时按书源生效
     #[test]
     fn source_concurrency_reads_field_or_default() {
         let json = r#"{"book_source_url":"https://x","book_source_name":"x"}"#;
         let mut s: BookSource = serde_json::from_str(json).unwrap();
-        assert_eq!(source_concurrency(&s), 2, "缺省时默认值生效");
+        assert_eq!(source_concurrency(&s), 8, "缺省时默认值生效");
         s.concurrent_rate = Some("4/2".into());
         assert_eq!(source_concurrency(&s), 4);
         s.concurrent_rate = Some("0".into());
-        assert_eq!(source_concurrency(&s), 2, "0 回退默认");
+        assert_eq!(source_concurrency(&s), 8, "0 回退默认");
         // 原始 Legado JSON（camelCase）也应被接受
         let raw =
             r#"{"book_source_url":"https://y","book_source_name":"y","concurrentRate":"3/5"}"#;

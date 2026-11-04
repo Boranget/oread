@@ -33,7 +33,7 @@ pub struct BookSource {
     #[serde(default, deserialize_with = "string_or_bool")]
     pub enabled_cookie_jar: bool,
     /// 每源在飞请求上限的 Legado 原始字段（`concurrentRate`，形如 `"3/1"`）。
-    /// 解析规则见 `req::parse_source_concurrency`（取整数部分、夹 1–8、缺省默认 2）。
+    /// 解析规则见 `req::parse_source_concurrency`（取整数部分、夹 1–8、缺省默认 8）。
     #[serde(default, alias = "concurrentRate")]
     pub concurrent_rate: Option<String>,
     /// 单源请求超时（毫秒，oread 扩展字段）。0/负数/缺失/非法 → 回退全局

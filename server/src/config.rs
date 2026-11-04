@@ -46,9 +46,10 @@ fn resolve_all_slots(raw: Option<u64>) -> usize {
 const MAX_SEARCH_CONCURRENCY: u64 = 16;
 
 /// 每源在飞请求上限：书源未声明 `concurrentRate` 时的默认值。
-/// 2 是折中值：既能把「一个源同时占满多个全局槽」压住（封面/正文/图片并发），
-/// 又不至于让单本书的目录 + 首章串行化太久。
-pub const SOURCE_CONCURRENCY_DEFAULT: usize = 2;
+/// 默认 8 与旧行为等价（全局槽 16，单源最多占一半），避免改变既有首屏与开书耗时；
+/// 实测把默认压到 2/4 只在同源图片突发时增加排队，RSS 无显著收益，
+/// 需要按设备收紧的部署用 `BORANLIB_SOURCE_CONCURRENCY_DEFAULT` 覆盖。
+pub const SOURCE_CONCURRENCY_DEFAULT: usize = 8;
 pub const SOURCE_CONCURRENCY_MIN: usize = 1;
 pub const SOURCE_CONCURRENCY_MAX: usize = 8;
 
@@ -149,7 +150,7 @@ pub struct Config {
     /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
     pub search_all_slots: usize,
     /// 每源在飞请求上限的默认值（书源未声明 `concurrentRate` 时使用）。
-    /// 范围 1–8，默认 2；`SOURCE_CONCURRENCY_DEFAULT` 可覆盖。
+    /// 范围 1–8，默认 8；`SOURCE_CONCURRENCY_DEFAULT` 可覆盖。
     pub source_concurrency_default: usize,
     /// 单响应体大小上限（字节）
     pub http_max_body_bytes: usize,
@@ -490,11 +491,11 @@ mod tests {
         assert_eq!(resolve_all_slots(Some(0)), 1);
     }
 
-    // 每源在飞上限默认值：缺省/0 → 2；1..8 原样；>8 夹到 8
+    // 每源在飞上限默认值：缺省/0 → 8；1..8 原样；>8 夹到 8
     #[test]
     fn source_concurrency_default_is_resolved_and_clamped() {
-        assert_eq!(resolve_source_concurrency_default(None), 2);
-        assert_eq!(resolve_source_concurrency_default(Some(0)), 2, "0 回退默认");
+        assert_eq!(resolve_source_concurrency_default(None), 8);
+        assert_eq!(resolve_source_concurrency_default(Some(0)), 8, "0 回退默认");
         assert_eq!(resolve_source_concurrency_default(Some(1)), 1);
         assert_eq!(resolve_source_concurrency_default(Some(2)), 2);
         assert_eq!(resolve_source_concurrency_default(Some(8)), 8);
