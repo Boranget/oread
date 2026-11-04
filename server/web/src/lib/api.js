@@ -402,13 +402,11 @@ export const api = {
     request('POST', '/sources/bench/corpus/toggle', { id, enabled: !!enabled }),
   deleteBenchCorpus: (id) =>
     request('DELETE', `/sources/bench/corpus?id=${encodeURIComponent(id)}`),
+  // 体检改为异步：POST 立即返回 {run_id}，用 benchRunStatus 轮询进度
   runBench: (sourceIds = 'all', limit = 5) =>
-    request(
-      'POST',
-      '/sources/bench/run',
-      { source_ids: sourceIds, limit },
-      { timeout: 120000 }
-    ),
+    request('POST', '/sources/bench/run', { source_ids: sourceIds, limit }),
+  benchRunStatus: (runId) =>
+    request('GET', `/sources/bench/run/${encodeURIComponent(runId)}`),
   curatedSources: () => request('GET', '/sources/bench/curated'),
 
   // ---- discovery / reading ----

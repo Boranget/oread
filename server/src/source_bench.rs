@@ -9,7 +9,8 @@
 //! - `curated` 只是 `preferred` 的子集标记，不新增 tier；断层截断数量夹在 8..14。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -841,6 +842,127 @@ pub struct BenchReport {
     pub excluded_from_score: i64,
 }
 
+/// 异步体检进度：源总数 / 已完成源数（按源完成即 +1，不等整批结束）。
+#[derive(Debug, Default)]
+pub struct BenchProgress {
+    total: AtomicUsize,
+    done: AtomicUsize,
+}
+
+/// `GET /bench/run/{id}` 返回的任务视图。
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchJobView {
+    pub run_id: String,
+    pub status: String,
+    pub batch_id: Option<String>,
+    pub sources_total: usize,
+    pub sources_done: usize,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub elapsed_ms: Option<i64>,
+    pub curated_total: Option<usize>,
+    pub novel_total: Option<usize>,
+    pub comic_total: Option<usize>,
+    pub error: Option<String>,
+}
+
+struct BenchJobEntry {
+    status: String,
+    batch_id: Option<String>,
+    progress: Arc<BenchProgress>,
+    started_at: i64,
+    finished_at: Option<i64>,
+    curated_total: Option<usize>,
+    novel_total: Option<usize>,
+    comic_total: Option<usize>,
+    error: Option<String>,
+}
+
+static BENCH_JOBS: OnceLock<Mutex<HashMap<String, BenchJobEntry>>> = OnceLock::new();
+
+fn bench_jobs() -> &'static Mutex<HashMap<String, BenchJobEntry>> {
+    BENCH_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 启动一次后台体检，立即返回 run_id；进度用 `bench_job_view` 查询。
+pub fn start_bench_job(
+    pool: SqlitePool,
+    cfg: Config,
+    source_ids: Option<Vec<String>>,
+    limit: Option<usize>,
+) -> AppResult<String> {
+    if !try_begin_bench() {
+        return Err(AppError::BadRequest("已有体检任务在运行，请稍后查询结果".into()));
+    }
+    let started_at = now_ms();
+    let run_id = format!("br-{}-{}", started_at, next_seq());
+    let progress = Arc::new(BenchProgress::default());
+    bench_jobs()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            run_id.clone(),
+            BenchJobEntry {
+                status: "running".into(),
+                batch_id: None,
+                progress: progress.clone(),
+                started_at,
+                finished_at: None,
+                curated_total: None,
+                novel_total: None,
+                comic_total: None,
+                error: None,
+            },
+        );
+
+    let job_id = run_id.clone();
+    tokio::spawn(async move {
+        let result = run_bench(&pool, &cfg, source_ids, limit, Some(progress)).await;
+        let finished_at = now_ms();
+        let mut jobs = bench_jobs().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = jobs.get_mut(&job_id) {
+            entry.finished_at = Some(finished_at);
+            match result {
+                Ok(report) => {
+                    entry.status = "completed".into();
+                    entry.batch_id = Some(report.batch_id);
+                    entry.novel_total = Some(report.novel_curated.len());
+                    entry.comic_total = Some(report.comic_curated.len());
+                    entry.curated_total =
+                        Some(report.novel_curated.len() + report.comic_curated.len());
+                }
+                Err(e) => {
+                    entry.status = "failed".into();
+                    entry.error = Some(e.to_string());
+                }
+            }
+        }
+        end_bench();
+    });
+    Ok(run_id)
+}
+
+/// 查询异步体检任务；未知 run_id 返回 None。
+pub fn bench_job_view(run_id: &str) -> Option<BenchJobView> {
+    let jobs = bench_jobs().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = jobs.get(run_id)?;
+    let finished_at = entry.finished_at;
+    Some(BenchJobView {
+        run_id: run_id.to_string(),
+        status: entry.status.clone(),
+        batch_id: entry.batch_id.clone(),
+        sources_total: entry.progress.total.load(Ordering::SeqCst),
+        sources_done: entry.progress.done.load(Ordering::SeqCst),
+        started_at: entry.started_at,
+        finished_at,
+        elapsed_ms: finished_at.map(|t| t - entry.started_at),
+        curated_total: entry.curated_total,
+        novel_total: entry.novel_total,
+        comic_total: entry.comic_total,
+        error: entry.error.clone(),
+    })
+}
+
 struct RawSample {
     corpus_key: String,
     title: String,
@@ -1188,6 +1310,7 @@ pub async fn run_bench(
     cfg: &Config,
     source_ids: Option<Vec<String>>,
     limit: Option<usize>,
+    progress: Option<Arc<BenchProgress>>,
 ) -> AppResult<BenchReport> {
     let started_at = now_ms();
     let started = Instant::now();
@@ -1243,9 +1366,13 @@ pub async fn run_bench(
 
     // 每个源内部顺序执行 N 条；源之间用 buffer_unordered 限制在 BENCH_CONCURRENCY。
     // 真正的 HTTP 并发仍由 req 的全局信号量（HTTP_CONCURRENCY）兜底。
+    if let Some(p) = &progress {
+        p.total.store(sources.len(), Ordering::SeqCst);
+    }
     let mut tasks = futures::stream::iter(sources.into_iter().enumerate().map(|(idx, src)| {
         let novel = novel_corpus.clone();
         let comic = comic_corpus.clone();
+        let task_progress = progress.clone();
         async move {
             let pool_corpus = if src.book_source_type == TYPE_COMIC { comic } else { novel };
             let picked = pick_samples(&pool_corpus, src.book_source_type, samples_per_source, batch_seq as usize + idx);
@@ -1256,6 +1383,9 @@ pub async fn run_bench(
                 }
                 let sample = run_one_sample(&src, &item, deadline).await;
                 out.push((src.book_source_url.clone(), src.book_source_type, sample));
+            }
+            if let Some(p) = &task_progress {
+                p.done.fetch_add(1, Ordering::SeqCst);
             }
             out
         }
@@ -1572,7 +1702,7 @@ pub fn maybe_schedule_stale_bench(pool: SqlitePool, cfg: &Config) {
             return;
         }
         tracing::info!(target: "search_job", interval_hours = interval, "source bench stale; running in background");
-        let result = run_bench(&pool, &Config::from_env(), None, None).await;
+        let result = run_bench(&pool, &Config::from_env(), None, None, None).await;
         end_bench();
         if let Err(e) = result {
             tracing::warn!(error = %e, "scheduled source bench failed");

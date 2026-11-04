@@ -237,6 +237,52 @@
   const corpusCategories = ['玄幻', '都市', '历史', '科幻', '出版', '漫画', '其他'];
   let newCorpus = { title: '', expectedAuthor: '', category: '玄幻', type: 0 };
 
+  // 体检是异步任务：POST 返回 run_id，前端每 1.5s 轮询进度
+  let benchRunning = false;
+  let benchJob = null;
+  let benchError = '';
+
+  async function runBenchNow() {
+    if (benchRunning) return;
+    benchRunning = true;
+    benchError = '';
+    benchJob = null;
+    try {
+      const r = await api.runBench('all', 5);
+      await pollBench(r.run_id);
+    } catch (e) {
+      benchError = e.message || String(e);
+      benchRunning = false;
+    }
+  }
+
+  async function pollBench(runId) {
+    try {
+      for (;;) {
+        const v = await api.benchRunStatus(runId);
+        benchJob = v;
+        if (v.status === 'completed' || v.status === 'failed') break;
+        await new Promise((res) => setTimeout(res, 1500));
+      }
+      if (benchJob.status === 'failed') {
+        benchError = benchJob.error || '体检失败';
+      } else {
+        await load();
+      }
+    } finally {
+      benchRunning = false;
+    }
+  }
+
+  function benchStatusText() {
+    if (!benchJob) return '';
+    if (benchJob.status === 'running')
+      return `体检中：已跑 ${benchJob.sources_done}/${benchJob.sources_total} 个源…`;
+    if (benchJob.status === 'failed') return '体检失败';
+    const secs = ((benchJob.elapsed_ms || 0) / 1000).toFixed(1);
+    return `完成：精选 ${benchJob.curated_total}（小说 ${benchJob.novel_total} / 漫画 ${benchJob.comic_total}），用时 ${secs}s`;
+  }
+
   async function loadCorpus() {
     corpusLoading = true;
     corpusError = '';
@@ -622,6 +668,16 @@
     {#if corpusNotice}<p class="ok-line">{corpusNotice}</p>{/if}
 
     {#if isAdmin}
+      <div class="bench-run">
+        <button class="ghost" on:click={runBenchNow} disabled={benchRunning}>
+          {benchRunning ? '体检中…' : '跑一次体检'}
+        </button>
+        {#if benchJob}<span class="muted">{benchStatusText()}</span>{/if}
+        {#if benchError}<span class="err">{benchError}</span>{/if}
+      </div>
+    {/if}
+
+    {#if isAdmin}
       <div class="bench-add">
         <input placeholder="书名（必填）" bind:value={newCorpus.title} />
         <input placeholder="作者（可空）" bind:value={newCorpus.expectedAuthor} />
@@ -934,6 +990,14 @@
   .bench-box > summary {
     cursor: pointer;
     font-size: 13px;
+  }
+  .bench-run {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 4px 0 10px;
+    font-size: 12px;
   }
   .bench-add {
     display: flex;

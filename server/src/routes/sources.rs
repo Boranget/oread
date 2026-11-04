@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -42,6 +42,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sources/bench/corpus/update", post(bench_corpus_update))
         .route("/api/sources/bench/corpus/toggle", post(bench_corpus_toggle))
         .route("/api/sources/bench/run", post(bench_run))
+        .route("/api/sources/bench/run/:id", get(bench_run_status))
         .route("/api/sources/bench/curated", get(bench_curated))
 }
 
@@ -1842,7 +1843,8 @@ pub struct BenchRunReq {
     pub limit: Option<usize>,
 }
 
-/// `POST /api/sources/bench/run`：跑一次体检，返回每源命中/延迟/错误与精选清单。
+/// `POST /api/sources/bench/run`：启动一次后台体检，立即返回 `{run_id}`。
+/// 进度用 `GET /api/sources/bench/run/{id}` 轮询（status / sources_done / finished_at）。
 pub async fn bench_run(
     State(s): State<AppState>,
     u: AuthUser,
@@ -1871,8 +1873,20 @@ pub async fn bench_run(
         }
         _ => return Err(AppError::BadRequest("source_ids 必须是字符串数组或 \"all\"".into())),
     };
-    let report = crate::source_bench::run_bench(&s.shared, &s.cfg, ids, req.limit).await?;
-    Ok(Json(serde_json::to_value(report).unwrap_or(Value::Null)))
+    let run_id =
+        crate::source_bench::start_bench_job(s.shared.clone(), s.cfg.clone(), ids, req.limit)?;
+    Ok(Json(json!({ "run_id": run_id, "status": "running" })))
+}
+
+/// `GET /api/sources/bench/run/{id}`：异步体检任务状态。
+pub async fn bench_run_status(
+    _s: State<AppState>,
+    _u: AuthUser,
+    Path(run_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let view = crate::source_bench::bench_job_view(&run_id)
+        .ok_or_else(|| AppError::NotFound("bench run not found".into()))?;
+    Ok(Json(serde_json::to_value(view).unwrap_or(Value::Null)))
 }
 
 /// `GET /api/sources/bench/curated`：当前精选清单（小说 / 漫画两套）。
