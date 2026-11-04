@@ -326,11 +326,29 @@ jobs:
 
             校验：`sha256sum -c SHA256SUMS.txt`
 
-            ## 升级说明（重要）
+            ## 搜索
 
-            1. 旧库首次启动会做一次迁移校验和归一化（仅当差异只有换行、即 CRLF↔LF，且记录 `success=1`）：
-               **会先备份**（`VACUUM INTO`），备份路径写在启动日志里，失败可从 `data/backups` 恢复。
-            2. `v0.3.1` 的 Windows 包与已撤回的 `v0.3.2` 均不可用，请直接使用本版。
-            3. 若归一化后仍报 `VersionMismatch`，说明迁移内容真的不一致，需要人工处理（不会被自动掩盖）。
+            - 聚合搜索引入**源级并发槽 + 全局 deadline**：等槽位的时间不再吃掉单源预算，慢源不会再拖垮整轮聚合。
+            - `enabled` 以数据库列为准，停用的源不再进入聚合搜索（修复"停用源仍被搜"）。
 
-            归一化可用 `BORANLIB_MIGRATION_REPAIR=off` 关闭（关闭后只报错、不修改任何记录）。
+            ## 规则引擎
+
+            - 多行规则**逐行求值**：修复快看/爱看等站点 `book_url` 被拼成整段 JSON 的问题。
+            - `searchUrl` 支持 `{{encodeURIComponent(key)}}`、`{{page*N}}` 模板。
+            - CSS/文本取值语义对齐上游：单值规则合并多结果、`<tr>` 片段保留表格上下文、多值按行合并、`class` 首段、尾部 `.N` 下标、`@text` 块间空格等（F1/F2/F6）。
+
+            ## 图像
+
+            - 墨水屏转码默认 **1200 宽 / q70**；JPEG 源在墨水屏模式下也走灰度重编码。
+            - 新增 **8 MP 解码像素上限**（`MAX_TRANSCODE_PIXELS`），源图超限直接拒绝，防解压炸弹。
+            - `BORANLIB_EINK_JPEG_WIDTH` / `BORANLIB_EINK_ADAPTIVE` / `BORANLIB_EINK_USM` 见 `docs/BUILD.md` 环境变量表。
+
+            ## 迁移
+
+            - 沿用 v0.3.3 的 CRLF→LF 校验和归一化：旧库首次启动会**先备份**（`VACUUM INTO`，路径在启动日志里）再做一次归一化，仅当差异只有换行且记录 `success=1`；内容真不一致仍拒绝启动。
+            - 可用 `BORANLIB_MIGRATION_REPAIR=off` 关闭（只报错、不改库）。
+
+            ## 已知问题
+
+            - `@put/@get`、JS `cache`、`java.base64Decode` 尚未实现，部分漫画源的取图规则仍会失败。
+            - 设备侧外网较慢时，仍可能出现较多单源超时（并发槽降低了相互影响，但不消除源站本身慢）。
