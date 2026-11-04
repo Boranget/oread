@@ -1403,11 +1403,7 @@ async fn search_all_budgeted_scoped(
     let deadline = tokio::time::Instant::now() + total;
     let mut tasks = Vec::new();
     for s in sources {
-        if !s.enabled
-            || !crate::entities::is_supported_source_type(s.book_source_type)
-            || s.rule_search.is_none()
-            || s.search_url.is_none()
-        {
+        if !crate::entities::is_searchable_source(s) {
             continue;
         }
         let src = s.clone();

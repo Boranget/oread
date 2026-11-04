@@ -568,6 +568,41 @@ pub fn visible_in_search(row: Option<&HealthRow>) -> bool {
     .unwrap_or(true)
 }
 
+/// 探测失败是否属于“明确站点级拒绝”（HTTP 4xx/5xx）。
+/// 导入期只有这类失败参与阻断性判定；超时/连接失败属于“未知”，不能据此把源判死。
+pub fn is_explicit_site_rejection(error: Option<&str>) -> bool {
+    error
+        .map(|e| e.trim_start().to_ascii_lowercase().starts_with("http status "))
+        .unwrap_or(false)
+}
+
+/// 导入期探测的“未知失败”修正：保留 `record_outcomes` 已写入的健康事件与失败计数，
+/// 但在未达到既有硬阈值（连续/站点失败 3 次）前把 tier 拉回 observing，
+/// 让新导入的源保持可搜索，下一次真实搜索/体检再按既有评分、冷却、隔离规则判定。
+pub async fn keep_observing_after_transient_probe(
+    pool: &SqlitePool,
+    source_urls: &[String],
+) -> AppResult<()> {
+    if source_urls.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for url in source_urls {
+        sqlx::query(
+            "UPDATE source_health SET tier = ?1, demote_streak = 0 \
+             WHERE source_url = ?2 \
+               AND consecutive_failures < ?3 AND fail_site_count < ?3",
+        )
+        .bind(source_quality::TIER_OBSERVING)
+        .bind(url)
+        .bind(FAIL_THRESHOLD)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// 该源当前是否 preferred（用于两批调度的第一批）。
 pub fn is_preferred(row: Option<&HealthRow>) -> bool {
     row.map(|h| h.tier.as_str() == source_quality::TIER_PREFERRED)
@@ -1011,5 +1046,113 @@ mod tests {
         assert_eq!(cut.chars().count(), MAX_ERROR_CHARS + 1);
         assert!(cut.ends_with('…'));
         assert_eq!(truncate_error("短"), "短");
+    }
+
+    #[test]
+    fn explicit_site_rejection_only_matches_http_status() {
+        assert!(is_explicit_site_rejection(Some("http status 403 Forbidden")));
+        assert!(is_explicit_site_rejection(Some("HTTP status 503 Service Unavailable")));
+        assert!(!is_explicit_site_rejection(Some(
+            "搜索超时（单源 10s 预算）"
+        )));
+        assert!(!is_explicit_site_rejection(Some(
+            "error sending request for url (https://x.example): connection timed out"
+        )));
+        assert!(!is_explicit_site_rejection(None));
+    }
+
+    #[tokio::test]
+    async fn import_transient_timeout_keeps_source_visible() {
+        let pool = test_pool().await;
+        record_outcomes(
+            &pool,
+            &[Outcome {
+                source_url: "https://slow.example".into(),
+                status: STATUS_FAIL,
+                latency_ms: 10_000,
+                error: Some("搜索超时（单源 10s 预算）".into()),
+                hits: 0,
+                parsed: false,
+                usage: false,
+                rule_complete: 1.0,
+            }],
+            86400,
+            &test_tier_cfg(),
+        )
+        .await
+        .unwrap();
+        // 导入期的未知失败：事件已记录，但 tier 拉回 observing，仍可进入搜索池。
+        keep_observing_after_transient_probe(&pool, &["https://slow.example".into()])
+            .await
+            .unwrap();
+        let map = load_map(&pool).await.unwrap();
+        let row = map.get("https://slow.example").unwrap();
+        assert_eq!(row.consecutive_failures, 1);
+        assert_eq!(row.tier, source_quality::TIER_OBSERVING);
+        assert!(visible_in_search(Some(row)), "导入超时不得把源判死");
+        assert!(
+            row.cooldown_until.map(|t| t <= now_ms()).unwrap_or(true),
+            "单次未知失败不应立刻冷却"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_zero_hit_partial_keeps_source_visible() {
+        let pool = test_pool().await;
+        record_outcomes(
+            &pool,
+            &[Outcome {
+                source_url: "https://empty.example".into(),
+                status: STATUS_PARTIAL,
+                latency_ms: 40,
+                error: Some("规则未产出结果".into()),
+                hits: 0,
+                parsed: false,
+                usage: true,
+                rule_complete: 1.0,
+            }],
+            86400,
+            &test_tier_cfg(),
+        )
+        .await
+        .unwrap();
+        let map = load_map(&pool).await.unwrap();
+        let row = map.get("https://empty.example").unwrap();
+        assert!(visible_in_search(Some(row)), "0 命中不得把源判死");
+    }
+
+    #[tokio::test]
+    async fn explicit_site_failures_still_quarantine_at_threshold() {
+        let pool = test_pool().await;
+        for _ in 0..FAIL_THRESHOLD {
+            record_outcomes(
+                &pool,
+                &[Outcome {
+                    source_url: "https://dead.example".into(),
+                    status: STATUS_FAIL,
+                    latency_ms: 30,
+                    error: Some("http status 503 Service Unavailable".into()),
+                    hits: 0,
+                    parsed: false,
+                    usage: false,
+                    rule_complete: 1.0,
+                }],
+                86400,
+                &test_tier_cfg(),
+            )
+            .await
+            .unwrap();
+        }
+        let map = load_map(&pool).await.unwrap();
+        let row = map.get("https://dead.example").unwrap();
+        assert_eq!(row.tier, source_quality::TIER_QUARANTINED);
+        assert!(!visible_in_search(Some(row)));
+        // 已达到硬阈值：导入期的“保留 observing”不得复活
+        keep_observing_after_transient_probe(&pool, &["https://dead.example".into()])
+            .await
+            .unwrap();
+        let map = load_map(&pool).await.unwrap();
+        let row = map.get("https://dead.example").unwrap();
+        assert_eq!(row.tier, source_quality::TIER_QUARANTINED, "达到阈值仍应隔离");
     }
 }

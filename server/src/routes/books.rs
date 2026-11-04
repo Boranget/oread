@@ -660,26 +660,20 @@ fn select_sources(
 }
 
 /// 单个源是否可参与聚合搜索：所有入口（两段式 / legacy / `/k`）必须共用这一口径。
+/// 规则层判定（启用/类型/搜索规则/非登录源）直接复用 `entities::is_searchable_source`，
+/// 这里再叠加隔离区与健康档；`enabled=0` 与需登录源都不会进入 source_total，也不会被 spawn。
 pub(crate) fn is_searchable_source(
     x: &crate::entities::BookSource,
     quarantined: &HashSet<String>,
     health: &HashMap<String, source_health::HealthRow>,
 ) -> bool {
-    x.enabled
-        && crate::entities::is_supported_source_type(x.book_source_type)
-        && x.rule_search.is_some()
-        && x.search_url.is_some()
-        // 带 login_url 的源需要登录态，匿名聚合搜索无法使用，不参与可搜索统计。
-        && x.login_url
-            .as_deref()
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
+    crate::entities::is_searchable_source(x)
         && !quarantined.contains(&x.book_source_url)
         && source_health::visible_in_search(health.get(&x.book_source_url))
 }
 
-/// 聚合搜索的唯一准入闸门：先 `enabled`，再 tier（只放行 preferred / observing）。
-/// `enabled=0` 的源不会进入 source_total，也不会被 spawn，因此不可能出现在任何 origin 里。
+/// 聚合搜索的唯一准入闸门：先规则层 `is_searchable_source`（含非登录源），
+/// 再 tier（只放行 preferred / observing）。
 fn searchable_sources(
     sources: Vec<crate::entities::BookSource>,
     quarantined: &HashSet<String>,
@@ -3413,6 +3407,48 @@ mod tests {
         assert_eq!(plan.source_total, 0);
         assert!(plan.active.is_empty());
         assert_eq!(plan.curated_total, 0);
+    }
+
+    // 空库/冷启动：0 源时各层退化链都返回空集合，不 panic、不依赖库规模。
+    #[test]
+    fn empty_source_pool_degrades_safely() {
+        use crate::req::SearchScope;
+        use std::collections::{HashMap, HashSet};
+
+        let empty: Vec<crate::entities::BookSource> = vec![];
+        assert!(
+            searchable_sources(empty.clone(), &HashSet::new(), &HashMap::new()).is_empty(),
+            "空库的搜索池必须为空"
+        );
+        assert!(preferred_sources(empty.clone(), &HashMap::new()).is_empty());
+        assert!(filter_sources_by_scope(empty, None, SearchScope::Curated).is_empty());
+    }
+
+    // 需登录源不进搜索池；去掉登录字段后同一加载结果自动恢复（纯运行时派生）。
+    #[test]
+    fn login_source_is_excluded_from_search_pool() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut login = src("登录源", "http://login", 1, true);
+        login.login_url = Some("http://login/login".into());
+        let open = src("开放源", "http://open", 1, true);
+
+        let pool = searchable_sources(
+            vec![login.clone(), open.clone()],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(pool.len(), 1, "需登录源不应进入搜索池");
+        assert_eq!(pool[0].book_source_url, "http://open");
+
+        let mut restored = login;
+        restored.login_url = None;
+        let pool = searchable_sources(
+            vec![restored, open],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(pool.len(), 2, "去掉 loginUrl 后应自动回到搜索池");
     }
 
     // phase：pending>0 → first（partial=true），pending==0 → final

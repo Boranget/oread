@@ -34,8 +34,11 @@ pub struct BookSourceListItem {
     /// 最近一次评分时间（毫秒时间戳）
     #[serde(default)]
     pub last_eval_at: Option<i64>,
+    /// 规则声明需登录（loginUrl/loginUi/loginCheckJs 非空）：仅在书源页展示，不参与搜索/体检/语料扫描
+    #[serde(default)]
+    pub login_required: bool,
     /// 是否可参与聚合搜索：与后端 `searchable_sources` 口径一致
-    /// （启用 + 类型支持 + 有搜索规则/地址 + 未隔离且健康档不是 quarantined）。
+    /// （启用 + 类型支持 + 有搜索规则/地址 + 非登录源 + 未隔离且健康档不是 quarantined）。
     #[serde(default)]
     pub searchable: bool,
 }

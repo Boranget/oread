@@ -93,7 +93,7 @@
   let retryNote = '';
   let retryExtra = []; // 重试新增的结果，翻页时重新附加，避免翻页丢失
 
-  // 可搜索源：与后端 searchable_sources 同一口径（enabled + 类型/规则/searchUrl + 未隔离）
+  // 可搜索源：与后端 searchable_sources 同一口径（enabled + 类型/规则/searchUrl + 非登录源 + 未隔离）
   // 计数、全选、可选状态都用它，不能只看 enabled。
   $: searchableSources = sources.filter((s) => s.searchable);
   $: groupOptions = [...new Set(sources.map((s) => s.book_source_group).filter(Boolean))];
