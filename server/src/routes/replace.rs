@@ -499,11 +499,36 @@ pub async fn preview_rules(
     })))
 }
 
+/// 一次性归一化标记：每个用户桶只执行一次（记录存在即视为已迁移）。
+const DEFAULTS_MIGRATED_KEY: &str = "defaults_migrated_v1";
+
+/// 把“恰好等于旧默认 1.8”的行距归一化为新默认 1.75。
+///
+/// 只匹配精确的 `1.8`：1.7 / 1.75 / 1.9 等用户主动选择的值一律不动。
+/// 执行后写入 `defaults_migrated_v1` 标记，重复调用返回 0，避免把用户后来
+/// 主动选回的 1.8 再次改掉。返回本次实际更新的行数。
+async fn migrate_legacy_line_height_once(db: &SqlitePool) -> AppResult<u64> {
+    let marked: Option<String> = sqlx::query_scalar("SELECT value FROM user_settings WHERE key=?1")
+        .bind(DEFAULTS_MIGRATED_KEY)
+        .fetch_optional(db)
+        .await?;
+    if marked.is_some() {
+        return Ok(0);
+    }
+    let affected = sqlx::query("UPDATE user_settings SET value='1.75' WHERE key='line_height' AND value='1.8'")
+        .execute(db)
+        .await?
+        .rows_affected();
+    put_setting(db, DEFAULTS_MIGRATED_KEY, "1").await?;
+    Ok(affected)
+}
+
 pub async fn get_settings(
     State(_s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
+    migrate_legacy_line_height_once(&db.0).await?;
     let rows: Vec<(String, Option<String>)> =
         sqlx::query_as("SELECT key, value FROM user_settings")
             .fetch_all(&db.0)
@@ -980,6 +1005,63 @@ mod tests {
             ],
             "正文不能误删: {out}"
         );
+    }
+
+    async fn settings_pool_with_line_height(v: &str) -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE user_settings (key TEXT PRIMARY KEY, value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_settings (key,value) VALUES ('line_height', ?1)")
+            .bind(v)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    // 旧默认行距 1.8 只归一化一次；其它值（1.7/1.75/1.9/2.0）一律不动
+    #[tokio::test]
+    async fn legacy_line_height_migrates_once_and_only_exact_default() {
+        let p18 = settings_pool_with_line_height("1.8").await;
+        assert_eq!(migrate_legacy_line_height_once(&p18).await.unwrap(), 1);
+        let got: String = sqlx::query_scalar("SELECT value FROM user_settings WHERE key='line_height'")
+            .fetch_one(&p18)
+            .await
+            .unwrap();
+        assert_eq!(got, "1.75");
+        let marked: Option<String> =
+            sqlx::query_scalar("SELECT value FROM user_settings WHERE key=?1")
+                .bind(DEFAULTS_MIGRATED_KEY)
+                .fetch_optional(&p18)
+                .await
+                .unwrap();
+        assert!(marked.is_some(), "迁移后应写入 defaults_migrated_v1 标记");
+        assert_eq!(
+            migrate_legacy_line_height_once(&p18).await.unwrap(),
+            0,
+            "标记生效后第二次执行 rows_affected 应为 0"
+        );
+
+        for v in ["1.7", "1.75", "1.9", "2.0"] {
+            let p = settings_pool_with_line_height(v).await;
+            assert_eq!(
+                migrate_legacy_line_height_once(&p).await.unwrap(),
+                0,
+                "{v} 不是旧默认值，不应被改"
+            );
+            let keep: String =
+                sqlx::query_scalar("SELECT value FROM user_settings WHERE key='line_height'")
+                    .fetch_one(&p)
+                    .await
+                    .unwrap();
+            assert_eq!(keep, v);
+        }
     }
 
     // 内置规则必须全部是合法正则，且默认关闭（开关在 /api/settings）
