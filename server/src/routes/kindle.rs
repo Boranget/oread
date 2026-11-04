@@ -1787,11 +1787,19 @@ async fn search(
                 );
                 let name = b.name.as_deref().unwrap_or("未命名");
                 let first = name.chars().next().unwrap_or('书');
-                let sub = format!(
+                // 沿用现有副标题位置（字号/颜色不变）：多源共识显示「N 个源」，
+                // partial 档追加「可能相关」，不与正名结果混在一起。
+                let mut sub = format!(
                     "{} · {}",
                     b.author.as_deref().unwrap_or("未知作者"),
                     b.origin_name.as_deref().unwrap_or("未知来源")
                 );
+                if b.origins.len() > 1 {
+                    sub.push_str(&format!(" · {} 个源", b.origins.len()));
+                }
+                if b.relevance.as_deref() == Some("partial") {
+                    sub.push_str(" · 可能相关");
+                }
                 list.push_str(&format!(
                     "<tr><td style=\"padding:0\">\
                      <a href=\"{href}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\

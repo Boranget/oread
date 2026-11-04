@@ -26,8 +26,17 @@ pub const SCORE_APPROX_MIN: u8 = 40;
 /// 低于 `SCORE_APPROX_MIN`，因此严格排在所有书名命中之后；
 /// 加上权重/共识加分（合计 ≤6）仍低于近似档，不会跨层。
 pub const SCORE_PARTIAL: u8 = 25;
-/// 作者匹配加分
+/// 只命中作者（书名完全不沾）的基础分。
+///
+/// 旧实现给 3 分，低于 `SCORE_PARTIAL`，导致 4 字以上的作者名查询会被
+/// “标题只含 2 字片段”的无关书压住。这里抬到 partial 之上、近似档之下：
+/// 作者全名命中排在任意 partial 之前，但不会冒充书名命中。
+pub const SCORE_AUTHOR_ONLY: u8 = 35;
+/// 书名命中时的作者匹配加分
 pub const AUTHOR_BONUS: u8 = 3;
+/// “强命中”门槛：exact / prefix / contains / approx 都算。
+/// 强命中达到该条数时，只命中片段的 partial 不再进入首屏。
+pub const STRONG_MIN_RESULTS: usize = 5;
 /// 源权重加分上限
 pub const WEIGHT_BONUS_MAX: u8 = 3;
 /// 多源共识加分上限（每多一个源 +1）
@@ -205,10 +214,29 @@ pub fn relevance_score(query: &str, title: &str, author: &str) -> u8 {
     };
     let bonus = author_bonus(&q, &normalize_author(author));
     if base == 0 {
-        // 书名完全不相关时，作者命中只保留极低的基础分（仍低于近似档）。
-        return bonus;
+        // 书名完全不相关时，作者命中只保留较低的“仅作者”分（低于近似档、高于 partial）。
+        return if bonus > 0 { SCORE_AUTHOR_ONLY } else { 0 };
     }
     (base + bonus).min(100)
+}
+
+/// 相关性档位名：`strong`（书名 exact/prefix/contains/approx）、
+/// `author`（只命中作者）、`partial`（只命中查询词片段）、`none`。
+pub fn relevance_class(relevance: u8) -> &'static str {
+    if relevance >= SCORE_APPROX_MIN {
+        "strong"
+    } else if relevance >= SCORE_AUTHOR_ONLY {
+        "author"
+    } else if relevance > 0 {
+        "partial"
+    } else {
+        "none"
+    }
+}
+
+/// 强命中（书名正规/近似）是否足够多，需要把 partial 折叠出首屏。
+pub fn should_fold_partials(strong_count: usize) -> bool {
+    strong_count >= STRONG_MIN_RESULTS
 }
 
 /// 把源权重折算成 0–`WEIGHT_BONUS_MAX` 的加分。
@@ -586,8 +614,11 @@ mod tests {
 
     #[test]
     fn author_bonus_stays_below_title_tiers() {
-        // 查询词是作者名时，只有极低基础分
-        assert_eq!(relevance_score("唐家三少", "斗罗大陆", "唐家三少"), AUTHOR_BONUS);
+        // 查询词是作者名、书名完全不沾时 → 仅作者档（高于 partial、低于 approx）
+        assert_eq!(
+            relevance_score("唐家三少", "斗罗大陆", "唐家三少"),
+            SCORE_AUTHOR_ONLY
+        );
         // 书名精确命中不因作者字段额外加分（作者没命中查询词）
         assert_eq!(relevance_score("斗罗大陆", "斗罗大陆", "唐家三少"), SCORE_EXACT);
         // 作者命中时仅在书名档位上追加 3 分
@@ -595,6 +626,35 @@ mod tests {
             relevance_score("斗罗大陆", "斗罗大陆", "斗罗"),
             SCORE_EXACT + AUTHOR_BONUS
         );
+    }
+
+    #[test]
+    fn author_only_ranks_before_any_partial_but_below_approx() {
+        assert!(SCORE_AUTHOR_ONLY < SCORE_APPROX_MIN);
+        assert!(SCORE_AUTHOR_ONLY > SCORE_PARTIAL);
+        // 作者全名命中（35）排在任意 partial（25，即使加满权重+共识 31）之前
+        assert!(
+            combined_score(SCORE_AUTHOR_ONLY, 0, 1) > combined_score(SCORE_PARTIAL, 9, 4)
+        );
+        // 典型误伤场景：4 字作者名 vs 只含「百年」的无关标题
+        let author_hit = relevance_score("烽火戏诸侯", "剑来", "烽火戏诸侯");
+        let partial = search_relevance("百年孤独", "百年争战", "");
+        assert_eq!(author_hit, SCORE_AUTHOR_ONLY);
+        assert_eq!(partial, SCORE_PARTIAL);
+        assert!(author_hit > partial);
+    }
+
+    #[test]
+    fn fold_partials_only_when_strong_enough() {
+        assert!(!should_fold_partials(0));
+        assert!(!should_fold_partials(STRONG_MIN_RESULTS - 1));
+        assert!(should_fold_partials(STRONG_MIN_RESULTS));
+        assert!(should_fold_partials(STRONG_MIN_RESULTS + 10));
+        assert_eq!(relevance_class(SCORE_EXACT), "strong");
+        assert_eq!(relevance_class(SCORE_APPROX_MIN), "strong");
+        assert_eq!(relevance_class(SCORE_AUTHOR_ONLY), "author");
+        assert_eq!(relevance_class(SCORE_PARTIAL), "partial");
+        assert_eq!(relevance_class(0), "none");
     }
 
     // ----- 部分匹配 -----

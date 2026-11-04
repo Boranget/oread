@@ -106,6 +106,9 @@ pub struct JobResultQ {
     job_id: String,
     page: Option<i32>,
     page_size: Option<usize>,
+    /// 稳定翻页游标：上一页返回的 `next_cursor`（`bucket:seq`）；
+    /// 传 `start` 表示从头开始并立刻冻结快照。缺省时退回旧的 offset 分页。
+    cursor: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ExploreQ {
@@ -241,6 +244,8 @@ struct SearchJobState {
     scheduled: usize,
     /// 真正拿到并发槽并发出过至少一次请求的源数
     attempted: usize,
+    /// job 内的稳定排序/快照：首次翻页后冻结，保证同一会话不重不漏。
+    rank: web_book::RankFreeze,
 }
 
 fn job_registry() -> &'static Mutex<Vec<Arc<SearchJob>>> {
@@ -314,20 +319,25 @@ struct JobView {
     attempted: usize,
 }
 
-/// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）
+/// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）。
+///
+/// 排序使用 job 内的稳定 `(bucket, seq)`：同一条结果首次入池后位置固定，
+/// 后到的源只会追加到桶内尾部，不会挤动已经翻过的页。
 fn job_view(job: &SearchJob) -> JobView {
-    let (books, errors, finished, pending, scheduled, attempted) = {
-        let st = job.state.lock().unwrap();
-        (
-            st.books.clone(),
-            st.errors.clone(),
-            st.finished,
-            st.pending,
-            st.scheduled,
-            st.attempted,
-        )
-    };
-    let mut full = web_book::dedupe_and_sort(books, &job.sources, &job.key);
+    let mut st = job.state.lock().unwrap();
+    let books = st.books.clone();
+    let mut full = web_book::dedupe_and_sort_with(
+        books,
+        &job.sources,
+        &job.key,
+        Some(&mut st.rank),
+    );
+    let errors = st.errors.clone();
+    let finished = st.finished;
+    let pending = st.pending;
+    let scheduled = st.scheduled;
+    let attempted = st.attempted;
+    drop(st);
     full.truncate(AGG_MAX_BOOKS);
     JobView {
         books: full,
@@ -338,6 +348,32 @@ fn job_view(job: &SearchJob) -> JobView {
         scheduled,
         attempted,
     }
+}
+
+/// 冻结快照读取：首次翻页（cursor / page>1）时把当前有序结果固化，
+/// 后续页全部从同一份快照取，保证同一搜索会话翻页不重不漏。
+fn frozen_job_view(job: &SearchJob) -> JobView {
+    {
+        let st = job.state.lock().unwrap();
+        if let Some(snap) = st.rank.snapshot.clone() {
+            let view = JobView {
+                books: snap,
+                errors: st.errors.clone(),
+                done: st.pending == 0,
+                finished: st.finished,
+                pending: st.pending,
+                scheduled: st.scheduled,
+                attempted: st.attempted,
+            };
+            return view;
+        }
+    }
+    let view = job_view(job);
+    let mut st = job.state.lock().unwrap();
+    if st.rank.snapshot.is_none() {
+        st.rank.snapshot = Some(view.books.clone());
+    }
+    view
 }
 
 async fn run_search_job(
@@ -358,36 +394,25 @@ async fn run_search_job(
     // 排队等槽不计入单源预算，但整次搜索仍受此上限约束。
     let deadline = tokio::time::Instant::now() + total_budget;
 
-    // 两批调度：preferred 先跑，但只占一段预算，剩余时间强制留给 observing，
-    // 避免优选源很多时 observing 一次都跑不到（饿死）。
+    // 两批同时进调度：preferred 先入队（优先占源级并发槽），但不再等它整批跑完；
+    // observing 立刻跟上，共用同一总预算与同一套源级并发信号量。
+    // 各自完成即写回结果，首批慢站不再拖住首屏。
     let (preferred, observing): (Vec<_>, Vec<_>) = sources
         .into_iter()
         .partition(|s| source_health::is_preferred(health.get(&s.book_source_url)));
-    let preferred_deadline = if observing.is_empty() {
-        deadline
-    } else {
-        (tokio::time::Instant::now()
-            + preferred_phase_budget(total_budget, true, tier_cfg.preferred_budget_pct))
-        .min(deadline)
-    };
 
-    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
-    if !preferred.is_empty() {
+    let (mut pref_outcomes, obs_outcomes) = tokio::join!(
         run_search_batch(
             &job,
             preferred,
             &key,
-            preferred_deadline,
+            deadline,
             budget,
             &health,
-            &mut outcomes,
             scope,
             &book_pool,
             &store,
-        )
-        .await;
-    }
-    if !observing.is_empty() {
+        ),
         run_search_batch(
             &job,
             observing,
@@ -395,27 +420,17 @@ async fn run_search_job(
             deadline,
             budget,
             &health,
-            &mut outcomes,
             scope,
             &book_pool,
             &store,
         )
-        .await;
-    }
+    );
+    pref_outcomes.extend(obs_outcomes);
 
     if let Err(e) =
-        source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
+        source_health::record_outcomes(&pool, &pref_outcomes, cooldown_secs, &tier_cfg).await
     {
         tracing::warn!(error = %e, "record source health after search failed");
-    }
-}
-
-/// preferred 批次的预算上限：有 observing 等待时只占 `pct`，其余强制留给第二批。
-fn preferred_phase_budget(total: Duration, has_observing: bool, pct: u64) -> Duration {
-    if has_observing {
-        total.mul_f64(pct.clamp(1, 99) as f64 / 100.0)
-    } else {
-        total
     }
 }
 
@@ -426,11 +441,10 @@ async fn run_search_batch(
     phase_deadline: tokio::time::Instant,
     budget: Duration,
     health: &HashMap<String, source_health::HealthRow>,
-    outcomes: &mut Vec<source_health::Outcome>,
     scope: crate::req::SearchScope,
     book_pool: &SqlitePool,
     store: &Arc<web_book::BookStore>,
-) {
+) -> Vec<source_health::Outcome> {
     enum TaskOutcome {
         Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
         /// 拿到槽后真实请求超时（或全局剩余时间不足被截断）
@@ -440,6 +454,7 @@ async fn run_search_batch(
     }
 
     let mut pending = futures::stream::FuturesUnordered::new();
+    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
     {
         let mut st = job.state.lock().unwrap();
         st.scheduled += sources.len();
@@ -588,6 +603,7 @@ async fn run_search_batch(
         st.pending = st.pending.saturating_sub(1);
         drop(st);
     }
+    outcomes
 }
 
 /// 解析逗号分隔的 source_ids，去空、去重并保留用户输入顺序。
@@ -696,6 +712,31 @@ fn search_phase(pending: usize) -> &'static str {
     } else {
         "first"
     }
+}
+
+/// 解析翻页游标：`bucket:seq`；`start` 表示“从头开始”（配合冻结快照）。
+fn parse_cursor(raw: &str) -> Option<(u8, u64)> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("start") {
+        return Some((u8::MAX, 0));
+    }
+    let (b, s) = t.split_once(':')?;
+    Some((b.parse().ok()?, s.parse().ok()?))
+}
+
+/// 该条目是否严格位于游标之后（与 `search_rank::Cursor::item_after` 同义）。
+fn book_after_cursor(b: &SearchBook, (cb, cs): (u8, u64)) -> bool {
+    match (b.rank_bucket, b.rank_seq) {
+        (Some(bb), Some(ss)) => bb < cb || (bb == cb && ss > cs),
+        // 缺稳定序号的条目无法定位，宁可多显示也不丢。
+        _ => true,
+    }
+}
+
+fn cursor_of(b: &SearchBook) -> Option<String> {
+    b.rank_bucket
+        .zip(b.rank_seq)
+        .map(|(bucket, seq)| format!("{bucket}:{seq}"))
 }
 
 async fn search_start(
@@ -885,22 +926,63 @@ async fn search_result(
         found
     };
     let job = job.ok_or_else(|| AppError::NotFound("搜索任务不存在或已过期（60s TTL）".into()))?;
-    let view = job_view(&job);
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
+    // 游标 / 翻页请求 → 冻结快照；page=1 的普通轮询仍读实时结果（首屏持续更新）。
+    let cursor = q.cursor.as_deref().and_then(parse_cursor);
+    let paginated = q.cursor.is_some() || page > 1;
+    let view = if paginated {
+        frozen_job_view(&job)
+    } else {
+        job_view(&job)
+    };
     let done = view.done;
     let finished = view.finished;
     let pending = view.pending;
     let scheduled = view.scheduled;
     let attempted = view.attempted;
-    // 未排上的源（两段式里尚未进入调度的批次）
+    // 未排上的源（两批同时调度后通常为 0）
     let pending_scheduled = job.source_total.saturating_sub(scheduled);
     let full = view.books;
     let errors = view.errors;
 
-    let page = q.page.unwrap_or(1).max(1);
-    let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
     let total = full.len();
-    let skip = ((page as usize) - 1) * page_size;
-    let books: Vec<SearchBook> = full.into_iter().skip(skip).take(page_size).collect();
+    let strong_total = full
+        .iter()
+        .filter(|b| b.relevance.as_deref() == Some("strong"))
+        .count();
+    let author_total = full
+        .iter()
+        .filter(|b| b.relevance.as_deref() == Some("author"))
+        .count();
+    let partial_total = full
+        .iter()
+        .filter(|b| b.relevance.as_deref() == Some("partial"))
+        .count();
+    let partial_folded = strong_total >= crate::search_rank::STRONG_MIN_RESULTS;
+    let (books, has_more, next_cursor) = match cursor {
+        Some(after) => {
+            let eligible: Vec<SearchBook> = full
+                .iter()
+                .filter(|b| book_after_cursor(b, after))
+                .cloned()
+                .collect();
+            let has_more = eligible.len() > page_size;
+            let page_books: Vec<SearchBook> = eligible.into_iter().take(page_size).collect();
+            let next = has_more
+                .then(|| page_books.last().and_then(cursor_of))
+                .flatten();
+            (page_books, has_more, next)
+        }
+        None => {
+            let skip = ((page as usize) - 1) * page_size;
+            let page_books: Vec<SearchBook> =
+                full.iter().skip(skip).take(page_size).cloned().collect();
+            let has_more = skip + page_books.len() < total;
+            let next = has_more.then(|| page_books.last().and_then(cursor_of)).flatten();
+            (page_books, has_more, next)
+        }
+    };
     let source_failed = errors.len();
     Ok(Json(json!({
         "books": books,
@@ -908,9 +990,17 @@ async fn search_result(
         "page": page,
         "page_size": page_size,
         "total": total,
-        "has_more": skip + page_size < total,
+        "has_more": has_more,
+        // 下一页游标：`bucket:seq`；传回 `cursor=` 即从该位置继续，翻页不重不漏。
+        "next_cursor": next_cursor,
         "done": done,
-        // 两段式进度：scheduled=已进入调度（逐批累加），attempted=真正发过请求；
+        // 相关性分层：strong=书名命中，author=只命中作者，partial=只命中片段（可能相关）。
+        "strong_total": strong_total,
+        "author_total": author_total,
+        "partial_total": partial_total,
+        // strong ≥ 5 时 partial 被折叠出首屏（不再返回）。
+        "partial_folded": partial_folded,
+        // 两段式进度：scheduled=已进入调度，attempted=真正发过请求；
         // pending_sources=尚未排上的源（source_total - scheduled），done 仍以“全部处理完”为准。
         "phase": search_phase(pending),
         "partial": !done,
@@ -2528,19 +2618,110 @@ mod tests {
         pool
     }
 
-    // 搜索调度：两批预算分配
+    // 搜索调度：两批共用一个总预算，不再给 preferred 单独切分时段
     #[test]
-    fn observing_keeps_a_reserved_budget_share() {
-        let total = Duration::from_millis(10_000);
-        assert_eq!(
-            preferred_phase_budget(total, true, 70),
-            Duration::from_millis(7_000)
-        );
-        assert_eq!(preferred_phase_budget(total, false, 70), total);
-        assert_eq!(
-            preferred_phase_budget(total, true, 99),
-            Duration::from_millis(9_900)
-        );
+    fn pipeline_uses_single_total_budget_for_both_batches() {
+        // 两批同时进调度：调度时间窗就是整批总预算（不再按 pct 提前截断）。
+        assert_eq!(crate::req::search_total_budget(crate::req::SearchScope::Curated), Duration::from_secs(6));
+        assert_eq!(crate::req::search_total_budget(crate::req::SearchScope::All), Duration::from_secs(10));
+    }
+
+    fn mk_book(name: String, url: String) -> SearchBook {
+        let mut b = SearchBook::default();
+        b.name = Some(name);
+        b.author = Some("作者".into());
+        b.origin = Some("http://s".into());
+        b.book_url = url;
+        b
+    }
+
+    fn stream_job(books: Vec<SearchBook>, pending: usize) -> SearchJob {
+        let mut s = crate::entities::BookSource::default();
+        s.book_source_url = "http://s".into();
+        SearchJob {
+            id: "j-stream".into(),
+            key: "剑来".into(),
+            at: Instant::now(),
+            created_unix_ms: 0,
+            sources: vec![s],
+            source_total: 2,
+            scope: crate::req::SearchScope::Curated,
+            skipped_cooldown: 0,
+            cooldown_total: 0,
+            coverage: "curated".into(),
+            curated_total: 0,
+            state: Mutex::new(SearchJobState {
+                books,
+                pending,
+                ..Default::default()
+            }),
+        }
+    }
+
+    // 搜索进行中连翻 3 页：游标不重不漏；迟到结果只有在游标之后才会补进后续页。
+    #[test]
+    fn cursor_pagination_no_dup_no_gap_while_streaming() {
+        let initial: Vec<SearchBook> = (0..10)
+            .map(|i| mk_book(format!("剑来{i}"), format!("u{i}")))
+            .collect();
+        let job = stream_job(initial, 3);
+        let view = job_view(&job);
+        let page1: Vec<SearchBook> = view.books.iter().take(3).cloned().collect();
+        let mut seen: Vec<String> = page1.iter().map(|b| b.book_url.clone()).collect();
+        let mut cursor = page1.last().and_then(cursor_of);
+
+        // 模拟“搜索还没结束，新结果陆续到达”
+        {
+            let mut st = job.state.lock().unwrap();
+            for i in 10..18 {
+                st.books.push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
+            }
+        }
+        loop {
+            let Some(cur) = cursor.clone() else { break };
+            let after = parse_cursor(&cur).expect("游标可解析");
+            let view = job_view(&job);
+            let page: Vec<SearchBook> = view
+                .books
+                .iter()
+                .filter(|b| book_after_cursor(b, after))
+                .take(3)
+                .cloned()
+                .collect();
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|b| b.book_url.clone()));
+            cursor = page.last().and_then(cursor_of);
+        }
+
+        let final_view = job_view(&job);
+        let all: HashSet<String> = final_view.books.iter().map(|b| b.book_url.clone()).collect();
+        assert_eq!(seen.len(), all.len(), "逐条不重复");
+        for u in &all {
+            assert_eq!(seen.iter().filter(|x| *x == u).count(), 1, "{u} 应恰好出现一次");
+        }
+        assert_eq!(seen.len(), 18, "首屏 + 后续页应覆盖全部 18 条");
+    }
+
+    // 首次翻页后冻结快照：后续迟到结果不再改变同一会话的页内容。
+    #[test]
+    fn frozen_snapshot_keeps_pages_stable() {
+        let books: Vec<SearchBook> = (0..6)
+            .map(|i| mk_book(format!("剑来{i}"), format!("u{i}")))
+            .collect();
+        let job = stream_job(books, 2);
+        let frozen = frozen_job_view(&job);
+        assert_eq!(frozen.books.len(), 6);
+        {
+            let mut st = job.state.lock().unwrap();
+            for i in 6..10 {
+                st.books.push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
+            }
+        }
+        let again = frozen_job_view(&job);
+        assert_eq!(again.books.len(), 6, "快照冻结后不再吸收新结果");
+        assert_eq!(job_view(&job).books.len(), 10, "实时视图仍可看到新结果");
     }
 
     // 回归：enabled=0 与 quarantined 都不能进入搜索池（source_total / origin 的源头）。
@@ -2950,23 +3131,23 @@ mod tests {
     async fn queued_but_never_executed_is_not_attempted() {
         let job = test_job("queue", 0, 1);
         let past = tokio::time::Instant::now() - Duration::from_secs(1);
-        let mut outcomes = Vec::new();
         // 排队阶段不会真正执行任务，这里给一个惰性池即可满足参数类型。
         let book_pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let store = Arc::new(web_book::BookStore::new());
-        run_search_batch(
+        let outcomes = run_search_batch(
             &job,
             vec![src("排队源", "http://queue.example", 1, true)],
             "书",
             past,
             Duration::from_millis(100),
             &HashMap::new(),
-            &mut outcomes,
             crate::req::SearchScope::Curated,
             &book_pool,
             &store,
         )
         .await;
+        assert!(outcomes.iter().all(|o| o.status != source_health::STATUS_OK));
+        assert_eq!(job.state.lock().unwrap().attempted, 0, "未拿到槽不算 attempted");
         let view = job_view(&job);
         assert_eq!(view.scheduled, 1);
         assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
