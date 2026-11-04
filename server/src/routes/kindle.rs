@@ -1270,11 +1270,16 @@ struct ComicPage {
 }
 
 /// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ `READ_STAGE_CONTENT_H`。
-/// - 长条页（`slice_count_window` > 1）：一图拆 `layers` 页，非末片 1196、末片取剩余；
+/// - 长条页（切片开关开启且 `slice_count_window` > 1）：一图拆 `layers` 页，
+///   非末片 1196、末片取剩余；
 /// - 一屏内：整图按版心 928 宽，显示高超过 1196 时按高度等比缩小；
 /// - 尺寸未知：整图一页，只给宽度。
-fn comic_pages(images: &[BookImage], dims: &[Option<(u32, u32)>]) -> Vec<ComicPage> {
-    let sp = image::SliceParams::default();
+fn comic_pages(
+    images: &[BookImage],
+    dims: &[Option<(u32, u32)>],
+    cfg: &crate::config::Config,
+) -> Vec<ComicPage> {
+    let sp = image::SliceParams::from_config(cfg, None, None, None);
     let dw = sp.dw as usize;
     let mut pages = Vec::new();
     for i in 0..images.len() {
@@ -1293,7 +1298,12 @@ fn comic_pages(images: &[BookImage], dims: &[Option<(u32, u32)>]) -> Vec<ComicPa
             });
             continue;
         };
-        let n = image::slice_count_window(w, h, &sp);
+        // 开关关闭时恒按整图一页，与切片上线前的行为一致。
+        let n = if cfg.comic_slice {
+            image::slice_count_window(w, h, &sp)
+        } else {
+            1
+        };
         if n > 1 {
             // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1196/620），
             // 写死 height 会把图拉扁；这里只给宽度，页面高度由固定 1268 的 stage 兜住。
@@ -1621,7 +1631,7 @@ async fn comic_read(
             }
         }
     }
-    let pages = comic_pages(&images, &dims);
+    let pages = comic_pages(&images, &dims, &s.cfg);
     if pages.is_empty() {
         return err_page("本章没有图片");
     }
@@ -2400,6 +2410,19 @@ mod tests {
         assert_eq!(hot_zones(None, None).matches("<a ").count(), 0);
     }
 
+    /// 测试用配置：切片参数取默认值，开关按用例需要打开/关闭。
+    fn test_cfg(slice: bool) -> crate::config::Config {
+        let mut cfg = crate::config::Config::from_env();
+        cfg.comic_slice = slice;
+        cfg.comic_slice_dw = 928;
+        cfg.comic_slice_vh = 1196;
+        cfg.comic_slice_ov = 64;
+        cfg.comic_slice_mu = 200;
+        cfg.comic_slice_sd = 30;
+        cfg.comic_slice_r = 96;
+        cfg
+    }
+
     /// 漫画页表：长条页按窗口拆片（非末片 1196、末片取剩余），一屏内整图 1 页且高 ≤ 1196。
     #[test]
     fn comic_pages_slice_long_strip_and_keep_one_screen() {
@@ -2413,7 +2436,8 @@ mod tests {
             })
             .collect();
         let dims: Vec<Option<(u32, u32)>> = vec![Some((1200, 2266)); 3];
-        let pages = comic_pages(&images, &dims);
+        let cfg = test_cfg(true);
+        let pages = comic_pages(&images, &dims, &cfg);
         assert_eq!(pages.len(), 6, "三张两片长条页 = 6 页");
         for (i, pg) in pages.iter().enumerate() {
             assert_eq!(pg.layers, 2, "第 {i} 页片数");
@@ -2422,6 +2446,11 @@ mod tests {
             // 切片真实高度由服务端落点决定，页表只给宽度（≠0 才写 height，避免拉扁）
             assert_eq!(pg.height, 0, "第 {i} 页不写死切片高度");
         }
+        // 开关关闭：同一批长条页退回「一图一页」，且不得带切片参数
+        let off = comic_pages(&images, &dims, &test_cfg(false));
+        assert_eq!(off.len(), 3, "关闭时三张图各一页");
+        assert!(off.iter().all(|p| p.layers == 1 && p.slice == 0));
+        assert_eq!(off[0].height, READ_STAGE_CONTENT_H, "整图按高度约束缩到一屏");
         // 1.1 屏（1024×1471）：不切，一屏一页，按高度约束等比缩小
         let one = vec![BookImage {
             index: 1,
@@ -2431,7 +2460,7 @@ mod tests {
             ..Default::default()
         }];
         let one_dims = vec![Some((1024, 1471))];
-        let p1 = comic_pages(&one, &one_dims);
+        let p1 = comic_pages(&one, &one_dims, &cfg);
         assert_eq!(p1.len(), 1, "1.1 屏不切");
         assert_eq!(p1[0].layers, 1);
         assert_eq!(p1[0].height, READ_STAGE_CONTENT_H);
@@ -2442,7 +2471,7 @@ mod tests {
             url: "https://example.test/x.jpg".into(),
             ..Default::default()
         }];
-        let u = comic_pages(&unknown, &[None]);
+        let u = comic_pages(&unknown, &[None], &cfg);
         assert_eq!(u.len(), 1);
         assert_eq!((u[0].layers, u[0].height), (1, 0));
     }
@@ -2457,7 +2486,7 @@ mod tests {
             height: Some(1200),
             ..Default::default()
         }];
-        let pages = comic_pages(&images, &[Some((1024, 1200))]);
+        let pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(true));
         assert_eq!(pages.len(), 1);
         let html = comic_stage(&images, &pages[0], "src", "book", "https://example.test/ch", "1/1");
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
@@ -2465,6 +2494,12 @@ mod tests {
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
         assert!(html.contains("id=\"k-stage\"") && html.contains("height:1268px"));
+        // 短图在开关开/关两种模式下 HTML 必须逐字节一致（回归要求）
+        let off_html = {
+            let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false));
+            comic_stage(&images, &off_pages[0], "src", "book", "https://example.test/ch", "1/1")
+        };
+        assert_eq!(html, off_html, "短图在切片开关两种模式下必须字节一致");
 
         let strip = vec![BookImage {
             index: 1,
@@ -2473,7 +2508,7 @@ mod tests {
             height: Some(2266),
             ..Default::default()
         }];
-        let sp = comic_pages(&strip, &[Some((1200, 2266))]);
+        let sp = comic_pages(&strip, &[Some((1200, 2266))], &test_cfg(true));
         assert_eq!(sp.len(), 2);
         let s2 = comic_stage(&strip, &sp[1], "src", "book", "https://example.test/ch", "2/2");
         assert!(s2.contains("slice=1&i=1"), "{s2}");

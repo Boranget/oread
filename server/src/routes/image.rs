@@ -281,12 +281,18 @@ fn candidate_qualities(cfg: &EinkConfig) -> Vec<u8> {
 
 // ---------------- 长条页切片（墨水屏） ----------------
 
-/// 切片参数（CSS px）：版心宽 / 可用高 / 片间 overlap。
+/// 切片参数（CSS px / 亮度阈值）：全部进缓存 key，参数一变 key 必变。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SliceParams {
     pub dw: u32,
     pub vh: u32,
     pub ov: u32,
+    /// 近白行亮度均值下限
+    pub mu: u8,
+    /// 近白行带内标准差上限
+    pub sd: u8,
+    /// 切点搜索半径（CSS px）
+    pub r: u32,
 }
 
 impl Default for SliceParams {
@@ -295,24 +301,65 @@ impl Default for SliceParams {
             dw: SLICE_DW_DEFAULT,
             vh: SLICE_VH_DEFAULT,
             ov: SLICE_OV_DEFAULT,
+            mu: SLICE_MU,
+            sd: SLICE_SD_U8,
+            r: SLICE_R_CSS,
         }
     }
 }
 
 impl SliceParams {
     /// 非法/越界值夹到安全区间：版心 320–2000、可用高 320–2000、overlap ≤ 1/4 窗高。
+    #[cfg(test)]
     fn new(dw: Option<u32>, vh: Option<u32>, ov: Option<u32>) -> Self {
-        let dw = dw.unwrap_or(SLICE_DW_DEFAULT).clamp(320, 2000);
-        let vh = vh.unwrap_or(SLICE_VH_DEFAULT).clamp(320, 2000);
-        let ov = ov.unwrap_or(SLICE_OV_DEFAULT).clamp(0, vh / 4);
-        Self { dw, vh, ov }
+        let d = Self::default();
+        Self::resolve(d.dw, d.vh, d.ov, dw, vh, ov, d.mu, d.sd, d.r)
+    }
+
+    /// 生效值：环境变量给出的默认值（见 `Config`），查询参数可覆盖版心宽/可用高/重叠。
+    pub(crate) fn from_config(cfg: &crate::config::Config, dw: Option<u32>, vh: Option<u32>, ov: Option<u32>) -> Self {
+        Self::resolve(
+            cfg.comic_slice_dw,
+            cfg.comic_slice_vh,
+            cfg.comic_slice_ov,
+            dw,
+            vh,
+            ov,
+            cfg.comic_slice_mu,
+            cfg.comic_slice_sd,
+            cfg.comic_slice_r,
+        )
+    }
+
+    fn resolve(
+        dw: u32,
+        vh: u32,
+        ov: u32,
+        dw_q: Option<u32>,
+        vh_q: Option<u32>,
+        ov_q: Option<u32>,
+        mu: u8,
+        sd: u8,
+        r: u32,
+    ) -> Self {
+        let dw = dw_q.unwrap_or(dw).clamp(320, 2000);
+        let vh = vh_q.unwrap_or(vh).clamp(320, 2000);
+        let ov = ov_q.unwrap_or(ov).clamp(0, vh / 4);
+        Self {
+            dw,
+            vh,
+            ov,
+            mu,
+            sd,
+            r: r.clamp(8, 480),
+        }
     }
 
     /// 缓存 key 里的参数段；参数一变 key 必变，旧档不会串味。
     fn label(&self) -> String {
         format!(
             "sl1-dw{}-vh{}-ov{}-mu{}-sd{}-r{}",
-            self.dw, self.vh, self.ov, SLICE_MU, SLICE_SD_U8, SLICE_R_CSS
+            self.dw, self.vh, self.ov, self.mu, self.sd, self.r
         )
     }
 }
@@ -327,9 +374,7 @@ const SLICE_OV_DEFAULT: u32 = 64;
 const SLICE_R_CSS: u32 = 96;
 /// 近白行判定：3 行带 × 64 列采样的亮度均值下限
 const SLICE_MU: u8 = 200;
-/// 近白行判定：带内标准差上限
-const SLICE_SD: f64 = 30.0;
-/// 缓存 key 用的标准差整数标签
+/// 近白行判定：带内标准差上限（缓存 key 用整数标签，切片时转 f64）
 const SLICE_SD_U8: u8 = 30;
 /// 采样列数（整行扫描 1200×2872 要 340 万次读取，采样后每候选行约 200 次）
 const SLICE_SAMPLE_COLS: usize = 64;
@@ -363,7 +408,7 @@ fn src_metrics(img_w: u32, p: &SliceParams) -> (usize, usize, usize) {
     let css_to_src = img_w.max(1) as f64 / p.dw as f64;
     let win = ((p.vh as f64 * css_to_src).round() as usize).max(64);
     let ov = ((p.ov as f64 * css_to_src).round() as usize).min(win / 4);
-    let r = ((SLICE_R_CSS as f64 * css_to_src).round() as usize).max(1);
+    let r = ((p.r as f64 * css_to_src).round() as usize).max(1);
     (win, ov, r)
 }
 
@@ -604,7 +649,7 @@ fn transcode_slice(
         resize_lanczos_linear(&luma, tw, th)
     };
     let (win, ov, r) = src_metrics(resized.width(), p);
-    let cuts = plan_cuts(&resized, win, ov, r, SLICE_MU, SLICE_SD);
+    let cuts = plan_cuts(&resized, win, ov, r, p.mu, p.sd as f64);
     let ranges = slice_ranges(&cuts, ov, resized.height() as usize);
     if ranges.len() <= 1 {
         let out = if cfg.usm { usm_luma(&resized) } else { resized };
@@ -1358,6 +1403,29 @@ async fn handle_slice(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let ct_base = ct
+        .split(';')
+        .next()
+        .unwrap_or("image/*")
+        .trim()
+        .to_string();
+    // PNG/GIF/BMP 等非 JPEG/WebP 源：image 依赖没有启用这些解码器，整图路径是原样直出。
+    // 切片路径必须同样原样直出，否则 `slice=1` 会对普通图报 502，违反「普通图字节不变」。
+    if !matches!(
+        image_format_of(&ct),
+        Some(image::ImageFormat::Jpeg) | Some(image::ImageFormat::WebP)
+    ) {
+        let raw = match collect_image_body(resp, max_bytes).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        let orig_key = format!("{}#orig", q.url);
+        let etag = etag_of(&orig_key);
+        if raw.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&orig_key, raw.clone(), ct_base.clone());
+        }
+        return serve_bytes(raw, &ct_base, &etag, false, headers);
+    }
     let Some(format) = image_format_of(&ct) else {
         return error_body(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1736,10 +1804,10 @@ async fn proxy(
     let eink = is_eink_client(&headers, q.eink.as_deref());
     let cfg = eink_config();
     let profile = EncodeProfile::eink();
-    // 长条页切片：只有「墨水屏 + slice=1」才走；缺省/`slice=0` 完全沿用整图路径，
-    // 缓存 key 与字节输出都不变（桌面/手机不受影响）。
-    if eink && slice_requested(q.slice.as_deref()) {
-        let params = SliceParams::new(q.dw, q.vh, q.ov);
+    // 长条页切片：只有「墨水屏 + 切片开关开启 + slice=1」才走；开关关闭、缺省或
+    // `slice=0` 时完全沿用整图路径，缓存 key 与字节输出都不变（桌面/手机不受影响）。
+    if eink && s.cfg.comic_slice && slice_requested(q.slice.as_deref()) {
+        let params = SliceParams::from_config(&s.cfg, q.dw, q.vh, q.ov);
         return handle_slice(
             &source,
             &q,
@@ -2438,7 +2506,7 @@ mod tests {
     fn plan_cuts_snaps_to_white_row_within_radius() {
         // 1200×2266 的源像素空间：win≈1547、ov≈83、r≈124，target≈1547
         let luma = luma_with_white_band(1200, 2266, 1480..1491);
-        let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD);
+        let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD_U8 as f64);
         assert_eq!(cuts.len(), 3, "两片 + 首尾切点");
         assert_eq!(cuts[0], 0);
         // 白带内离 target 最近的近白行（带的下沿）就是切点
@@ -2452,7 +2520,7 @@ mod tests {
     fn plan_cuts_hard_cuts_when_no_white_row() {
         // 全暗图：窗口内没有近白行，硬切在本片最远端 target = win = 1547
         let luma = luma_with_white_band(1200, 2266, 0..0);
-        let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD);
+        let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD_U8 as f64);
         assert_eq!(cuts, vec![0, 1547, 2266]);
         // 第二片从 1547 − 83 开始，与上片重叠 83 行
         let ranges = slice_ranges(&cuts, 83, 2266);
@@ -2463,7 +2531,7 @@ mod tests {
     fn plan_cuts_ranges_cover_height_and_overlap() {
         let luma = luma_with_white_band(1200, 2872, 0..0);
         let (win, ov, r) = src_metrics(1200, &SliceParams::default());
-        let cuts = plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD);
+        let cuts = plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD_U8 as f64);
         let ranges = slice_ranges(&cuts, ov, 2872);
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].0, 0);
@@ -2474,7 +2542,7 @@ mod tests {
             assert!(e - s <= win, "单片源高不得超过窗高: {s}..{e}");
         }
         // 确定性：同一图同一参数必须得到同一 cuts
-        assert_eq!(cuts, plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD));
+        assert_eq!(cuts, plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD_U8 as f64));
     }
 
     #[test]
@@ -2564,7 +2632,7 @@ mod tests {
         let plan = first.plan.as_ref().expect("plan");
         let ov = {
             let (win, ov, r) = src_metrics(w, &p);
-            let expect = plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD);
+            let expect = plan_cuts(&luma, win, ov, r, SLICE_MU, SLICE_SD_U8 as f64);
             assert_eq!(expect.len(), 3);
             // JPEG 有损：白带边界可能被振铃污染，允许切点在带内 ±2 行漂移
             assert!(

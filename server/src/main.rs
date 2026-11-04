@@ -32,6 +32,17 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env();
+    // 切片参数与开关的生效值：排障时只看启动日志即可确认是否开了、用的是哪组参数。
+    tracing::info!(
+        comic_slice = cfg.comic_slice,
+        dw = cfg.comic_slice_dw,
+        vh = cfg.comic_slice_vh,
+        ov = cfg.comic_slice_ov,
+        mu = cfg.comic_slice_mu,
+        sd = cfg.comic_slice_sd,
+        r = cfg.comic_slice_r,
+        "comic slice config (off = whole image)"
+    );
 
     // 低资源预算：474 MiB 可用的 OpenStick。
     // worker 线程固定 2 个、线程栈 512 KiB（默认 2 MiB），避免栈内存随线程数放大。
