@@ -19,8 +19,9 @@ body {
 a { color: var(--accent); cursor: pointer; }
 button {
   cursor: pointer;
-  border: none;
+  border: 1px solid transparent;
   border-radius: 8px;
+  min-height: var(--control-h, 36px);
   padding: 8px 16px;
   background: var(--accent);
   color: #fff;
@@ -40,6 +41,7 @@ input, textarea, select {
   font-family: inherit;
   background: #fff;
 }
+input, select { min-height: var(--control-h, 36px); }
 textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
 
@@ -76,11 +78,13 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
   padding: 16px;
   box-shadow: var(--shadow);
 }
-.grid { display: grid; gap: 12px; }
+.grid { display: grid; gap: var(--space-2, 12px); }
 .grid.cols2 { grid-template-columns: repeat(2, 1fr); }
 .grid.cols3 { grid-template-columns: repeat(3, 1fr); }
 .grid.auto { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
 .tiny-note { font-size: 11px; margin: 2px 0 10px; }
+/* 书架卡片标题统一占两行高度，卡片底部对齐 */
+.book .title { min-height: 2.6em; line-height: 1.3; }
 .shelf-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; font-size: 12px; }
 .prog-line { color: var(--accent); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

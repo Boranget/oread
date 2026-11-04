@@ -880,19 +880,19 @@
     width: 96px;
   }
   :global(html[data-vp='sm']) .rf-val { flex: 1 1 160px; }
-  :global(html[data-device='eink']) .base-sec,
-  :global(html[data-device='eink']) .rule-panel,
-  :global(html[data-device='eink']) .panel-head,
-  :global(html[data-device='eink']) .panel-body,
-  :global(html[data-device='eink']) .val-box {
-    border-color: #000;
+  :global(html[data-theme='eink']) .base-sec,
+  :global(html[data-theme='eink']) .rule-panel,
+  :global(html[data-theme='eink']) .panel-head,
+  :global(html[data-theme='eink']) .panel-body,
+  :global(html[data-theme='eink']) .val-box {
+    border-color: #333;
     background: #fff;
   }
-  :global(html[data-device='eink']) .panel-en,
-  :global(html[data-device='eink']) .rf-key { color: #333; }
-  :global(html[data-device='eink']) .panel-err {
+  :global(html[data-theme='eink']) .panel-en,
+  :global(html[data-theme='eink']) .rf-key { color: #333; }
+  :global(html[data-theme='eink']) .panel-err {
     color: #000;
-    border-color: #000;
+    border-color: #333;
   }
-  :global(html[data-device='eink']) .field-err { color: #000; font-weight: 700; }
+  :global(html[data-theme='eink']) .field-err { color: #000; font-weight: 700; }
 </style>

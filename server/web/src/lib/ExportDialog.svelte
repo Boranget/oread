@@ -235,12 +235,9 @@
       transform: rotate(360deg);
     }
   }
-  /* 墨水屏：纯黑白、无动画，进度只用文字 */
-  :global(html[data-device='eink']) .exp-spin {
-    display: none;
-  }
-  :global(html[data-device='eink']) .ok-line,
-  :global(html[data-device='eink']) .err {
+  /* 墨水屏主题：纯黑白（只改配色，不动布局） */
+  :global(html[data-theme='eink']) .ok-line,
+  :global(html[data-theme='eink']) .err {
     color: #000 !important;
   }
 </style>

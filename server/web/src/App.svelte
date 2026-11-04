@@ -5,7 +5,6 @@
   import Discover from './pages/Discover.svelte';
   import Reader from './pages/Reader.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
-  import { DEVICE_MODES, deviceLabels, devicePref, setDeviceMode } from './lib/device.js';
 
   let loggedIn = false;
   let role = 'user';
@@ -154,16 +153,6 @@
       {/each}
     </div>
     <div class="right">
-      <select
-        class="device-select"
-        aria-label="显示模式"
-        value={$devicePref}
-        on:change={(e) => setDeviceMode(e.target.value)}
-      >
-        {#each DEVICE_MODES as m}
-          <option value={m}>{deviceLabels[m]}</option>
-        {/each}
-      </select>
       <button class="ghost" on:click={onLogout}>退出</button>
     </div>
   </div>

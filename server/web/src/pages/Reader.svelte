@@ -3,7 +3,6 @@
   import { api, describeFailure } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
   import { convertZh, zhLabels } from '../lib/zhconvert.js';
-  import { deviceKind } from '../lib/device.js';
   import {
     FONT_OPTIONS,
     FONT_STACKS,
@@ -145,8 +144,6 @@
   let pageCount = 1;
   let pageIndex = 0;
   let flipDir = 0;
-  let einkFlash = false;
-  let einkTimer = null;
 
   let scrollEl = null;
   let tocEl = null;
@@ -215,7 +212,6 @@
     clearTimeout(autoTimer);
     clearTimeout(resizeTimer);
     clearTimeout(toastTimer);
-    clearTimeout(einkTimer);
     clearInterval(statsTimer);
     flushStats(true);
     cancelAnimationFrame(autoRaf);
@@ -543,15 +539,14 @@
     : [];
   $: imageParas = paras.filter((p) => p.type === 'image');
   $: if (current && imageParas.length) queueImages(imageParas);
-  // 墨水屏固定整页翻页，字号下限 20px、行距下限 1.8
-  $: eink = $deviceKind === 'eink';
-  $: isPaged = eink || readMode !== 'scroll';
-  $: isFade = !eink && readMode === 'fade';
-  $: effFont = eink ? Math.max(font, 20) : font;
-  $: effLine = eink ? Math.max(lineHeight, 1.8) : lineHeight;
+  // 阅读模式由用户在阅读器内选择；墨水屏主题只改配色，不改布局与模式
+  $: isPaged = readMode !== 'scroll';
+  $: isFade = readMode === 'fade';
+  $: effFont = font;
+  $: effLine = lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
   $: displayParas = paras.map((p) => (p.type === 'text' ? { ...p, text: convertZh(p.text, zhMode) } : p));
-  $: dimOpacity = eink ? 0 : ((100 - brightness) / 100) * 0.82;
+  $: dimOpacity = ((100 - brightness) / 100) * 0.82;
   $: contentStyle = isPaged && viewW > 0 && viewH > 0
     ? `width:${viewW}px;height:${viewH}px;max-width:none;margin:0;padding:0;column-width:${viewW}px;column-gap:0;column-fill:auto;font-size:${effFont}px;line-height:${effLine};font-family:${FONT_STACKS[fontFamily]}`
     : `max-width:${widthCss(width)};font-size:${effFont}px;line-height:${effLine};font-family:${FONT_STACKS[fontFamily]}`;
@@ -636,7 +631,6 @@
       await measurePages();
       applyRatio(opts.ratio || 0);
       restored = true;
-      if (eink) einkPulse();
       if (!opts.initial) saveProgressNow(opts.ratio || 0);
     } catch (e) {
       if (myReq !== reqId) return;
@@ -720,7 +714,7 @@
     const left = target * w;
     pageIndex = target;
     if (Math.abs(scrollEl.scrollLeft - left) > 1) {
-      scrollEl.scrollTo({ left, behavior: eink ? 'auto' : 'smooth' });
+      scrollEl.scrollTo({ left, behavior: 'smooth' });
     }
   }
 
@@ -1070,21 +1064,12 @@
   }
 
   function triggerFlip(dir) {
-    if (eink) return;
     flipDir = 0;
     clearTimeout(flipTimer);
     tick().then(() => {
       flipDir = dir;
       flipTimer = setTimeout(() => (flipDir = 0), 340);
     });
-  }
-
-  // 墨水屏整屏重绘：先白屏，再换页，减少残影
-  function einkPulse() {
-    if (!eink) return;
-    einkFlash = true;
-    clearTimeout(einkTimer);
-    einkTimer = setTimeout(() => (einkFlash = false), 120);
   }
 
   // ---- 翻页 ----
@@ -1096,22 +1081,6 @@
     const ratio = pageCount > 1 ? target / (pageCount - 1) : 0;
     pageIndex = target;
     suppressScroll = true;
-
-    if (eink) {
-      // 墨水屏：不做平滑位移，整屏闪白后直接替换当前屏
-      einkFlash = true;
-      clearTimeout(einkTimer);
-      einkTimer = setTimeout(() => {
-        if (scrollEl) scrollEl.scrollLeft = target * viewW;
-        recordRatio(ratio);
-        einkTimer = setTimeout(() => {
-          einkFlash = false;
-          suppressScroll = false;
-          if (scrollEl) pageIndex = clamp(Math.round(scrollEl.scrollLeft / Math.max(1, viewW)), 0, pageCount - 1);
-        }, 80);
-      }, 60);
-      return;
-    }
 
     scrollEl.scrollTo({ left: target * viewW, behavior: smooth ? 'smooth' : 'auto' });
     recordRatio(ratio);
@@ -1230,10 +1199,10 @@
   }
 
   function stepFont(delta) {
-    applyStyle(() => (font = clamp(effFont + delta, eink ? 20 : 12, 30)));
+    applyStyle(() => (font = clamp(effFont + delta, 12, 30)));
   }
   function stepLine(delta) {
-    applyStyle(() => (lineHeight = clamp(Math.round((effLine + delta) * 10) / 10, eink ? 1.8 : 1.2, 2.6)));
+    applyStyle(() => (lineHeight = clamp(Math.round((effLine + delta) * 10) / 10, 1.2, 2.6)));
   }
   function setTheme(t) {
     applyStyle(() => (theme = t));
@@ -1343,13 +1312,9 @@
   function scheduleAutoPage(delay) {
     clearTimeout(autoTimer);
     if (!autoOn || !isPaged) return;
-    // 墨水屏放慢节奏：整屏跳转太快会积累残影
-    const wait = delay != null
-      ? delay
-      : eink
-        ? (11 - autoSpeed) * 1500
-        : (11 - autoSpeed) * 1000;
-    autoTimer = setTimeout(autoPageStep, Math.max(eink ? 3000 : 900, wait));
+    // 自动翻页节奏按档位线性变化，最低 900ms
+    const wait = delay != null ? delay : (11 - autoSpeed) * 1000;
+    autoTimer = setTimeout(autoPageStep, Math.max(900, wait));
   }
 
   async function autoPageStep() {
@@ -1606,7 +1571,6 @@
   </div>
 
   <div class="dim-layer" style={`opacity:${dimOpacity}`}></div>
-  <div class="eink-flash" class:on={einkFlash}></div>
 
   {#if isPaged && controlsVisible}
     <div class="rd-pager">
@@ -1685,21 +1649,17 @@
 
         <div class="panel-row">
           <span>模式</span>
-          {#if eink}
-            <div class="eink-fixed">左右整页翻页（墨水屏固定）</div>
-          {:else}
-            <div class="seg small">
-              {#each MODES as m}
-                <button class:on={readMode === m} on:click={() => changeMode(m)}>{modeName[m]}</button>
-              {/each}
-            </div>
-          {/if}
+          <div class="seg small">
+            {#each MODES as m}
+              <button class:on={readMode === m} on:click={() => changeMode(m)}>{modeName[m]}</button>
+            {/each}
+          </div>
         </div>
 
         <div class="panel-row">
           <span>字号</span>
           <div class="stepper">
-            <button class="rd-btn" on:click={() => stepFont(-1)} disabled={effFont <= (eink ? 20 : 12)}>A−</button>
+            <button class="rd-btn" on:click={() => stepFont(-1)} disabled={effFont <= 12}>A−</button>
             <span class="val">{effFont}</span>
             <button class="rd-btn" on:click={() => stepFont(1)} disabled={effFont >= 30}>A+</button>
           </div>
@@ -1708,7 +1668,7 @@
         <div class="panel-row">
           <span>行距</span>
           <div class="stepper">
-            <button class="rd-btn" on:click={() => stepLine(-0.1)} disabled={effLine <= (eink ? 1.8 : 1.2)}>−</button>
+            <button class="rd-btn" on:click={() => stepLine(-0.1)} disabled={effLine <= 1.2}>−</button>
             <span class="val">{effLine.toFixed(1)}</span>
             <button class="rd-btn" on:click={() => stepLine(0.1)} disabled={effLine >= 2.6}>+</button>
           </div>
@@ -1728,16 +1688,14 @@
           <button class="rd-btn" on:click={openJump}>跳转章节 / 段</button>
         </div>
 
-        {#if !eink}
-          <div class="panel-row">
-            <span>配色</span>
-            <div class="seg small">
-              {#each ['light', 'dark', 'sepia'] as t}
-                <button class:on={theme === t} on:click={() => setTheme(t)}>{themeName[t]}</button>
-              {/each}
-            </div>
+        <div class="panel-row">
+          <span>配色</span>
+          <div class="seg small">
+            {#each ['light', 'dark', 'sepia'] as t}
+              <button class:on={theme === t} on:click={() => setTheme(t)}>{themeName[t]}</button>
+            {/each}
           </div>
-        {/if}
+        </div>
 
         <div class="panel-row">
           <span>字形</span>
@@ -1766,15 +1724,13 @@
           </div>
         {/if}
 
-        {#if !eink}
-          <div class="panel-row">
-            <span>亮度</span>
-            <div class="slider-wrap">
-              <input type="range" min="0" max="100" step="5" bind:value={brightness} on:input={(e) => setBrightness(e.target.value)} />
-              <span class="val">{brightness}%</span>
-            </div>
+        <div class="panel-row">
+          <span>亮度</span>
+          <div class="slider-wrap">
+            <input type="range" min="0" max="100" step="5" bind:value={brightness} on:input={(e) => setBrightness(e.target.value)} />
+            <span class="val">{brightness}%</span>
           </div>
-        {/if}
+        </div>
 
         <div class="panel-row">
           <span>自动滚动</span>
@@ -2197,7 +2153,7 @@
     text-indent: 2em;
     word-break: break-word;
   }
-  /* 内嵌图片：桌面居中 + max-width；手机满宽；墨水屏块级 + 百分比宽（颜色交给服务端灰度转码） */
+  /* 内嵌图片：桌面居中 + max-width；手机满宽（颜色交给服务端灰度转码） */
   .rd-img {
     display: block;
     margin: 0.8em 0;
@@ -2232,14 +2188,8 @@
   .rd-img-ph .rd-btn {
     margin-top: 10px;
   }
-  :global(html[data-device='mobile']) .rd-img img {
+  :global(html[data-vp='sm']) .rd-img img {
     width: 100%;
-  }
-  :global(html[data-device='eink']) .rd-img img {
-    display: block;
-    width: 92%;
-    max-width: 100%;
-    height: auto;
   }
   .rd-navrow {
     display: flex;
@@ -2424,28 +2374,23 @@
   }
   .pay-notice .pay-text { flex: 1; min-width: 0; }
   /* 提示条不在 .rd-bar 内，单独保证手机触控目标 44px */
-  :global(html[data-device='mobile']) .pay-notice .rd-btn {
+  :global(html[data-vp='sm']) .pay-notice .rd-btn {
     min-height: 44px;
     min-width: 44px;
   }
-  /* 墨水屏：纯文字 [V]/[P]，不用色块/图标/动画 */
-  :global(html[data-device='eink']) .pay-badge {
-    min-width: 0;
-    height: auto;
-    padding: 0;
+  /* 墨水屏主题：纯文字 [V]/[P]，不用彩色块（只改配色，不动布局） */
+  :global(html[data-theme='eink']) .pay-badge {
     background: none;
-    border: none;
-    border-radius: 0;
     color: #000;
     font-weight: 700;
   }
-  :global(html[data-device='eink']) .pay-badge::before { content: '['; }
-  :global(html[data-device='eink']) .pay-badge::after { content: ']'; }
-  :global(html[data-device='eink']) .pay-notice,
-  :global(html[data-device='eink']) .pay-notice .pay-text {
+  :global(html[data-theme='eink']) .pay-badge::before { content: '['; }
+  :global(html[data-theme='eink']) .pay-badge::after { content: ']'; }
+  :global(html[data-theme='eink']) .pay-notice,
+  :global(html[data-theme='eink']) .pay-notice .pay-text {
     color: #000;
     background: #fff;
-    border-color: #000;
+    border-color: #333;
   }
 
   /* 底部设置面板 */
@@ -2488,7 +2433,6 @@
     font-size: 14px;
     font-variant-numeric: tabular-nums;
   }
-  .eink-fixed { font-size: 12px; color: var(--rd-muted); }
 
   .row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
   .bm-tools { display: flex; gap: 8px; margin-bottom: 4px; }

@@ -1,9 +1,9 @@
 import './app.css';
 import './lib/layout.css';
-import { initDevice } from './lib/device.js';
+import { initTheme } from './lib/theme.js';
 import App from './App.svelte';
 
-initDevice();
+initTheme();
 
 const app = new App({
   target: document.getElementById('app'),

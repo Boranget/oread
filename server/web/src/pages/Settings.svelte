@@ -1,7 +1,6 @@
 <script>
   import { onMount } from 'svelte';
   import { api, describeFailure, describeSourceError } from '../lib/api.js';
-  import { DEVICE_MODES, deviceLabels, devicePref, deviceKind, setDeviceMode } from '../lib/device.js';
   import {
     FONT_OPTIONS,
     PAGE_WIDTH_PX,
@@ -196,7 +195,6 @@
   let healthLoading = false;
 
   const themeName = { light: '日间', dark: '夜间', sepia: '护眼' };
-  $: eink = $deviceKind === 'eink';
 
   async function loadHealth() {
     healthLoading = true;
@@ -285,18 +283,6 @@
 
 <div class="settings-wrap">
   <div class="card">
-    <h3>显示模式</h3>
-    <div class="seg" style="margin:0">
-      {#each DEVICE_MODES as m}
-        <button class:on={$devicePref === m} on:click={() => setDeviceMode(m)}>{deviceLabels[m]}</button>
-      {/each}
-    </div>
-    <div class="muted field-hint">
-      自动按视口宽度判断（单色/慢刷新屏幕识别为墨水屏）。选择保存在本机；墨水屏模式会强制纯黑白、整页翻页并关闭全部过渡与动画。
-    </div>
-  </div>
-
-  <div class="card">
     <h3>正文净化</h3>
     <label class="switch-row">
       <span>
@@ -371,16 +357,14 @@
       <div class="muted field-hint">保存到账号，换设备登录后同步；本机保留一份用于离线兜底。等宽（mono）已由后端支持。</div>
     </div>
 
-    {#if !eink}
-      <div class="field">
-        <div class="field-label">配色主题</div>
-        <div class="seg" style="margin:0">
-          {#each ['light', 'dark', 'sepia'] as t}
-            <button class:on={settings.theme === t} on:click={() => (settings.theme = t)}>{themeName[t]}</button>
-          {/each}
-        </div>
+    <div class="field">
+      <div class="field-label">配色主题</div>
+      <div class="seg" style="margin:0">
+        {#each ['light', 'dark', 'sepia'] as t}
+          <button class:on={settings.theme === t} on:click={() => (settings.theme = t)}>{themeName[t]}</button>
+        {/each}
       </div>
-    {/if}
+    </div>
 
     <div class="field">
       <div class="field-label">阅读模式</div>

@@ -1055,7 +1055,7 @@
     font-size: 11px;
     color: var(--muted, #666);
   }
-  :global(html[data-device='mobile']) .src-item {
+  :global(html[data-vp='sm']) .src-item {
     min-height: 44px;
   }
 </style>

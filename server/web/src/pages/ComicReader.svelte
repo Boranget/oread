@@ -614,39 +614,33 @@
     z-index: 5;
   }
 
-  /* 桌面：图片限宽居中；点击热区 30% / 70% 更符合鼠标习惯 */
-  :global(html[data-device='desktop']) .cm-img {
+  /* 桌面：图片限宽居中；点击热区按 30% / 70% 分（更符合鼠标习惯） */
+  :global(html[data-vp='lg']) .cm-img {
     max-width: 960px;
   }
-  :global(html[data-device='desktop']) .cm-hit-prev {
+  :global(html[data-vp='lg']) .cm-hit-prev {
     width: 30%;
   }
-  :global(html[data-device='desktop']) .cm-hit-next {
+  :global(html[data-vp='lg']) .cm-hit-next {
     left: 30%;
   }
 
-  /* 墨水屏：纯黑白、无阴影；左右各半屏翻页，底栏固定（全部为实测可用声明） */
-  :global(html[data-device='eink']) .cm-root {
+  /* 墨水屏主题：纯黑白（只改配色，不动布局） */
+  :global(html[data-theme='eink']) .cm-root {
     background: #fff;
     color: #000;
   }
-  :global(html[data-device='eink']) .cm-top,
-  :global(html[data-device='eink']) .cm-bar,
-  :global(html[data-device='eink']) .cm-toast {
+  :global(html[data-theme='eink']) .cm-top,
+  :global(html[data-theme='eink']) .cm-bar,
+  :global(html[data-theme='eink']) .cm-toast {
     background: #fff;
     color: #000;
-    border-color: #000;
+    border-color: #333;
   }
-  :global(html[data-device='eink']) .cm-title,
-  :global(html[data-device='eink']) .cm-count,
-  :global(html[data-device='eink']) .cm-state,
-  :global(html[data-device='eink']) .cm-hint {
+  :global(html[data-theme='eink']) .cm-title,
+  :global(html[data-theme='eink']) .cm-count,
+  :global(html[data-theme='eink']) .cm-state,
+  :global(html[data-theme='eink']) .cm-hint {
     color: #000;
-  }
-  :global(html[data-device='eink']) .cm-hit-prev {
-    width: 50%;
-  }
-  :global(html[data-device='eink']) .cm-hit-next {
-    left: 50%;
   }
 </style>

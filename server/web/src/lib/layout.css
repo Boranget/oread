@@ -1,9 +1,24 @@
 /* ============================================================
-   三端适配集中样式
-   - 断点：html[data-vp=sm] <=680 / [md] <=1100 / [lg] >1100，由 lib/device.js 写入
-   - 设备：html[data-device=desktop|mobile|eink]
+   响应式集中样式
+   - 断点：html[data-vp=sm] <=680 / [md] <=1100 / [lg] >1100，由 lib/theme.js 写入
+   - 主题：html[data-theme=default|eink]；eink 仅 `?theme=eink` 后门，只改配色/对比度/字重
+   - 渲染器由服务端按 UA 决定：kindle/silk → /k，其它 → SPA，前端无设备开关
    组件自身的 <style> 只保留外观，不再写 @media。
    ============================================================ */
+
+/* 与 docs/EINK_STYLE.md 对齐的 token（SPA 只取颜色/间距部分） */
+:root {
+  --eink-paper: #fff;
+  --eink-ink: #000;
+  --eink-ink-2: #333;
+  --eink-ink-3: #555;
+  --eink-rule: #ccc;
+  --space-1: 8px;
+  --space-2: 12px;
+  --space-3: 16px;
+  --space-4: 24px;
+  --control-h: 36px;
+}
 
 /* ---------- 断点（手机/窄屏） ---------- */
 html[data-vp='sm'] .container {
@@ -30,7 +45,7 @@ html[data-vp='sm'] .nav .right button {
 html[data-vp='sm'] .nav .tabs::-webkit-scrollbar {
   display: none;
 }
-/* 5 个 tab + 设备下拉 + 退出，390px 下需要收窄导航项 */
+/* 5 个 tab + 退出，390px 下需要收窄导航项 */
 html[data-vp='sm'] .nav .tab {
   padding: 12px 7px;
   font-size: 13px;
@@ -55,20 +70,16 @@ html[data-vp='sm'] .rd-content.paged .rd-navrow {
   padding-left: 16px;
   padding-right: 16px;
 }
-/* 阅读器工具条多了「书签」，390px 下收窄按钮与间距，标题保持可截断 */
+/* 阅读器工具条：390px 下收窄按钮与间距，标题保持可截断 */
 html[data-vp='sm'] .rd-bar {
   gap: 4px;
   padding-left: 4px;
   padding-right: 4px;
 }
+/* 组件内 .rd-btn 声明了 38px，这里用更高优先级保证触控目标不小于 44px */
 html[data-vp='sm'] .rd-bar .rd-btn {
   padding: 6px 7px;
   font-size: 12px;
-}
-/* 阅读器工具栏的导出等按钮：组件内 .rd-btn 声明了 38px，这里用更高优先级
-   保证手机/墨水屏触控目标不小于 40px（44px 与全局按钮一致） */
-html[data-device='mobile'] .rd-bar .rd-btn,
-html[data-device='eink'] .rd-bar .rd-btn {
   min-height: 44px;
   min-width: 44px;
 }
@@ -76,95 +87,73 @@ html[data-vp='sm'] .rd-title {
   font-size: 12px;
 }
 
-/* ---------- 手机 / 墨水屏：触控尺寸、安全区、软键盘 ---------- */
-html[data-device='mobile'] button,
-html[data-device='eink'] button {
+/* ---------- 手机：触控尺寸、安全区、软键盘 ---------- */
+html[data-vp='sm'] button {
   min-height: 44px;
 }
-html[data-device='mobile'] .nav .tab {
+html[data-vp='sm'] .nav .tab {
   min-height: 44px;
   display: flex;
   align-items: center;
 }
-/* KPW3 真机会静默丢弃 flex/grid 声明（见 docs/KPW3.md），墨水屏改用实测可用的 -webkit-box */
-html[data-device='eink'] .nav .tab {
-  min-height: 44px;
-  display: -webkit-box;
-  -webkit-box-align: center;
-  -webkit-box-pack: center;
-}
-html[data-device='mobile'] input,
-html[data-device='mobile'] select,
-html[data-device='mobile'] textarea {
+html[data-vp='sm'] input,
+html[data-vp='sm'] select,
+html[data-vp='sm'] textarea {
   font-size: 16px; /* 避免 iOS 聚焦缩放 */
 }
-html[data-device='mobile'] .sticky-actions,
-html[data-device='eink'] .sticky-actions {
+html[data-vp='sm'] .sticky-actions {
   padding-bottom: 10px; /* env() 不支持时的静态兜底 */
   padding-bottom: calc(10px + env(safe-area-inset-bottom));
 }
 /* 软键盘弹出时用可视视口高度修正根容器，避免 100vh 陷阱 */
-html[data-device='mobile'] .container {
+html[data-vp='sm'] .container {
   min-height: 0;
 }
 
 /* ---------- 桌面 ---------- */
-html[data-device='desktop'] .container {
+html[data-vp='lg'] .container {
   max-width: 1100px;
 }
 /* 桌面分页：限制正文栏宽，约 40 字/行，避免 1440 屏拉满 */
-html[data-device='desktop'] .rd-scroll.mode-paged {
+html[data-vp='lg'] .rd-scroll.mode-paged {
   width: 100%;
   max-width: 780px;
   margin-left: auto;
   margin-right: auto;
 }
-html[data-device='desktop'] .grid.auto {
+html[data-vp='lg'] .grid.auto {
   grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
 }
 /* 桌面设置页两栏，避免 560px 单列在大屏左侧留下大片空白 */
-html[data-device='desktop'] .settings-wrap.settings-wrap {
+html[data-vp='lg'] .settings-wrap {
   max-width: 960px;
   grid-template-columns: 1fr 1fr;
   align-items: start;
   margin: 0 auto;
 }
-html[data-device='desktop'] .settings-wrap .sticky-actions {
+html[data-vp='lg'] .settings-wrap .sticky-actions {
   grid-column: 1 / -1;
 }
-html[data-device='desktop'] .book .cover {
+html[data-vp='lg'] .book .cover {
   height: 220px;
 }
-html[data-device='desktop'] .nav .tab:hover {
+html[data-vp='lg'] .nav .tab:hover {
   color: var(--accent);
   background: rgba(179, 57, 47, 0.04);
 }
-html[data-device='desktop'] .card:hover {
+html[data-vp='lg'] .card:hover {
   border-color: #cfcfd4;
 }
-html[data-device='desktop'] button:hover {
+html[data-vp='lg'] button:hover {
   filter: brightness(0.95);
 }
-html[data-device='desktop'] .cover-btn:hover {
+html[data-vp='lg'] .cover-btn:hover {
   filter: none;
-}
-html[data-device='desktop'] .device-select {
-  width: auto;
-  min-width: 92px;
-  height: 32px;
-  padding: 2px 6px;
-  font-size: 12px;
-}
-html[data-vp='sm'] .device-select {
-  min-width: 58px;
-  width: 58px;
-  padding: 2px 2px;
-  font-size: 11px;
 }
 .desk-only {
   display: none;
 }
-html[data-device='desktop'] .desk-only {
+html[data-vp='lg'] .desk-only {
   display: block;
 }
 kbd {
@@ -178,453 +167,143 @@ kbd {
   background: var(--card, #fff);
 }
 
-/* ---------- 墨水屏：纯黑白、无动画、无阴影 ---------- */
-html[data-device='eink'] {
+/* ---------- 墨水屏主题（?theme=eink） ----------
+   只改配色 / 对比度 / 字重，不改布局、字号与阅读模式；
+   现代墨水屏（Boox、海信 A5 等）默认走普通响应式，只有手动带 ?theme=eink 才进入本主题。
+   色值对齐 docs/EINK_STYLE.md：正文 #000、次级 #333、弱 #555、分隔 #ccc、底 #fff。 */
+html[data-theme='eink'] {
+  --bg: #fff;
+  --fg: #000;
+  --card: #fff;
+  --border: #ccc;
+  --muted: #333;
+  --accent: #000;
+  --accent-d: #000;
+  --shadow: none;
   background: #fff;
   color: #000;
 }
-html[data-device='eink'] *,
-html[data-device='eink'] *::before,
-html[data-device='eink'] *::after {
-  transition: none !important;
-  -webkit-transition: none !important;
-  animation: none !important;
-  -webkit-animation: none !important;
-  transform: none !important;
-  -webkit-transform: none !important;
-  box-shadow: none !important;
-  border-radius: 0 !important;
-  background-image: none !important;
-  text-shadow: none !important;
+html[data-theme='eink'] body {
+  background: #fff;
+  color: #000;
 }
-html[data-device='eink'],
-html[data-device='eink'] body {
-  background: #fff !important;
-  color: #000 !important;
-}
-html[data-device='eink'] a {
+html[data-theme='eink'] a {
   color: #000;
   text-decoration: underline;
 }
-html[data-device='eink'] .nav,
-html[data-device='eink'] .card,
-html[data-device='eink'] .modal,
-html[data-device='eink'] .seg,
-html[data-device='eink'] .chip,
-html[data-device='eink'] .warn-box,
-html[data-device='eink'] .rd-root,
-html[data-device='eink'] .rd-bar,
-html[data-device='eink'] .panel,
-html[data-device='eink'] .toc-drawer {
-  background: #fff !important;
-  color: #000 !important;
-  border-color: #000 !important;
+html[data-theme='eink'] .nav,
+html[data-theme='eink'] .card,
+html[data-theme='eink'] .modal,
+html[data-theme='eink'] .seg,
+html[data-theme='eink'] .chip,
+html[data-theme='eink'] .warn-box,
+html[data-theme='eink'] .rd-root,
+html[data-theme='eink'] .rd-bar,
+html[data-theme='eink'] .panel,
+html[data-theme='eink'] .toc-drawer {
+  background: var(--eink-paper);
+  color: var(--eink-ink);
+  border-color: var(--eink-rule);
+  box-shadow: none;
 }
-html[data-device='eink'] .nav {
-  border-bottom: 1px solid #000;
+html[data-theme='eink'] .nav {
+  border-bottom: 1px solid var(--eink-rule);
 }
-html[data-device='eink'] .nav .brand,
-html[data-device='eink'] .nav .tab.active {
-  color: #000 !important;
-}
-html[data-device='eink'] .nav .tab.active {
-  border-bottom-color: #000 !important;
-}
-/* KPW3 丢弃 display:flex，导航栏整条用 -webkit-box 保持横排（否则品牌/标签/右侧会各占一行） */
-html[data-device='eink'] .nav {
-  display: -webkit-box;
-  -webkit-box-align: center;
-}
-html[data-device='eink'] .nav .tabs {
-  display: -webkit-box;
-  -webkit-box-flex: 1;
-}
-/* KPW3 丢弃 display:flex，用 -webkit-box 保持横向排列；间距改为子项 margin（gap 不可用） */
-html[data-device='eink'] .nav .right {
-  display: -webkit-box;
-  -webkit-box-align: center;
-  -webkit-box-pack: end;
-}
-html[data-device='eink'] .nav .right > * {
-  margin-left: 8px;
-}
-html[data-device='eink'] .device-select {
-  width: auto;
-  min-width: 104px;
-  height: 38px;
-  padding: 2px 6px;
-}
-/* 统计页柱状图/进度条：墨水屏强制纯黑 */
-html[data-device='eink'] .bar,
-html[data-device='eink'] .meter > div {
-  background: #000 !important;
-}
-html[data-device='eink'] .meter {
-  border-color: #000 !important;
-}
-html[data-device='eink'] .kpi-label,
-html[data-device='eink'] .bar-date {
-  color: #333 !important;
-}
-html[data-device='eink'] .pg-fill {
-  background: #000 !important;
-}
-html[data-device='eink'] .pg-track,
-html[data-device='eink'] .gm-panel,
-html[data-device='eink'] .gm-row {
-  border-color: #000 !important;
-}
-html[data-device='eink'] .book .cover-ph {
-  background: #fff !important;
-  color: #000 !important;
-  border: 1px solid #000;
-}
-/* 批量工具栏/进度块/选择框：墨水屏纯块级，不依赖 flex/grid */
-html[data-device='eink'] .batch-bar,
-html[data-device='eink'] .toc-progress {
-  background: #fff !important;
-  border-color: #000 !important;
-}
-html[data-device='eink'] .sel-lab {
-  background: #fff;
-  border: 1px solid #000;
-}
-html[data-device='eink'] .new-badge {
-  background: #000 !important;
-  color: #fff !important;
-}
-html[data-device='eink'] .batch-line progress {
-  border: 1px solid #000;
-}
-html[data-device='eink'] .replace-hint {
-  color: #000 !important;
-  border: 1px solid #000;
-  background: #fff;
-}
-/* SPA 书架/阅读页仍有少量 flex 容器：墨水屏上一律退化为块级（与真机丢弃 flex 的效果一致） */
-html[data-device='eink'] .row,
-html[data-device='eink'] .shelf-meta,
-html[data-device='eink'] .card-actions,
-html[data-device='eink'] .rd-root,
-html[data-device='eink'] .rd-bar,
-html[data-device='eink'] .rd-meta,
-html[data-device='eink'] .rd-navrow,
-html[data-device='eink'] .rd-pager,
-html[data-device='eink'] .rd-state,
-html[data-device='eink'] .toc-drawer,
-html[data-device='eink'] .toc-head,
-html[data-device='eink'] .toc-tools,
-html[data-device='eink'] .toc-row,
-html[data-device='eink'] .batch-bar,
-html[data-device='eink'] .modal-mask {
-  display: block !important;
-}
-/* 搜索页/书源页的既有 flex 容器：墨水屏一律退化为块级（新组件同样只用块级/行内块） */
-html[data-device='eink'] .seg,
-html[data-device='eink'] .chips,
-html[data-device='eink'] .sw-line,
-html[data-device='eink'] .src-item {
-  display: block !important;
-}
-html[data-device='eink'] .seg button,
-html[data-device='eink'] .chip {
-  display: inline-block;
-}
-html[data-device='eink'] .src-item input {
-  display: inline-block;
-  margin-right: 8px;
-}
-html[data-device='eink'] .src-name,
-html[data-device='eink'] .src-type,
-html[data-device='eink'] .src-off {
-  display: inline;
-}
-html[data-device='eink'] .batch-bar {
-  position: static;
-}
-html[data-device='eink'] .detail-grid,
-html[data-device='eink'] .detail-grid > div {
-  display: block;
-}
-html[data-device='eink'] .detail-grid > div {
-  margin-bottom: 4px;
-}
-html[data-device='eink'] .modal-mask {
-  position: static;
-  background: #fff;
-}
-html[data-device='eink'] .modal {
-  margin: 12px auto;
-  width: 96%;
-  max-width: 96%;
-  max-height: none;
-}
-html[data-device='eink'] .hist,
-html[data-device='eink'] .retry-note,
-html[data-device='eink'] .check-panel,
-html[data-device='eink'] .val-box {
-  background: #fff;
-  border: 1px solid #000;
+html[data-theme='eink'] .nav .brand,
+html[data-theme='eink'] .nav .tab.active {
   color: #000;
 }
-html[data-device='eink'] .retry-tag,
-html[data-device='eink'] .check-row,
-html[data-device='eink'] .val-box {
-  color: #000;
-}
-html[data-device='eink'] .link-btn {
-  display: inline-block;
-  color: #000;
-  text-decoration: underline;
-  background: transparent !important;
-}
-html[data-device='eink'] .hist-word,
-html[data-device='eink'] .hist-del {
-  background: transparent !important;
-  color: #000 !important;
-  border: 0 !important;
-}
-html[data-device='eink'] .cover-ph {
-  display: block !important;
-  text-align: center;
-}
-html[data-device='eink'] button,
-html[data-device='eink'] input,
-html[data-device='eink'] select,
-html[data-device='eink'] textarea {
-  background: #fff !important;
-  color: #000 !important;
-  border: 1px solid #000 !important;
-}
-html[data-device='eink'] input[type='checkbox'],
-html[data-device='eink'] input[type='radio'],
-html[data-device='eink'] input[type='range'] {
-  accent-color: #000;
-  background: #fff !important;
-}
-html[data-device='eink'] button:hover {
-  background: #fff !important;
-}
-html[data-device='eink'] .seg button.on,
-html[data-device='eink'] .chip.on,
-html[data-device='eink'] .rd-btn.solid {
-  background: #000 !important;
-  color: #fff !important;
-}
-html[data-device='eink'] .badge {
-  background: #fff;
-  color: #000;
-  border: 1px solid #000;
-  border-radius: 0;
-}
-html[data-device='eink'] .muted,
-html[data-device='eink'] .rd-muted,
-html[data-device='eink'] .author,
-html[data-device='eink'] .rd-meta {
-  color: #333 !important;
-}
-html[data-device='eink'] .book:hover {
-  transform: none;
-}
-html[data-device='eink'] .book .cover {
-  height: 200px;
-  background: #fff;
-  border: 1px solid #000;
-}
-/* 墨水屏兜底：KPW3 不支持 display:grid，统一退化为块级 + 子项下间距 */
-html[data-device='eink'] .grid {
-  display: block;
-}
-html[data-device='eink'] .grid > * {
-  margin-bottom: 12px;
-}
-/* 书卡/搜索结果三列：块级容器 + float 子项 + 百分比定宽（KPW3 不支持亚像素，取 32.3% + 1.5% 间距） */
-html[data-device='eink'] .grid.auto {
-  display: block;
-}
-html[data-device='eink'] .grid.auto::after {
-  content: '';
-  display: block;
-  clear: both;
-}
-html[data-device='eink'] .grid.auto > * {
-  float: left;
-  width: 32.3%;
-  margin: 0 1.5% 12px 0;
-}
-html[data-device='eink'] .grid.auto > *:nth-child(3n) {
-  margin-right: 0;
-}
-/* 极窄屏（强制墨水屏 + 390px）三列会把文字挤成竖条，降为两列 */
-@media (max-width: 480px) {
-  html[data-device='eink'] .grid.auto > * {
-    width: 48.7%;
-    margin-right: 2.6%;
-  }
-  html[data-device='eink'] .grid.auto > *:nth-child(3n) {
-    margin-right: 2.6%;
-  }
-  html[data-device='eink'] .grid.auto > *:nth-child(2n) {
-    margin-right: 0;
-  }
-}
-/* 设置页两栏：float 子项各 48.5%，sticky-actions 通栏 */
-html[data-device='eink'] .settings-wrap.settings-wrap {
-  display: block;
-  max-width: 820px;
-  margin: 0 auto;
-}
-html[data-device='eink'] .settings-wrap.settings-wrap::after {
-  content: '';
-  display: block;
-  clear: both;
-}
-html[data-device='eink'] .settings-wrap.settings-wrap > .card {
-  float: left;
-  width: 48.5%;
-  margin: 0 3% 12px 0;
-}
-html[data-device='eink'] .settings-wrap.settings-wrap > .card:nth-child(even) {
-  margin-right: 0;
-}
-html[data-device='eink'] .settings-wrap .sticky-actions {
-  float: none;
-  clear: both;
-  width: auto;
-}
-html[data-device='eink'] .warn-box {
-  background: #fff;
-  border: 1px solid #000;
-  color: #000;
-}
-html[data-device='eink'] .search-wait {
-  background: #fff;
-  border: 1px solid #000;
-}
-html[data-device='eink'] .search-wait .sw-time {
-  color: #000 !important;
-}
-html[data-device='eink'] .skeleton .sk-cover,
-html[data-device='eink'] .skeleton .sk-line {
-  background: #fff;
-  border: 1px dashed #000;
-}
-html[data-device='eink'] .spinner {
-  display: none;
-}
-html[data-device='eink'] .dim-layer {
-  display: none;
-}
-html[data-device='eink'] .panel-mask {
-  background: #fff;
-}
-html[data-device='eink'] .toc-mask {
-  display: none;
-}
-html[data-device='eink'] .toc-drawer {
-  width: 100%;
-  max-width: none;
-  border-right: 0;
-}
-html[data-device='eink'] .toc-row {
-  border-bottom: 1px solid #000;
-}
-html[data-device='eink'] .toc-row.active {
-  color: #000;
-  background: #000;
-  color: #fff;
-}
-/* 10 寸大屏墨水屏：限制正文行宽，避免一行 50+ 字 */
-html[data-device='eink'] .rd-scroll {
-  width: 100%;
-  max-width: 800px;
-  margin: 0 auto;
-}
-html[data-device='eink'] .rd-content {
-  font-family: Georgia, 'Songti SC', 'SimSun', 'Times New Roman', serif;
-}
-html[data-device='eink'] .rd-p {
-  line-height: 1.85;
-}
-html[data-device='eink'] .rd-chapter-title {
+html[data-theme='eink'] .nav .tab.active {
+  border-bottom-color: #000;
   font-weight: 700;
 }
-html[data-device='eink'] .rd-pager {
-  border: 1px solid #000;
+html[data-theme='eink'] button,
+html[data-theme='eink'] input,
+html[data-theme='eink'] select,
+html[data-theme='eink'] textarea {
   background: #fff;
+  color: #000;
+  border-color: #333;
 }
-html[data-device='eink'] .rd-pager .rd-btn {
-  border: 0 !important;
+html[data-theme='eink'] button.ghost {
+  color: #000;
+  border-color: #333;
 }
-html[data-device='eink'] .auto-pill {
+html[data-theme='eink'] .seg button.on,
+html[data-theme='eink'] .chip.on,
+html[data-theme='eink'] .rd-btn.solid {
   background: #000;
   color: #fff;
-  border: 1px solid #000;
+  border-color: #000;
 }
-html[data-device='eink'] .rd-toast {
+html[data-theme='eink'] .badge {
+  background: #fff;
+  color: #000;
+  border: 1px solid #333;
+}
+html[data-theme='eink'] .muted,
+html[data-theme='eink'] .rd-muted,
+html[data-theme='eink'] .author,
+html[data-theme='eink'] .rd-meta,
+html[data-theme='eink'] .kpi-label,
+html[data-theme='eink'] .bar-date {
+  color: var(--eink-ink-2);
+}
+html[data-theme='eink'] .tiny-note,
+html[data-theme='eink'] .replace-hint {
+  color: var(--eink-ink-3);
+}
+html[data-theme='eink'] .err,
+html[data-theme='eink'] .ok-line {
+  color: #000;
+}
+html[data-theme='eink'] .new-badge {
   background: #000;
   color: #fff;
 }
-/* 清零 transform 后，补回两处靠 translate 做静态居中的浮层（KPW3 本就不支持 transform，行为不变；
-   其他能跑 transform 的墨水屏设备不至于跑偏） */
-html[data-device='eink'] .gm-panel {
-  -webkit-transform: translate(-50%, -50%) !important;
-  transform: translate(-50%, -50%) !important;
+html[data-theme='eink'] .bar,
+html[data-theme='eink'] .meter > div,
+html[data-theme='eink'] .pg-fill {
+  background: #000;
 }
-html[data-device='eink'] .rd-toast {
-  -webkit-transform: translateX(-50%) !important;
-  transform: translateX(-50%) !important;
+html[data-theme='eink'] .meter,
+html[data-theme='eink'] .pg-track,
+html[data-theme='eink'] .gm-panel,
+html[data-theme='eink'] .gm-row {
+  border-color: var(--eink-rule);
 }
-/* 墨水屏：非阅读页整体放大字号，避免 10 寸屏上显得过小 */
-html[data-device='eink'] body {
-  font-size: 16px;
-}
-html[data-device='eink'] .nav .brand {
-  font-size: 18px;
-}
-html[data-device='eink'] .nav .tab {
-  font-size: 16px;
-}
-html[data-device='eink'] .card {
-  padding: 20px;
-}
-html[data-device='eink'] h2 {
-  font-size: 20px;
-}
-html[data-device='eink'] h3 {
-  font-size: 17px;
-}
-html[data-device='eink'] .book .title {
-  font-size: 16px;
-}
-html[data-device='eink'] .book .author,
-html[data-device='eink'] .shelf-meta {
-  font-size: 14px;
-}
-html[data-device='eink'] .tiny-note {
-  font-size: 13px;
-}
-html[data-device='eink'] input,
-html[data-device='eink'] select,
-html[data-device='eink'] textarea,
-html[data-device='eink'] button {
-  font-size: 15px;
-}
-
-/* 整页闪白：翻页时强制整屏重绘，减少残影 */
-.eink-flash {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 27;
+html[data-theme='eink'] .book .cover,
+html[data-theme='eink'] .book .cover-ph {
   background: #fff;
-  display: none;
-  pointer-events: none;
+  color: #000;
+  border: 1px solid var(--eink-rule);
 }
-.eink-flash.on {
-  display: block;
+html[data-theme='eink'] .sel-lab {
+  background: #fff;
+  border: 1px solid var(--eink-rule);
 }
-
-
+html[data-theme='eink'] .toc-row.active {
+  background: #000;
+  color: #fff;
+}
+html[data-theme='eink'] .rd-pager {
+  background: #fff;
+  border: 1px solid var(--eink-rule);
+}
+html[data-theme='eink'] .auto-pill,
+html[data-theme='eink'] .rd-toast {
+  background: #000;
+  color: #fff;
+}
+html[data-theme='eink'] .rd-chapter-title {
+  font-weight: 700;
+}
+/* 阅读器配色主题由 .rd-root 上的局部变量控制，主题后门在 html 层强制覆盖 */
+html[data-theme='eink'] .rd-root {
+  --rd-bg: #fff !important;
+  --rd-fg: #000 !important;
+  --rd-muted: #333 !important;
+  --rd-panel: #fff !important;
+  --rd-border: #ccc !important;
+  --rd-accent: #000 !important;
+}
