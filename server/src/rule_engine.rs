@@ -79,6 +79,31 @@ struct JsJob {
 /// 全局唯一的 JS 执行线程入口（容量 8，避免无界排队）。
 static JS_TX: OnceLock<SyncSender<JsJob>> = OnceLock::new();
 
+/// 等待 JS 线程回传结果。
+///
+/// 规则解析整条调用链是同步的（`AnalyzeRule` 内含 `RefCell`/`Rc`，既不能 `await`
+/// 也不满足 `Send + 'static`，无法整体搬进 `spawn_blocking`）。因此这里在
+/// tokio 多线程 runtime 上用 `block_in_place`：它会把当前 worker 的调度核心
+/// 迁移到 blocking 线程并从 blocking 池补一个执行者，本线程只做等待，
+/// **不再占住 worker**，慢 JS 也就不会把 2 个 worker 一起拖死。
+///
+/// 单线程 runtime（`current_thread`）与纯同步上下文（单测/CLI）没有该能力，
+/// 退回直接阻塞，行为与原实现一致。
+fn wait_js_reply(
+    rx: Receiver<(Result<String, String>, u64, u64)>,
+) -> Result<(Result<String, String>, u64, u64), RuleError> {
+    let wait = || {
+        rx.recv()
+            .map_err(|_| RuleError::Other("js worker dropped".into()))
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
 fn js_sender() -> &'static SyncSender<JsJob> {
     JS_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<JsJob>(8);
@@ -1456,9 +1481,8 @@ impl AnalyzeRule {
         js_sender()
             .send(JsJob { script, reply: tx })
             .map_err(|_| RuleError::Other("js worker unavailable".into()))?;
-        let (result, net_ms, js_elapsed) = rx
-            .recv()
-            .map_err(|_| RuleError::Other("js worker dropped".into()))?;
+        // 慢 JS 只阻塞本次规则求值，不再占住 tokio worker（见 `wait_js_reply`）。
+        let (result, net_ms, js_elapsed) = wait_js_reply(rx)?;
         // 结果串尾部依次带回 cache 变更与规则自身耗时（非法/超大都忽略，不影响主结果）
         let mut rule_ms: Option<u64> = None;
         let result = match result {
@@ -4661,6 +4685,135 @@ nodes.filter(function (node) {
         assert!(
             err.contains("拒绝访问") || err.contains("java.ajax"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// `java.ajax` 的同步语义不变，但求值发生在专用 JS 线程（非 tokio worker），
+    /// 因此嵌套 `block_on` 不会在 worker 上触发 "Cannot start a runtime from within
+    /// a runtime" 的 panic。这里从多线程 runtime 的任务里跑一次，固住该不变式。
+    #[test]
+    fn js_ajax_inside_runtime_does_not_panic_on_nested_block_on() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(async {
+                tokio::spawn(async {
+                    AnalyzeRule::new()
+                        .get_string("", "<js>java.ajax('http://127.0.0.1:1/')</js>", false, "")
+                })
+                .await
+                .unwrap()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("拒绝访问") || err.contains("java.ajax"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---------------- JS 调度层：慢 JS 不得占住 tokio worker ----------------
+
+    /// 构造一条「可控墙钟耗时」的慢 JS 规则。
+    ///
+    /// 每轮做一次 8 KiB 字符串分配，迭代次数远低于 `loop_iteration_limit`(500k)，
+    /// 因此耗时由 `ms` 决定，而不会先撞上 RuntimeLimit（便于稳定复现慢源）。
+    fn slow_js_rule(ms: u64) -> String {
+        format!(
+            "@js:var t0=Date.now(), n=0; while(Date.now()-t0<{ms}) {{ 'abcdefghijklmnop'.repeat(500); n++; }} n"
+        )
+    }
+
+    /// 在独立线程里跑规则，避免 `AnalyzeRule`（!Send）进入 tokio 任务状态机。
+    fn run_rule_in_thread(rule: String) -> Result<String, RuleError> {
+        AnalyzeRule::new().get_string("", &rule, false, "")
+    }
+
+    #[test]
+    fn slow_js_does_not_block_other_requests() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // 与生产一致的 runtime 形状（main.rs：2 worker + max_blocking_threads 4）
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        const SLOW_MS: u64 = 500;
+        const NORMAL_MS: u64 = 30;
+        // 旧实现：两个 worker 都被阻塞，普通请求要等第一条慢 JS 跑完（≈SLOW_MS）
+        let latencies = Arc::new(Mutex::new(Vec::<Duration>::new()));
+
+        let lat = latencies.clone();
+        rt.block_on(async move {
+            // 两个并发请求各命中一条慢 JS 源（单 JS 线程串行执行，两条各 500ms）。
+            // 用 ready 信号确保两个 worker 分别进入 JS 求值后，再发起普通请求，
+            // 否则任务可能集中在一个 worker 的本地队列里，无法复现“两个 worker 同时被占”。
+            let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(2);
+            let mut slow = Vec::new();
+            for _ in 0..2 {
+                let rule = slow_js_rule(SLOW_MS);
+                let tx = ready_tx.clone();
+                slow.push(tokio::spawn(async move {
+                    let _ = tx.send(()).await;
+                    run_rule_in_thread(rule)
+                }));
+            }
+            drop(ready_tx);
+            let _ = ready_rx.recv().await;
+            let _ = ready_rx.recv().await;
+            // 两个 worker 此刻都在 JS 里同步阻塞；block_on 线程用 std sleep，
+            // 不依赖 timer driver（此时它可能没线程来驱动）。
+            std::thread::sleep(Duration::from_millis(20));
+
+            // 普通请求：只需要一个空闲 worker 就能按时完成。
+            // 计时从 spawn 前开始，包含“排队等 worker”的时间（旧实现的真正代价）。
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let lat2 = lat.clone();
+            let normal_started = Instant::now();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(NORMAL_MS)).await;
+                lat2.lock().unwrap().push(normal_started.elapsed());
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.await;
+
+            for h in slow {
+                let _ = h.await;
+            }
+        });
+
+        let latency = *latencies.lock().unwrap().first().expect("普通请求未执行");
+        let budget = Duration::from_millis(SLOW_MS / 2);
+        assert!(
+            latency < budget,
+            "普通请求被慢 JS 拖慢：{latency:?} >= {budget:?}（SLOW_MS={SLOW_MS}）"
+        );
+    }
+
+    /// 超预算行为保持不变：报错文案含 exceeded/budget，且不污染后续求值。
+    /// 这里用 `#[tokio::test]`（current_thread）同时验证降级路径不会 panic。
+    #[tokio::test]
+    async fn slow_js_rule_reports_budget_timeout() {
+        // 测试进程未调用 init_js，默认预算 200ms
+        let err = AnalyzeRule::new()
+            .get_string("", &slow_js_rule(400), false, "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exceeded") && err.contains("budget"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            AnalyzeRule::new()
+                .get_string("", "@js:1+1", false, "")
+                .unwrap(),
+            "2"
         );
     }
 
