@@ -794,6 +794,48 @@ impl AnalyzeRule {
         }
     }
 
+    /// Legado `@put:{key:rule}` / `@get:{key}`：
+    /// - 上游 `AnalyzeRule.splitPutRule`（L516，正则 L1027 `@put:(\{[^}]+?\})`，大小写不敏感）
+    ///   先把 `@put:{…}` 从规则正文里摘掉；求值时 `putRule`（L507）把每个 value 当**完整规则**
+    ///   在当前 content 上求值后 `put(key, value)`（L856；chapter→book→ruleData→source 依次落库）。
+    /// - `@get:{key}` 由 `makeUpRule`（L698/L718）替换成变量值，未命中返回空串（`get` L875）。
+    /// - key 允许下划线；`value` 走完整求值链（含 `@js:`、`$.path`）；put 失败不影响主结果。
+    ///
+    /// 本服务没有 Book/Chapter 实体，作用域退化为一次 `AnalyzeRule`（一次请求内新建）的
+    /// 变量表，不写任何全局状态，因此不同源/不同请求天然隔离。
+    fn apply_put_get(&self, rule: &str, content: &str, is_url: bool, base_url: &str) -> String {
+        if !rule.contains("@put:") && !rule.contains("@get:") && !rule.contains("@PUT:")
+            && !rule.contains("@GET:")
+        {
+            return rule.to_string();
+        }
+        let put_re = Regex::new(r"(?i)@put:\{([^}]*)\}").unwrap();
+        let mut text = rule.to_string();
+        for caps in put_re.captures_iter(rule) {
+            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            // 先摘掉操作符本身（与上游 splitPutRule 一致），失败也不影响剩余规则
+            text = text.replacen(whole, "", 1);
+            for (key, value_rule) in split_put_pairs(inner) {
+                let key = key.trim();
+                if key.is_empty() {
+                    continue;
+                }
+                let value = value_rule.trim().to_string();
+                if let Ok(v) = self.get_string_inner(content, &value, is_url, base_url) {
+                    self.variables.borrow_mut().insert(key.to_string(), v);
+                }
+            }
+        }
+        let get_re = Regex::new(r"(?i)@get:\{([^}]*)\}").unwrap();
+        get_re
+            .replace_all(&text, |caps: &regex::Captures| {
+                let key = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                self.variables.borrow().get(key).cloned().unwrap_or_default()
+            })
+            .to_string()
+    }
+
     /// 单值入口：对应 Legado `getString(..., unescape = true)`。
     /// HTML4 实体只在**最外层**反转义一次；内部递归走 `get_string_inner`，避免重复反转义。
     pub fn get_string(
@@ -815,7 +857,16 @@ impl AnalyzeRule {
         is_url: bool,
         base_url: &str,
     ) -> Result<String, RuleError> {
-        let rule = self.expand_vars(rule, content);
+        // 整条规则只有 `@get:{key}`：直接返回变量值（否则替换后的字面量会被当成 CSS 选择器）。
+        let raw = rule.trim();
+        let only_get = (starts_with_ci(raw, "@get:") && raw.ends_with('}'))
+            && !raw[5..].contains('@')
+            && raw[5..].starts_with('{');
+        let rule = self.apply_put_get(rule, content, is_url, base_url);
+        if only_get {
+            return Ok(rule.trim().to_string());
+        }
+        let rule = self.expand_vars(&rule, content);
         let rule = rule.trim().to_string();
         if rule.is_empty() {
             return Ok(String::new());
@@ -835,35 +886,8 @@ impl AnalyzeRule {
         if rule.starts_with('{') && rule.ends_with('}') && rule.contains(':') {
             return Ok(rule.to_string());
         }
-        // @get:{key} / @put:{key:value} 规则级变量操作符（Legado 跨规则变量传递）
-        let trimmed = rule.trim();
-        if let Some(rest) = trimmed.strip_prefix("@get:{") {
-            if rest.ends_with('}') {
-                let key = &rest[..rest.len() - 1];
-                return Ok(self
-                    .variables
-                    .borrow()
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_default());
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("@put:{") {
-            if let Some(end) = rest.rfind('}') {
-                let inner = &rest[..end];
-                if let Some(colon) = inner.find(':') {
-                    let key = inner[..colon].trim().to_string();
-                    let mut val = inner[colon + 1..].trim();
-                    // 去掉可能的引号包裹
-                    if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                        val = &val[1..val.len() - 1];
-                    }
-                    let res = self.get_string_inner(content, val, is_url, base_url)?;
-                    self.variables.borrow_mut().insert(key, res.clone());
-                    return Ok(res);
-                }
-            }
-        }
+        // @get:{key} / @put:{key:value} 已在 `apply_put_get` 里按 Legado 的
+        // `splitPutRule` + `makeUpRule` 语义处理（可出现在规则任意位置，不只整串）。
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
         // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
         if let Some(parts) = split_outside_js(&rule, "##") {
@@ -1226,7 +1250,8 @@ impl AnalyzeRule {
 
     /// 列表：返回多个元素的字符串（HTML 取 inner_html；JSON 取数组元素字符串）
     pub fn get_string_list(&self, content: &str, rule: &str) -> Result<Vec<String>, RuleError> {
-        let rule = self.expand_vars(rule, content);
+        let rule = self.apply_put_get(rule, content, false, "");
+        let rule = self.expand_vars(&rule, content);
         // Legado 约定：规则以 `-` 开头表示「结果倒序」（多见于章节列表，如 `-$..comics.*`）。
         if let Some(rest) = rule.trim_start().strip_prefix('-') {
             let mut v = self.get_string_list(content, rest.trim_start())?;
@@ -1301,7 +1326,8 @@ impl AnalyzeRule {
         rule: &str,
         base_url: &str,
     ) -> Vec<String> {
-        let rule = self.expand_vars(rule, content);
+        let rule = self.apply_put_get(rule, content, false, base_url);
+        let rule = self.expand_vars(&rule, content);
         let r = rule.trim();
         if r.is_empty() {
             return vec![];
@@ -3129,6 +3155,82 @@ fn find_js_tag_end(rule: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// 解析 `@put:{k1:v1,k2:v2}` 的 `{…}` 内部：顶层（不在引号/括号内）按 `,` 分组，再按首个 `:`
+/// 拆 key/value。对应上游 `splitPutRule`（规则语义 L516-530）里的 GSON 宽松解析。
+fn split_put_pairs(inner: &str) -> Vec<(String, String)> {
+    let mut groups: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            cur.push(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '{' | '[' | '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '}' | ']' | ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                groups.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        groups.push(cur.trim().to_string());
+    }
+    let mut out = Vec::new();
+    for group in groups {
+        let mut quote: Option<char> = None;
+        let mut depth = 0i32;
+        let mut split_at = None;
+        for (idx, ch) in group.char_indices() {
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
+                ':' if depth == 0 => {
+                    split_at = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(idx) = split_at {
+            let key = group[..idx].trim().trim_matches('"').trim_matches('\'').trim();
+            let value = group[idx + 1..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            if !key.is_empty() {
+                out.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// 在规则串顶层按分隔符拆分，但忽略落在 `<js>…</js>` 或 `@js:` 段内的分隔符。
 /// 仅当当前字节为 ASCII 时才尝试 `starts_with`（分隔符/标记均为 ASCII），避免多字节
 /// UTF-8（如中文）字符内部切片越界。
@@ -3615,14 +3717,63 @@ nodes.filter(function (node) {
     }
 
     #[test]
-    fn put_get_variables() {
+    fn put_then_get_in_same_scope() {
         let ar = AnalyzeRule::new();
         let html = "<div><a>lit</a></div>";
-        // @put 求值后存入变量，@get 取回
-        let stored = ar.get_string(html, "@put:{x:a@text}", false, "").unwrap();
+        // 上游语义：@put 是副作用，摘掉后主体规则照常求值（快看/爱看都是嵌在规则尾部）
+        let stored = ar
+            .get_string(html, "a@text@put:{x:a@text}", false, "")
+            .unwrap();
         assert_eq!(stored, "lit");
         let got = ar.get_string(html, "@get:{x}", false, "").unwrap();
         assert_eq!(got, "lit");
+        // 纯 @put 规则自身求值为空串（Legado splitPutRule 后规则正文为空）
+        let only_put = ar.get_string(html, "@put:{y:a@text}", false, "").unwrap();
+        assert_eq!(only_put, "");
+        assert_eq!(ar.get_string("", "@get:{y}", false, "").unwrap(), "lit");
+    }
+
+    #[test]
+    fn get_missing_returns_empty() {
+        let ar = AnalyzeRule::new();
+        let got = ar.get_string("", "@get:{nope}", false, "").unwrap();
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn put_get_jsonpath_and_underscore_key() {
+        let ar = AnalyzeRule::new();
+        let json = r#"{"comic_name":"海贼王","comic_id":106492}"#;
+        // 爱看形态：name 规则尾部 put，toc_url 里 get；key 允许下划线
+        let name = ar
+            .get_string(json, "$.comic_name@put:{comic_bid:$.comic_id}", false, "")
+            .unwrap();
+        assert_eq!(name, "海贼王");
+        let url = ar
+            .get_string(
+                json,
+                "https://m.kanman.com/api/getchapterlist?comic_id=@get:{comic_bid}",
+                true,
+                "",
+            )
+            .unwrap();
+        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+        // 多个 put 键
+        let json2 = r#"{"a":1,"b":2}"#;
+        ar.get_string(json2, "@put:{k1:$.a,k2:$.b}", false, "").unwrap();
+        assert_eq!(ar.get_string("", "@get:{k1}", false, "").unwrap(), "1");
+        assert_eq!(ar.get_string("", "@get:{k2}", false, "").unwrap(), "2");
+    }
+
+    #[test]
+    fn vars_do_not_leak_across_scopes() {
+        let a = AnalyzeRule::new();
+        let b = AnalyzeRule::new();
+        let html = "<a>111</a>";
+        a.get_string(html, "@put:{bid:a@text}", false, "").unwrap();
+        // 另一个源（另一个 AnalyzeRule）读不到
+        assert_eq!(b.get_string("", "@get:{bid}", false, "").unwrap(), "");
+        assert_eq!(a.get_string("", "@get:{bid}", false, "").unwrap(), "111");
     }
 
     #[test]
