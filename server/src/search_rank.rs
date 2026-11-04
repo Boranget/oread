@@ -327,8 +327,8 @@ pub struct QuotaCaps {
 impl Default for QuotaCaps {
     fn default() -> Self {
         Self {
-            preferred: 30,
-            observing: 10,
+            preferred: 60,
+            observing: 20,
             quarantined: 0,
         }
     }
@@ -336,6 +336,7 @@ impl Default for QuotaCaps {
 
 /// 配额策略：`observing_floor` 是观察源的**下限**——即使配置把观察配额调成 0，
 /// 有命中的观察源仍至少保留这么多条，避免长尾源被永久饿死。
+/// 配额只作用于**首屏批次**；后续补批（`top_up` / 后台继续灌）不设上限。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuotaPolicy {
     pub caps: QuotaCaps,
@@ -346,7 +347,7 @@ impl Default for QuotaPolicy {
     fn default() -> Self {
         Self {
             caps: QuotaCaps::default(),
-            observing_floor: 1,
+            observing_floor: 2,
         }
     }
 }
@@ -388,6 +389,7 @@ fn tier_of(tiers: &HashMap<String, SourceTier>, source: &str) -> SourceTier {
 /// - 每条按 `sources` 顺序记到第一个还有余量的源；全部源都满则丢弃。
 /// - 隔离源配额为 0，任何只由隔离源命中的条目都会被丢弃。
 /// - 观察源另有下限（`observing_floor`），配额调到 0 时也不会被饿死。
+/// - 本函数只处理**首屏批次**；补批走 [`top_up`]，不受上限约束。
 pub fn apply_quota(
     items: Vec<RankItem>,
     tiers: &HashMap<String, SourceTier>,
@@ -468,7 +470,7 @@ impl Default for StopConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            min_usable: 40,
+            min_usable: 20,
             preferred_done_ratio: 0.8,
         }
     }
@@ -646,30 +648,34 @@ mod tests {
     // ----- 配额 -----
 
     #[test]
-    fn quota_caps_per_source_and_top_up_fills_page() {
+    fn quota_caps_first_batch_only_and_top_up_is_uncapped() {
         let tier_map = tiers(&[
             ("pref", SourceTier::Preferred),
             ("obs", SourceTier::Observing),
             ("bad", SourceTier::Quarantined),
         ]);
-        let mut items: Vec<RankItem> = (0..40)
+        // 单个优选源 80 条：首屏批次按 60 截断，补批必须能突破 60。
+        let mut items: Vec<RankItem> = (0..80)
             .map(|i| item(i as u64, 90, &format!("P{i}"), "pref"))
             .collect();
-        items.push(item(40, 20, "OBS", "obs"));
-        items.push(item(41, 10, "BAD", "bad"));
+        items.push(item(80, 20, "OBS-1", "obs"));
+        items.push(item(81, 19, "OBS-2", "obs"));
+        items.push(item(82, 10, "BAD", "bad"));
         sort_ranked(&mut items);
 
         let policy = QuotaPolicy::default();
         let out = apply_quota(items, &tier_map, &policy);
-        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "pref").count(), 30);
-        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "obs").count(), 1);
+        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "pref").count(), 60);
+        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "obs").count(), 2);
         assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "bad").count(), 0);
-        assert_eq!(out.capped_out, 11); // 10 条优选超额 + 1 条隔离
+        assert_eq!(out.capped_out, 21); // 20 条优选超额 + 1 条隔离
 
+        // 补批不设上限：把 20 条超额优选全部补回，总数 82，仍排除隔离源。
         let mut kept = out.kept;
-        let added = top_up(&mut kept, out.dropped, 40, &tier_map);
-        assert_eq!(added, 9); // 31 → 40
-        assert_eq!(kept.len(), 40);
+        let added = top_up(&mut kept, out.dropped, 100, &tier_map);
+        assert_eq!(added, 20);
+        assert_eq!(kept.len(), 82);
+        assert_eq!(kept.iter().filter(|i| i.sources[0] == "pref").count(), 80);
         assert!(!kept.iter().any(|i| i.sources[0] == "bad"));
     }
 
@@ -679,38 +685,40 @@ mod tests {
             ("pref", SourceTier::Preferred),
             ("obs", SourceTier::Observing),
         ]);
-        // 优选源 30 条高分结果；观察源只有 1 条低分结果。
+        // 优选源 30 条高分结果；观察源只有 2 条低分结果。
         let mut items: Vec<RankItem> = (0..30)
             .map(|i| item(i as u64, 100, &format!("P{i}"), "pref"))
             .collect();
-        items.push(item(30, 35, "OBS-ONLY", "obs"));
+        items.push(item(30, 35, "OBS-1", "obs"));
+        items.push(item(31, 34, "OBS-2", "obs"));
         sort_ranked(&mut items);
 
-        // 即使把观察配额调成 0，下限仍保证它有 1 条进入结果池。
+        // 即使把观察配额调成 0，下限仍保证它有 2 条进入结果池。
         let policy = QuotaPolicy {
             caps: QuotaCaps {
                 observing: 0,
                 ..QuotaCaps::default()
             },
-            observing_floor: 1,
+            observing_floor: 2,
         };
         let out = apply_quota(items, &tier_map, &policy);
-        assert_eq!(out.kept.len(), 31);
-        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "obs").count(), 1);
+        assert_eq!(out.kept.len(), 32);
+        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "obs").count(), 2);
         assert!(!out.dropped.iter().any(|i| i.sources[0] == "obs"));
     }
 
     #[test]
     fn should_stop_defaults_off_and_requires_both_thresholds() {
         let off = StopConfig::default();
+        assert_eq!(off.min_usable, 20);
         assert!(!should_stop(100, 1.0, &off));
 
         let on = StopConfig {
             enabled: true,
             ..StopConfig::default()
         };
-        assert!(should_stop(40, 0.8, &on));
-        assert!(!should_stop(39, 0.8, &on));
-        assert!(!should_stop(40, 0.79, &on));
+        assert!(should_stop(20, 0.8, &on));
+        assert!(!should_stop(19, 0.8, &on));
+        assert!(!should_stop(20, 0.79, &on));
     }
 }
