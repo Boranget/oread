@@ -63,10 +63,12 @@ const READ_STAGE_H: usize = K_H;
 const BAR_H: usize = 64;
 /// 阅读页正文容器高度 = 1268 − 64（底栏）= 1204
 const READ_BODY_H: usize = READ_STAGE_H - BAR_H;
-/// 正文底部页码行：28px 行高 + 24px 上距 = 52
-const READ_PAGENO_H: usize = 52;
-/// 阅读页正文可用高度 = 1204 − 52 = 1152
-const READ_TEXT_H: usize = READ_BODY_H - READ_PAGENO_H;
+/// 阅读页正文顶部留白：与左右版心一致 36px（此前贴顶 10px，视觉上像被裁切）
+const READ_PAD_TOP: usize = 36;
+/// 正文底部页码行：28px 行高 + 上下各 14px = 56
+const READ_PAGENO_H: usize = 56;
+/// 阅读页正文可用高度 = 1204 − 36（顶部留白）− 56（页码行）= 1112
+const READ_TEXT_H: usize = READ_BODY_H - READ_PAD_TOP - READ_PAGENO_H;
 /// 漫画整图高度上限（沿用一屏可用高 1196，底栏只占 64）
 const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - BAR_H - 8;
 /// 左右透明翻页热区宽度 = 视口 1072 / 3（取整），整屏高可点
@@ -75,10 +77,10 @@ const HOT_W: usize = K_W / 3;
 const HOT_LEFT_R: usize = K_W - HOT_W;
 
 /// 阅读页每页目标行数：≈26 行（WeRead 整页阅读观感）
-const READ_TARGET_LINES: usize = 26;
+const READ_TARGET_LINES: usize = 25;
 
-/// 阅读页每页行数预算：目标 26 行，但不超过 1152px 物理可容纳的行数
-/// （28/46 → 25，32/52 → 22，38/62 → 18；26 行只在 20/36 档成立）
+/// 阅读页每页行数预算：目标 25 行，但不超过 1112px 物理可容纳的行数
+/// （28/46 → 24，32/52 → 21，38/62 → 17；25 行只在 20/36 档成立）
 const fn line_budget(line: usize) -> usize {
     let fit = READ_TEXT_H / line;
     if fit < READ_TARGET_LINES {
@@ -347,10 +349,10 @@ fn fixed_bar(row: &str) -> String {
     )
 }
 
-/// 底栏格内容：图标（28×28 描边框）+ 标签（20px）
+/// 底栏格内容：粗体字符（28px/700，无边框）+ 标签（20px）
 fn bar_inner(icon: &str, label: &str) -> String {
     format!(
-        "<div style=\"width:28px;height:28px;margin:0 auto;border:1px solid #000;font-size:18px;line-height:26px;text-align:center\">{icon}</div>\
+        "<div style=\"width:28px;height:28px;margin:0 auto;font-size:28px;line-height:28px;font-weight:700;text-align:center\">{icon}</div>\
          <div style=\"font-size:20px;line-height:20px;margin-top:4px\">{label}</div>",
         icon = esc(icon),
         label = esc(label)
@@ -549,7 +551,7 @@ fn empty_shelf(fs: usize) -> String {
     format!(
         "<table width=\"1000\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
          <td align=\"center\" valign=\"middle\">\
-         <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:2px solid #000\"><tr>\
+         <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #000\"><tr>\
          <td align=\"left\" style=\"padding:32px\">\
          <div style=\"font-size:26px;line-height:40px;font-weight:700\">书架还是空的</div>\
          <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\
@@ -1523,10 +1525,11 @@ async fn read(
     }
     // 阅读页无顶栏：正文区 1204（底栏 64 贴底），底部 52 留页码行
     let stage = format!(
-        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
+        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:{pt}px {pad}px 0;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
         h = READ_BODY_H,
         w = PAGE_W,
         pad = SIDE_PAD,
+        pt = READ_PAD_TOP,
         paras = paras,
         meta = esc(&meta)
     );
@@ -2095,7 +2098,7 @@ mod tests {
     fn font_specs_fit_read_stage() {
         assert_eq!(READ_STAGE_H, 1268);
         assert_eq!(READ_STAGE_CONTENT_H, 1196);
-        let expect = [(28, 46, 25), (32, 52, 22), (38, 62, 18), (20, 36, 26)];
+        let expect = [(28, 46, 24), (32, 52, 21), (38, 62, 17), (20, 36, 25)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -2113,7 +2116,7 @@ mod tests {
                 "fs={size} 每页字数 {chars} 超出合理区间"
             );
         }
-        // 标准档 32px：29 字/行 × 22 行 = 638 字，落在 500–800 的参考区间
+        // 标准档 32px：29 字/行 × 21 行 = 609 字，落在 500–800 的参考区间
         let std_chars = FS_SPECS[1].lines * (PAGE_W - SIDE_PAD * 2) / FS_SPECS[1].size;
         assert!(
             (500..=800).contains(&std_chars),
@@ -2177,11 +2180,11 @@ mod tests {
         assert!(!is_spa_entry("/favicon.ico"));
     }
 
-    /// 版式硬约束：底栏 64 不压正文、正文区 = 1268 − 64 − 52（页码行）；标准档显式 32/52。
+    /// 版式硬约束：底栏 64 不压正文、正文区 = 1268 − 64 − 36（顶部留白）− 56（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
         assert_eq!(READ_BODY_H, READ_STAGE_H - BAR_H);
-        assert_eq!(READ_TEXT_H, READ_BODY_H - READ_PAGENO_H);
+        assert_eq!(READ_TEXT_H, READ_BODY_H - READ_PAD_TOP - READ_PAGENO_H);
         assert!(READ_TEXT_H <= READ_STAGE_CONTENT_H, "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
         assert_eq!(spec.size, 32, "标准档必须显式 32px（实测 32/52，勿低于 30）");
@@ -2196,13 +2199,13 @@ mod tests {
         assert!(spec.lines <= READ_TEXT_H / spec.line);
     }
 
-    /// 四档行预算对齐参考值（28/46→25、32/52→22、38/62→18、20/36→26），
-    /// 比 26/23/19/26 各让 1 行给底部页码行；仍在 ±1 容差内且都 ≤1196 可用高。
+    /// 四档行预算对齐参考值（28/46→24、32/52→21、38/62→17、20/36→25）：
+    /// 顶部留白 36px + 页码行 56px 各让出行数，仍保证总高 ≤1196 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
         assert_eq!(
             FS_SPECS.iter().map(|s| s.lines).collect::<Vec<_>>(),
-            vec![25, 22, 18, 26]
+            vec![24, 21, 17, 25]
         );
         for s in FS_SPECS.iter() {
             assert!(s.lines * s.line <= READ_TEXT_H, "{}px 行高溢出", s.line);
@@ -2234,11 +2237,11 @@ mod tests {
         assert_eq!(nav.matches("id=\"k-nav\"").count(), 1, "顶栏只能有一条");
     }
 
-    /// 空书架：2px 描边块 + 满区居中（table 100% + valign=middle）+ 240×72 描边按钮。
+    /// 空书架：1px 描边块 + 满区居中（table 100% + valign=middle）+ 240×72 描边按钮。
     #[test]
     fn empty_shelf_is_outlined_and_centered() {
         let html = empty_shelf(2);
-        assert!(html.contains("border:2px solid #000"), "{html}");
+        assert!(html.contains("border:1px solid #000"), "{html}");
         assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
         assert!(html.contains("align=\"center\" valign=\"middle\""), "{html}");
         assert!(html.contains("书架还是空的"), "{html}");
@@ -2264,6 +2267,8 @@ mod tests {
         assert_eq!(bar.matches("width=\"20%\"").count(), 5, "{bar}");
         assert_eq!(bar.matches("height=\"64\"").count(), 5, "{bar}");
         assert!(bar.contains("width:28px;height:28px"));
+        assert!(bar.contains("font-size:28px;line-height:28px;font-weight:700"), "{bar}");
+        assert!(!bar.contains("border:1px solid #000"), "字符不得再套方框");
         assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
         assert_eq!(bar.matches("<a ").count(), 3, "上/下/目录/字号里只有 3 个 <a>，记录是 form");
         assert!(bar.contains("color:#555"), "禁用态用弱灰 #555");
