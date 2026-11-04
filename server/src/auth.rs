@@ -246,6 +246,11 @@ pub async fn login(
     if !verify(&req.password, &pw_hash).map_err(AppError::Bcrypt)? {
         return Err(AppError::Unauthorized);
     }
+    // 记录最后登录时间（UTC），供管理员在设置页查看；失败不影响登录本身
+    let _ = sqlx::query("UPDATE users SET last_login_at = datetime('now') WHERE id = ?")
+        .bind(id)
+        .execute(&state.shared)
+        .await;
     let token = create_token(id, &req.username, &role, ver, &state.cfg.jwt_secret)?;
     Ok(Json(TokenRes { token }))
 }
@@ -401,19 +406,20 @@ pub async fn admin_list_users(
     user: AuthUser,
 ) -> AppResult<Json<serde_json::Value>> {
     ensure_admin(&user)?;
-    let rows: Vec<(i64, String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, username, role, disabled, created_at FROM users ORDER BY id",
+    let rows: Vec<(i64, String, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, username, role, disabled, created_at, last_login_at FROM users ORDER BY id",
     )
     .fetch_all(&state.shared)
     .await?;
     Ok(Json(json!({
         "ok": true,
-        "users": rows.into_iter().map(|(id, username, role, disabled, created_at)| json!({
+        "users": rows.into_iter().map(|(id, username, role, disabled, created_at, last_login_at)| json!({
             "id": id,
             "username": username,
             "role": role,
             "disabled": disabled != 0,
             "created_at": created_at,
+            "last_login_at": last_login_at,
         })).collect::<Vec<_>>(),
     })))
 }

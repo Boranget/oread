@@ -837,7 +837,7 @@
 {#if mode === 'search' && jobExpired}
   <div class="warn-box" role="alert">
     <div class="warn-title">搜索任务已过期，结果可能不完整</div>
-    <div class="warn-item">后端搜索任务只保留 60 秒、最多 8 个；当前 job 已不在服务端，无法继续取回剩余结果。</div>
+    <div class="warn-item">后端搜索任务只保留 60 秒；已完成任务最多 32 个，进行中任务另有 64 个硬上限。当前 job 已不在服务端，无法继续取回剩余结果。</div>
     <div class="row" style="margin-top:8px">
       <button on:click={doSearch} disabled={starting || !key.trim()}>重新搜索</button>
     </div>

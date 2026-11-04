@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, describeFailure, describeSourceError } from '../lib/api.js';
+  import { api, describeFailure, describeSourceError, getRole, getToken, parseJwt, clearToken } from '../lib/api.js';
   import { THEMES, THEME_LABELS, setTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
@@ -33,6 +33,99 @@
   let notice = '';
   let loading = true;
   let saving = false;
+
+  // 账户：用户名/角色来自本地 JWT claims；服务端权限判定始终以签名校验结果为准
+  const claims = parseJwt(getToken());
+  let accountName = String(claims.username || '');
+  let accountRole = String(claims.role || getRole());
+  let accountId = Number(claims.sub) || 0;
+  const isAdmin = accountRole === 'admin';
+
+  let pwOld = '';
+  let pwNew = '';
+  let pwConfirm = '';
+  let pwBusy = false;
+  let pwErr = '';
+  let pwNotice = '';
+
+  let users = [];
+  let usersLoading = false;
+  let usersErr = '';
+  let userBusy = 0;
+  $: enabledAdminCount = users.filter((u) => u.role === 'admin' && !u.disabled).length;
+
+  function roleText(r) {
+    return r === 'admin' ? '管理员' : '普通用户';
+  }
+
+  // 后端按 Unicode 字符数校验 6–128，这里用 [...s].length 保持一致
+  function passwordProblem() {
+    if (!pwOld) return '请输入当前密码';
+    const n = [...String(pwNew || '')].length;
+    if (n < 6 || n > 128) return `新密码需为 6–128 个字符（当前 ${n} 个）`;
+    if (pwNew !== pwConfirm) return '两次输入的新密码不一致';
+    return '';
+  }
+
+  async function changePassword() {
+    pwErr = '';
+    pwNotice = '';
+    const problem = passwordProblem();
+    if (problem) {
+      pwErr = problem;
+      return;
+    }
+    pwBusy = true;
+    try {
+      await api.changePassword(pwOld, pwNew);
+      pwNotice = '密码已修改，旧密码与所有旧登录状态已失效；正在返回登录页…';
+      pwOld = '';
+      pwNew = '';
+      pwConfirm = '';
+      clearToken();
+      setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+      pwErr = describeFailure(e, '修改密码');
+    } finally {
+      pwBusy = false;
+    }
+  }
+
+  async function loadUsers() {
+    if (!isAdmin) return;
+    usersLoading = true;
+    usersErr = '';
+    try {
+      const res = await api.adminUsers();
+      users = (res && res.users) || [];
+    } catch (e) {
+      usersErr = describeFailure(e, '读取用户列表');
+    } finally {
+      usersLoading = false;
+    }
+  }
+
+  async function toggleUser(u) {
+    userBusy = u.id;
+    usersErr = '';
+    try {
+      await api.adminSetUserStatus(u.id, !u.disabled);
+      await loadUsers();
+    } catch (e) {
+      usersErr = describeFailure(e, u.disabled ? '启用账号' : '停用账号');
+    } finally {
+      userBusy = 0;
+    }
+  }
+
+  // 后端时间均为 UTC datetime('now') 字符串，换成本机时区展示；空值表示从未网页登录
+  function fmtServerTime(s) {
+    if (!s) return '从未登录';
+    const d = new Date(String(s).replace(' ', 'T') + 'Z');
+    if (Number.isNaN(d.getTime())) return String(s);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
 
   // 页宽 / 字体族：服务端 user_settings 为准，本机 key 只做离线兜底
   let layoutBusy = '';
@@ -218,6 +311,7 @@
     error = '';
     loadHealth();
     loadShelfBooks();
+    if (isAdmin) loadUsers();
     try {
       const s = await api.settings();
       const merged = { ...DEFAULTS, ...(s || {}) };
@@ -288,6 +382,94 @@
 {#if loading}<p class="loading">读取设置…</p>{/if}
 
 <div class="settings-wrap">
+  <div class="card">
+    <h3>账户</h3>
+    <div class="account-head">
+      <span class="muted">当前账号</span>
+      <b>{accountName || '未记录'}</b>
+      <span class="badge">{roleText(accountRole)}</span>
+    </div>
+
+    <div class="warn-box">
+      <div class="warn-title">默认密码请立即修改</div>
+      <div class="warn-item">首次部署的 admin 账号可能仍在使用部署默认密码。修改成功后旧密码立即失效，所有已登录设备都需要用新密码重新登录。</div>
+    </div>
+
+    <div class="field">
+      <div class="field-label">修改密码</div>
+      <input
+        type="password"
+        placeholder="当前密码"
+        autocomplete="current-password"
+        bind:value={pwOld}
+      />
+      <div style="height:8px"></div>
+      <input
+        type="password"
+        placeholder="新密码（6–128 个字符）"
+        autocomplete="new-password"
+        bind:value={pwNew}
+      />
+      <div style="height:8px"></div>
+      <input
+        type="password"
+        placeholder="再次输入新密码"
+        autocomplete="new-password"
+        bind:value={pwConfirm}
+      />
+      <div class="muted field-hint">密码按字符数校验 6–128；提交前会本地检查长度与两次输入是否一致。</div>
+      {#if pwErr}<p class="err">{pwErr}</p>{/if}
+      {#if pwNotice}<p class="ok-line">{pwNotice}</p>{/if}
+      <div class="cache-actions">
+        <button class="primary" on:click={changePassword} disabled={pwBusy}>
+          {pwBusy ? '提交中…' : '修改密码'}
+        </button>
+      </div>
+    </div>
+  </div>
+
+  {#if isAdmin}
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <h3 style="margin:0">用户管理</h3>
+        <div class="spacer"></div>
+        <button class="ghost" on:click={loadUsers} disabled={usersLoading}>
+          {usersLoading ? '读取中…' : '刷新'}
+        </button>
+      </div>
+      {#if usersErr}<p class="err">{usersErr}</p>{/if}
+      {#if users.length}
+        <div class="user-table">
+          <div class="user-row user-head">
+            <span>用户名</span><span>角色</span><span>状态</span><span>最后登录</span><span></span>
+          </div>
+          {#each users as u (u.id)}
+            <div class="user-row">
+              <span class="user-name">
+                {u.username}{#if u.id === accountId}<span class="muted">（当前）</span>{/if}
+              </span>
+              <span>{roleText(u.role)}</span>
+              <span class:user-off={u.disabled}>{u.disabled ? '已停用' : '启用中'}</span>
+              <span class="muted">{fmtServerTime(u.last_login_at)}</span>
+              <span>
+                <button
+                  class="ghost"
+                  on:click={() => toggleUser(u)}
+                  disabled={userBusy === u.id || u.id === accountId || (u.role === 'admin' && !u.disabled && enabledAdminCount <= 1)}
+                >
+                  {userBusy === u.id ? '处理中…' : u.disabled ? '启用' : '停用'}
+                </button>
+              </span>
+            </div>
+          {/each}
+        </div>
+        <div class="muted field-hint">停用会立即让该账号所有已登录设备失效；重新启用后仍需重新登录。不能停用当前账号或最后一个启用中的管理员。</div>
+      {:else if !usersLoading}
+        <p class="muted field-hint">暂无用户。</p>
+      {/if}
+    </div>
+  {/if}
+
   <div class="card">
     <h3>正文净化</h3>
     <label class="switch-row">
@@ -388,7 +570,7 @@
     <div class="field">
       <div class="field-label">正文缓存上限（MB）</div>
       <input type="number" min="10" max="1000" step="10" bind:value={settings.cache_limit_mb} />
-      <div class="muted field-hint">由服务端执行 LRU 淘汰（当前服务端使用全局配置，尚未按用户读取该值）。</div>
+      <div class="muted field-hint">由服务端按账号执行 LRU 淘汰；实际上限取本值与服务端部署上限的较小值。</div>
     </div>
 
     <label class="switch-row">
@@ -511,6 +693,22 @@
 <style>
   .settings-wrap { max-width: none; display: grid; gap: 12px; }
   .settings-wrap h3 { margin-bottom: 12px; }
+  .account-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .account-head b { font-size: 15px; }
+  .user-table { border: 1px solid var(--border, #d8d8d8); border-radius: 8px; overflow-x: auto; }
+  .user-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 1.2fr) 70px 70px minmax(130px, 1fr) 96px;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 10px;
+    border-top: 1px solid var(--border, #d8d8d8);
+    font-size: 13px;
+  }
+  .user-row:first-child { border-top: 0; }
+  .user-head { color: var(--muted); font-size: 12px; background: var(--soft-bg, #fafafa); }
+  .user-name { font-weight: 600; word-break: break-all; }
+  .user-off { color: var(--muted); }
   .field { margin-bottom: 16px; }
   .field:last-child { margin-bottom: 0; }
   .field-label { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
