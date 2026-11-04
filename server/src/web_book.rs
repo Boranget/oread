@@ -433,13 +433,14 @@ pub async fn search_book(
         None => return Ok(vec![]),
     };
     let (url, method, headers, body) = build_search_request(source, key, page);
-    let html = req::fetch_for_source_timed(
+    let html = req::fetch_for_source_limited(
         &url,
         &method,
         &headers,
         body.as_deref(),
         &source.book_source_url,
         req::source_timeout(source),
+        req::source_concurrency(source),
     )
     .await?;
     let ar = make_ar(source);
@@ -488,13 +489,14 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
         None => return Ok(vec![]),
     };
     let headers = req::source_headers(source, &source.book_source_url);
-    let html = req::fetch_for_source_timed(
+    let html = req::fetch_for_source_limited(
         url,
         "GET",
         &headers,
         None,
         &source.book_source_url,
         req::source_timeout(source),
+        req::source_concurrency(source),
     )
     .await?;
     let ar = make_ar(source);
@@ -546,13 +548,14 @@ pub async fn book_info_book(
     }
     let url = book.book_url.clone();
     let headers = req::source_headers(source, &url);
-    let html = req::fetch_for_source_timed(
+    let html = req::fetch_for_source_limited(
         &url,
         "GET",
         &headers,
         None,
         &source.book_source_url,
         req::source_timeout(source),
+        req::source_concurrency(source),
     )
     .await?;
     parse_book_info_html(source, book, &html, store)
@@ -684,13 +687,14 @@ pub async fn chapter_list_book(
         seen.insert(url.clone());
         // 让规则里的 `${page}` / `{{page}}` 拿到当前页号
         ar.set_var("page", page.to_string());
-        let html = req::fetch_for_source_timed(
+        let html = req::fetch_for_source_limited(
             &url,
             "GET",
             &headers,
             None,
             &source.book_source_url,
             req::source_timeout(source),
+            req::source_concurrency(source),
         )
         .await?;
         let rule_text = rule.chapter_list.as_deref().unwrap_or("");
@@ -768,13 +772,14 @@ async fn fetch_html_pages(
         }
         guard += 1;
         seen.insert(url.clone());
-        let html = req::fetch_for_source_timed(
+        let html = req::fetch_for_source_limited(
             &url,
             "GET",
             &headers,
             None,
             &source.book_source_url,
             req::source_timeout(source),
+            req::source_concurrency(source),
         )
         .await?;
         let ar = make_ar(source);

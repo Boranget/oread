@@ -45,6 +45,26 @@ fn resolve_all_slots(raw: Option<u64>) -> usize {
 /// 搜索并发硬上限：设备实测 16 槽不构成资源瓶颈（VmHWM 46–71 MB）。
 const MAX_SEARCH_CONCURRENCY: u64 = 16;
 
+/// 每源在飞请求上限：书源未声明 `concurrentRate` 时的默认值。
+/// 默认 8 与旧行为等价（全局槽 16，单源最多占一半），避免改变既有首屏与开书耗时；
+/// 实测把默认压到 2/4 只在同源图片突发时增加排队，RSS 无显著收益，
+/// 需要按设备收紧的部署用 `BORANLIB_SOURCE_CONCURRENCY_DEFAULT` 覆盖。
+pub const SOURCE_CONCURRENCY_DEFAULT: usize = 8;
+pub const SOURCE_CONCURRENCY_MIN: usize = 1;
+pub const SOURCE_CONCURRENCY_MAX: usize = 8;
+
+fn clamp_source_concurrency(n: u64) -> usize {
+    n.clamp(SOURCE_CONCURRENCY_MIN as u64, SOURCE_CONCURRENCY_MAX as u64) as usize
+}
+
+/// 默认每源上限：缺省/0/非法 → [`SOURCE_CONCURRENCY_DEFAULT`]，其余夹取 1–8。
+fn resolve_source_concurrency_default(raw: Option<u64>) -> usize {
+    match raw {
+        Some(0) | None => SOURCE_CONCURRENCY_DEFAULT,
+        Some(n) => clamp_source_concurrency(n),
+    }
+}
+
 /// 单段 JS 规则的默认时间预算（毫秒）。
 ///
 /// 200ms 是早期按开发机估算的值：慢设备上腾讯漫画图片规则单次约 1.4s，
@@ -129,6 +149,9 @@ pub struct Config {
     /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
     /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
     pub search_all_slots: usize,
+    /// 每源在飞请求上限的默认值（书源未声明 `concurrentRate` 时使用）。
+    /// 范围 1–8，默认 8；`SOURCE_CONCURRENCY_DEFAULT` 可覆盖。
+    pub source_concurrency_default: usize,
     /// 单响应体大小上限（字节）
     pub http_max_body_bytes: usize,
     /// 图片代理进程内 LRU 缓存上限（MiB）
@@ -242,6 +265,9 @@ impl Config {
             http_concurrency: clamp_http_concurrency(http_concurrency_raw.unwrap_or(16)),
             // all 范围：显式设置时尊重用户（min(配置,16)），未设置时用设备建议的 16。
             search_all_slots: resolve_all_slots(http_concurrency_raw),
+            source_concurrency_default: resolve_source_concurrency_default(env_u64_opt(
+                "SOURCE_CONCURRENCY_DEFAULT",
+            )),
             http_timeout_secs: env_u64("HTTP_TIMEOUT_SECS", 15).clamp(3, 60),
             // 单源预算与整批预算分开：单源默认 8s，整批按 scope 默认（curated 6s / all 10s）。
             search_timeout_secs,
@@ -463,6 +489,22 @@ mod tests {
         assert_eq!(resolve_all_slots(None), 16, "未设置时用设备建议 16");
         assert_eq!(resolve_all_slots(Some(32)), 16, "超过 16 夹回");
         assert_eq!(resolve_all_slots(Some(0)), 1);
+    }
+
+    // 每源在飞上限默认值：缺省/0 → 8；1..8 原样；>8 夹到 8
+    #[test]
+    fn source_concurrency_default_is_resolved_and_clamped() {
+        assert_eq!(resolve_source_concurrency_default(None), 8);
+        assert_eq!(resolve_source_concurrency_default(Some(0)), 8, "0 回退默认");
+        assert_eq!(resolve_source_concurrency_default(Some(1)), 1);
+        assert_eq!(resolve_source_concurrency_default(Some(2)), 2);
+        assert_eq!(resolve_source_concurrency_default(Some(8)), 8);
+        assert_eq!(
+            resolve_source_concurrency_default(Some(9)),
+            8,
+            "超过 8 夹回"
+        );
+        assert_eq!(resolve_source_concurrency_default(Some(99)), 8);
     }
 
     // JS 预算：默认 3s（覆盖腾讯漫画图片规则实测 1.4s），显式值原样生效

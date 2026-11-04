@@ -394,11 +394,12 @@ async fn import_url(
     }
 
     let headers = req::source_headers(&source, &book_url);
-    let page = req::fetch_page_for_source_timed(
+    let page = req::fetch_page_for_source_limited(
         &book_url,
         &headers,
         &source.book_source_url,
         req::source_timeout(&source),
+        req::source_concurrency(&source),
     )
     .await?;
     check_page(page.status, page.content_type.as_deref(), &page.body)?;
