@@ -26,11 +26,21 @@ use crate::web_book;
 pub const TYPE_NOVEL: i64 = 0;
 pub const TYPE_COMIC: i64 = 2;
 
-/// 单条搜索预算（5s）；整批默认 60s，超时后中断并保留已完成的结果。
+/// 单条搜索预算（5s）；整批预算按源数×样本数动态估算（至少 60s，最多 600s）。
 pub const PER_SAMPLE_BUDGET_SECS: u64 = 5;
 pub const BATCH_BUDGET_SECS: u64 = 60;
+pub const MAX_BATCH_BUDGET_SECS: u64 = 600;
 /// 体检源的并发数；真正的 HTTP 并发仍由 `req` 全局信号量（HTTP_CONCURRENCY）兜底。
 pub const BENCH_CONCURRENCY: usize = 8;
+
+/// 整批预算：源多/样本多时按最坏情况（每条都打满单条预算）估算，
+/// 避免 139 个源只跑完前几十个就把后面的源记成 timeout（漫画源因此常年 0 命中）。
+pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 {
+    let est = (source_count.saturating_mul(samples_per_source) as u64)
+        .saturating_mul(PER_SAMPLE_BUDGET_SECS)
+        / BENCH_CONCURRENCY as u64;
+    est.max(BATCH_BUDGET_SECS).min(MAX_BATCH_BUDGET_SECS)
+}
 
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
 pub const MIN_CURATED_SAMPLES: i64 = 2;
@@ -1151,14 +1161,18 @@ fn compute_source_rows(
         let source_type = src.map(|s| s.book_source_type).unwrap_or(TYPE_NOVEL);
         let total = list.len() as i64;
         let excluded = list.iter().filter(|r| r.suspicious).count() as i64;
-        let usable: Vec<&&BenchRun> = list.iter().filter(|r| !r.suspicious).collect();
+        let usable: Vec<&BenchRun> = list.iter().filter(|r| !r.suspicious).copied().collect();
         let obs = usable.len() as i64;
-        let hits = usable.iter().filter(|r| r.found).count() as i64;
-        let errors = usable.iter().filter(|r| r.error_kind.is_some()).count() as i64;
-        let avg_latency = if obs == 0 {
-            0
+        // 只有真正拿到响应的样本才算“有效样本”：
+        // 体检整批 deadline 到了还没发出的请求不能算样本，更不能按 latency=0 拿满分。
+        let ok: Vec<&BenchRun> = usable.iter().filter(|r| r.error_kind.is_none()).copied().collect();
+        let samples = ok.len() as i64;
+        let hits = ok.iter().filter(|r| r.found).count() as i64;
+        let errors = obs - samples;
+        let avg_latency = if samples == 0 {
+            (PER_SAMPLE_BUDGET_SECS * 1000) as i64
         } else {
-            usable.iter().map(|r| r.latency_ms.max(0)).sum::<i64>() / obs
+            ok.iter().map(|r| r.latency_ms.max(0)).sum::<i64>() / samples
         };
         let mut kinds: HashMap<String, i64> = HashMap::new();
         for r in usable.iter() {
@@ -1166,15 +1180,15 @@ fn compute_source_rows(
                 *kinds.entry(k.to_string()).or_insert(0) += 1;
             }
         }
-        // 按 category 聚合命中率（单条冷门书名不会单独把源判死）
+        // 按 category 聚合命中率（单条冷门书名不会单独把源判死）；错误样本不计入分母。
         let cats = scoring_cats.get(&source_type).cloned().unwrap_or_default();
         let mut per_cat: Vec<CategoryRate> = Vec::new();
         for cat in cats.iter() {
-            let cs = usable.iter().filter(|r| r.category == *cat).count() as i64;
+            let cs = ok.iter().filter(|r| r.category == *cat).count() as i64;
             if cs == 0 {
                 continue;
             }
-            let ch = usable
+            let ch = ok
                 .iter()
                 .filter(|r| r.category == *cat && r.found)
                 .count() as i64;
@@ -1190,7 +1204,11 @@ fn compute_source_rows(
         } else {
             per_cat.iter().map(|c| c.hit_rate).sum::<f64>() / per_cat.len() as f64
         };
-        let latency_score = 1.0 - (avg_latency as f64 / (PER_SAMPLE_BUDGET_SECS * 1000) as f64).clamp(0.0, 1.0);
+        let latency_score = if samples == 0 {
+            0.0
+        } else {
+            1.0 - (avg_latency as f64 / (PER_SAMPLE_BUDGET_SECS * 1000) as f64).clamp(0.0, 1.0)
+        };
         let success = if obs == 0 {
             0.0
         } else {
@@ -1206,7 +1224,7 @@ fn compute_source_rows(
             source_url: url.clone(),
             name,
             source_type,
-            samples: obs,
+            samples,
             hits,
             hit_rate: (hit_rate * 1000.0).round() / 1000.0,
             avg_latency_ms: avg_latency,
@@ -1314,7 +1332,6 @@ pub async fn run_bench(
 ) -> AppResult<BenchReport> {
     let started_at = now_ms();
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(BATCH_BUDGET_SECS);
     let batch_seq = next_seq();
     let batch_id = format!("b{}-{}", started_at, batch_seq);
 
@@ -1355,6 +1372,7 @@ pub async fn run_bench(
     let comic_corpus = corpus_for_type(TYPE_COMIC);
 
     let health = source_health::load_map(pool).await.unwrap_or_default();
+    let deadline = started + Duration::from_secs(batch_budget_secs(sources.len(), samples_per_source));
     let prev_streak: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
         "SELECT source_url, fail_streak FROM source_curated",
     )
@@ -2019,6 +2037,35 @@ mod tests {
         assert_eq!(row.excluded_samples, 1);
         assert_eq!(row.hits, 2);
         assert!((row.hit_rate - 1.0).abs() < 1e-9, "剔除冷门语料后命中率不受拖累");
+    }
+
+    #[test]
+    fn batch_budget_scales_with_source_count() {
+        assert_eq!(batch_budget_secs(1, 5), BATCH_BUDGET_SECS, "单源仍用 60s");
+        assert_eq!(batch_budget_secs(139, 5), 434, "139 源×5 样本：按最坏情况估算");
+        assert_eq!(batch_budget_secs(200, 20), MAX_BATCH_BUDGET_SECS, "封顶 600s");
+    }
+
+    #[test]
+    fn timeout_samples_are_not_scored_as_fast() {
+        let corpus = vec![entry("正常1", "玄幻", TYPE_NOVEL, true)];
+        let mut src = BookSource::default();
+        src.book_source_url = "https://dead".into();
+        src.book_source_name = "dead".into();
+        let sources = HashMap::from([("https://dead".to_string(), src)]);
+        let cfg = Config::from_env();
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            let mut r = run("https://dead", "玄幻", "正常1", false, false);
+            r.latency_ms = 0;
+            r.error_kind = Some("timeout".into());
+            runs.push(r);
+        }
+        let rows = compute_source_rows(&runs, &sources, &corpus, &cfg, &HashMap::new(), &HashMap::new());
+        let row = &rows[0];
+        assert_eq!(row.samples, 0, "超时样本不算有效样本");
+        assert_eq!(row.errors, 5);
+        assert_eq!(row.bench_score, 0, "全超时不能靠 latency=0 拿到 30 分基线");
     }
 
     #[test]
