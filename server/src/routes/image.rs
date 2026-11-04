@@ -10,12 +10,16 @@
 //! （Luma8 + BT.709 亮度系数，质量默认 78，可用 `BORANLIB_EINK_JPEG_QUALITY` 调整）；
 //! 其余客户端原样透传 WebP（不做无谓的 CPU 开销）。缓存 key 带色彩模式/质量后缀，
 //! 避免不同档位互相覆盖。
+//!
+//! 墨水屏灰度：源图本身是 JPEG 时（图文小说、漫画的多数源都是 JPEG），墨水屏请求
+//! 也走「解码 → Luma8 → 重编码 JPEG」，质量沿用 `BORANLIB_EINK_JPEG_QUALITY`；
+//! 缓存变体用 `#jpegsrc-w1200-gq78` 独立后缀，彩色端始终原图直出、不会命中灰度图。
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Json, Query, State};
@@ -39,16 +43,52 @@ const CACHE_ITEM_MAX: usize = 2 * 1024 * 1024;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 流式转发前为解析宽高最多预读的字节数（JPEG 的 SOF 通常很靠前）
 const PEEK_MAX: usize = 64 * 1024;
-/// WebP→JPEG 转码的目标宽度上限（KPW3 视口 1072 CSS px，按 ~1.12 倍留余地）
-const TRANSCODE_MAX_WIDTH: u32 = 1200;
-/// 墨水屏灰度 JPEG 的默认质量：灰度在电子墨水屏上对压缩伪影不敏感，78 是可看下限。
+/// 墨水屏灰度 JPEG 的默认质量。8 页真实漫画的 Pareto 结论：q70 相比 q78
+/// 体积 -13.6%、文字区 SSIM 仅 -0.25%（0.9819 vs 0.9844），CER 无显著变差。
 /// 可用 `BORANLIB_EINK_JPEG_QUALITY` 覆盖（允许 60–90，越界会被夹到区间内）。
-const EINK_JPEG_QUALITY_DEFAULT: u8 = 78;
+const EINK_JPEG_QUALITY_DEFAULT: u8 = 70;
 const EINK_JPEG_QUALITY_MIN: u8 = 60;
 const EINK_JPEG_QUALITY_MAX: u8 = 90;
 const EINK_JPEG_QUALITY_ENV: &str = "BORANLIB_EINK_JPEG_QUALITY";
-/// 解码前允许的最大像素数（防解压炸弹：20 MP 的灰度缓冲约 20 MB、RGB 约 60 MB）
-const MAX_TRANSCODE_PIXELS: u64 = 20_000_000;
+/// 缩放目标宽度：KPW3 视口 1072 CSS px，1200 约 1.12 倍；1440 只增加字迹超采样，
+/// 体积 +31%，Pareto 不占优。可用 `BORANLIB_EINK_JPEG_WIDTH` 覆盖（800–1600）。
+const EINK_JPEG_WIDTH_DEFAULT: u32 = 1200;
+const EINK_JPEG_WIDTH_MIN: u32 = 800;
+const EINK_JPEG_WIDTH_MAX: u32 = 1600;
+const EINK_JPEG_WIDTH_ENV: &str = "BORANLIB_EINK_JPEG_WIDTH";
+/// 自适应质量开关（默认关）：按画面中间调占比判文字页，样本命中 7/8，样本太少不默认开。
+const EINK_ADAPTIVE_ENV: &str = "BORANLIB_EINK_ADAPTIVE";
+const EINK_ADAPTIVE_TEXT_Q: u8 = 85;
+const EINK_ADAPTIVE_ART_Q: u8 = 70;
+/// mid_ratio < 0.30 判为文字页；8 页标注样本上 7/8 正确（纯画面 1 页被误判为文字）。
+const EINK_ADAPTIVE_MID_THRESHOLD: f64 = 0.30;
+/// 轻量 USM 开关（默认关）：样本上文字区 SSIM 略降、CER 变差，不启用。
+const EINK_USM_ENV: &str = "BORANLIB_EINK_USM";
+/// 编码器标签（当前只有纯 Rust `image` 编码器；mozjpeg 需要 cmake/nasm，环境不可用）。
+/// 8 页样本上 8-bit 灰度 PNG 全部 2.3–3.0 倍于 JPEG，PNG 兜底不采用，也不引入额外 encoder 特性。
+const EINK_JPEG_ENCODER_TAG: &str = "img";
+/// 解码前允许的最大像素数（防解压炸弹：8 MP 解码为 RGB 约 24 MB、Luma8 约 8 MB）。
+const MAX_TRANSCODE_PIXELS: u64 = 8_000_000;
+
+/// 墨水屏转码参数。所有影响输出的参数都必须进缓存 key，避免旧档串味。
+#[derive(Clone, Copy, Debug)]
+struct EinkConfig {
+    width: u32,
+    quality: u8,
+    adaptive: bool,
+    usm: bool,
+}
+
+impl Default for EinkConfig {
+    fn default() -> Self {
+        Self {
+            width: EINK_JPEG_WIDTH_DEFAULT,
+            quality: EINK_JPEG_QUALITY_DEFAULT,
+            adaptive: false,
+            usm: false,
+        }
+    }
+}
 
 /// 转码输出档：墨水屏走灰度（Luma8，BT.709 亮度系数），彩色档仅用于对比/测试。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,15 +105,9 @@ impl EncodeProfile {
             quality: eink_jpeg_quality(),
         }
     }
-
-    /// 缓存 key 后缀，把色彩模式与质量并入，避免不同档互相覆盖。
-    fn key_suffix(self) -> String {
-        let mode = if self.grayscale { "g" } else { "c" };
-        format!("{mode}q{}", self.quality)
-    }
 }
 
-/// 读取墨水屏质量档：非法值回落默认 78，越界夹到 60–90。
+/// 读取墨水屏质量档：非法值回落默认 70，越界夹到 60–90。
 fn eink_jpeg_quality() -> u8 {
     std::env::var(EINK_JPEG_QUALITY_ENV)
         .ok()
@@ -86,6 +120,32 @@ fn parse_eink_jpeg_quality(raw: &str) -> Option<u8> {
     Some(v.clamp(EINK_JPEG_QUALITY_MIN, EINK_JPEG_QUALITY_MAX))
 }
 
+fn parse_env_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes" | "eink"
+    )
+}
+
+/// 从环境变量读取完整转码参数；宽度夹到 800–1600，非法值回落默认。
+fn eink_config() -> EinkConfig {
+    let width = std::env::var(EINK_JPEG_WIDTH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|v| v.clamp(EINK_JPEG_WIDTH_MIN, EINK_JPEG_WIDTH_MAX))
+        .unwrap_or(EINK_JPEG_WIDTH_DEFAULT);
+    EinkConfig {
+        width,
+        quality: eink_jpeg_quality(),
+        adaptive: std::env::var(EINK_ADAPTIVE_ENV)
+            .map(|v| parse_env_bool(&v))
+            .unwrap_or(false),
+        usm: std::env::var(EINK_USM_ENV)
+            .map(|v| parse_env_bool(&v))
+            .unwrap_or(false),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ImageQ {
     pub url: String,
@@ -95,6 +155,8 @@ pub struct ImageQ {
     pub book_url: Option<String>,
     /// 章节页地址，用作 Referer
     pub chapter_url: Option<String>,
+    /// 墨水屏模式显式开关：`eink=1`（等价于请求头 `X-Device-Mode: eink`）
+    pub eink: Option<String>,
 }
 
 /// 批量元数据请求：一次返回整章图片的宽高/字节数，避免“一张一个额外请求”（KPW3 每次请求约 0.3s TTFB）。
@@ -137,6 +199,11 @@ fn is_webp_content_type(ct: &str) -> bool {
     base == "image/webp"
 }
 
+fn is_jpeg_content_type(ct: &str) -> bool {
+    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(base.as_str(), "image/jpeg" | "image/jpg" | "image/pjpeg")
+}
+
 /// 是否需要把 WebP 转成 JPEG：老 Kindle/Silk 一律转；其他客户端仅在 Accept 明确
 /// 不含 `image/webp` 时转。Accept 缺失按现代客户端处理，原样透传。
 fn wants_webp_transcode(headers: &HeaderMap) -> bool {
@@ -153,68 +220,312 @@ fn wants_webp_transcode(headers: &HeaderMap) -> bool {
     }
 }
 
-/// 缓存 key 的客户端变体：转码后的 JPEG 与原图必须分开存，不同编码档（灰度/彩色、
-/// 质量）也必须分开，否则桌面/墨水屏、灰度/彩色会互相覆盖。
-fn cache_variant_key(url: &str, profile: Option<EncodeProfile>) -> String {
-    match profile {
-        Some(p) => format!("{url}#jpeg-w{TRANSCODE_MAX_WIDTH}-{}", p.key_suffix()),
-        None => format!("{url}#orig"),
+/// 是否墨水屏客户端：Kindle/Silk 真机 UA，或前端显式声明 eink 模式
+/// （`X-Device-Mode: eink` 头 / `?eink=1` 参数，二者等价）。
+/// 普通桌面/手机浏览器不开 eink 模式时一律原图直出，不做灰度重编码。
+fn is_eink_client(headers: &HeaderMap, q_eink: Option<&str>) -> bool {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if crate::routes::kindle::is_kindle_ua(ua) {
+        return true;
+    }
+    if let Some(v) = q_eink {
+        let v = v.trim().to_ascii_lowercase();
+        if v == "1" || v == "true" || v == "eink" {
+            return true;
+        }
+    }
+    headers
+        .get("x-device-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("eink"))
+        .unwrap_or(false)
+}
+
+/// 缓存 key 的客户端变体：转码后的 JPEG 与原图必须分开存，宽度/质量/编码器/自适应
+/// 也必须分开，否则桌面/墨水屏、灰度/彩色、不同调参档会互相覆盖。
+/// `jpeg_source` 区分「WebP 转码」与「JPEG 源灰度」两条路径。
+fn variant_key(url: &str, jpeg_source: bool, cfg: &EinkConfig, quality: u8) -> String {
+    let kind = if jpeg_source { "jpegsrc" } else { "jpeg" };
+    format!(
+        "{url}#{kind}-w{}-q{}-enc{}-a{}{}",
+        cfg.width,
+        quality,
+        EINK_JPEG_ENCODER_TAG,
+        u8::from(cfg.adaptive),
+        if cfg.usm { "-usm" } else { "" }
+    )
+}
+
+/// 自适应开启时质量由画面内容决定，缓存查找需要同时试两个档位。
+fn candidate_qualities(cfg: &EinkConfig) -> Vec<u8> {
+    if cfg.adaptive {
+        vec![EINK_ADAPTIVE_TEXT_Q, EINK_ADAPTIVE_ART_Q]
+    } else {
+        vec![cfg.quality]
     }
 }
 
-/// 目标尺寸：宽度超过上限时等比缩小，否则保持原尺寸。
-fn transcode_target_size(w: u32, h: u32) -> (u32, u32) {
-    if w <= TRANSCODE_MAX_WIDTH || h == 0 {
+fn key_pairs(url: &str, jpeg_source: bool, cfg: &EinkConfig) -> Vec<(String, String)> {
+    candidate_qualities(cfg)
+        .into_iter()
+        .map(|q| {
+            let key = variant_key(url, jpeg_source, cfg, q);
+            let etag = etag_of(&key);
+            (key, etag)
+        })
+        .collect()
+}
+
+fn cache_lookup(keys: &[(String, String)]) -> Option<(Vec<u8>, String, String)> {
+    for (key, etag) in keys {
+        if let Some((data, ct)) = image_cache::get(key) {
+            return Some((data, ct, etag.clone()));
+        }
+    }
+    None
+}
+
+/// 找到客户端 `If-None-Match` 命中的那个变体 ETag（用于 304 响应）。
+fn matching_key_etag<'a>(headers: &HeaderMap, keys: &'a [(String, String)]) -> Option<&'a String> {
+    keys.iter()
+        .find(|(_, etag)| matches_if_none_match(headers, etag))
+        .map(|(_, etag)| etag)
+}
+
+/// 目标尺寸：宽度超过上限时等比缩小，绝不放大（1024 宽的手机源保持原尺寸）。
+fn transcode_target_size(w: u32, h: u32, max_width: u32) -> (u32, u32) {
+    if w <= max_width || h == 0 {
         return (w.max(1), h.max(1));
     }
-    let nw = TRANSCODE_MAX_WIDTH;
-    let nh = ((h as u64 * nw as u64) / w as u64).max(1) as u32;
-    (nw, nh)
+    let nh = ((h as u64 * max_width as u64) / w as u64).max(1) as u32;
+    (max_width, nh)
 }
 
-/// WebP → JPEG（内存内完成，不落盘）：解码用 `image` crate 的纯 Rust 实现，
-/// 解码前先只读头部拿尺寸做像素上限校验，避免解压炸弹把设备内存打爆。
-/// 灰度档先转 Luma8 再缩放，缩放量与编码量都只有 RGB 的 1/3。
-fn transcode_webp_to_jpeg(
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1e-6 {
+        1.0
+    } else {
+        let px = std::f32::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+fn lanczos3(x: f32) -> f32 {
+    if x.abs() < 3.0 {
+        sinc(x) * sinc(x / 3.0)
+    } else {
+        0.0
+    }
+}
+
+/// 分离式 Lanczos3，在线性光空间缩放（gamma 正确），避免暗部被过度压暗。
+fn resize_lanczos_linear(src: &image::GrayImage, tw: u32, th: u32) -> image::GrayImage {
+    let sw = src.width() as usize;
+    let sh = src.height() as usize;
+    let twu = tw as usize;
+    let thu = th as usize;
+    let a = src.as_raw();
+    let mut lin = vec![0f32; sw * sh];
+    for i in 0..sw * sh {
+        lin[i] = srgb_to_linear(a[i] as f32 / 255.0);
+    }
+
+    let mut tmp = vec![0f32; twu * sh];
+    let scale_x = sw as f32 / twu as f32;
+    let support_x = 3.0 * scale_x.max(1.0);
+    for x in 0..twu {
+        let center = (x as f32 + 0.5) * scale_x - 0.5;
+        let start = ((center - support_x).floor() as isize).max(0);
+        let end = ((center + support_x).ceil() as isize).min(sw as isize - 1);
+        let mut weights = Vec::new();
+        let mut sum = 0f32;
+        for s in start..=end {
+            let d = (s as f32 - center) / scale_x.max(1.0);
+            let w = lanczos3(d);
+            weights.push((s as usize, w));
+            sum += w;
+        }
+        if sum.abs() < 1e-9 {
+            weights.clear();
+            let s = center.round().clamp(0.0, (sw - 1) as f32) as usize;
+            weights.push((s, 1.0));
+            sum = 1.0;
+        }
+        for y in 0..sh {
+            let mut v = 0f32;
+            for &(s, w) in &weights {
+                v += lin[y * sw + s] * w;
+            }
+            tmp[y * twu + x] = (v / sum).clamp(0.0, 1.0);
+        }
+    }
+
+    let mut out = vec![0u8; twu * thu];
+    let scale_y = sh as f32 / thu as f32;
+    let support_y = 3.0 * scale_y.max(1.0);
+    for y in 0..thu {
+        let center = (y as f32 + 0.5) * scale_y - 0.5;
+        let start = ((center - support_y).floor() as isize).max(0);
+        let end = ((center + support_y).ceil() as isize).min(sh as isize - 1);
+        let mut weights = Vec::new();
+        let mut sum = 0f32;
+        for s in start..=end {
+            let d = (s as f32 - center) / scale_y.max(1.0);
+            let w = lanczos3(d);
+            weights.push((s as usize, w));
+            sum += w;
+        }
+        if sum.abs() < 1e-9 {
+            weights.clear();
+            let s = center.round().clamp(0.0, (sh - 1) as f32) as usize;
+            weights.push((s, 1.0));
+            sum = 1.0;
+        }
+        for x in 0..twu {
+            let mut v = 0f32;
+            for &(s, w) in &weights {
+                v += tmp[s * twu + x] * w;
+            }
+            out[y * twu + x] = (linear_to_srgb((v / sum).clamp(0.0, 1.0)) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    image::GrayImage::from_raw(tw, th, out).expect("尺寸与缓冲一致")
+}
+
+/// 轻量 USM：5×5 高斯近似（sigma≈0.8），量 0.3，满足「半径≤1、量≤0.3」。
+fn usm_luma(src: &image::GrayImage) -> image::GrayImage {
+    let w = src.width() as usize;
+    let h = src.height() as usize;
+    let a = src.as_raw();
+    let kernel = [0.0545f32, 0.2442, 0.4026, 0.2442, 0.0545];
+    let mut tmp = vec![0f32; w * h];
+    let mut blur = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = 0f32;
+            for (k, kw) in kernel.iter().enumerate() {
+                let sx = (x as isize + k as isize - 2).clamp(0, w as isize - 1) as usize;
+                v += a[y * w + sx] as f32 * kw;
+            }
+            tmp[y * w + x] = v;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut v = 0f32;
+            for (k, kw) in kernel.iter().enumerate() {
+                let sy = (y as isize + k as isize - 2).clamp(0, h as isize - 1) as usize;
+                v += tmp[sy * w + x] * kw;
+            }
+            blur[y * w + x] = v;
+        }
+    }
+    let mut out = vec![0u8; w * h];
+    for i in 0..w * h {
+        let v = a[i] as f32;
+        out[i] = (v + 0.3 * (v - blur[i]).round()).round().clamp(0.0, 255.0) as u8;
+    }
+    image::GrayImage::from_raw(src.width(), src.height(), out).expect("尺寸与缓冲一致")
+}
+
+/// 自适应判定：中间调（80–200）像素占比 < 0.30 视为文字页，走 q85；否则画面页 q70。
+/// 按 2 像素步长采样，避免整页 Sobel 的 CPU 开销。
+fn adaptive_quality(luma: &image::GrayImage) -> u8 {
+    let w = luma.width() as usize;
+    let h = luma.height() as usize;
+    let a = luma.as_raw();
+    let mut mid = 0u64;
+    let mut n = 0u64;
+    for y in (0..h).step_by(2) {
+        for x in (0..w).step_by(2) {
+            let v = a[y * w + x];
+            if (80..200).contains(&v) {
+                mid += 1;
+            }
+            n += 1;
+        }
+    }
+    if (mid as f64 / n.max(1) as f64) < EINK_ADAPTIVE_MID_THRESHOLD {
+        EINK_ADAPTIVE_TEXT_Q
+    } else {
+        EINK_ADAPTIVE_ART_Q
+    }
+}
+
+/// 通用「解码 → 灰度/彩色 → 缩放 → JPEG 重编码」，WebP 源与 JPEG 源共用。
+/// 返回 (输出字节, 尺寸, 实际质量)。灰度档先转 Luma8 再缩放，缩放量与编码量
+/// 都只有 RGB 的 1/3。
+fn transcode_to_jpeg(
     raw: &[u8],
+    format: image::ImageFormat,
     profile: EncodeProfile,
-) -> Result<(Vec<u8>, Dims), String> {
-    let reader = image::ImageReader::with_format(
-        std::io::Cursor::new(raw),
-        image::ImageFormat::WebP,
-    );
+    cfg: EinkConfig,
+) -> Result<(Vec<u8>, Dims, u8), String> {
+    let label = match format {
+        image::ImageFormat::WebP => "WebP",
+        image::ImageFormat::Jpeg => "JPEG",
+        _ => "图片",
+    };
+    let reader = image::ImageReader::with_format(std::io::Cursor::new(raw), format);
     let (w, h) = reader
         .into_dimensions()
-        .map_err(|e| format!("WebP 头部解析失败: {e}"))?;
+        .map_err(|e| format!("{label} 头部解析失败: {e}"))?;
     if w == 0 || h == 0 {
-        return Err("WebP 尺寸为 0".to_string());
+        return Err(format!("{label} 尺寸为 0"));
     }
     if w as u64 * h as u64 > MAX_TRANSCODE_PIXELS {
         return Err(format!(
             "源图 {w}x{h} 超过解码像素上限 {MAX_TRANSCODE_PIXELS}"
         ));
     }
-    let img = image::load_from_memory_with_format(raw, image::ImageFormat::WebP)
-        .map_err(|e| format!("WebP 解码失败: {e}"))?;
+    let img = image::load_from_memory_with_format(raw, format)
+        .map_err(|e| format!("{label} 解码失败: {e}"))?;
     let (src_w, src_h) = (img.width(), img.height());
-    let (tw, th) = transcode_target_size(src_w, src_h);
+    let (tw, th) = transcode_target_size(src_w, src_h, cfg.width);
     let mut buf: Vec<u8> = Vec::new();
     if profile.grayscale {
         // to_luma8 使用 BT.709 亮度系数（0.2126R + 0.7152G + 0.0722B），不是通道平均
         let luma = img.to_luma8();
-        let out = if (tw, th) == (luma.width(), luma.height()) {
+        let quality = if cfg.adaptive {
+            adaptive_quality(&luma)
+        } else {
+            profile.quality
+        };
+        let resized = if (tw, th) == (luma.width(), luma.height()) {
             luma
         } else {
-            image::imageops::resize(&luma, tw, th, image::imageops::FilterType::Triangle)
+            resize_lanczos_linear(&luma, tw, th)
         };
+        let out = if cfg.usm { usm_luma(&resized) } else { resized };
         let dims = Dims {
             width: out.width(),
             height: out.height(),
         };
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, profile.quality)
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
             .encode_image(&out)
             .map_err(|e| format!("JPEG 编码失败: {e}"))?;
-        Ok((buf, dims))
+        Ok((buf, dims, quality))
     } else {
         let rgb = img.to_rgb8();
         let out = if (tw, th) == (rgb.width(), rgb.height()) {
@@ -229,8 +540,32 @@ fn transcode_webp_to_jpeg(
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, profile.quality)
             .encode_image(&out)
             .map_err(|e| format!("JPEG 编码失败: {e}"))?;
-        Ok((buf, dims))
+        Ok((buf, dims, profile.quality))
     }
+}
+
+/// WebP → JPEG（内存内完成，不落盘）。仅测试用便捷封装；生产路径直接调用 `transcode_to_jpeg`。
+#[cfg(test)]
+fn transcode_webp_to_jpeg(
+    raw: &[u8],
+    profile: EncodeProfile,
+) -> Result<(Vec<u8>, Dims), String> {
+    let (data, dims, _) =
+        transcode_to_jpeg(raw, image::ImageFormat::WebP, profile, EinkConfig::default())?;
+    Ok((data, dims))
+}
+
+/// JPEG 源 → 灰度 JPEG：仅墨水屏使用，强制 Luma8。
+fn transcode_jpeg_to_gray(
+    raw: &[u8],
+    profile: EncodeProfile,
+    cfg: EinkConfig,
+) -> Result<(Vec<u8>, Dims, u8), String> {
+    let gray = EncodeProfile {
+        grayscale: true,
+        quality: profile.quality,
+    };
+    transcode_to_jpeg(raw, image::ImageFormat::Jpeg, gray, cfg)
 }
 
 /// 把整段响应体读入内存（受单图上限约束），仅转码路径使用。
@@ -451,6 +786,36 @@ fn serve_bytes(data: Vec<u8>, ct: &str, etag: &str, hit: bool, headers: &HeaderM
     }
     b.body(Body::from(data))
         .unwrap_or_else(|_| error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", "构建响应失败"))
+}
+
+/// 转码响应：在通用响应上补 `x-image-transcoded`（路径/宽度/质量）、
+/// `x-image-source-bytes` 与 `x-image-transcode-ms`，便于前端与压测量化收益。
+#[allow(clippy::too_many_arguments)]
+fn serve_transcoded(
+    data: Vec<u8>,
+    ct: &str,
+    etag: &str,
+    headers: &HeaderMap,
+    label: &str,
+    dims: Dims,
+    quality: u8,
+    source_bytes: usize,
+    elapsed: Duration,
+) -> Response {
+    let mut res = serve_bytes(data, ct, etag, false, headers);
+    if let Ok(v) = HeaderValue::from_str(&format!("{label};w={};q={}", dims.width, quality)) {
+        res.headers_mut()
+            .insert(HeaderName::from_static("x-image-transcoded"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&source_bytes.to_string()) {
+        res.headers_mut()
+            .insert(HeaderName::from_static("x-image-source-bytes"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&elapsed.as_millis().to_string()) {
+        res.headers_mut()
+            .insert(HeaderName::from_static("x-image-transcode-ms"), v);
+    }
+    res
 }
 
 /// 单批最多查询的图片数（前端可按 30 张一批，避免一次请求过大）
@@ -696,16 +1061,33 @@ async fn proxy(
         }
     }
     let transcode = wants_webp_transcode(&headers);
+    let eink = is_eink_client(&headers, q.eink.as_deref());
+    let cfg = eink_config();
     let profile = EncodeProfile::eink();
-    let eink_key = cache_variant_key(&q.url, Some(profile));
-    let orig_key = cache_variant_key(&q.url, None);
-    let eink_etag = etag_of(&eink_key);
+    // 两条转码路径的缓存 key 分开：WebP 源用 `#jpeg-…`，JPEG 源用 `#jpegsrc-…`，
+    // 宽度/质量/编码器/自适应标记全部编进后缀，旧档不会串味。
+    let webp_keys = key_pairs(&q.url, false, &cfg);
+    let jpeg_keys = key_pairs(&q.url, true, &cfg);
+    let orig_key = format!("{}#orig", q.url);
     let orig_etag = etag_of(&orig_key);
-    // 缓存命中：按变体查。墨水屏客户端还可以复用原图变体里已有的 JPEG/PNG/GIF，
-    // 但绝不能复用其中的 WebP（那正是它解不了的格式）。
-    if transcode {
-        if let Some((data, ct)) = image_cache::get(&eink_key) {
-            return serve_bytes(data, &ct, &eink_etag, true, &headers);
+    // 缓存命中：按变体查。墨水屏优先「JPEG 源灰度」，其次「WebP 转码」；
+    // 非 WebP/JPEG 的原始格式（PNG/GIF）墨水屏可直接复用原图。
+    // 普通客户端要么复用原图，要么（不认 WebP 时）复用 WebP 转码变体。
+    if eink {
+        if let Some((data, ct, etag)) = cache_lookup(&jpeg_keys) {
+            return serve_bytes(data, &ct, &etag, true, &headers);
+        }
+        if let Some((data, ct, etag)) = cache_lookup(&webp_keys) {
+            return serve_bytes(data, &ct, &etag, true, &headers);
+        }
+        if let Some((data, ct)) = image_cache::get(&orig_key) {
+            if !is_webp_content_type(&ct) && !is_jpeg_content_type(&ct) {
+                return serve_bytes(data, &ct, &orig_etag, true, &headers);
+            }
+        }
+    } else if transcode {
+        if let Some((data, ct, etag)) = cache_lookup(&webp_keys) {
+            return serve_bytes(data, &ct, &etag, true, &headers);
         }
         if let Some((data, ct)) = image_cache::get(&orig_key) {
             if !is_webp_content_type(&ct) {
@@ -782,20 +1164,33 @@ async fn proxy(
         .trim()
         .to_string();
 
+    // 墨水屏的变体 ETag 与普通 WebP 降级档的 ETag 都可能在客户端手里：
+    // 命中任意一个就直接 304，省掉回源与解码。
+    let variant_keys: Vec<(String, String)> = if eink {
+        jpeg_keys.iter().chain(webp_keys.iter()).cloned().collect()
+    } else if transcode {
+        webp_keys.clone()
+    } else {
+        Vec::new()
+    };
+    if let Some(etag) = matching_key_etag(&headers, &variant_keys) {
+        return not_modified(etag);
+    }
+
     // WebP 且客户端不认 WebP：整图读入内存 → 纯 Rust 解码 → 缩放 → JPEG，不落盘。
     // 源站无视 Accept 一律返回 WebP 的情况（如 content.mkzcdn.com）只能走这条路。
-    if is_webp_content_type(&ct_base) && transcode {
-        if matches_if_none_match(&headers, &eink_etag) {
-            return not_modified(&eink_etag);
-        }
+    if is_webp_content_type(&ct_base) && (transcode || eink) {
         let raw = match collect_image_body(resp, max_bytes).await {
             Ok(v) => v,
             Err(r) => return r,
         };
         let source_bytes = raw.len();
-        let decoded =
-            tokio::task::spawn_blocking(move || transcode_webp_to_jpeg(&raw, profile)).await;
-        let (jpeg, dims) = match decoded {
+        let started = Instant::now();
+        let decoded = tokio::task::spawn_blocking(move || {
+            transcode_to_jpeg(&raw, image::ImageFormat::WebP, profile, cfg)
+        })
+        .await;
+        let (out, dims, quality) = match decoded {
             Ok(Ok(v)) => v,
             Ok(Err(msg)) => {
                 return error_body(
@@ -812,24 +1207,76 @@ async fn proxy(
                 )
             }
         };
-        if jpeg.len() <= CACHE_ITEM_MAX {
-            image_cache::put(&eink_key, jpeg.clone(), "image/jpeg".to_string());
+        let key = variant_key(&q.url, false, &cfg, quality);
+        let etag = etag_of(&key);
+        if out.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&key, out.clone(), "image/jpeg".to_string());
         }
-        let mut res = serve_bytes(jpeg, "image/jpeg", &eink_etag, false, &headers);
-        if let Ok(v) = HeaderValue::from_str(&format!(
-            "webp->jpeg-{};w={};q={}",
-            if profile.grayscale { "gray" } else { "color" },
-            dims.width,
-            profile.quality
-        )) {
-            res.headers_mut()
-                .insert(HeaderName::from_static("x-image-transcoded"), v);
+        let label = format!("webp->jpeg-{}", if profile.grayscale { "gray" } else { "color" });
+        return serve_transcoded(
+            out,
+            "image/jpeg",
+            &etag,
+            &headers,
+            &label,
+            dims,
+            quality,
+            source_bytes,
+            started.elapsed(),
+        );
+    }
+
+    // JPEG 源 + 墨水屏：解码 → Luma8 → （可选 Lanczos/USM）→ 重编码灰度 JPEG。
+    // 普通浏览器不进这个分支，仍然原图直出。
+    if is_jpeg_content_type(&ct_base) && eink {
+        let raw = match collect_image_body(resp, max_bytes).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        let source_bytes = raw.len();
+        let started = Instant::now();
+        let decoded = tokio::task::spawn_blocking(move || match transcode_jpeg_to_gray(
+            &raw, profile, cfg,
+        ) {
+            Ok(v) => Ok(v),
+            Err(msg) => Err((msg, raw)),
+        })
+        .await;
+        let (out, dims, quality) = match decoded {
+            Ok(Ok(v)) => v,
+            Ok(Err((msg, raw))) => {
+                // 单图转码失败不影响整章：降级为原图直出，前端仍能看到这一页。
+                let mut res = serve_bytes(raw, &ct_base, &orig_etag, false, &headers);
+                if let Ok(v) = HeaderValue::from_str(&format!("jpeg->gray-failed;reason={msg}")) {
+                    res.headers_mut()
+                        .insert(HeaderName::from_static("x-image-transcoded"), v);
+                }
+                return res;
+            }
+            Err(e) => {
+                return error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &format!("转码任务异常：{e}"),
+                )
+            }
+        };
+        let key = variant_key(&q.url, true, &cfg, quality);
+        let etag = etag_of(&key);
+        if out.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&key, out.clone(), "image/jpeg".to_string());
         }
-        if let Ok(v) = HeaderValue::from_str(&source_bytes.to_string()) {
-            res.headers_mut()
-                .insert(HeaderName::from_static("x-image-source-bytes"), v);
-        }
-        return res;
+        return serve_transcoded(
+            out,
+            "image/jpeg",
+            &etag,
+            &headers,
+            "jpeg->gray",
+            dims,
+            quality,
+            source_bytes,
+            started.elapsed(),
+        );
     }
 
     if matches_if_none_match(&headers, &orig_etag) {
@@ -1141,16 +1588,114 @@ mod tests {
 
     #[test]
     fn cache_variants_do_not_collide() {
-        let u = "https://img.example/a.webp";
-        let g78 = cache_variant_key(u, Some(gray_profile(78)));
-        let c82 = cache_variant_key(u, Some(color_profile(82)));
-        let g60 = cache_variant_key(u, Some(gray_profile(60)));
-        let orig = cache_variant_key(u, None);
-        assert_ne!(g78, c82, "灰度/彩色档不能共用 key");
-        assert_ne!(g78, g60, "不同质量档不能共用 key");
-        assert_ne!(g78, orig, "转码档与原图不能共用 key");
-        assert_ne!(etag_of(&g78), etag_of(&c82));
-        assert_ne!(etag_of(&g78), etag_of(&orig));
+        let u = "https://img.example/a.jpg";
+        let base = EinkConfig::default();
+        let webp_key = variant_key(u, false, &base, 78);
+        let jpeg_key = variant_key(u, true, &base, 78);
+        let orig = format!("{u}#orig");
+        assert_ne!(webp_key, jpeg_key, "WebP 转码与 JPEG 源灰度不能共用 key");
+        assert_ne!(jpeg_key, orig, "转码档与原图不能共用 key");
+        assert_ne!(etag_of(&webp_key), etag_of(&jpeg_key));
+
+        let wide = EinkConfig { width: 1440, ..base };
+        let adaptive = EinkConfig { adaptive: true, ..base };
+        assert_ne!(
+            variant_key(u, true, &base, 70),
+            variant_key(u, true, &wide, 70),
+            "宽度必须进 key"
+        );
+        assert_ne!(
+            variant_key(u, true, &base, 70),
+            variant_key(u, true, &base, 85),
+            "质量必须进 key"
+        );
+        assert_ne!(
+            variant_key(u, true, &base, 70),
+            variant_key(u, true, &adaptive, 70),
+            "自适应标记必须进 key"
+        );
+    }
+
+    #[test]
+    fn adaptive_lookup_covers_both_qualities() {
+        let cfg = EinkConfig {
+            adaptive: true,
+            ..EinkConfig::default()
+        };
+        let pairs = key_pairs("https://img.example/a.jpg", true, &cfg);
+        assert_eq!(pairs.len(), 2, "自适应要同时查文字档与画面档");
+        assert!(pairs.iter().any(|(k, _)| k.contains("-q85-")));
+        assert!(pairs.iter().any(|(k, _)| k.contains("-q70-")));
+        assert!(pairs
+            .iter()
+            .all(|(k, _)| k.starts_with("https://img.example/a.jpg#jpegsrc-w1200-")));
+    }
+
+    fn make_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([(x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8]);
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92)
+            .encode_image(&img)
+            .expect("encode jpeg");
+        buf
+    }
+
+    #[test]
+    fn jpeg_source_transcodes_to_width_capped_gray() {
+        let jpeg = make_jpeg(1500, 2400);
+        assert_eq!(jpeg_components(&jpeg), Some(3));
+        let cfg = EinkConfig::default();
+        let (out, dims, quality) =
+            transcode_jpeg_to_gray(&jpeg, gray_profile(EINK_JPEG_QUALITY_DEFAULT), cfg)
+                .expect("transcode");
+        assert_eq!(dims, Dims { width: 1200, height: 1920 });
+        assert_eq!(quality, EINK_JPEG_QUALITY_DEFAULT);
+        assert_eq!(jpeg_components(&out), Some(1), "墨水屏输出必须是单分量灰度");
+        assert_eq!(parse_dims(&out), Some(dims));
+        assert!(transcode_jpeg_to_gray(b"not a jpeg", gray_profile(70), cfg).is_err());
+    }
+
+    #[test]
+    fn jpeg_source_with_env_width_is_honored() {
+        let cfg = EinkConfig {
+            width: 1440,
+            ..EinkConfig::default()
+        };
+        let (out, dims, _) =
+            transcode_jpeg_to_gray(&make_jpeg(2000, 3000), gray_profile(70), cfg).expect("transcode");
+        assert_eq!(dims, Dims { width: 1440, height: 2160 });
+        assert_eq!(parse_dims(&out), Some(dims));
+    }
+
+    #[test]
+    fn eink_detection_covers_ua_header_and_query() {
+        fn h(ua: Option<&str>) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            if let Some(ua) = ua {
+                h.insert(header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+            }
+            h
+        }
+        let kindle_ua = "Mozilla/5.0 (Linux; U; Android 2.3.4) AppleWebKit/531.2+ (KHTML, like Gecko) Version/5.0 Safari/531.2 Kindle/3.0+";
+        let desktop_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36";
+
+        let desktop = h(Some(desktop_ua));
+        assert!(!is_eink_client(&desktop, None), "普通浏览器默认不转灰度");
+        assert!(!is_eink_client(&desktop, Some("0")));
+        assert!(is_eink_client(&desktop, Some("1")));
+        assert!(is_eink_client(&desktop, Some("eink")));
+
+        let mut mode = h(Some(desktop_ua));
+        mode.insert(
+            HeaderName::from_static("x-device-mode"),
+            HeaderValue::from_static("eink"),
+        );
+        assert!(is_eink_client(&mode, None), "X-Device-Mode: eink 等价于 ?eink=1");
+
+        assert!(is_eink_client(&h(Some(kindle_ua)), None), "Kindle UA 无需额外声明");
     }
 
     #[test]
