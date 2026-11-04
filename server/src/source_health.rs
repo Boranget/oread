@@ -821,7 +821,6 @@ mod tests {
             promote_streak: 3,
             demote_streak: 2,
             update_score_margin: 5,
-            preferred_budget_pct: 70,
             weights: Weights::default(),
         }
     }

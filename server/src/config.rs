@@ -151,8 +151,6 @@ pub struct Config {
     pub source_tier_demote_streak: i64,
     /// 源质量：覆盖旧版本时新评分允许的最低差值（默认 5）
     pub source_tier_update_margin: i32,
-    /// 搜索调度：preferred 批次可占用的总预算百分比（默认 70，其余留给 observing）
-    pub source_tier_preferred_budget_pct: u64,
     /// 评分权重（合计 100）
     pub source_score_w_connect: i32,
     pub source_score_w_rule: i32,
@@ -249,8 +247,6 @@ impl Config {
                 .clamp(1, 20) as i64,
             source_tier_update_margin: env_u64("SOURCE_TIER_UPDATE_MARGIN", 5)
                 .clamp(0, 50) as i32,
-            source_tier_preferred_budget_pct: env_u64("SOURCE_TIER_PREFERRED_BUDGET_PCT", 70)
-                .clamp(20, 95),
             source_score_w_connect: env_u64("SOURCE_SCORE_W_CONNECT", 25).clamp(0, 100) as i32,
             source_score_w_rule: env_u64("SOURCE_SCORE_W_RULE", 15).clamp(0, 100) as i32,
             source_score_w_hit: env_u64("SOURCE_SCORE_W_HIT", 30).clamp(0, 100) as i32,
