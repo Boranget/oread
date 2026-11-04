@@ -327,7 +327,7 @@ fn job_view(job: &SearchJob) -> JobView {
             st.attempted,
         )
     };
-    let mut full = web_book::dedupe_and_sort(books, &job.sources);
+    let mut full = web_book::dedupe_and_sort(books, &job.sources, &job.key);
     full.truncate(AGG_MAX_BOOKS);
     JobView {
         books: full,
