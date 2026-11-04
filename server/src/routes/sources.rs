@@ -168,6 +168,51 @@ fn prepare_import(src: &mut BookSource) -> bool {
     supported
 }
 
+/// 漫画特征词：用于导入时给出 `type=2` 建议（不做自动改库）。
+/// 中文“漫”单独出现会误伤（如“浪漫”），因此必须同时满足内容规则含 `<img` / `@js`。
+const COMIC_NAME_HINTS: [&str; 13] = [
+    "漫画", "漫", "mkz", "manhua", "comic", "manga", "baozimh", "kanman", "kuaikan",
+    "ac.qq", "1kkk", "哔哩哔哩漫画", "腾讯动漫",
+];
+
+fn comic_name_hit(src: &BookSource) -> Option<String> {
+    let name = src.book_source_name.to_lowercase();
+    let url = src.book_source_url.to_lowercase();
+    COMIC_NAME_HINTS
+        .iter()
+        .find(|h| name.contains(*h) || url.contains(*h))
+        .map(|h| h.to_string())
+}
+
+fn comic_content_hit(src: &BookSource) -> bool {
+    let Some(rc) = src.rule_content.as_ref() else {
+        return false;
+    };
+    let joined = [rc.content.as_deref(), rc.image_style.as_deref(), rc.image_decode.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    joined.contains("<img") || joined.contains("@js")
+}
+
+/// 导入时的类型推断：只产出“建议”，绝不修改 `src.book_source_type`。
+fn suggest_comic_type(src: &BookSource) -> Option<Value> {
+    if src.book_source_type == 2 {
+        return None;
+    }
+    let hint = comic_name_hit(src)?;
+    if !comic_content_hit(src) {
+        return None;
+    }
+    Some(json!({
+        "suggested_type": 2,
+        "current_type": src.book_source_type,
+        "matched": hint,
+        "reason": "名称/URL 命中漫画特征且内容规则含 <img 或 @js 拼图",
+    }))
+}
+
 #[derive(Deserialize, Default)]
 pub struct ProbeQ {
     /// `probe=0` 可关闭导入体检；默认对“新增 + 规则变化 + 隔离区复活检查”的源自动体检。
@@ -506,6 +551,7 @@ pub async fn import(
     let mut probe_engine_limited = 0usize;
     let mut kept_enabled = 0usize;
     let mut disable_suggested = 0usize;
+    let mut type_suggestions = 0usize;
 
     for src in &list {
         let url = src.book_source_url.clone();
@@ -669,6 +715,10 @@ pub async fn import(
             }
         }
 
+        let type_suggestion = suggest_comic_type(src);
+        if type_suggestion.is_some() {
+            type_suggestions += 1;
+        }
         let ledger_probe = match probe_status {
             source_health::STATUS_OK => "ok",
             source_health::STATUS_PARTIAL => "fail",
@@ -690,6 +740,8 @@ pub async fn import(
         results.push(json!({
             "book_source_url": url,
             "name": src.book_source_name.clone(),
+            // 仅建议、不改库：命中漫画特征但当前类型不是 2 时给出 suggested_type=2
+            "type_suggestion": type_suggestion,
             "probe_status": if probed {
                 if probe_status == source_health::STATUS_OK { "ok" } else { "fail" }
             } else { "never" },
@@ -761,6 +813,7 @@ pub async fn import(
         "newly_quarantined": newly_quarantined,
         "force": force,
         "disabled_unsupported": disabled_unsupported,
+        "type_suggestions": type_suggestions,
         "distinct_hosts": source_health::distinct_host_count(&list),
         "probe_summary": probe_summary,
         "probe_results": results,
@@ -1529,5 +1582,80 @@ mod tests {
             assert_eq!(s.unsupported_type, !supported);
             assert_eq!(s.enabled, supported, "type {ty} 的默认启用状态错误");
         }
+    }
+
+    /// 回归：现有 422 源里 9 条“漫画源存成 type=0”必须全部被判定为漫画（仅建议，不改库）。
+    #[test]
+    fn suggests_type2_for_mislabelled_comic_sources() {
+        // (名称, URL, 真实 rule_content.content 片段)
+        let cases: [(&str, &str, &str); 9] = [
+            ("拷贝漫画（优++）", "https://www.mangacopy.com/", "$..url\n<js>\nresult.split(\"\\n\").map(x=>'<img src=\"'+x+'\">').join(\"\\n\")"),
+            ("爱看漫画（优+）", "https://m.kanman.com#♤Haxc", "$.data.current_chapter.chapter_img_list@js:\nheader={\"Referer\":baseUrl}"),
+            ("爱看漫画（优）", "https://m.kanman.com/", "$.data.current_chapter.chapter_img_list@js:\nheader={\"Referer\":baseUrl}"),
+            ("爱看漫画（优）", "https://m.kanman.com#", "$.data.current_chapter.chapter_img_list@js:\nheader={\"Referer\":baseUrl}"),
+            ("酷看漫画（优）", "https://www.kukk.net#♤Haxc", ".lazy@html##src=.*\"@js:result.replace(/data-original/g,\"src"),
+            ("奇漫屋子（优）", "https://m.qimanwu.app", "img@data-src||img@src\n@js:\nresult.split(\"\\n\").map(url => `<img src=\"${url}\">`)"),
+            ("星际漫画（优）", "http://www.xmanhua.com#♤Haxc", "@js:\ntry{header={\"Referer\":baseUrl};headers={\"headers\":JS"),
+            ("爱漫客栈", "https://www.mkzhan.com", "$..image@js:result.split(\"\\n\").map(x=>'<img src=\"'+x+'\">')"),
+            ("爱漫客栈", "https://www.mkzhan.com#yc1101", "$..image@js:result.split(\"\\n\").map(x=>'<img src=\"'+x+'\">')"),
+        ];
+        for (name, url, content) in cases {
+            let s = BookSource {
+                book_source_name: name.to_string(),
+                book_source_url: url.to_string(),
+                book_source_type: 0,
+                rule_content: Some(crate::entities::ContentRule {
+                    content: Some(content.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let sug = suggest_comic_type(&s).unwrap_or_else(|| panic!("{name} {url} 未被判为漫画"));
+            assert_eq!(sug["suggested_type"], 2, "{name} 建议类型错误");
+            assert_eq!(sug["current_type"], 0, "{name} 当前类型不应被改写");
+            assert_eq!(s.book_source_type, 0, "建议不得修改源本身");
+        }
+    }
+
+    #[test]
+    fn no_comic_suggestion_for_novel_or_already_comic() {
+        // 小说源：名字不含漫画特征
+        let novel = BookSource {
+            book_source_name: "企鹅浏览".to_string(),
+            book_source_url: "https://qbnovel.qq.com".to_string(),
+            book_source_type: 0,
+            rule_content: Some(crate::entities::ContentRule {
+                content: Some("class.content@html".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(suggest_comic_type(&novel).is_none());
+
+        // 名字像漫画但内容规则没有图片特征 → 不盲判
+        let text = BookSource {
+            book_source_name: "漫画小说站".to_string(),
+            book_source_url: "https://example.com".to_string(),
+            book_source_type: 0,
+            rule_content: Some(crate::entities::ContentRule {
+                content: Some("class.content@text".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(suggest_comic_type(&text).is_none());
+
+        // 已经是 type=2 → 无需建议
+        let comic = BookSource {
+            book_source_name: "酸奶漫画".to_string(),
+            book_source_url: "https://m.1kkk.com/".to_string(),
+            book_source_type: 2,
+            rule_content: Some(crate::entities::ContentRule {
+                content: Some("@js:img".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(suggest_comic_type(&comic).is_none());
     }
 }
