@@ -11,8 +11,18 @@
   let busy = '';
   let loading = false;
   let filterStatus = 'all'; // all | enabled | disabled
+  let filterTier = 'all'; // all | preferred | observing | quarantined
   let filterGroup = 'all';
   let keyword = '';
+
+  // 三档标签只用黑白灰，墨水屏友好
+  function sourceTier(s) {
+    const t = (s && s.tier) || 'observing';
+    return t === 'preferred' || t === 'quarantined' ? t : 'observing';
+  }
+  function tierText(t) {
+    return t === 'preferred' ? '优选' : t === 'quarantined' ? '隔离' : '观察';
+  }
 
   let selected = new Set();
   let fileInput = null;
@@ -103,9 +113,17 @@
   }
 
   $: groupOptions = [...new Set(sources.map((s) => s.book_source_group).filter(Boolean))];
+  $: tierCounts = sources.reduce(
+    (acc, s) => {
+      acc[sourceTier(s)] += 1;
+      return acc;
+    },
+    { preferred: 0, observing: 0, quarantined: 0 }
+  );
   $: filtered = sources.filter((s) => {
     if (filterStatus === 'enabled' && !s.enabled) return false;
     if (filterStatus === 'disabled' && s.enabled) return false;
+    if (filterTier !== 'all' && sourceTier(s) !== filterTier) return false;
     if (filterGroup !== 'all' && (s.book_source_group || '') !== filterGroup) return false;
     if (keyword.trim()) {
       const k = keyword.trim().toLowerCase();
@@ -171,15 +189,17 @@
     setTimeout(() => URL.revokeObjectURL(href), 1000);
   }
 
+  let exportTier = 'all'; // all | preferred
+
   async function exportAll() {
     error = '';
     busy = '正在导出…';
     try {
-      const list = await api.exportSources();
+      const list = await api.exportSources(exportTier);
       const d = new Date();
       const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-      downloadJson(list, `oread-sources-${stamp}.json`);
-      notice = `已导出 ${(list || []).length} 个书源`;
+      downloadJson(list, `oread-sources-${exportTier === 'preferred' ? 'preferred-' : ''}${stamp}.json`);
+      notice = `已导出 ${(list || []).length} 个书源（${exportTier === 'preferred' ? '仅优选' : '全部'}）`;
     } catch (e) {
       error = '导出失败：' + e.message;
     } finally {
@@ -440,7 +460,11 @@
   {#if isAdmin}
     <button class="ghost" on:click={() => fileInput.click()} disabled={!!busy}>导入 JSON</button>
   {/if}
-  <button class="ghost" on:click={exportAll} disabled={!!busy}>导出全部</button>
+  <select bind:value={exportTier} style="width:auto" aria-label="导出范围">
+    <option value="all">全部书源</option>
+    <option value="preferred">只导优选</option>
+  </select>
+  <button class="ghost" on:click={exportAll} disabled={!!busy}>导出</button>
   <button class="ghost" on:click={openUpdateChecker} disabled={!!busy}>检查更新</button>
   <div class="spacer"></div>
   {#if isAdmin}
@@ -462,6 +486,25 @@
       <option value={g}>{g}</option>
     {/each}
   </select>
+</div>
+
+<!-- 三档汇总：点一下按档筛选，再点一次复位 -->
+<div class="row tier-summary" style="margin-bottom:8px">
+  <button
+    class="tier-chip tier-preferred"
+    class:active={filterTier === 'preferred'}
+    on:click={() => (filterTier = filterTier === 'preferred' ? 'all' : 'preferred')}
+  >优选 {tierCounts.preferred}</button>
+  <button
+    class="tier-chip tier-observing"
+    class:active={filterTier === 'observing'}
+    on:click={() => (filterTier = filterTier === 'observing' ? 'all' : 'observing')}
+  >观察 {tierCounts.observing}</button>
+  <button
+    class="tier-chip tier-quarantined"
+    class:active={filterTier === 'quarantined'}
+    on:click={() => (filterTier = filterTier === 'quarantined' ? 'all' : 'quarantined')}
+  >隔离 {tierCounts.quarantined}</button>
 </div>
 
 {#if isAdmin && selected.size}
@@ -517,6 +560,7 @@
               {#if s.book_source_group}<span class="badge">{s.book_source_group}</span>{/if}
               {#if s.type_name || s.type}<span class="badge">类型 {s.type_name || s.type}</span>{/if}
               <span class="badge" class:badge-off={!s.enabled}>{s.enabled ? '启用' : '禁用'}</span>
+              <span class="badge tier-badge tier-{sourceTier(s)}">{tierText(sourceTier(s))}</span>
               {#if s.weight}<span class="badge">权重 {s.weight}</span>{/if}
             </div>
           </div>
@@ -593,6 +637,9 @@
         </div>
       {:else}
         <div class="detail-grid">
+          <div><span class="muted">质量档位</span><b>{tierText(sourceTier(detail))}</b></div>
+          <div><span class="muted">质量分</span><b>{detail.score ?? 50}</b></div>
+          <div><span class="muted">最近评分</span><b>{detail.last_eval_at ? new Date(detail.last_eval_at).toLocaleString() : '—'}</b></div>
           <div><span class="muted">分组</span><b>{detail.book_source_group || '—'}</b></div>
           <div><span class="muted">权重</span><b>{detail.weight ?? 0}</b></div>
           <div><span class="muted">自定义排序</span><b>{detail.custom_order ?? 0}</b></div>
@@ -602,6 +649,22 @@
           <div><span class="muted">正文规则</span><b>{detail.rule_content ? '有' : '无'}</b></div>
           <div><span class="muted">发现规则</span><b>{detail.rule_explore ? '有' : '无'}</b></div>
         </div>
+        {#if detail.evidence && detail.evidence.components}
+          <div class="evidence-box">
+            <div class="muted" style="font-size:12px;margin:8px 0 4px">评分构成（0–1 原始分，按配置权重折算成 0–100）</div>
+            <div class="detail-grid">
+              {#each [['connect', '连通性 25'], ['rule', '规则完整度 15'], ['hit', '命中率 30'], ['parse', '解析成功率 15'], ['ttfb', '速度 15']] as [k, label]}
+                <div>
+                  <span class="muted">{label}</span>
+                  <b>{detail.evidence.components[k] != null ? Number(detail.evidence.components[k]).toFixed(2) : '—'}</b>
+                </div>
+              {/each}
+            </div>
+            {#if detail.evidence.reasons && detail.evidence.reasons.length}
+              <div class="muted" style="font-size:12px;margin-top:6px;word-break:break-all">{detail.evidence.reasons.join(' · ')}</div>
+            {/if}
+          </div>
+        {/if}
         {#if detail.search_url}<div class="muted" style="font-size:12px;margin:8px 0;word-break:break-all">搜索地址：{detail.search_url}</div>{/if}
         {#if detail.explore_url}<div class="muted" style="font-size:12px;margin:8px 0;word-break:break-all">发现地址：{detail.explore_url}</div>{/if}
         <pre class="json-view">{JSON.stringify(detail, null, 2)}</pre>
@@ -654,6 +717,20 @@
     font-size: 13px;
   }
   .disabled-card { opacity: 0.72; }
+  /* 三档标签：黑底白字 / 描边 / 灰底，不使用彩色 */
+  .tier-badge { border: 1px solid currentColor; }
+  .tier-preferred { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .tier-observing { background: transparent; color: var(--text); }
+  .tier-quarantined { background: var(--border); color: var(--muted); border-color: var(--border); }
+  .tier-summary { gap: 6px; flex-wrap: wrap; }
+  .tier-chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; cursor: pointer; }
+  .tier-chip.active { outline: 2px solid var(--text); outline-offset: 1px; }
+  .evidence-box {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin-top: 8px;
+  }
   .val-box {
     margin-top: 8px;
     padding: 6px 8px;

@@ -366,7 +366,7 @@ export const api = {
   sourceDetail: (url) => request('GET', `/sources/detail?url=${encodeURIComponent(url)}`),
   saveSource: (s) => request('POST', '/sources', s),
   importSources: (list) => request('POST', '/sources/import', list),
-  exportSources: () => request('GET', '/sources/export'),
+  exportSources: (tier = 'all') => request('GET', `/sources/export?tier=${encodeURIComponent(tier)}`),
   deleteSource: (url) => request('DELETE', `/sources/delete?url=${encodeURIComponent(url)}`),
   setSourcesEnabled: (urls, enabled) =>
     request('POST', '/sources/enabled', {

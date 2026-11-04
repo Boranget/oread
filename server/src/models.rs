@@ -25,6 +25,15 @@ pub struct BookSourceListItem {
     /// 非 0/2 类型：保留数据但不参与搜索，默认禁用
     #[serde(default)]
     pub unsupported_type: bool,
+    /// 质量分层：preferred / observing / quarantined（缺失健康行时为空，前端按 observing 展示）
+    #[serde(default)]
+    pub tier: String,
+    /// 源质量分 0–100
+    #[serde(default)]
+    pub score: i64,
+    /// 最近一次评分时间（毫秒时间戳）
+    #[serde(default)]
+    pub last_eval_at: Option<i64>,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]

@@ -330,10 +330,11 @@ async fn run_search_job(
 
     let mut outcomes: Vec<source_health::Outcome> = Vec::new();
     if !preferred.is_empty() {
-        run_search_batch(&job, preferred, &key, preferred_deadline, budget, &mut outcomes).await;
+        run_search_batch(&job, preferred, &key, preferred_deadline, budget, &health, &mut outcomes)
+            .await;
     }
     if !observing.is_empty() {
-        run_search_batch(&job, observing, &key, deadline, budget, &mut outcomes).await;
+        run_search_batch(&job, observing, &key, deadline, budget, &health, &mut outcomes).await;
     }
 
     if let Err(e) =
@@ -358,6 +359,7 @@ async fn run_search_batch(
     key: &str,
     phase_deadline: tokio::time::Instant,
     budget: Duration,
+    health: &HashMap<String, source_health::HealthRow>,
     outcomes: &mut Vec<source_health::Outcome>,
 ) {
     enum TaskOutcome {
@@ -420,6 +422,20 @@ async fn run_search_batch(
             TaskOutcome::Done(Ok(mut books)) => {
                 let hits = books.len() as i64;
                 books.truncate(SEARCH_PER_SOURCE_MAX);
+                // 回显来源档位，便于排查“这条结果来自什么档的源”。
+                let src_tier = health
+                    .get(&src.book_source_url)
+                    .map(|h| h.tier.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| crate::source_quality::TIER_OBSERVING.to_string());
+                let src_score = health
+                    .get(&src.book_source_url)
+                    .map(|h| h.score)
+                    .unwrap_or(50);
+                for b in books.iter_mut() {
+                    b.tier = Some(src_tier.clone());
+                    b.score = Some(src_score);
+                }
                 st.books.append(&mut books);
                 outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),

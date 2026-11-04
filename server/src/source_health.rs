@@ -336,7 +336,18 @@ fn apply_evaluation(
     row.promote_streak = eval.promote_streak;
     row.demote_streak = eval.demote_streak;
     row.last_eval_at = Some(now);
+    let mut components = serde_json::Map::new();
+    for r in &eval.reasons {
+        if let Some((k, v)) = r.split_once('=') {
+            if matches!(k, "connect" | "rule" | "hit" | "parse" | "ttfb") {
+                if let Ok(n) = v.parse::<f64>() {
+                    components.insert(k.to_string(), serde_json::json!(n));
+                }
+            }
+        }
+    }
     let evidence = serde_json::json!({
+        "components": components,
         "network": network.as_str(),
         "rule_completeness": (rule_complete * 100.0).round() / 100.0,
         "search_count": row.search_count,

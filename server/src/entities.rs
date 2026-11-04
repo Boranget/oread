@@ -295,6 +295,12 @@ pub struct SearchBook {
     pub origin: Option<String>,
     #[serde(default)]
     pub origin_name: Option<String>,
+    /// 结果来源源的 tier（preferred / observing），仅用于排查与展示
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// 结果来源源的质量分
+    #[serde(default)]
+    pub score: Option<i64>,
     #[serde(rename = "type", default)]
     pub book_type: Option<String>,
     #[serde(default)]

@@ -115,19 +115,31 @@ pub async fn list(
 ) -> AppResult<Json<Vec<BookSourceListItem>>> {
     let mut sources = load_sources(&s.shared).await?;
     sort_sources(&mut sources);
+    let health = crate::source_health::load_map(&s.shared)
+        .await
+        .unwrap_or_default();
     Ok(Json(
         sources
             .into_iter()
-            .map(|x| BookSourceListItem {
-                book_source_url: x.book_source_url,
-                book_source_name: x.book_source_name,
-                enabled: x.enabled,
-                book_source_group: x.book_source_group,
-                weight: x.weight,
-                custom_order: x.custom_order,
-                book_source_type: x.book_source_type,
-                type_name: crate::entities::source_type_name(x.book_source_type).to_string(),
-                unsupported_type: x.unsupported_type,
+            .map(|x| {
+                let h = health.get(&x.book_source_url);
+                BookSourceListItem {
+                    tier: h
+                        .map(|h| h.tier.clone())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| crate::source_quality::TIER_OBSERVING.to_string()),
+                    score: h.map(|h| h.score).unwrap_or(50),
+                    last_eval_at: h.and_then(|h| h.last_eval_at),
+                    book_source_url: x.book_source_url,
+                    book_source_name: x.book_source_name,
+                    enabled: x.enabled,
+                    book_source_group: x.book_source_group,
+                    weight: x.weight,
+                    custom_order: x.custom_order,
+                    book_source_type: x.book_source_type,
+                    type_name: crate::entities::source_type_name(x.book_source_type).to_string(),
+                    unsupported_type: x.unsupported_type,
+                }
             })
             .collect(),
     ))
@@ -954,19 +966,41 @@ pub async fn import(
     })))
 }
 
+/// 导出过滤：`tier=preferred|observing|all`（默认 all，保持旧行为）。
+#[derive(Deserialize, Default)]
+pub struct ExportTierQ {
+    tier: Option<String>,
+}
+
 /// 导出为 Legado 兼容格式（camelCase、数组），供 Android 客户端直接导入。
 pub async fn export_all(
     State(s): State<AppState>,
     _u: AuthUser,
+    Query(q): Query<ExportTierQ>,
 ) -> AppResult<Json<Vec<Value>>> {
     // 安全口径：导出本地源库时排除隔离区条目，避免把源里自带的认证头再分发出去。
     let quarantined = source_ledger::quarantined_set(&s.shared)
         .await
         .unwrap_or_default();
+    let health = crate::source_health::load_map(&s.shared)
+        .await
+        .unwrap_or_default();
+    let want_tier = q.tier.as_deref().map(str::trim).unwrap_or("all");
     let list: Vec<BookSource> = load_sources(&s.shared)
         .await?
         .into_iter()
         .filter(|x| !quarantined.contains(&x.book_source_url))
+        .filter(|x| match want_tier {
+            "preferred" => health
+                .get(&x.book_source_url)
+                .map(|h| h.tier == crate::source_quality::TIER_PREFERRED)
+                .unwrap_or(false),
+            "observing" => health
+                .get(&x.book_source_url)
+                .map(|h| h.tier == crate::source_quality::TIER_OBSERVING)
+                .unwrap_or(true),
+            _ => true,
+        })
         .collect();
     let out = list
         .into_iter()
@@ -1032,6 +1066,10 @@ pub async fn get_one(
     Query(q): Query<UrlQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let src = load_source(&s.shared, &q.url).await?;
+    let health = crate::source_health::load_map(&s.shared)
+        .await
+        .unwrap_or_default();
+    let row = health.get(&src.book_source_url);
     let mut v = serde_json::to_value(&src)?;
     if let Some(obj) = v.as_object_mut() {
         obj.insert("type".into(), json!(src.book_source_type));
@@ -1040,6 +1078,21 @@ pub async fn get_one(
             json!(crate::entities::source_type_name(src.book_source_type)),
         );
         obj.insert("unsupported_type".into(), json!(src.unsupported_type));
+        obj.insert(
+            "tier".into(),
+            json!(row
+                .map(|h| h.tier.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| crate::source_quality::TIER_OBSERVING.to_string())),
+        );
+        obj.insert("score".into(), json!(row.map(|h| h.score).unwrap_or(50)));
+        obj.insert("last_eval_at".into(), json!(row.and_then(|h| h.last_eval_at)));
+        obj.insert(
+            "evidence".into(),
+            json!(row
+                .and_then(|h| h.evidence_json.as_deref())
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())),
+        );
     }
     Ok(Json(v))
 }
