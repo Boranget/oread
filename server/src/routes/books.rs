@@ -717,6 +717,15 @@ fn filter_sources_by_scope(
     }
 }
 
+/// 精选集合缺失（`curated_total == 0`）时的退化目标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CuratedMissingFallback {
+    /// 退化到全量可搜索源（`/api` 语义：Web 端可等，文案标注已回退）。
+    All,
+    /// 退化到 preferred 层（`/k` 语义：KPW3 服务端渲染必须首屏快）。
+    Preferred,
+}
+
 /// 统一源过滤结果：`/api/search/start`、legacy `/api/search`、`/k/search` 共用。
 pub(crate) struct SearchSourcePlan {
     /// 最终参与搜索的源（scope 过滤 + 冷却分区后）
@@ -742,7 +751,8 @@ pub(crate) struct SearchSourcePlan {
 ///
 /// 语义：
 /// - 显式 `source_ids`：跳过 curated 收缩（否则非优选源会被静默丢弃），`source_mode=user`；
-/// - `scope=curated`：只保留体检精选集合；集合缺失时退化为全量，交集为空时退化为 preferred（再为空退全量）；
+/// - `scope=curated`：只保留体检精选集合；集合缺失时按 `curated_missing` 退化
+///   （`/api` 退全量、`/k` 退 preferred），交集为空时退化为 preferred（再为空退全量）；
 /// - `scope=all`：全部可搜索源；
 /// - 最后统一做冷却分区（`include_cooled` 为真则全部参与）。
 pub(crate) async fn resolve_search_sources(
@@ -751,6 +761,7 @@ pub(crate) async fn resolve_search_sources(
     requested: &[String],
     scope: crate::req::SearchScope,
     include_cooled: bool,
+    curated_missing: CuratedMissingFallback,
 ) -> SearchSourcePlan {
     let quarantined = source_ledger::quarantined_set(pool)
         .await
@@ -812,12 +823,21 @@ pub(crate) async fn resolve_search_sources(
                     )
                 }
             }
-            None => (
-                searchable_all.clone(),
-                "curated_fallback",
-                "expanded",
-                crate::req::SearchScope::All,
-            ),
+            None => match curated_missing {
+                CuratedMissingFallback::All => (
+                    searchable_all.clone(),
+                    "curated_fallback",
+                    "expanded",
+                    crate::req::SearchScope::All,
+                ),
+                // `/k` 不退全量：只跑 preferred 层，保住首屏耗时（预算仍随 curated）。
+                CuratedMissingFallback::Preferred => (
+                    preferred_sources(searchable_all.clone(), &health),
+                    "curated_fallback",
+                    "expanded",
+                    crate::req::SearchScope::Curated,
+                ),
+            },
         }
     } else {
         (
@@ -924,6 +944,7 @@ async fn search_start(
         &requested,
         q.scope(),
         include_cooled,
+        CuratedMissingFallback::All,
     )
     .await;
     let enabled = plan.active.clone();
@@ -1147,6 +1168,7 @@ async fn search(
         &requested,
         q.scope(),
         include_cooled,
+        CuratedMissingFallback::All,
     )
     .await;
     let (full, _) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
@@ -1218,6 +1240,7 @@ async fn search_aggregate(
         &requested,
         q.scope(),
         include_cooled,
+        CuratedMissingFallback::All,
     )
     .await;
     let (full, errors) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
@@ -3223,6 +3246,7 @@ mod tests {
             &[],
             SearchScope::All,
             false,
+            CuratedMissingFallback::All,
         )
         .await;
         assert_eq!(all.source_mode, "all");
@@ -3236,6 +3260,7 @@ mod tests {
             &["http://observing".to_string()],
             SearchScope::Curated,
             false,
+            CuratedMissingFallback::All,
         )
         .await;
         assert_eq!(user.source_mode, "user");
@@ -3247,6 +3272,84 @@ mod tests {
         );
         assert!(user.ignored.is_empty());
         assert_eq!(user.scope_filtered, 0, "显式源模式不存在 scope 过滤");
+    }
+
+    // `/k` 语义：精选集合缺失时只退 preferred 层（不退全量）；`/api` 语义仍退全量。
+    #[tokio::test]
+    async fn curated_missing_falls_back_to_preferred_for_kindle() {
+        use crate::req::SearchScope;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // 精选表留空（curated_total=0）；健康表给出 preferred/observing 两档。
+        sqlx::query(
+            "CREATE TABLE source_curated (source_url TEXT PRIMARY KEY, \
+             curated INTEGER NOT NULL DEFAULT 0, meta_json TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE source_health ( \
+             source_url TEXT PRIMARY KEY, last_checked_at INTEGER, \
+             last_status TEXT NOT NULL DEFAULT 'never', last_error TEXT, \
+             consecutive_failures INTEGER NOT NULL DEFAULT 0, last_ok_at INTEGER, \
+             cooldown_until INTEGER, avg_latency_ms INTEGER, check_total INTEGER NOT NULL DEFAULT 0, \
+             tier TEXT NOT NULL DEFAULT 'observing', score INTEGER NOT NULL DEFAULT 50, \
+             evidence_json TEXT, last_eval_at INTEGER, \
+             search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+             parse_ok_count INTEGER NOT NULL DEFAULT 0, \
+             fail_site_count INTEGER NOT NULL DEFAULT 0, \
+             fail_engine_count INTEGER NOT NULL DEFAULT 0, \
+             ttfb_ms_p90 INTEGER, ttfb_samples_json TEXT, \
+             promote_streak INTEGER NOT NULL DEFAULT 0, \
+             demote_streak INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_health (source_url, tier) \
+             VALUES ('http://preferred', 'preferred'), ('http://observing', 'observing')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sources = vec![
+            src("优选", "http://preferred", 1, true),
+            src("观察", "http://observing", 1, true),
+        ];
+
+        let api = resolve_search_sources(
+            &pool,
+            sources.clone(),
+            &[],
+            SearchScope::Curated,
+            true,
+            CuratedMissingFallback::All,
+        )
+        .await;
+        assert_eq!(api.source_mode, "curated_fallback");
+        assert_eq!(api.scope, SearchScope::All, "/api 精选缺失退全量");
+        assert_eq!(api.active.len(), 2);
+        assert_eq!(api.curated_total, 0);
+
+        let kindle = resolve_search_sources(
+            &pool,
+            sources,
+            &[],
+            SearchScope::Curated,
+            true,
+            CuratedMissingFallback::Preferred,
+        )
+        .await;
+        assert_eq!(kindle.source_mode, "curated_fallback");
+        assert_eq!(kindle.scope, SearchScope::Curated, "/k 精选缺失不退全量");
+        assert_eq!(kindle.active.len(), 1, "只跑 preferred 层");
+        assert_eq!(kindle.active[0].book_source_url, "http://preferred");
+        assert_eq!(kindle.curated_total, 0);
     }
 
     // phase：pending>0 → first（partial=true），pending==0 → final
