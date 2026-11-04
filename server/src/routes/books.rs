@@ -2151,10 +2151,13 @@ async fn cache_all(
         }
     };
     let source = load_source(&s.shared, &source_id).await?;
+    // 只有当前解析管线指纹的记录才算已缓存；旧指纹/无指纹的行交给预取重建。
     let cached_urls: Vec<String> = sqlx::query_scalar(
-        "SELECT url FROM book_content WHERE book_url = ?1 AND content IS NOT NULL",
+        "SELECT url FROM book_content WHERE book_url = ?1 AND content IS NOT NULL \
+         AND cache_version = ?2",
     )
     .bind(&book_url)
+    .bind(content_cache_version())
     .fetch_all(&db.0)
     .await?;
     let cached_set: HashSet<String> = cached_urls.into_iter().collect();
@@ -2621,7 +2624,34 @@ pub(crate) async fn save_chapters(
     Ok(())
 }
 
-/// 正文缓存读取：TTL 内命中则更新 accessed_at（LRU 依据）。
+/// 正文解析管线各步骤的版本号。抽取策略、清洗步骤、替换规则等任一变更时，
+/// 递增对应数字即可让全量旧缓存失效，无需人工清库，也不按时间粗暴失效。
+const CONTENT_PIPELINE_STEPS: &[(&str, u32)] = &[
+    ("extract", 1), // 规则抽取：@textNodes 空结果回退 @html
+    ("clean", 2),   // 空白/换行清洗与字符计数
+    ("replace", 1), // 书源替换规则
+];
+
+/// 当前解析管线指纹（`p1-<fnv64>`）。存进 `book_content.cache_version`；
+/// 读取时指纹不符或缺失（旧记录）都按未命中处理并重建。
+pub(crate) fn content_cache_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let joined = CONTENT_PIPELINE_STEPS
+            .iter()
+            .map(|(name, v)| format!("{name}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in joined.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("p1-{hash:016x}")
+    })
+}
+
+/// 正文缓存读取：TTL 内命中原管线指纹则更新 accessed_at（LRU 依据）。
 pub(crate) async fn load_cached_content(
     pool: &SqlitePool,
     url: &str,
@@ -2629,7 +2659,7 @@ pub(crate) async fn load_cached_content(
 ) -> anyhow::Result<Option<BookContent>> {
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
-         content_type, images \
+         content_type, images, cache_version \
          FROM book_content WHERE url = ?1 AND updated_at >= datetime('now', ?2)",
     )
     .bind(url)
@@ -2642,6 +2672,16 @@ pub(crate) async fn load_cached_content(
         if content_is_empty(&row) {
             return Ok(None);
         }
+        // 解析管线变了（或旧记录没有指纹）：旧结果可能残缺，按未命中重建。
+        if row.cache_version.as_deref() != Some(content_cache_version()) {
+            tracing::debug!(
+                url,
+                cached = row.cache_version.as_deref().unwrap_or("<none>"),
+                current = content_cache_version(),
+                "content cache version mismatch, refetch"
+            );
+            return Ok(None);
+        }
         let _ = sqlx::query("UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?")
             .bind(url)
             .execute(pool)
@@ -2651,13 +2691,30 @@ pub(crate) async fn load_cached_content(
     Ok(None)
 }
 
-/// 判定缓存正文是否为空：文本章节 content 去空白后为空；图片章节 images 列表为空。
+/// 判定缓存正文是否为空：文本章节按渲染结果判断（去掉标签/`&nbsp;` 后无可见字符）；
+/// 图片章节 images 列表为空。
 fn content_is_empty(c: &BookContent) -> bool {
     if c.content_type.trim() == "image" {
         decode_cached_images(c.images_json.as_deref()).0.is_empty()
     } else {
-        c.content.as_deref().unwrap_or("").trim().is_empty()
+        text_is_blank(c.content.as_deref().unwrap_or(""))
     }
+}
+
+/// 文本正文是否没有可见字符：`<p>正文</p>` 不算空，`<div class="text">   </div>`
+/// （`@textNodes` 为空时回退 `@html` 的产物）算空，避免把渲染后空白的正文写进缓存。
+fn text_is_blank(s: &str) -> bool {
+    let mut visible = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => visible.push(ch),
+            _ => {}
+        }
+    }
+    visible.replace("&nbsp;", " ").trim().is_empty()
 }
 
 /// 单条正文 upsert（不做淘汰），供 `/api/book/content` 与整本缓存共用。
@@ -2672,12 +2729,13 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     sqlx::query(
         "INSERT INTO book_content \
          (url, book_url, title, content, chapter_index, resource_url, is_local, \
-          content_type, images, size_bytes, updated_at, accessed_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10, datetime('now'), datetime('now')) \
+          content_type, images, size_bytes, cache_version, updated_at, accessed_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11, datetime('now'), datetime('now')) \
          ON CONFLICT(url) DO UPDATE SET title=excluded.title, content=excluded.content, \
           chapter_index=excluded.chapter_index, resource_url=excluded.resource_url, \
           is_local=excluded.is_local, content_type=excluded.content_type, \
           images=excluded.images, size_bytes=excluded.size_bytes, \
+          cache_version=excluded.cache_version, \
           updated_at=datetime('now'), accessed_at=datetime('now')",
     )
     .bind(&c.url)
@@ -2690,6 +2748,7 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     .bind(content_type)
     .bind(&c.images_json)
     .bind(size)
+    .bind(content_cache_version())
     .execute(pool)
     .await?;
     // 正文字数回填到目录行（未知时保持 0）；SQLite TEXT 的 length() 按字符计数。
@@ -2788,7 +2847,8 @@ mod tests {
              title TEXT, content TEXT, chapter_index INTEGER NOT NULL DEFAULT 0, \
              resource_url TEXT, is_local INTEGER NOT NULL DEFAULT 0, \
              content_type TEXT NOT NULL DEFAULT 'text', images TEXT, \
-             size_bytes INTEGER NOT NULL DEFAULT 0, updated_at TEXT, accessed_at TEXT)",
+             size_bytes INTEGER NOT NULL DEFAULT 0, cache_version TEXT, \
+             updated_at TEXT, accessed_at TEXT)",
         )
         .execute(&pool)
         .await
@@ -2834,10 +2894,100 @@ mod tests {
             .unwrap();
         assert_eq!(n3, 0);
 
+        // 只有标签没有可见文字（@textNodes 空结果回退 @html 的产物）同样不落库。
+        let markup = mk_content("u4", "b1", 4, "<div class=\"text\">   </div>");
+        save_content_cached(&pool, &markup, 1 << 20).await.unwrap();
+        let n4: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u4'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n4, 0, "标签包裹的空白不应写入缓存");
+
+        // 带可见文字的 HTML 片段仍然落库并命中。
+        let html = mk_content("u5", "b1", 5, "<p>有正文的段落</p>");
+        save_content_cached(&pool, &html, 1 << 20).await.unwrap();
+        assert!(load_cached_content(&pool, "u5", 7 * 24 * 3600).await.unwrap().is_some());
+
         // 正常正文仍然命中。
         let ok = mk_content("u2", "b1", 2, "正文内容");
         save_content_cached(&pool, &ok, 1 << 20).await.unwrap();
         assert!(load_cached_content(&pool, "u2", 7 * 24 * 3600).await.unwrap().is_some());
+    }
+
+    // 解析管线指纹不符 → 旧缓存按未命中处理，重建后按当前指纹回写并正常命中。
+    #[tokio::test]
+    async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
+        let pool = mem_pool().await;
+        let body = "当前管线抓到的完整正文";
+        let c = mk_content("u1", "b1", 1, body);
+        save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+        let hit = load_cached_content(&pool, "u1", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("新写入的缓存应命中");
+        assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
+
+        // 模拟旧解析管线写下的残缺正文（短但非空，之前只能等 TTL）。
+        sqlx::query("UPDATE book_content SET cache_version = 'p1-0000000000000000', content = '半截正文' WHERE url = 'u1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            load_cached_content(&pool, "u1", 7 * 24 * 3600).await.unwrap().is_none(),
+            "指纹不符必须视为未命中"
+        );
+
+        // 重建（重新抓取后写入）应回到命中，且指纹为当前版本。
+        save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+        let rebuilt = load_cached_content(&pool, "u1", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("重建后应命中");
+        assert_eq!(rebuilt.content.as_deref(), Some(body));
+        assert_eq!(rebuilt.cache_version.as_deref(), Some(content_cache_version()));
+    }
+
+    // 旧记录没有 cache_version（迁移前写入）→ 未命中，首次读取重建后回写指纹。
+    #[tokio::test]
+    async fn legacy_content_without_version_is_miss_and_rewritten() {
+        let pool = mem_pool().await;
+        sqlx::query(
+            "INSERT INTO book_content (url, book_url, title, content, chapter_index, content_type, \
+             updated_at, accessed_at) VALUES ('legacy','b1','t','迁移前的正文',1,'text',\
+             datetime('now'),datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            load_cached_content(&pool, "legacy", 7 * 24 * 3600).await.unwrap().is_none(),
+            "无指纹的旧记录必须视为未命中"
+        );
+
+        let rebuilt = mk_content("legacy", "b1", 1, "迁移前的正文");
+        save_content_cached(&pool, &rebuilt, 1 << 20).await.unwrap();
+        let hit = load_cached_content(&pool, "legacy", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("回写后应命中");
+        assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
+    }
+
+    // 短但完整（<100 字符）的正文必须正常落库并命中，不能按长度误判为空。
+    #[tokio::test]
+    async fn short_complete_content_is_cached_and_hit() {
+        let pool = mem_pool().await;
+        let short = "短章也有完整正文：这一段不足一百字符，但内容完整，缓存必须正常命中。";
+        assert!(short.chars().count() < 100);
+        assert!(short.chars().count() > 20);
+        let c = mk_content("short", "b1", 1, short);
+        save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+        let hit = load_cached_content(&pool, "short", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("短且非空的正文应命中");
+        assert_eq!(hit.content.as_deref(), Some(short));
+        assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
     }
 
     // 搜索调度：两批共用一个总预算，不再给 preferred 单独切分时段
