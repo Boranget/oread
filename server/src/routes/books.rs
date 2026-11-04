@@ -520,6 +520,24 @@ async fn run_search_batch(
     }
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
     while let Some((src, outcome, latency_ms, attempted)) = pending.next().await {
+        // 逐源耗时埋点（默认 debug 不输出；扫参时开 `RUST_LOG=search_source=debug`）。
+        // 排队时间不计入 latency_ms，`timed_out` 只标真实请求超时，与 Skipped 区分。
+        let (kind, hits, timed_out) = match &outcome {
+            TaskOutcome::Done(Ok(b)) => ("ok", b.len() as i64, false),
+            TaskOutcome::Done(Err(_)) => ("error", 0, false),
+            TaskOutcome::Timeout(_) => ("timeout", 0, true),
+            TaskOutcome::Skipped(_) => ("skipped", 0, false),
+        };
+        tracing::debug!(
+            target: "search_source",
+            source = %src.book_source_url,
+            scope = scope.as_str(),
+            kind,
+            timed_out,
+            latency_ms,
+            hits,
+            "search source done"
+        );
         let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut st = job.state.lock().unwrap();
         if attempted {
