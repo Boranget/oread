@@ -19,7 +19,7 @@
     image_style: 0,
     theme: 'light',
     font_size: 18,
-    line_height: 1.8,
+    line_height: 1.75,
     cache_limit_mb: 50,
     auto_refresh: true,
     read_mode: 'scroll',

@@ -103,7 +103,7 @@
 
   // 排版偏好：初始来自后端 user_settings，宽度/亮度/字形/速度仅存本机
   let font = 18;
-  let lineHeight = 1.8;
+  let lineHeight = 1.75;
   let theme = 'light';
   // 页宽/字体族以服务端 user_settings 为准，本机 key 仅作离线兜底
   const initialLayout = readLocalLayout();

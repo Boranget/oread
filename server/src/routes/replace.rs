@@ -53,11 +53,11 @@ const SETTINGS_DEFAULTS: &[(&str, &str)] = &[
     ("image_style", "0"),
     ("theme", "light"),
     ("font_size", "18"),
-    ("line_height", "1.8"),
+    ("line_height", "1.75"),
     ("cache_limit_mb", "50"),
     ("auto_refresh", "1"),
     ("read_mode", "scroll"),
-    ("page_width", "800"),
+    ("page_width", "720"),
     ("font_family", "serif"),
     ("builtin_clean", "0"),
 ];
@@ -522,11 +522,11 @@ pub async fn get_settings(
         "image_style": get("image_style").parse::<i64>().unwrap_or(0),
         "theme": get("theme"),
         "font_size": get("font_size").parse::<i64>().unwrap_or(18),
-        "line_height": get("line_height").parse::<f64>().unwrap_or(1.8),
+        "line_height": get("line_height").parse::<f64>().unwrap_or(1.75),
         "cache_limit_mb": get("cache_limit_mb").parse::<i64>().unwrap_or(50),
         "auto_refresh": b("auto_refresh"),
         "read_mode": get("read_mode"),
-        "page_width": get("page_width").parse::<i64>().unwrap_or(800),
+        "page_width": get("page_width").parse::<i64>().unwrap_or(720),
         "font_family": get("font_family"),
         "builtin_clean": b("builtin_clean"),
     })))
@@ -815,6 +815,12 @@ fn builtin_rules() -> Vec<ReplaceRule> {
             "去网址/域名广告行",
             r"(?m)^[^\n]*(?:https?://|www\.[A-Za-z0-9.-]+\.[A-Za-z]{2,10}|(?:[A-Za-z0-9-]+\.)+(?:com|net|org|cc|info|la|xyz|top|cn|tw|me|io|vip))(?:/\S*)?[^\n]*$",
         ),
+        // 源站反爬提示（只删该句，不按整行匹配，避免连正文一起吞掉）：
+        // “阅读提示：为防止内容获取不全，请勿使用浏览器阅读模式。”及其变体
+        mk(
+            "去源站反爬阅读提示句",
+            r"(?:阅读提示[：:][ \t]*[^\n。！!？?]{0,40}?|为防止内容(?:获取)?不全[，,、][ \t]*)(?:请勿|切勿|不要)(?:再|继续)?使用(?:浏览器)?(?:的)?(?:阅读模式|浏览模式)[，,。！!．]?",
+        ),
         // 求票/举报/收藏等短推广句（整行不超过 80 字）
         mk(
             "去推广/求票短句",
@@ -938,6 +944,41 @@ mod tests {
             lines,
             vec!["痛！好痛！", "月如银盘，漫天繁星武动乾坤。"],
             "仅独立成行的书名推广应删除"
+        );
+    }
+
+    // 源站反爬提示：常见变体整句删除；正文恰好含“阅读模式”四字时不能误删
+    #[test]
+    fn builtin_clean_removes_anticrawl_tip_sentence() {
+        let positives = [
+            "阅读提示：为防止内容获取不全，请勿使用浏览器阅读模式。",
+            "阅读提示：请勿使用阅读模式。",
+            "为防止内容不全，请勿使用浏览器阅读模式！",
+        ];
+        for line in positives {
+            let out = apply_rules(&builtin_rules(), "", "", line, false);
+            assert_eq!(out.trim(), "", "反爬提示应整句删除: {line} -> {out}");
+        }
+
+        let text = "阅读提示：为防止内容获取不全，请勿使用浏览器阅读模式。\n\
+                   他研究了很久的阅读模式。\n\
+                   作者在文中谈到阅读模式，请勿错过。\n\
+                   为防止内容不全，编辑补充了后文。";
+        let out = apply_rules(&builtin_rules(), "", "", text, false);
+        assert!(!out.contains("阅读提示"), "反爬提示句应删除: {out}");
+        let lines: Vec<&str> = out
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "他研究了很久的阅读模式。",
+                "作者在文中谈到阅读模式，请勿错过。",
+                "为防止内容不全，编辑补充了后文。"
+            ],
+            "正文不能误删: {out}"
         );
     }
 
