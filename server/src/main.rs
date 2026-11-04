@@ -41,6 +41,8 @@ fn main() -> anyhow::Result<()> {
         mu = cfg.comic_slice_mu,
         sd = cfg.comic_slice_sd,
         r = cfg.comic_slice_r,
+        kindle_vw = cfg.kindle_vw,
+        kindle_vh = cfg.kindle_vh,
         "comic slice config (off = whole image)"
     );
 

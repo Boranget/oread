@@ -119,6 +119,10 @@ pub struct Config {
     pub comic_slice_sd: u8,
     /// 切点搜索半径（CSS px，默认 96）
     pub comic_slice_r: u32,
+    /// `/k` 默认视口宽（CSS px，缺 `vw` 参数时兜底，默认 1072）
+    pub kindle_vw: u32,
+    /// `/k` 默认视口高（CSS px，缺 `vh` 参数时兜底，默认 1268）
+    pub kindle_vh: u32,
     /// 书源 JS 规则总开关
     pub js_enabled: bool,
     /// 单段 JS 规则的时间预算（毫秒，用于超时提示/统计）
@@ -219,6 +223,9 @@ impl Config {
             comic_slice_mu: env_u64("COMIC_SLICE_MU", 200).clamp(0, 255) as u8,
             comic_slice_sd: env_u64("COMIC_SLICE_SD", 30).clamp(0, 255) as u8,
             comic_slice_r: env_u64("COMIC_SLICE_R", 96).clamp(8, 480) as u32,
+            // `/k` 视口兜底：请求带 `vw`/`vh` 时以请求为准，缺参才用这两个环境默认值。
+            kindle_vw: env_u64("KINDLE_VW", 1072).clamp(480, 2400) as u32,
+            kindle_vh: env_u64("KINDLE_VH", 1268).clamp(480, 2400) as u32,
             js_enabled: env_bool("JS_ENABLED", true),
             js_timeout_ms: env_u64("JS_TIMEOUT_MS", 200).clamp(20, 5000),
             toc_ttl_secs: env_u64("TOC_TTL_SECS", 6 * 3600).clamp(60, 7 * 86400) as i64,

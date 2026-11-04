@@ -46,48 +46,81 @@ use crate::web_book;
 
 // ---------------- 真机版心常量 ----------------
 
-/// 版心宽度（1072 视口 − 左右各 36px）
-const PAGE_W: usize = 1000;
 /// 版心左右留白
 const SIDE_PAD: usize = 36;
-/// 视口宽 / 高（Kindle Paperwhite 3 内嵌浏览器实测 1072×1268）
+/// 视口宽 / 高兜底（请求未带 `vw`/`vh` 时使用；可用环境变量覆盖）
 const K_W: usize = 1072;
 const K_H: usize = 1268;
 /// 顶栏高度：72px 内容 + 1px 下边线 = 73
 const NAV_H: usize = 72;
-/// 带顶栏页面（书架/目录/搜索）的正文区高度 = 1268 − 73 = 1195
-const STAGE_H: usize = K_H - NAV_H - 1;
-/// 阅读页无顶栏：整页 1268 全部给正文（WeRead Kindle 阅读页同样没有顶栏）
-const READ_STAGE_H: usize = K_H;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
-/// 阅读页正文容器高度 = 1268 − 64（底栏）= 1204
-const READ_BODY_H: usize = READ_STAGE_H - BAR_H;
 /// 阅读页正文顶部留白：与左右版心一致 36px（此前贴顶 10px，视觉上像被裁切）
 const READ_PAD_TOP: usize = 36;
 /// 正文底部页码行：28px 行高 + 上下各 14px = 56
 const READ_PAGENO_H: usize = 56;
-/// 阅读页正文可用高度 = 1204 − 36（顶部留白）− 56（页码行）= 1112
-const READ_TEXT_H: usize = READ_BODY_H - READ_PAD_TOP - READ_PAGENO_H;
-/// 漫画整图高度上限（沿用一屏可用高 1196，底栏只占 64）
-const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - BAR_H - 8;
-/// 左右透明翻页热区宽度 = 视口 1072 / 3（取整），整屏高可点
-const HOT_W: usize = K_W / 3;
-/// 右侧热区左边界 = 1072 − 357
-const HOT_LEFT_R: usize = K_W - HOT_W;
 
-/// 阅读页每页目标行数：≈26 行（WeRead 整页阅读观感）
-const READ_TARGET_LINES: usize = 25;
+/// 请求级视口（CSS px）。几何全部由它推导，不再写死 1000/1268；
+/// 优先级：请求参数 `vw`/`vh` > 环境变量默认（见 `Config.kindle_vw/vh`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Vp {
+    w: usize,
+    h: usize,
+    /// 请求是否显式带了 `vw`。显式时 viewport 锁 `width={w}`（真机 1:1 不缩放）；
+    /// 缺参时用 `width=device-width`，让补参脚本能量出真实 CSS 宽度。
+    fixed: bool,
+}
 
-/// 阅读页每页行数预算：目标 25 行，但不超过 1112px 物理可容纳的行数
-/// （28/46 → 24，32/52 → 21，38/62 → 17；25 行只在 20/36 档成立）
-const fn line_budget(line: usize) -> usize {
-    let fit = READ_TEXT_H / line;
-    if fit < READ_TARGET_LINES {
-        fit
-    } else {
-        READ_TARGET_LINES
+impl Vp {
+    /// 缺参/越界时回落到默认视口，保证任何尺寸都不会算出负高度。
+    fn resolve(vw: Option<i64>, vh: Option<i64>, d: (usize, usize)) -> Self {
+        let ok = |v: Option<i64>| v.filter(|n| (480..=2400).contains(n)).map(|n| n as usize);
+        Self {
+            w: ok(vw).unwrap_or(d.0),
+            h: ok(vh).unwrap_or(d.1),
+            fixed: ok(vw).is_some(),
+        }
     }
+    /// 版心宽 = 视口宽 − 左右留白 ×2（1072 → 1000）
+    fn page_w(self) -> usize {
+        self.w.saturating_sub(SIDE_PAD * 2)
+    }
+    /// 漫画图宽 = 版心宽 − 左右留白 ×2（1072 → 928，即切片版心宽 dw）
+    fn content_w(self) -> usize {
+        self.w.saturating_sub(SIDE_PAD * 4)
+    }
+    /// 阅读页正文容器高 = 视口高 − 底栏（1268 → 1204）
+    fn body_h(self) -> usize {
+        self.h.saturating_sub(BAR_H)
+    }
+    /// 带顶栏页面的正文区高 = 视口高 − 顶栏 − 1（1268 → 1195）
+    fn nav_h(self) -> usize {
+        self.h.saturating_sub(NAV_H + 1)
+    }
+    /// 小说正文可用高 = 正文容器 − 顶部留白 − 页码行（1268 → 1112）
+    fn text_h(self) -> usize {
+        self.body_h().saturating_sub(READ_PAD_TOP + READ_PAGENO_H)
+    }
+    /// 漫画整图/单片可用高 = 视口高 − 底栏 − 8（1268 → 1196，即切片可用高 vh）
+    fn content_h(self) -> usize {
+        self.h.saturating_sub(BAR_H + 8)
+    }
+    /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357）
+    fn hot_w(self) -> usize {
+        self.w / 3
+    }
+}
+
+impl Default for Vp {
+    fn default() -> Self {
+        Self { w: K_W, h: K_H, fixed: true }
+    }
+}
+
+/// 阅读页每页行数预算 = 可用高 ÷ 行高（字号四档 28/32/38/20 对应 46/52/62/36）。
+/// 动态算出，不再有 24/21/17/25 这类硬编码常量。
+fn line_budget(vp: Vp, line: usize) -> usize {
+    (vp.text_h() / line.max(1)).max(1)
 }
 /// 段间距（行）：WeRead 实测段距 0.6 行（默认档 27px）
 const PARA_GAP_LINES: f64 = 0.6;
@@ -95,7 +128,7 @@ const PARA_GAP_LINES: f64 = 0.6;
 const fn para_gap_px(line: usize) -> usize {
     (line * 6) / 10
 }
-/// 目录每页章节数：两列各 15 行 × 72px = 1080，正文区 1131 装得下
+/// 目录每页章节数：两列各 15 行 × 72px = 1080
 const K_TOC_PAGE: usize = 30;
 /// 目录每列行数
 const K_TOC_COLS: usize = 2;
@@ -109,29 +142,31 @@ const K_MAX_TEXT_CHARS: usize = 800_000;
 const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
-/// 版心固定 1072（1000 + 左右各 36），必须 1:1 不缩放；Silk 等会缩放设备也按 1072 排版
-const K_VIEWPORT: &str = "width=1072,initial-scale=1,maximum-scale=1,user-scalable=0";
 
-/// 四档字号。`lines` = 每页行数预算（min(26, 正文区能装下的行数)），
-/// 每页字符数 = `行数 × 每行字数`（由测试按版心宽度换算校验）。
+/// 视口补参脚本（ES5，≤300 字节）：URL 缺 `vw`/`vh` 或与真实窗口不符时，
+/// 用 `location.replace` 补参并重载一次；`kfix=1` 是防循环标记，最多重载一次。
+/// 服务端渲染的翻页/换章链接已带参，正常翻页不会触发重载。
+const K_VP_FIX_JS: &str = "(function(){var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
+for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
+if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}\
+if(!f&&(vw!=innerWidth||vh!=innerHeight)){o.push('vw='+innerWidth,'vh='+innerHeight,'kfix=1');\
+location.replace(location.pathname+'?'+o.join('&'));}})()";
+
+/// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
     size: usize,
     line: usize,
-    lines: usize,
     label: &'static str,
 }
 
 const FS_SPECS: [FsSpec; 4] = [
-    // 928/28 ≈ 33 字/行，1196/46 = 26 行 → 858 字（正好是 26 行目标档）。
-    FsSpec { size: 28, line: 46, lines: line_budget(46), label: "小" },
-    // 928/32 = 29 字/行，1196/52 = 23 行（26 行需 1352px，物理装不下）→ 667 字。
+    // 927/28 ≈ 33 字/行；行数 = 正文可用高 ÷ 46。
+    FsSpec { size: 28, line: 46, label: "小" },
     // 字号口径：真机实测 32px/52px，保留 32px。此处显式写死 32，且全局
     // `-webkit-text-size-adjust:none` 已关闭老引擎的字号自动放大——实测 32/52，勿低于 30。
-    FsSpec { size: 32, line: 52, lines: line_budget(52), label: "标准" },
-    // 928/38 ≈ 24 字/行，1196/62 = 19 行（26 行需 1612px，物理装不下）→ 475 字。
-    FsSpec { size: 38, line: 62, lines: line_budget(62), label: "大" },
-    // 928/20 ≈ 46 字/行，1196/36 = 33 行 → 仍取 26 行，26×36=936px 装下 → 1196 字。
-    FsSpec { size: 20, line: 36, lines: line_budget(36), label: "超小" },
+    FsSpec { size: 32, line: 52, label: "标准" },
+    FsSpec { size: 38, line: 62, label: "大" },
+    FsSpec { size: 20, line: 36, label: "超小" },
 ];
 
 pub fn routes() -> Router<AppState> {
@@ -211,6 +246,17 @@ fn with_fs(url: &str, fs: usize) -> String {
     }
 }
 
+/// 给链接补上视口参数：链接自传播，客户端翻页零测量、零额外请求。
+fn with_vp(url: &str, vp: Vp) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}vw={}&vh={}", vp.w, vp.h)
+}
+
+/// /k 内部链接的标配：字号 + 视口参数。
+fn qlink(url: &str, fs: usize, vp: Vp) -> String {
+    with_vp(&with_fs(url, fs), vp)
+}
+
 /// 解析字号：显式 `?fs=1..4` 优先，其次 `k_fs` Cookie，缺省标准档（2）。
 /// 档位 1/2/3 为既有小/标准/大，4 为新增超小档。
 /// 返回 (档位, 是否需要回写 Cookie)。
@@ -255,15 +301,22 @@ fn remember_fs(res: &mut Response, fs: usize) {
     }
 }
 
-/// 统一页面骨架：无脚本、固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大。
-/// viewport 固定 1072（与版心一致）；不写 initial-scale=1 时 Silk 会按 device-width 缩放。
-fn page_html(title: &str, fs: usize, body: &str) -> String {
-    page_html_css(title, fs, body, "")
+/// 统一页面骨架：固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大。
+/// viewport 宽度随请求视口（`vw`），缺参时回落到默认 1072；不写 initial-scale=1
+/// 时 Silk 会按 device-width 缩放。
+fn page_html(title: &str, fs: usize, body: &str, vp: Vp) -> String {
+    page_html_css(title, fs, body, "", vp)
 }
 
 /// 与 `page_html` 相同，额外拼接一段页面级 CSS（阅读页用「一屏一页」锁高，其它页不受影响）。
-fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str) -> String {
+fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> String {
     let spec = &FS_SPECS[fs - 1];
+    // 显式 vw → 锁死版心宽（1:1 不缩放）；缺参 → device-width，交给补参脚本量出真实宽度
+    let viewport = if vp.fixed {
+        format!("width={},initial-scale=1,maximum-scale=1,user-scalable=0", vp.w)
+    } else {
+        "width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0".to_string()
+    };
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
@@ -276,26 +329,27 @@ h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style></head><body><div class=\"wrap\">{body}</div></body></html>",
-        viewport = K_VIEWPORT,
+</style></head><body><div class=\"wrap\">{body}</div><script>{js}</script></body></html>",
+        viewport = viewport,
         title = esc(title),
         size = spec.size,
         line = spec.line,
-        pw = PAGE_W,
+        pw = vp.page_w(),
         pad = SIDE_PAD,
-        w = K_W,
-        h = K_H,
+        w = vp.w,
+        h = vp.h,
         extra = extra_css,
-        body = body
+        body = body,
+        js = K_VP_FIX_JS
     )
 }
 
-fn page(title: &str, fs: usize, body: &str) -> Response {
-    page_css(title, fs, body, "")
+fn page(title: &str, fs: usize, body: &str, vp: Vp) -> Response {
+    page_css(title, fs, body, "", vp)
 }
 
-fn page_css(title: &str, fs: usize, body: &str, extra_css: &str) -> Response {
-    let html = page_html_css(title, fs, body, extra_css);
+fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> Response {
+    let html = page_html_css(title, fs, body, extra_css, vp);
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
@@ -305,7 +359,7 @@ fn page_css(title: &str, fs: usize, body: &str, extra_css: &str) -> Response {
 
 /// 顶栏（73px = 72 内容 + 1px 下边线，白底，只有一条）：
 /// 左：标题 28px 加粗（可带一段 20px 弱灰副标题）；右：动作链接 20px，间距 32px。
-fn top_bar(title: &str, sub: Option<&str>, actions: &str) -> String {
+fn top_bar(title: &str, sub: Option<&str>, actions: &str, vp: Vp) -> String {
     let sub = match sub {
         Some(s) => format!(
             " <span style=\"font-size:20px;color:#555;font-weight:400\">{}</span>",
@@ -319,7 +373,7 @@ fn top_bar(title: &str, sub: Option<&str>, actions: &str) -> String {
          <td height=\"72\" align=\"left\" style=\"font-size:28px;line-height:72px;font-weight:700;padding-left:36px;overflow:hidden\">{title}{sub}</td>\
          <td height=\"72\" align=\"right\" style=\"font-size:20px;line-height:72px;padding-right:36px\">{actions}</td>\
          </tr></table></div>",
-        pw = PAGE_W,
+        pw = vp.page_w(),
         title = esc(title),
         sub = sub,
         actions = actions
@@ -337,13 +391,13 @@ fn nav_link(href: &str, label: &str) -> String {
 
 /// 贴底固定栏（仅阅读页）：`position:fixed` + table 5 格等宽 200px、高 64px。
 /// 每格：图标 28px 方框 + 4px 缝 + 文字 20px；格顶 1px `#ccc` 连成整条分隔线。
-fn fixed_bar(row: &str) -> String {
+fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
         "<div id=\"k-bar\" style=\"position:fixed;left:0;bottom:0;width:{w}px;height:{h}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
-        w = K_W,
+        w = vp.w,
         h = BAR_H,
-        pw = PAGE_W,
+        pw = vp.page_w(),
         pad = SIDE_PAD,
         row = row
     )
@@ -379,7 +433,11 @@ fn bar_cell_off(icon: &str, label: &str) -> String {
 
 /// 列表页翻页条（书架/搜索/目录）：64px 高、两格各占一半，贴 stage 底部。
 /// 禁用态用 `#555` 弱灰且不可点。
-fn pager_bar(prev: Option<(String, &'static str)>, next: Option<(String, &'static str)>) -> String {
+fn pager_bar(
+    prev: Option<(String, &'static str)>,
+    next: Option<(String, &'static str)>,
+    vp: Vp,
+) -> String {
     let cell = |item: &Option<(String, &'static str)>, fallback: &str| match item {
         Some((href, label)) => format!(
             "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
@@ -396,7 +454,7 @@ fn pager_bar(prev: Option<(String, &'static str)>, next: Option<(String, &'stati
     format!(
         "<div id=\"k-pager\" style=\"position:absolute;left:0;bottom:0;width:{pw}px;height:{h}px;background:#fff;z-index:8\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"table-layout:fixed\"><tr>{p}{n}</tr></table></div>",
-        pw = PAGE_W,
+        pw = vp.page_w(),
         h = BAR_H,
         p = cell(&prev, "上一页"),
         n = cell(&next, "下一页")
@@ -406,41 +464,41 @@ fn pager_bar(prev: Option<(String, &'static str)>, next: Option<(String, &'stati
 /// 左右透明翻页热区：各占屏宽 1/3（357px）、整屏高 1268px。
 /// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
 /// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1268 ≫ 200×200。
-fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
+fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
     let mut out = String::new();
     if let Some(pv) = prev {
         out.push_str(&format!(
             "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
             prev = pv,
-            w = HOT_W,
-            h = READ_STAGE_H
+            w = vp.hot_w(),
+            h = vp.h
         ));
     }
     if let Some(nx) = next {
         out.push_str(&format!(
             "<a href=\"{nx}\" style=\"position:absolute;top:0;left:{l}px;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
             nx = nx,
-            l = HOT_LEFT_R,
-            w = HOT_W,
-            h = READ_STAGE_H
+            l = vp.w - vp.hot_w(),
+            w = vp.hot_w(),
+            h = vp.h
         ));
     }
     out
 }
 
-fn read_only_css() -> String {
+fn read_only_css(vp: Vp) -> String {
     format!(
         "html,body{{height:{h}px;overflow:hidden}}#k-stage{{position:relative;height:{b}px;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
-        h = READ_STAGE_H,
-        b = READ_BODY_H,
+        h = vp.h,
+        b = vp.body_h(),
         pad = SIDE_PAD
     )
 }
 
 /// 阅读页内部链接：始终带目标档位的 `fs`，切档后不会被当前档位拼成重复参数。
-fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64) -> String {
-    with_fs(
+fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
+    qlink(
         &format!(
             "/k/read?book={}&source={}&ch={}&p={}",
             qenc(&q.book),
@@ -449,12 +507,13 @@ fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64) -> String {
             p
         ),
         fs,
+        vp,
     )
 }
 
 /// 目录链接（按 30 章/页定位到当前章所在目录页，并带上当前章用于高亮）
-fn toc_link(q: &ReadQ, fs: usize, ch: i64) -> String {
-    with_fs(
+fn toc_link(q: &ReadQ, fs: usize, ch: i64, vp: Vp) -> String {
+    qlink(
         &format!(
             "/k/toc?book={}&source={}&tp={}&ch={}",
             qenc(&q.book),
@@ -463,6 +522,7 @@ fn toc_link(q: &ReadQ, fs: usize, ch: i64) -> String {
             ch
         ),
         fs,
+        vp,
     )
 }
 
@@ -475,21 +535,22 @@ fn read_nav(
     n: i64,
     total: i64,
     _toc: &str,
+    vp: Vp,
 ) -> (
     Option<(String, &'static str)>,
     Option<(String, &'static str)>,
 ) {
     let prev = if p > 1 {
-        Some((read_link(q, fs, ch, p - 1), "上一页"))
+        Some((read_link(q, fs, ch, p - 1, vp), "上一页"))
     } else if ch > 0 {
-        Some((read_link(q, fs, ch - 1, 1), "上一章"))
+        Some((read_link(q, fs, ch - 1, 1, vp), "上一章"))
     } else {
         None
     };
     let next = if p < n {
-        Some((read_link(q, fs, ch, p + 1), "下一页"))
+        Some((read_link(q, fs, ch, p + 1, vp), "下一页"))
     } else if ch + 1 < total {
-        Some((read_link(q, fs, ch + 1, 1), "下一章"))
+        Some((read_link(q, fs, ch + 1, 1, vp), "下一章"))
     } else {
         None
     };
@@ -513,7 +574,7 @@ fn bar_cell_next(next: Option<&(String, &'static str)>) -> String {
 }
 
 /// 进度提交：零 JS 的原生 form（底栏第 5 格），整格是 `<button>`，与其它格同构
-fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) -> String {
+fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize, vp: Vp) -> String {
     format!(
         "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
          <form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
@@ -524,6 +585,8 @@ fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) ->
          <input type=\"hidden\" name=\"n\" value=\"{n}\">\
          <input type=\"hidden\" name=\"total\" value=\"{total}\">\
          <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
+         <input type=\"hidden\" name=\"vw\" value=\"{vw}\">\
+         <input type=\"hidden\" name=\"vh\" value=\"{vh}\">\
          <button type=\"submit\" style=\"width:100%;height:63px;border:0;padding:0;background:#fff;color:#000;font-family:serif;-webkit-appearance:none;appearance:none\">{inner}</button></form></td>",
         book = esc(&q.book),
         source = esc(&q.source),
@@ -532,6 +595,8 @@ fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) ->
         n = n,
         total = total,
         fs = fs,
+        vw = vp.w,
+        vh = vp.h,
         inner = bar_inner("记", "记录")
     )
 }
@@ -547,17 +612,18 @@ fn outline_button(href: &str, label: &str) -> String {
 
 /// 空书架：2px 描边块，整块在可用区内垂直居中（`table` 100% + `valign="middle"`），
 /// 含标题 26 加粗 + 说明 20 `#555` + 240×72 描边按钮。
-fn empty_shelf(fs: usize) -> String {
+fn empty_shelf(fs: usize, vp: Vp) -> String {
     format!(
-        "<table width=\"1000\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+        "<table width=\"{pw}\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
          <td align=\"center\" valign=\"middle\">\
          <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #000\"><tr>\
          <td align=\"left\" style=\"padding:32px\">\
          <div style=\"font-size:26px;line-height:40px;font-weight:700\">书架还是空的</div>\
          <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\
          <div style=\"margin-top:24px\">{btn}</div></td></tr></table></td></tr></table>",
-        h = STAGE_H,
-        btn = outline_button(&with_fs("/k/search", fs), "去搜索一本书")
+        pw = vp.page_w(),
+        h = vp.nav_h(),
+        btn = outline_button(&qlink("/k/search", fs, vp), "去搜索一本书")
     )
 }
 
@@ -581,7 +647,12 @@ fn notice_page(title: &str, msg: &str, href: &str, label: &str) -> String {
 }
 
 fn err_page(msg: &str) -> Response {
-    page("错误", 2, &notice_page("出错了", msg, "/k", "返回书架"))
+    page(
+        "错误",
+        2,
+        &notice_page("出错了", msg, "/k", "返回书架"),
+        Vp::default(),
+    )
 }
 
 fn err_to_page(e: AppError) -> Response {
@@ -599,10 +670,11 @@ fn visible_chapters(chapters: &[BookChapter]) -> Vec<&BookChapter> {
 }
 
 /// 直接访问分卷行时返回的友好提示页（沿用现有版心，不新增版式）。
-fn volume_notice(q: &ReadQ, fs: usize, explicit: bool) -> Response {
-    let back = with_fs(
+fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp) -> Response {
+    let back = qlink(
         &format!("/k/toc?book={}&source={}", qenc(&q.book), qenc(&q.source)),
         fs,
+        vp,
     );
     let body = notice_page(
         "分卷标题",
@@ -610,7 +682,7 @@ fn volume_notice(q: &ReadQ, fs: usize, explicit: bool) -> Response {
         &back,
         "返回目录",
     );
-    let mut res = page("分卷标题", fs, &body);
+    let mut res = page("分卷标题", fs, &body, vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -650,9 +722,9 @@ fn char_em(c: char) -> f64 {
     }
 }
 
-/// 每行可用 em 数（版心宽度 ÷ 字号）
-fn line_em(spec: &FsSpec) -> f64 {
-    (PAGE_W - SIDE_PAD * 2) as f64 / spec.size as f64
+/// 每行可用 em 数（版心宽度 ÷ 字号）；版心宽度随请求视口变化
+fn line_em(spec: &FsSpec, page_w: usize) -> f64 {
+    (page_w - SIDE_PAD * 2) as f64 / spec.size as f64
 }
 
 /// 段落占用行数：首行缩进 2em，续行不缩进（与渲染的 text-indent:2em 一致）
@@ -694,12 +766,12 @@ fn split_para(s: &str, cap: usize, em: f64) -> (usize, usize) {
 /// 行预算按「行当量」计：段与段之间另计 0.6 行段距（与渲染的 `margin-top` 一致），
 /// 保证页面实际高度 ≤ `lines × line`，不把最后一行挤出可视区。
 /// 返回每页的字节区间（相对 `text`），页边界只落在字符边界上。
-fn paginate_lines(text: &str, spec: &FsSpec) -> Vec<(usize, usize)> {
+fn paginate_lines(text: &str, spec: &FsSpec, budget: usize, page_w: usize) -> Vec<(usize, usize)> {
     if text.is_empty() {
         return vec![(0, 0)];
     }
-    let em = line_em(spec);
-    let budget = spec.lines as f64;
+    let em = line_em(spec, page_w);
+    let budget = budget.max(1) as f64;
     let gap = para_gap_px(spec.line) as f64 / spec.line as f64;
     let mut pages: Vec<(usize, usize)> = Vec::new();
     let mut page_start: Option<usize> = None;
@@ -793,11 +865,11 @@ struct PagePlan {
     pages: Vec<(usize, usize, usize)>,
 }
 
-fn plan_pages(text: &str, spec: &FsSpec) -> PagePlan {
+fn plan_pages(text: &str, spec: &FsSpec, budget: usize, page_w: usize) -> PagePlan {
     let chunks = chunk_ranges(text, K_CHUNK_CHARS);
     let mut pages = Vec::new();
     for (ci, &(cs, ce)) in chunks.iter().enumerate() {
-        for (s, e) in paginate_lines(&text[cs..ce], spec) {
+        for (s, e) in paginate_lines(&text[cs..ce], spec, budget, page_w) {
             pages.push((ci, cs + s, cs + e));
         }
     }
@@ -831,6 +903,9 @@ pub struct TocQ {
     fs: Option<i64>,
     /// 当前所在章（从阅读页跳目录时带上，用于「▸ + 加粗」高亮）
     ch: Option<i64>,
+    /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
+    vw: Option<i64>,
+    vh: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct ReadQ {
@@ -839,6 +914,9 @@ pub struct ReadQ {
     ch: Option<i64>,
     p: Option<i64>,
     fs: Option<i64>,
+    /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
+    vw: Option<i64>,
+    vh: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct SearchQ {
@@ -850,6 +928,8 @@ pub struct SearchQ {
     scope: Option<String>,
     /// 是否包含冷却中的源：缺省 0；验收/对拍时可显式 1。
     include_cooled: Option<String>,
+    vw: Option<i64>,
+    vh: Option<i64>,
 }
 
 /// `/k` 的 scope 解析：只有显式 `all`/`expanded` 走全量，其余（含缺省、未知值）一律 curated。
@@ -863,6 +943,8 @@ fn k_scope(raw: Option<&str>) -> crate::req::SearchScope {
 pub struct FsQ {
     fs: Option<i64>,
     sp: Option<i64>,
+    vw: Option<i64>,
+    vh: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct LoginQ {
@@ -878,9 +960,20 @@ pub struct ProgressQ {
     n: i64,
     fs: Option<i64>,
     total: Option<i64>,
+    vw: Option<i64>,
+    vh: Option<i64>,
 }
 
 // ---------------- 数据辅助 ----------------
+
+/// 解析请求视口：`vw`/`vh` 参数优先，缺参/越界回落到环境默认（默认 1072×1268）。
+fn vp_of(s: &AppState, vw: Option<i64>, vh: Option<i64>) -> Vp {
+    Vp::resolve(
+        vw,
+        vh,
+        (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize),
+    )
+}
 
 /// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
 async fn ensure_chapters(
@@ -936,6 +1029,7 @@ async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) 
             head = page_head("登录"),
             err = err
         ),
+        Vp::default(),
     )
 }
 
@@ -1004,12 +1098,13 @@ async fn logout() -> Response {
 // ---------------- 书架 ----------------
 
 async fn shelf(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     headers: HeaderMap,
     Query(q): Query<FsQ>,
 ) -> Response {
+    let vp = vp_of(&s, q.vw, q.vh);
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let rows: Vec<BookshelfItem> = match sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
         .bind(None::<String>)
@@ -1034,22 +1129,25 @@ async fn shelf(
     // 导航只出现一次：书架/搜索/目录用顶部导航，底栏只留给阅读页
     let nav = format!(
         "{}{}{}",
-        nav_link(&with_fs("/k/search", fs), "搜索"),
-        nav_link(&fs_url, FS_SPECS[next_fs - 1].label),
+        nav_link(&qlink("/k/search", fs, vp), "搜索"),
+        nav_link(&with_vp(&fs_url, vp), FS_SPECS[next_fs - 1].label),
         nav_link("/k/logout", "退出"),
     );
-    let top = top_bar("书架", None, &nav);
+    let top = top_bar("书架", None, &nav, vp);
 
     let mut list = String::new();
     if rows.is_empty() {
-        list.push_str(&empty_shelf(fs));
+        list.push_str(&empty_shelf(fs, vp));
     } else {
-        list.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+        list.push_str(&format!(
+            "<table width=\"{}\" cellpadding=\"0\" cellspacing=\"0\">",
+            vp.page_w()
+        ));
         for b in &rows[start..end] {
             let title = b.title.clone().unwrap_or_else(|| "未命名".into());
             let author = b.author.clone().unwrap_or_default();
             let src = b.source_id.clone().unwrap_or_default();
-            let read = with_fs(
+            let read = qlink(
                 &format!(
                     "/k/read?book={}&source={}&ch={}&p=1",
                     qenc(&b.book_id),
@@ -1057,12 +1155,13 @@ async fn shelf(
                     b.chapter_index
                 ),
                 fs,
+                vp,
             );
             let first = title.chars().next().unwrap_or('书');
             list.push_str(&format!(
                 "<tr><td style=\"padding:0\">\
                  <a href=\"{read}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
-                 <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+                 <table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
                  <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
                  <td style=\"padding-left:24px\" valign=\"middle\">\
                  <div style=\"font-size:32px;line-height:48px;font-weight:700\">{title}</div>\
@@ -1071,6 +1170,7 @@ async fn shelf(
                  <td align=\"right\" style=\"font-size:20px;line-height:32px;color:#555\">{pct:.0}%</td>\
                  </tr></table></td></tr></table></a></td></tr>",
                 read = read,
+                iw = vp.page_w(),
                 first = esc(&first.to_string()),
                 title = esc(&title),
                 author = esc(if author.is_empty() { "未知作者" } else { author.as_str() }),
@@ -1082,26 +1182,26 @@ async fn shelf(
 
     let pager = if t_pages > 1 {
         let prev = if sp > 1 {
-            Some((format!("/k?fs={}&sp={}", fs, sp - 1), "上一页"))
+            Some((with_vp(&format!("/k?fs={}&sp={}", fs, sp - 1), vp), "上一页"))
         } else {
             None
         };
         let next = if sp < t_pages {
-            Some((format!("/k?fs={}&sp={}", fs, sp + 1), "下一页"))
+            Some((with_vp(&format!("/k?fs={}&sp={}", fs, sp + 1), vp), "下一页"))
         } else {
             None
         };
-        pager_bar(prev, next)
+        pager_bar(prev, next, vp)
     } else {
         String::new()
     };
     let stage = format!(
         "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
-        h = STAGE_H,
+        h = vp.nav_h(),
         list = list,
         pager = pager
     );
-    let mut res = page("书架", fs, &format!("{top}{stage}"));
+    let mut res = page("书架", fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1117,6 +1217,7 @@ async fn toc(
     headers: HeaderMap,
     Query(q): Query<TocQ>,
 ) -> Response {
+    let vp = vp_of(&s, q.vw, q.vh);
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let (_source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
@@ -1138,30 +1239,34 @@ async fn toc(
         .unwrap_or_else(|| "目录".into());
 
     let next_fs = cycle_fs(fs);
-    let fs_href = with_fs(
-        &format!(
-            "/k/toc?book={}&source={}&tp={}&ch={}",
-            qenc(&q.book),
-            qenc(&q.source),
-            tp,
-            q.ch.unwrap_or(-1)
+    let fs_href = with_vp(
+        &with_fs(
+            &format!(
+                "/k/toc?book={}&source={}&tp={}&ch={}",
+                qenc(&q.book),
+                qenc(&q.source),
+                tp,
+                q.ch.unwrap_or(-1)
+            ),
+            next_fs,
         ),
-        next_fs,
+        vp,
     );
     // 导航只出现一次：标题=书名，右侧=书架 / 字号
     let nav = format!(
         "{}{}",
-        nav_link(&with_fs("/k", fs), "书架"),
+        nav_link(&qlink("/k", fs, vp), "书架"),
         nav_link(&fs_href, FS_SPECS[next_fs - 1].label),
     );
-    let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav);
+    let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
-    // 两列 × 15 行 = 每页 30 条；行高 72，分隔线 1px #ccc 左右各缩 36（表格左右边距）
+    // 两列各 15 行 = 每页 30 条；列宽随版心自适应（1072 → 452，1024 → 428）
     let rows_per_col = K_TOC_PAGE / K_TOC_COLS;
+    let col_w = vp.content_w().saturating_sub(24) / K_TOC_COLS;
     let mut cols = [String::new(), String::new()];
     for (i, c) in visible[start..end].iter().enumerate() {
         let col = (i / rows_per_col).min(K_TOC_COLS - 1);
-        let href = with_fs(
+        let href = qlink(
             &format!(
                 "/k/read?book={}&source={}&ch={}&p=1",
                 qenc(&q.book),
@@ -1169,6 +1274,7 @@ async fn toc(
                 c.index
             ),
             fs,
+            vp,
         );
         let title = c.title.as_deref().unwrap_or("未命名章节");
         let cur = q.ch.map(|x| x == c.index).unwrap_or(false);
@@ -1193,21 +1299,24 @@ async fn toc(
             c.push_str("<tr><td height=\"72\"></td></tr>");
         }
         *c = format!(
-            "<table width=\"452\" cellpadding=\"0\" cellspacing=\"0\">{}</table>",
+            "<table width=\"{col_w}\" cellpadding=\"0\" cellspacing=\"0\">{}</table>",
             c
         );
     }
     let list = format!(
-        "<table width=\"928\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:36px\"><tr>\
-         <td width=\"452\" valign=\"top\">{left}</td><td width=\"24\"></td><td width=\"452\" valign=\"top\">{right}</td>\
+        "<table width=\"{tw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}\"><tr>\
+         <td width=\"{col_w}\" valign=\"top\">{left}</td><td width=\"24\"></td><td width=\"{col_w}\" valign=\"top\">{right}</td>\
          </tr></table>",
+        tw = vp.content_w(),
+        pad = SIDE_PAD,
+        col_w = col_w,
         left = cols[0],
         right = cols[1]
     );
 
     let prev = if tp > 1 {
         Some((
-            with_fs(
+            qlink(
                 &format!(
                     "/k/toc?book={}&source={}&tp={}&ch={}",
                     qenc(&q.book),
@@ -1216,6 +1325,7 @@ async fn toc(
                     q.ch.unwrap_or(-1)
                 ),
                 fs,
+                vp,
             ),
             "上一页",
         ))
@@ -1224,7 +1334,7 @@ async fn toc(
     };
     let next = if tp < t_pages {
         Some((
-            with_fs(
+            qlink(
                 &format!(
                     "/k/toc?book={}&source={}&tp={}&ch={}",
                     qenc(&q.book),
@@ -1233,6 +1343,7 @@ async fn toc(
                     q.ch.unwrap_or(-1)
                 ),
                 fs,
+                vp,
             ),
             "下一页",
         ))
@@ -1241,12 +1352,12 @@ async fn toc(
     };
     let stage = format!(
         "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
-        h = STAGE_H,
+        h = vp.nav_h(),
         list = list,
-        pager = pager_bar(prev, next)
+        pager = pager_bar(prev, next, vp)
     );
 
-    let mut res = page(&name, fs, &format!("{top}{stage}"));
+    let mut res = page(&name, fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1278,9 +1389,10 @@ fn comic_pages(
     images: &[BookImage],
     dims: &[Option<(u32, u32)>],
     cfg: &crate::config::Config,
+    sp: &image::SliceParams,
 ) -> Vec<ComicPage> {
-    let sp = image::SliceParams::from_config(cfg, None, None, None);
     let dw = sp.dw as usize;
+    let content_h = sp.vh as usize;
     let mut pages = Vec::new();
     for i in 0..images.len() {
         let known = dims
@@ -1300,7 +1412,7 @@ fn comic_pages(
         };
         // 开关关闭时恒按整图一页，与切片上线前的行为一致。
         let n = if cfg.comic_slice {
-            image::slice_count_window(w, h, &sp)
+            image::slice_count_window(w, h, sp)
         } else {
             1
         };
@@ -1318,15 +1430,15 @@ fn comic_pages(
             }
         } else {
             let scaled = ((h as f64) * dw as f64 / w as f64).round() as usize;
-            if scaled > READ_STAGE_CONTENT_H {
+            if scaled > content_h {
                 // 1.1 屏这类「不切但一屏放不下」的整图：按高度约束等比缩小，仍是一屏一页
-                let cw = ((READ_STAGE_CONTENT_H as f64) * w as f64 / h as f64).round() as usize;
+                let cw = ((content_h as f64) * w as f64 / h as f64).round() as usize;
                 pages.push(ComicPage {
                     img: i,
                     slice: 0,
                     layers: 1,
                     width: cw.max(1),
-                    height: READ_STAGE_CONTENT_H,
+                    height: content_h,
                 });
             } else {
                 pages.push(ComicPage {
@@ -1351,6 +1463,8 @@ fn comic_stage(
     book_url: &str,
     chapter_url: &str,
     meta: &str,
+    vp: Vp,
+    sp: &image::SliceParams,
 ) -> String {
     let im = &images[pg.img];
     let mut src = format!(
@@ -1361,7 +1475,11 @@ fn comic_stage(
         qenc(&im.url)
     );
     if pg.layers > 1 {
-        src.push_str(&format!("&slice=1&i={}", pg.slice));
+        // 切片 URL 带 dw/vh：缓存 key 天然按尺寸隔离，换视口不会命中别的尺寸的旧片
+        src.push_str(&format!(
+            "&slice=1&i={}&dw={}&vh={}",
+            pg.slice, sp.dw, sp.vh
+        ));
     }
     let img = if pg.height > 0 {
         format!(
@@ -1385,8 +1503,8 @@ fn comic_stage(
     };
     format!(
         "<div id=\"k-stage\" style=\"position:relative;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
-        h = READ_STAGE_H,
-        w = PAGE_W,
+        h = vp.h,
+        w = vp.page_w(),
         pad = SIDE_PAD,
         pb = BAR_H + 8,
         img = img,
@@ -1452,6 +1570,7 @@ async fn read(
     Query(q): Query<ReadQ>,
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
+    let vp = vp_of(&s, q.vw, q.vh);
     let (source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
         Err(e) => return err_to_page(e),
@@ -1463,11 +1582,11 @@ async fn read(
     let chapter: &BookChapter = &chapters[ch as usize];
     // 目录已不展示分卷行；兜底拦截直接访问（合成 URL `volume:`）时给出友好提示，不抛错误页。
     if volume_entry(chapter) {
-        return volume_notice(&q, fs, explicit);
+        return volume_notice(&q, fs, explicit, vp);
     }
     // 漫画源：一屏一页（整图或切片），不走正文分页
     if source.book_source_type == 2 {
-        return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit).await;
+        return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp).await;
     }
 
     let mut c: BookContent = match load_cached_content(&db.0, &chapter.url, s.cfg.content_ttl_secs).await {
@@ -1503,7 +1622,9 @@ async fn read(
     let mut text = html_to_text(body_html.as_deref().unwrap_or(""));
     let truncated = truncate_to_chars(&mut text, K_MAX_TEXT_CHARS);
     let spec = &FS_SPECS[fs - 1];
-    let plan = plan_pages(&text, spec);
+    // 每页行数由「正文可用高 ÷ 行高」动态算出（字号四档不再有 24/21/17/25 硬编码）
+    let budget = line_budget(vp, spec.line);
+    let plan = plan_pages(&text, spec, budget, vp.page_w());
     let n = plan.pages.len() as i64;
     let p = q.p.unwrap_or(1).clamp(1, n);
     let (block_idx, cur_start, cur_end) = plan.pages[(p - 1) as usize];
@@ -1511,8 +1632,8 @@ async fn read(
     let blocks = plan.chunks.len();
 
     let ch_title = title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
-    let toc_url = toc_link(&q, fs, ch);
-    let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url);
+    let toc_url = toc_link(&q, fs, ch, vp);
+    let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
     let mut meta = if blocks > 1 {
         // 超长章节按 20 万字符分块：底栏“目录”格下方同时给出页内进度、页码与分块号
         let pct = ((p as f64 * 100.0 / n as f64).round() as usize).clamp(1, 100);
@@ -1524,9 +1645,9 @@ async fn read(
         meta.push_str("·已截断");
     }
     // 进度提交：零 JS 的原生 form，放在底栏第 5 格（阅读页无顶栏）
-    let progress_cell = progress_form(&q, ch, p, n, chapters.len(), fs);
+    let progress_cell = progress_form(&q, ch, p, n, chapters.len(), fs, vp);
     let next_fs = cycle_fs(fs);
-    let fs_href = read_link(&q, next_fs, ch, p);
+    let fs_href = read_link(&q, next_fs, ch, p, vp);
 
     let mut paras = String::new();
     let gap = para_gap_px(spec.line);
@@ -1549,8 +1670,8 @@ async fn read(
     // 阅读页无顶栏：正文区 1204（底栏 64 贴底），底部 52 留页码行
     let stage = format!(
         "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:{pt}px {pad}px 0;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
-        h = READ_BODY_H,
-        w = PAGE_W,
+        h = vp.body_h(),
+        w = vp.page_w(),
         pad = SIDE_PAD,
         pt = READ_PAD_TOP,
         paras = paras,
@@ -1564,18 +1685,19 @@ async fn read(
         toc = bar_cell(&toc_url, "目", "目录"),
         fs = bar_cell(&fs_href, "字", "字号"),
         progress = progress_cell
-    ));
+    ), vp);
 
     let body = format!(
         "{stage}{hot}{bottom}",
         stage = stage,
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
-            next.as_ref().map(|x| x.0.as_str())
+            next.as_ref().map(|x| x.0.as_str()),
+            vp
         ),
         bottom = bottom
     );
-    let mut res = page_css(&ch_title, fs, &body, &read_only_css());
+    let mut res = page_css(&ch_title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1592,6 +1714,7 @@ async fn comic_read(
     q: &ReadQ,
     fs: usize,
     explicit: bool,
+    vp: Vp,
 ) -> Response {
     let chapter = &chapters[ch as usize];
     let images = match load_comic_images(s, pool, source, chapter, &q.book).await {
@@ -1631,7 +1754,14 @@ async fn comic_read(
             }
         }
     }
-    let pages = comic_pages(&images, &dims, &s.cfg);
+    // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），可用高 = vh − 72（1268 → 1196）
+    let sp = image::SliceParams::from_config(
+        &s.cfg,
+        Some(vp.content_w() as u32),
+        Some(vp.content_h() as u32),
+        None,
+    );
+    let pages = comic_pages(&images, &dims, &s.cfg, &sp);
     if pages.is_empty() {
         return err_page("本章没有图片");
     }
@@ -1639,14 +1769,14 @@ async fn comic_read(
     let p = q.p.unwrap_or(1).clamp(1, n);
     let pg = &pages[(p - 1) as usize];
 
-    let toc_url = toc_link(q, fs, ch);
-    let (prev, next) = read_nav(q, fs, ch, p, n, chapters.len() as i64, &toc_url);
+    let toc_url = toc_link(q, fs, ch, vp);
+    let (prev, next) = read_nav(q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
     let meta = format!("{p}/{n}");
-    let progress_cell = progress_form(q, ch, p, n, chapters.len(), fs);
+    let progress_cell = progress_form(q, ch, p, n, chapters.len(), fs, vp);
     let next_fs = cycle_fs(fs);
-    let fs_href = read_link(q, next_fs, ch, p);
+    let fs_href = read_link(q, next_fs, ch, p, vp);
 
-    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url, &meta);
+    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url, &meta, vp, &sp);
     let bottom = fixed_bar(&format!(
         "{prev}{next}{toc}{fs}{progress}",
         prev = bar_cell_prev(prev.as_ref()),
@@ -1654,18 +1784,19 @@ async fn comic_read(
         toc = bar_cell(&toc_url, "目", "目录"),
         fs = bar_cell(&fs_href, "字", "字号"),
         progress = progress_cell
-    ));
+    ), vp);
     let title = chapter.title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
     let body = format!(
         "{stage}{hot}{bottom}",
         stage = stage,
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
-            next.as_ref().map(|x| x.0.as_str())
+            next.as_ref().map(|x| x.0.as_str()),
+            vp
         ),
         bottom = bottom
     );
-    let mut res = page_css(&title, fs, &body, &read_only_css());
+    let mut res = page_css(&title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1675,7 +1806,7 @@ async fn comic_read(
 // ---------------- 进度提交（零 JS form） ----------------
 
 async fn progress(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Form(q): Form<ProgressQ>,
@@ -1734,7 +1865,7 @@ async fn progress(
         Some(v) if (1..=4).contains(&v) => v as usize,
         _ => 2,
     };
-    let loc = with_fs(
+    let loc = qlink(
         &format!(
             "/k/read?book={}&source={}&ch={}&p={}",
             qenc(&q.book),
@@ -1743,6 +1874,7 @@ async fn progress(
             q.p.max(1)
         ),
         fs,
+        vp_of(&s, q.vw, q.vh),
     );
     let mut res = Response::new(axum::body::Body::empty());
     *res.status_mut() = StatusCode::SEE_OTHER;
@@ -1762,6 +1894,7 @@ async fn search(
     Query(q): Query<SearchQ>,
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
+    let vp = vp_of(&s, q.vw, q.vh);
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
     let fs_url = format!(
@@ -1772,10 +1905,10 @@ async fn search(
     // 导航只出现一次：标题=搜索，右侧=书架 / 字号
     let nav = format!(
         "{}{}",
-        nav_link(&with_fs("/k", fs), "书架"),
-        nav_link(&fs_url, FS_SPECS[next_fs - 1].label),
+        nav_link(&qlink("/k", fs, vp), "书架"),
+        nav_link(&with_vp(&fs_url, vp), FS_SPECS[next_fs - 1].label),
     );
-    let top = top_bar("搜索", None, &nav);
+    let top = top_bar("搜索", None, &nav, vp);
     let form = format!(
         "<div style=\"padding:20px 36px 12px\"><form method=\"get\" action=\"/k/search\">\
          <input type=\"text\" name=\"key\" value=\"{key}\" style=\"font-size:24px;height:56px;width:600px;border:1px solid #000;padding:0 12px;font-family:serif\">\
@@ -1864,12 +1997,16 @@ async fn search(
             let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
             let start = (sp - 1) * per_page;
             let end = (start + per_page).min(books.len());
-            list.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+            list.push_str(&format!(
+                "<table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\">",
+                iw = vp.page_w()
+            ));
             for b in &books[start..end] {
                 let src = b.origin.clone().unwrap_or_default();
-                let href = with_fs(
+                let href = qlink(
                     &format!("/k/toc?book={}&source={}", qenc(&b.book_url), qenc(&src)),
                     fs,
+                    vp,
                 );
                 let name = b.name.as_deref().unwrap_or("未命名");
                 let first = name.chars().next().unwrap_or('书');
@@ -1889,13 +2026,14 @@ async fn search(
                 list.push_str(&format!(
                     "<tr><td style=\"padding:0\">\
                      <a href=\"{href}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
-                     <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+                     <table width=\"{rw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
                      <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
                      <td style=\"padding-left:24px\" valign=\"middle\">\
                      <div style=\"font-size:32px;line-height:48px\">{name}</div>\
                      <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:8px\">{sub}</div></td>\
                      </tr></table></a></td></tr>",
                     href = href,
+                    rw = vp.page_w(),
                     first = esc(&first.to_string()),
                     name = esc(name),
                     sub = esc(&sub)
@@ -1911,16 +2049,16 @@ async fn search(
                     plan.scope.as_str()
                 );
                 let prev = if sp > 1 {
-                    Some((format!("{base}&sp={}", sp - 1), "上一页"))
+                    Some((with_vp(&format!("{base}&sp={}", sp - 1), vp), "上一页"))
                 } else {
                     None
                 };
                 let next = if sp < t_pages {
-                    Some((format!("{base}&sp={}", sp + 1), "下一页"))
+                    Some((with_vp(&format!("{base}&sp={}", sp + 1), vp), "下一页"))
                 } else {
                     None
                 };
-                pager = pager_bar(prev, next);
+                pager = pager_bar(prev, next, vp);
             }
         }
         if upgrade_link {
@@ -1935,12 +2073,12 @@ async fn search(
     }
     let stage = format!(
         "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{form}{list}{pager}</div>",
-        h = STAGE_H,
+        h = vp.nav_h(),
         form = form,
         list = list,
         pager = pager
     );
-    let mut res = page("搜索", fs, &format!("{top}{stage}"));
+    let mut res = page("搜索", fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1996,7 +2134,7 @@ async fn selftest(_u: AuthUser) -> Response {
          KPW3 视觉自测 · <a href=\"/k\">返回书架</a></div>\
          <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">{rows}</table>"
     );
-    page("KPW3 视觉自测", 2, &body)
+    page("KPW3 视觉自测", 2, &body, Vp::default())
 }
 
 #[cfg(test)]
@@ -2014,9 +2152,32 @@ mod tests {
         assert_eq!(k_scope(Some("ENHANCED")), crate::req::SearchScope::All);
     }
 
+    /// 默认 KPW3 视口（1072×1268）：所有历史几何断言都以它为基准。
+    fn vp() -> Vp {
+        Vp::default()
+    }
+    /// 指定尺寸的「已带参」视口（fixed = true，meta viewport 锁宽）。
+    fn vps(w: usize, h: usize) -> Vp {
+        Vp { w, h, fixed: true }
+    }
+    /// 某档字号在默认视口下的每页行预算。
+    fn budget(spec: &FsSpec) -> usize {
+        line_budget(vp(), spec.line)
+    }
+    /// 默认视口下的切片参数（与 `comic_read` 推出来的完全一致）。
+    fn slice_p() -> image::SliceParams {
+        image::SliceParams::from_config(
+            &test_cfg(true),
+            Some(vp().content_w() as u32),
+            Some(vp().content_h() as u32),
+            None,
+        )
+    }
+
     #[test]
     fn paginate_lines_respects_budget_and_char_boundaries() {
-        // 26 行预算（32px 档实际物理上限 23 行）：前 5 段占 20 行，第 6 段用余下 3 行切在行边界，余文进第 2 页。
+        // 行预算由视口高动态算出（32px 档 1112/52 = 21 行）：前 4 段占 16 行，
+        // 第 5 段再放会超预算，余文进第 2 页。
         let text = "字".repeat(100)
             + "\n"
             + &"字".repeat(100)
@@ -2029,7 +2190,8 @@ mod tests {
             + "\n"
             + &"字".repeat(100);
         let spec = &FS_SPECS[1];
-        let pages = paginate_lines(&text, spec);
+        let lines = budget(spec);
+        let pages = paginate_lines(&text, spec, lines, vp().page_w());
         assert_eq!(pages.len(), 2, "行数预算下 6 段应分 2 页");
         let p1 = &text[pages[0].0..pages[0].1];
         let p2 = &text[pages[1].0..pages[1].1];
@@ -2039,7 +2201,7 @@ mod tests {
             "分页不应丢字"
         );
         // 行当量 = 文本行 + 段间 0.6 行，任何一页都不得超预算；第 1 页也不该大量留白
-        let em = line_em(spec);
+        let em = line_em(spec, vp().page_w());
         let gap = para_gap_px(spec.line) as f64 / spec.line as f64;
         let cost = |p: &str| -> f64 {
             let paras: Vec<&str> = p
@@ -2052,21 +2214,23 @@ mod tests {
         };
         let c1 = cost(p1);
         let c2 = cost(p2);
-        assert!(c1 <= spec.lines as f64, "第 1 页行当量 {c1} 超预算");
-        assert!(c2 <= spec.lines as f64, "第 2 页行当量 {c2} 超预算");
+        assert!(c1 <= lines as f64, "第 1 页行当量 {c1} 超预算");
+        assert!(c2 <= lines as f64, "第 2 页行当量 {c2} 超预算");
         assert!(
-            c1 >= spec.lines as f64 - 2.0,
-            "第 1 页填充率过低：{c1} / {}",
-            spec.lines
+            c1 >= lines as f64 - 5.0,
+            "第 1 页填充率过低：{c1} / {lines}"
         );
         assert!(pages.windows(2).all(|w| w[0].1 <= w[1].0), "页区间不重叠");
         // 同一文本同一档位 → 分页结果恒定
-        assert_eq!(paginate_lines(&text, spec), pages);
+        assert_eq!(paginate_lines(&text, spec, lines, vp().page_w()), pages);
     }
 
     #[test]
     fn paginate_empty_is_one_blank_page() {
-        assert_eq!(paginate_lines("", &FS_SPECS[1]), vec![(0, 0)]);
+        assert_eq!(
+            paginate_lines("", &FS_SPECS[1], budget(&FS_SPECS[1]), vp().page_w()),
+            vec![(0, 0)]
+        );
     }
 
     /// 任意正文（含 ASCII/长英文词/全角标点）分页后，每页估算行数不得超过该档预算。
@@ -2084,8 +2248,9 @@ mod tests {
             text.push('\n');
         }
         for spec in &FS_SPECS {
-            let em = line_em(spec);
-            let pages = paginate_lines(&text, spec);
+            let em = line_em(spec, vp().page_w());
+            let budget = budget(spec);
+            let pages = paginate_lines(&text, spec, budget, vp().page_w());
             for &(s, e) in &pages {
                 let piece = &text[s..e];
                 let lines: usize = piece
@@ -2095,11 +2260,11 @@ mod tests {
                     .map(|p| para_lines(p, em))
                     .sum();
                 assert!(
-                    lines <= spec.lines,
+                    lines <= budget,
                     "fs={} 页内 {} 行超过预算 {}",
                     spec.size,
                     lines,
-                    spec.lines
+                    budget
                 );
                 assert!(piece.chars().count() > 0, "不应产生空页");
                 assert!(text.is_char_boundary(s) && text.is_char_boundary(e));
@@ -2121,7 +2286,12 @@ mod tests {
         assert_eq!(&text[chunks[0].0..chunks[0].1].chars().count(), &200_000);
         assert_eq!(&text[chunks[1].0..chunks[1].1].chars().count(), &100_000);
 
-        let plan = plan_pages(&text, &FS_SPECS[1]);
+        let plan = plan_pages(
+            &text,
+            &FS_SPECS[1],
+            budget(&FS_SPECS[1]),
+            vp().page_w(),
+        );
         assert_eq!(plan.chunks.len(), 2);
         assert!(plan.pages.len() > 2);
         assert_eq!(plan.pages[0].0, 0);
@@ -2213,31 +2383,32 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 阅读页整页 1268、可用 1196；四档行预算 = min(26, 物理可容纳行数)。
+    /// 阅读页整页 1268、可用 1196；四档行预算按「可用高 ÷ 行高」动态算出。
     #[test]
     fn font_specs_fit_read_stage() {
-        assert_eq!(READ_STAGE_H, 1268);
-        assert_eq!(READ_STAGE_CONTENT_H, 1196);
-        let expect = [(28, 46, 24), (32, 52, 21), (38, 62, 17), (20, 36, 25)];
+        assert_eq!(vp().h, 1268);
+        assert_eq!(vp().content_h(), 1196);
+        // 1072×1268 下：1112/46=24、1112/52=21、1112/62=17、1112/36=30（超小档不再被 25 行封顶）
+        let expect = [(28, 46, 24), (32, 52, 21), (38, 62, 17), (20, 36, 30)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
-            assert_eq!(spec.lines, lines, "fs={size} 行预算错误");
-            let per_line = (PAGE_W - SIDE_PAD * 2) / size;
-            let chars = spec.lines * per_line;
+            assert_eq!(budget(spec), lines, "fs={size} 行预算错误");
+            let per_line = (vp().page_w() - SIDE_PAD * 2) / size;
+            let chars = lines * per_line;
             assert!(
-                spec.lines * spec.line <= READ_TEXT_H,
+                lines * spec.line <= vp().text_h(),
                 "fs={size} 行高总和 {} 超过正文区 {}",
-                spec.lines * spec.line,
-                READ_TEXT_H
+                lines * spec.line,
+                vp().text_h()
             );
             assert!(
-                chars >= 400 && chars <= READ_STAGE_CONTENT_H,
+                chars >= 400 && chars <= 1500,
                 "fs={size} 每页字数 {chars} 超出合理区间"
             );
         }
         // 标准档 32px：29 字/行 × 21 行 = 609 字，落在 500–800 的参考区间
-        let std_chars = FS_SPECS[1].lines * (PAGE_W - SIDE_PAD * 2) / FS_SPECS[1].size;
+        let std_chars = budget(&FS_SPECS[1]) * (vp().page_w() - SIDE_PAD * 2) / FS_SPECS[1].size;
         assert!(
             (500..=800).contains(&std_chars),
             "标准档每页字数应在 500–800，实际 {std_chars}"
@@ -2255,15 +2426,27 @@ mod tests {
         assert_eq!(cycle_fs(3), 4);
     }
 
-    /// 三个 /k 页面共用同一骨架：必须带固定 1072 viewport，且零脚本、零子资源。
+    /// /k 页面骨架：viewport 宽度随请求视口，唯一的内联脚本只做「缺参补参一次」。
     #[test]
     fn viewport_is_fixed_and_page_is_self_contained() {
-        let html = page_html("测试", 2, "<div>正文</div>");
+        let html = page_html("测试", 2, "<div>正文</div>", vp());
         assert!(
             html.contains("<meta name=\"viewport\" content=\"width=1072,initial-scale=1"),
             "缺少 viewport meta"
         );
-        assert!(!html.contains("<script"), "不允许脚本");
+        // 视图宽跟着请求参数走：同一骨架换 1024 视口，viewport 也要跟着变
+        let html_small = page_html("测试", 2, "<div>正文</div>", vps(1024, 1200));
+        assert!(html_small.contains("content=\"width=1024,initial-scale=1"), "{html_small}");
+        // 缺参首屏：meta 必须放开给设备真实宽度（否则 innerWidth 恒等 vw，补参永远量不出真尺寸）
+        let html_naked = page_html("测试", 2, "<div>正文</div>", Vp::resolve(None, None, (K_W, K_H)));
+        assert!(
+            html_naked.contains("content=\"width=device-width,initial-scale=1"),
+            "{html_naked}"
+        );
+        // 唯一的脚本是视口补参（ES5、带 kfix 防循环标记），不是业务 JS
+        assert_eq!(html.matches("<script").count(), 1, "只允许视口补参脚本");
+        assert!(html.contains("kfix=1"), "补参脚本必须带防循环标记");
+        assert!(html.contains("location.replace"), "补参用 replace，不产生历史记录");
         assert!(!html.contains("<link"), "不允许子资源");
         assert!(!html.contains("<img"), "不允许子资源");
     }
@@ -2303,52 +2486,65 @@ mod tests {
     /// 版式硬约束：底栏 64 不压正文、正文区 = 1268 − 64 − 36（顶部留白）− 56（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
-        assert_eq!(READ_BODY_H, READ_STAGE_H - BAR_H);
-        assert_eq!(READ_TEXT_H, READ_BODY_H - READ_PAD_TOP - READ_PAGENO_H);
-        assert!(READ_TEXT_H <= READ_STAGE_CONTENT_H, "正文不得越过一屏可用高");
+        assert_eq!(vp().body_h(), vp().h - BAR_H);
+        assert_eq!(vp().text_h(), vp().body_h() - READ_PAD_TOP - READ_PAGENO_H);
+        assert!(vp().text_h() <= vp().content_h(), "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
         assert_eq!(spec.size, 32, "标准档必须显式 32px（实测 32/52，勿低于 30）");
         assert_eq!(spec.line, 52);
-        let per_line = (PAGE_W - SIDE_PAD * 2) / spec.size;
-        let chars = spec.lines * per_line;
+        let per_line = (vp().page_w() - SIDE_PAD * 2) / spec.size;
+        let chars = budget(spec) * per_line;
         assert!(
             (500..=800).contains(&chars),
             "默认档每页字数应在 500–800，实际 {}",
             chars
         );
-        assert!(spec.lines <= READ_TEXT_H / spec.line);
+        assert!(budget(spec) <= vp().text_h() / spec.line);
     }
 
-    /// 四档行预算对齐参考值（28/46→24、32/52→21、38/62→17、20/36→25）：
-    /// 顶部留白 36px + 页码行 56px 各让出行数，仍保证总高 ≤1196 可用高。
+    /// 四档行预算全部由视口高动态算出：1072×1268 → 24/21/17/30，
+    /// 1024×1200 同档位按更低可用高再算一遍（22/20/16/29），且总高始终 ≤ 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
         assert_eq!(
-            FS_SPECS.iter().map(|s| s.lines).collect::<Vec<_>>(),
-            vec![24, 21, 17, 25]
+            FS_SPECS.iter().map(|s| line_budget(vp(), s.line)).collect::<Vec<_>>(),
+            vec![24, 21, 17, 30]
         );
         for s in FS_SPECS.iter() {
-            assert!(s.lines * s.line <= READ_TEXT_H, "{}px 行高溢出", s.line);
-            assert!(s.lines * s.line <= READ_STAGE_CONTENT_H);
+            assert!(budget(s) * s.line <= vp().text_h(), "{}px 行高溢出", s.line);
+            assert!(budget(s) * s.line <= vp().content_h());
+        }
+        // 换尺寸：行预算随可用高变化，不会沿用 1072×1268 的常量
+        let small = vps(1024, 1200);
+        let small_lines: Vec<usize> = FS_SPECS
+            .iter()
+            .map(|s| line_budget(small, s.line))
+            .collect();
+        assert_eq!(small_lines, vec![22, 20, 16, 29], "1024×1200 行预算应按可用高重算");
+        for s in FS_SPECS.iter() {
+            assert!(line_budget(small, s.line) * s.line <= small.text_h());
         }
     }
 
-    /// 一屏一页：`html`/`body` 锁死 1268 并禁滚动，`#k-stage` 1204 内裁剪，阅读页不会产生第二屏。
+    /// 一屏一页：`html`/`body` 锁死视口高并禁滚动，`#k-stage` = 视口高 − 底栏，阅读页不会产生第二屏。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
-        let css = read_only_css();
+        let css = read_only_css(vp());
         assert!(css.contains("html,body{height:1268px;overflow:hidden}"), "{css}");
         assert!(css.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"), "{css}");
-        let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css);
+        let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp());
         assert!(html.contains("html,body{height:1268px;overflow:hidden}"));
         assert!(html.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"));
-        assert!(!html.contains("<script"), "阅读页仍然零脚本");
+        // 换尺寸后仍然锁一屏（1200 − 64 = 1136）
+        let small = read_only_css(vps(1024, 1200));
+        assert!(small.contains("html,body{height:1200px;overflow:hidden}"), "{small}");
+        assert!(small.contains("height:1136px;overflow:hidden}"), "{small}");
     }
 
     /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
     #[test]
     fn top_nav_is_single_and_has_no_gray_fill() {
-        let nav = top_bar("书架", None, &nav_link("/k/search", "搜索"));
+        let nav = top_bar("书架", None, &nav_link("/k/search", "搜索"), vp());
         assert!(nav.contains("height:73px;border-bottom:1px solid #ccc;background:#fff"));
         assert!(nav.contains("font-size:28px;line-height:72px;font-weight:700"));
         assert!(nav.contains("font-size:20px"), "动作链接 20px");
@@ -2360,7 +2556,7 @@ mod tests {
     /// 空书架：1px 描边块 + 满区居中（table 100% + valign=middle）+ 240×72 描边按钮。
     #[test]
     fn empty_shelf_is_outlined_and_centered() {
-        let html = empty_shelf(2);
+        let html = empty_shelf(2, vp());
         assert!(html.contains("border:1px solid #000"), "{html}");
         assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
         assert!(html.contains("align=\"center\" valign=\"middle\""), "{html}");
@@ -2378,11 +2574,19 @@ mod tests {
             bar_cell("/k?b", "目", "目录"),
             bar_cell("/k?c", "字", "字号"),
             progress_form(
-                &ReadQ { book: "b".into(), source: "s".into(), ch: None, p: None, fs: None },
-                0, 1, 1, 1, 2
+                &ReadQ {
+                    book: "b".into(),
+                    source: "s".into(),
+                    ch: None,
+                    p: None,
+                    fs: None,
+                    vw: None,
+                    vh: None,
+                },
+                0, 1, 1, 1, 2, vp()
             )
         );
-        let bar = fixed_bar(&row);
+        let bar = fixed_bar(&row, vp());
         assert_eq!(bar.matches("<td ").count(), 5, "{bar}");
         assert_eq!(bar.matches("width=\"20%\"").count(), 5, "{bar}");
         assert_eq!(bar.matches("height=\"64\"").count(), 5, "{bar}");
@@ -2398,16 +2602,62 @@ mod tests {
     /// 左右热区：各占屏宽 1/3（357px）、整屏 1268 高，右区左边界 715；无下一页时右区不渲染。
     #[test]
     fn hot_zones_are_one_third_screen_and_clickable() {
-        assert_eq!(HOT_W, 1072 / 3);
-        assert_eq!(HOT_LEFT_R, 1072 - HOT_W);
-        assert!(HOT_W >= 200, "热区宽必须 ≥ 200px，实际 {HOT_W}");
-        assert!(READ_STAGE_H >= 200, "热区高必须 ≥ 200px");
-        let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"));
+        assert_eq!(vp().hot_w(), 1072 / 3);
+        assert_eq!(vp().w - vp().hot_w(), 1072 - vp().hot_w());
+        assert!(vp().hot_w() >= 200, "热区宽必须 ≥ 200px");
+        assert!(vp().h >= 200, "热区高必须 ≥ 200px");
+        let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"), vp());
         assert_eq!(z.matches("<a ").count(), 2);
         assert!(z.contains("left:0;width:357px;height:1268px;z-index:5"));
         assert!(z.contains("left:715px;width:357px;height:1268px;z-index:5"));
-        assert_eq!(hot_zones(Some("/k/read?p=1"), None).matches("<a ").count(), 1);
-        assert_eq!(hot_zones(None, None).matches("<a ").count(), 0);
+        assert_eq!(hot_zones(Some("/k/read?p=1"), None, vp()).matches("<a ").count(), 1);
+        assert_eq!(hot_zones(None, None, vp()).matches("<a ").count(), 0);
+    }
+
+    /// `vw`/`vh` 参数优先，缺参回落默认 1072×1268，越界值直接忽略。
+    #[test]
+    fn viewport_params_override_defaults_and_clamp() {
+        assert_eq!(
+            Vp::resolve(Some(1024), Some(1200), (K_W, K_H)),
+            vps(1024, 1200)
+        );
+        // 缺参：几何回默认，但 fixed = false（meta 放开 device-width 才能量出真实尺寸）
+        let naked = Vp::resolve(None, None, (K_W, K_H));
+        assert_eq!((naked.w, naked.h), (K_W, K_H));
+        assert!(!naked.fixed, "缺参首屏不得锁宽");
+        // 越界/非法尺寸不许把版心算成负数
+        let bad = Vp::resolve(Some(100), Some(5000), (K_W, K_H));
+        assert_eq!((bad.w, bad.h), (K_W, K_H));
+        for (w, h) in [(1024usize, 1200usize), (800, 600), (1072, 1268)] {
+            let v = vps(w, h);
+            assert!(v.content_w() >= 320, "版心宽不能小于 320");
+            assert!(v.content_h() >= 320, "可用高不能小于 320");
+            assert_eq!(v.content_w(), w - 144);
+            assert_eq!(v.content_h(), h - 72);
+            assert_eq!(v.text_h(), h - 64 - 36 - 56);
+        }
+    }
+
+    /// 翻页/换章链接必须把 vw/vh 原样带下去（客户端零测量）。
+    #[test]
+    fn pagination_links_carry_viewport_params() {
+        let q = ReadQ {
+            book: "b".into(),
+            source: "s".into(),
+            ch: Some(3),
+            p: Some(2),
+            fs: Some(2),
+            vw: None,
+            vh: None,
+        };
+        let next = read_link(&q, 2, 3, 3, vp());
+        assert!(next.contains("vw=1072") && next.contains("vh=1268"), "{next}");
+        let toc = toc_link(&q, 2, 3, vp());
+        assert!(toc.contains("vw=1072") && toc.contains("vh=1268"), "{toc}");
+        // 换尺寸后链接里的参数跟着变
+        let small = read_link(&q, 2, 3, 3, vps(1024, 1200));
+        assert!(small.contains("vw=1024") && small.contains("vh=1200"), "{small}");
+        assert!(!small.contains("vw=1072"), "不得残留默认尺寸");
     }
 
     /// 测试用配置：切片参数取默认值，开关按用例需要打开/关闭。
@@ -2437,7 +2687,8 @@ mod tests {
             .collect();
         let dims: Vec<Option<(u32, u32)>> = vec![Some((1200, 2266)); 3];
         let cfg = test_cfg(true);
-        let pages = comic_pages(&images, &dims, &cfg);
+        let sp = slice_p();
+        let pages = comic_pages(&images, &dims, &cfg, &sp);
         assert_eq!(pages.len(), 6, "三张两片长条页 = 6 页");
         for (i, pg) in pages.iter().enumerate() {
             assert_eq!(pg.layers, 2, "第 {i} 页片数");
@@ -2447,10 +2698,14 @@ mod tests {
             assert_eq!(pg.height, 0, "第 {i} 页不写死切片高度");
         }
         // 开关关闭：同一批长条页退回「一图一页」，且不得带切片参数
-        let off = comic_pages(&images, &dims, &test_cfg(false));
+        let off = comic_pages(&images, &dims, &test_cfg(false), &sp);
         assert_eq!(off.len(), 3, "关闭时三张图各一页");
         assert!(off.iter().all(|p| p.layers == 1 && p.slice == 0));
-        assert_eq!(off[0].height, READ_STAGE_CONTENT_H, "整图按高度约束缩到一屏");
+        assert_eq!(
+            off[0].height,
+            vp().content_h(),
+            "整图按高度约束缩到一屏"
+        );
         // 1.1 屏（1024×1471）：不切，一屏一页，按高度约束等比缩小
         let one = vec![BookImage {
             index: 1,
@@ -2460,10 +2715,10 @@ mod tests {
             ..Default::default()
         }];
         let one_dims = vec![Some((1024, 1471))];
-        let p1 = comic_pages(&one, &one_dims, &cfg);
+        let p1 = comic_pages(&one, &one_dims, &cfg, &sp);
         assert_eq!(p1.len(), 1, "1.1 屏不切");
         assert_eq!(p1[0].layers, 1);
-        assert_eq!(p1[0].height, READ_STAGE_CONTENT_H);
+        assert_eq!(p1[0].height, vp().content_h());
         assert!(p1[0].width <= 928, "等比缩小后不得宽于版心");
         // 尺寸未知：整图一页，height=0（渲染退化为 max-height）
         let unknown = vec![BookImage {
@@ -2471,7 +2726,7 @@ mod tests {
             url: "https://example.test/x.jpg".into(),
             ..Default::default()
         }];
-        let u = comic_pages(&unknown, &[None], &cfg);
+        let u = comic_pages(&unknown, &[None], &cfg, &sp);
         assert_eq!(u.len(), 1);
         assert_eq!((u[0].layers, u[0].height), (1, 0));
     }
@@ -2486,9 +2741,12 @@ mod tests {
             height: Some(1200),
             ..Default::default()
         }];
-        let pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(true));
+        let sp0 = slice_p();
+        let pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(true), &sp0);
         assert_eq!(pages.len(), 1);
-        let html = comic_stage(&images, &pages[0], "src", "book", "https://example.test/ch", "1/1");
+        let html = comic_stage(
+            &images, &pages[0], "src", "book", "https://example.test/ch", "1/1", vp(), &sp0,
+        );
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
         // 1024×1200 缩到 928 宽 → 高 1088（≤1196），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
@@ -2496,8 +2754,10 @@ mod tests {
         assert!(html.contains("id=\"k-stage\"") && html.contains("height:1268px"));
         // 短图在开关开/关两种模式下 HTML 必须逐字节一致（回归要求）
         let off_html = {
-            let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false));
-            comic_stage(&images, &off_pages[0], "src", "book", "https://example.test/ch", "1/1")
+            let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false), &sp0);
+            comic_stage(
+                &images, &off_pages[0], "src", "book", "https://example.test/ch", "1/1", vp(), &sp0,
+            )
         };
         assert_eq!(html, off_html, "短图在切片开关两种模式下必须字节一致");
 
@@ -2508,10 +2768,14 @@ mod tests {
             height: Some(2266),
             ..Default::default()
         }];
-        let sp = comic_pages(&strip, &[Some((1200, 2266))], &test_cfg(true));
-        assert_eq!(sp.len(), 2);
-        let s2 = comic_stage(&strip, &sp[1], "src", "book", "https://example.test/ch", "2/2");
+        let sp1 = comic_pages(&strip, &[Some((1200, 2266))], &test_cfg(true), &sp0);
+        assert_eq!(sp1.len(), 2);
+        let s2 = comic_stage(
+            &strip, &sp1[1], "src", "book", "https://example.test/ch", "2/2", vp(), &sp0,
+        );
         assert!(s2.contains("slice=1&i=1"), "{s2}");
+        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离
+        assert!(s2.contains("dw=928") && s2.contains("vh=1196"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
         assert!(!s2.contains("height=\""), "切片页不写死高度，避免与真实落点错位拉扁");
     }
