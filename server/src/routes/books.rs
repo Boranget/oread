@@ -204,6 +204,8 @@ const SEARCH_PER_SOURCE_MAX: usize = 200;
 
 struct SearchJob {
     id: String,
+    /// 创建者用户 id：结果接口只允许本人读取，跨用户查询一律 404。
+    uid: i64,
     #[allow(dead_code)]
     key: String,
     at: Instant,
@@ -741,7 +743,7 @@ fn cursor_of(b: &SearchBook) -> Option<String> {
 
 async fn search_start(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     db: UserDb,
     Query(q): Query<SearchQ>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -833,6 +835,7 @@ async fn search_start(
     let id = next_job_id();
     let job = Arc::new(SearchJob {
         id: id.clone(),
+        uid: u.id,
         key: key.clone(),
         at: Instant::now(),
         created_unix_ms: unix_ms(),
@@ -905,7 +908,7 @@ async fn search_start(
 
 async fn search_result(
     State(_s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     Query(q): Query<JobResultQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let job = {
@@ -926,6 +929,20 @@ async fn search_result(
         found
     };
     let job = job.ok_or_else(|| AppError::NotFound("搜索任务不存在或已过期（60s TTL）".into()))?;
+    // 归属校验：别人的 job_id 与不存在保持同样的 404，避免泄露任务是否存在。
+    if job.uid != u.id {
+        tracing::warn!(
+            target: "search_job",
+            job_id = %q.job_id,
+            owner = job.uid,
+            requester = u.id,
+            reason = "uid_mismatch",
+            "search result 404"
+        );
+        return Err(AppError::NotFound(
+            "搜索任务不存在或已过期（60s TTL）".into(),
+        ));
+    }
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
     // 游标 / 翻页请求 → 冻结快照；page=1 的普通轮询仍读实时结果（首屏持续更新）。
@@ -2640,6 +2657,7 @@ mod tests {
         s.book_source_url = "http://s".into();
         SearchJob {
             id: "j-stream".into(),
+            uid: 1,
             key: "剑来".into(),
             at: Instant::now(),
             created_unix_ms: 0,
@@ -3023,6 +3041,7 @@ mod tests {
 
         let job = SearchJob {
             id: "j-test".into(),
+            uid: 1,
             key: "剑来".into(),
             at: Instant::now(),
             created_unix_ms: 0,
@@ -3208,6 +3227,7 @@ mod tests {
     fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
         Arc::new(SearchJob {
             id: id.into(),
+            uid: 7,
             key: "k".into(),
             at: Instant::now()
                 .checked_sub(Duration::from_secs(age_secs))
@@ -3369,5 +3389,56 @@ mod tests {
         let (sel, ign) = select_sources(&enabled, &parse_source_ids(None));
         assert_eq!(sel.len(), 2);
         assert!(ign.is_empty());
+    }
+
+    // 搜索任务归属：别人的 job_id 与不存在都返回 404，防越权读取与存在性探测。
+    #[tokio::test]
+    async fn search_result_rejects_other_users_job() {
+        use axum::response::IntoResponse;
+
+        // test_job 默认 uid=7；先注入一条真实存在的任务。
+        let job = test_job("owned-by-7", 0, 0);
+        job_registry().lock().unwrap().push(job);
+        let state = || {
+            State(AppState {
+                shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+                cfg: crate::config::Config::from_env(),
+                user_pools: Default::default(),
+            })
+        };
+        let q = |job_id: &str| {
+            Query(JobResultQ {
+                job_id: job_id.to_string(),
+                page: Some(1),
+                page_size: None,
+                cursor: None,
+            })
+        };
+
+        let bob = AuthUser {
+            id: 2,
+            username: "bob".into(),
+            role: "user".into(),
+        };
+        match search_result(state(), bob, q("owned-by-7")).await {
+            Ok(_) => panic!("别人的搜索任务不应可读"),
+            Err(e) => assert_eq!(
+                e.into_response().status(),
+                axum::http::StatusCode::NOT_FOUND
+            ),
+        }
+
+        let owner = AuthUser {
+            id: 7,
+            username: "owner".into(),
+            role: "user".into(),
+        };
+        let ok = search_result(state(), owner, q("owned-by-7"))
+            .await
+            .expect("任务创建者应可读");
+        assert_eq!(
+            ok.into_response().status(),
+            axum::http::StatusCode::OK
+        );
     }
 }

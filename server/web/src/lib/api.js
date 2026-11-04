@@ -106,8 +106,9 @@ export function describeFailure(e, scene = '操作') {
 
 // 把 400/422 的纯文本、JSON error 统一成用户能看懂的中文
 function errorText(status, data) {
-  const raw = data && typeof data === 'object' && data.error !== undefined
-    ? String(data.error)
+  // 新错误体：{ error: <稳定错误码>, message: <面向用户的文案>, request_id }
+  const raw = data && typeof data === 'object'
+    ? String(data.message ?? data.error ?? '')
     : typeof data === 'string' ? data : '';
   const text = shortText(raw);
   if (KNOWN_ERRORS[text]) return KNOWN_ERRORS[text];
@@ -116,7 +117,7 @@ function errorText(status, data) {
   }
   if (status === 400 || status === 422) {
     // 后端 400 常带 {"error":"具体原因"}（如设置越界），按原意直接展示
-    const isJsonError = data && typeof data === 'object' && data.error !== undefined;
+    const isJsonError = data && typeof data === 'object' && (data.message || data.error);
     if (isJsonError && text) return text;
     const missing = /missing field `([^`]+)`/.exec(text);
     if (missing) return '缺少参数：' + missing[1];

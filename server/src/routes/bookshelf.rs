@@ -556,6 +556,8 @@ pub async fn list_groups(
 }
 
 /// 分组局部更新：只覆盖请求里给出的字段（COALESCE），空 `name` 视为未给出。
+/// 改名时，同一事务内把 `bookshelf` / `book_meta` 里挂在该组名下的书一起迁移，
+/// 避免出现“组名已改、书还挂在旧名”的中间态（失败整体回滚）。
 pub(crate) async fn update_group(
     pool: &SqlitePool,
     id: i64,
@@ -565,19 +567,40 @@ pub(crate) async fn update_group(
     cover: Option<String>,
     show: Option<bool>,
 ) -> Result<(), sqlx::Error> {
+    let new_name = name.filter(|s| !s.is_empty());
+    let mut tx = pool.begin().await?;
+    let old_name: Option<String> = sqlx::query_scalar("SELECT name FROM book_groups WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE book_groups SET name=COALESCE(?2, name), \"order\"=COALESCE(?3, \"order\"), \
          book_sort=COALESCE(?4, book_sort), cover=COALESCE(?5, cover), \
          show=COALESCE(?6, show) WHERE id=?1",
     )
     .bind(id)
-    .bind(name.filter(|s| !s.is_empty()))
+    .bind(new_name.as_deref())
     .bind(order)
     .bind(book_sort)
     .bind(cover.filter(|s| !s.is_empty()))
     .bind(show)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if let (Some(old), Some(new)) = (old_name.as_deref(), new_name.as_deref()) {
+        if old != new {
+            sqlx::query("UPDATE bookshelf SET \"group\" = ?2 WHERE \"group\" = ?1")
+                .bind(old)
+                .bind(new)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE book_meta SET \"group\" = ?2 WHERE \"group\" = ?1")
+                .bind(old)
+                .bind(new)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -588,15 +611,41 @@ pub async fn add_group(
     db: UserDb,
     Json(q): Json<GroupQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let name = q.name.clone().unwrap_or_default();
+    let new_name = q
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     if let Some(id) = q.id {
-        update_group(&db.0, id, q.name, q.order, q.book_sort, q.cover, q.show).await?;
+        if let Some(name) = &new_name {
+            // 无唯一索引，靠应用层查重（改名时排除自己）
+            let dup: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM book_groups WHERE name = ?1 AND id <> ?2",
+            )
+            .bind(name)
+            .bind(id)
+            .fetch_one(&db.0)
+            .await?;
+            if dup > 0 {
+                return Err(crate::error::AppError::BadRequest("分组名已存在".into()));
+            }
+        }
+        update_group(&db.0, id, new_name, q.order, q.book_sort, q.cover, q.show).await?;
         return Ok(Json(json!({"ok": true, "id": id})));
     }
+    let name = new_name.unwrap_or_default();
     if name.is_empty() {
         return Err(crate::error::AppError::BadRequest(
             "group name required".into(),
         ));
+    }
+    let dup: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_groups WHERE name = ?1")
+        .bind(&name)
+        .fetch_one(&db.0)
+        .await?;
+    if dup > 0 {
+        return Err(crate::error::AppError::BadRequest("分组名已存在".into()));
     }
     let id = sqlx::query(
         "INSERT INTO book_groups (name, \"order\", book_sort, cover, show) \

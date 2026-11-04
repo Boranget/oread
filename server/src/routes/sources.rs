@@ -160,20 +160,25 @@ pub async fn list(
 /// 把 Legado 导出的 camelCase JSON 转为内部 snake_case 实体
 fn normalize_source(body: Value) -> AppResult<BookSource> {
     let v = crate::serde_util::camel_to_snake_value(body);
-    serde_json::from_value(v).map_err(|e| AppError::BadRequest(format!("invalid source: {e}")))
+    serde_json::from_value(v).map_err(|e| {
+        // 解析细节可能暴露字段名/类型，只进日志；对外给稳定文案。
+        tracing::warn!(error = %e, "normalize source failed");
+        AppError::BadRequest("书源 JSON 解析失败".into())
+    })
 }
 
-async fn store_source(pool: &SqlitePool, src: &BookSource) -> AppResult<()> {
+async fn store_source(pool: &SqlitePool, src: &BookSource, actor: &str) -> AppResult<()> {
     let content = serde_json::to_string(src)?;
     // rules 与 content 同时写入：旧读取路径（content）与新读取路径（rules）都能拿到数据
     sqlx::query(
         "INSERT INTO book_sources \
          (id, name, url, rules, content, enabled, book_source_type, unsupported_type, updated_by) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 'admin') \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, \
          rules=excluded.rules, content=excluded.content, enabled=excluded.enabled, \
          book_source_type=excluded.book_source_type, \
          unsupported_type=excluded.unsupported_type, \
+         updated_by=excluded.updated_by, \
          updated_at=datetime('now')",
     )
     .bind(&src.book_source_url)
@@ -183,6 +188,7 @@ async fn store_source(pool: &SqlitePool, src: &BookSource) -> AppResult<()> {
     .bind(src.enabled)
     .bind(src.book_source_type)
     .bind(src.unsupported_type)
+    .bind(actor)
     .execute(pool)
     .await?;
     Ok(())
@@ -424,7 +430,7 @@ pub async fn upsert(
     crate::auth::ensure_admin(&u)?;
     let mut src = normalize_source(body)?;
     prepare_import(&mut src);
-    store_source(&s.shared, &src).await?;
+    store_source(&s.shared, &src, &u.username).await?;
     let mut out = json!({
         "ok": true,
         "type": src.book_source_type,
@@ -778,7 +784,7 @@ pub async fn import(
             stored.enabled = false;
         }
         if accepted {
-            store_source(&s.shared, &stored).await?;
+            store_source(&s.shared, &stored, &u.username).await?;
             source_ledger::upsert_state(
                 &s.shared,
                 &url,
@@ -805,7 +811,7 @@ pub async fn import(
             // 覆盖被拒但本地评分已跌破隔离线：保留旧规则，同时把旧行停用。
             if let Some(mut local) = existing.cloned() {
                 local.enabled = false;
-                store_source(&s.shared, &local).await?;
+                store_source(&s.shared, &local, &u.username).await?;
             }
         }
 
@@ -987,9 +993,11 @@ pub struct ExportTierQ {
 /// 导出为 Legado 兼容格式（camelCase、数组），供 Android 客户端直接导入。
 pub async fn export_all(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     Query(q): Query<ExportTierQ>,
 ) -> AppResult<Json<Vec<Value>>> {
+    // 导出包含 header 等源站凭据，只允许管理员。
+    crate::auth::ensure_admin(&u)?;
     // 安全口径：导出本地源库时排除隔离区条目，避免把源里自带的认证头再分发出去。
     let quarantined = source_ledger::quarantined_set(&s.shared)
         .await
@@ -1014,6 +1022,12 @@ pub async fn export_all(
             _ => true,
         })
         .collect();
+    tracing::info!(
+        actor = %u.username,
+        tier = want_tier,
+        count = list.len(),
+        "source export"
+    );
     let out = list
         .into_iter()
         .filter_map(|src| serde_json::to_value(src).ok())
@@ -1053,12 +1067,12 @@ pub async fn set_enabled(
                 if q.enabled && !crate::entities::is_supported_source_type(src.book_source_type) {
                     src.enabled = false;
                     src.unsupported_type = true;
-                    store_source(&s.shared, &src).await?;
+                    store_source(&s.shared, &src, &u.username).await?;
                     unsupported.push(id);
                     continue;
                 }
                 src.enabled = q.enabled;
-                store_source(&s.shared, &src).await?;
+                store_source(&s.shared, &src, &u.username).await?;
                 updated += 1;
             }
             Err(_) => missing.push(id),
@@ -1074,9 +1088,11 @@ pub async fn set_enabled(
 
 pub async fn get_one(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     Query(q): Query<UrlQ>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // 详情含 header/rules，普通用户不可见。
+    crate::auth::ensure_admin(&u)?;
     let src = load_source(&s.shared, &q.url).await?;
     let health = crate::source_health::load_map(&s.shared)
         .await
@@ -1120,13 +1136,17 @@ pub struct ValidateReq {
 }
 
 /// 书源校验：规则必填项 + 可选 URL 可达性。返回 errors/warnings，不阻塞保存。
+/// `check_url=true` 会代服务端发起外连，仅管理员可用，避免普通用户驱动 SSRF/探测。
 pub async fn validate(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     body: Option<Json<Value>>,
 ) -> AppResult<Json<Value>> {
     let raw = body.map(|Json(v)| v).unwrap_or(Value::Null);
     let parsed: ValidateReq = serde_json::from_value(raw.clone()).unwrap_or_default();
+    if parsed.check_url {
+        crate::auth::ensure_admin(&u)?;
+    }
     let payload = parsed.source.unwrap_or(raw);
     let src = match normalize_source(payload) {
         Ok(s) => s,
@@ -1331,9 +1351,11 @@ pub struct HealthCheckQ {
 /// `POST /api/sources/health/check`：只跑一次“搜索”探测，并发 ≤8，整批 ≤90s。
 pub async fn health_check(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     Query(q): Query<HealthCheckQ>,
 ) -> AppResult<Json<Value>> {
+    // 会批量外连并写全局健康状态，仅管理员可触发。
+    crate::auth::ensure_admin(&u)?;
     let sources = load_sources(&s.shared).await?;
     let quarantined = source_ledger::quarantined_set(&s.shared)
         .await
@@ -1654,7 +1676,7 @@ pub async fn prune(
             match load_source(&s.shared, id).await {
                 Ok(mut src) => {
                     src.enabled = false;
-                    if let Err(e) = store_source(&s.shared, &src).await {
+                    if let Err(e) = store_source(&s.shared, &src, &u.username).await {
                         failed += 1;
                         tracing::warn!(source = id, error = %e, "prune disable failed");
                         continue;
@@ -2119,6 +2141,169 @@ mod tests {
         assert!(
             out.errors.iter().all(|e| e.source != "https://off.example.com"),
             "停用源出现在搜索结果 origin 中"
+        );
+    }
+
+    // ---------------- 权限收口回归 ----------------
+
+    use axum::response::IntoResponse;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    fn member() -> AuthUser {
+        AuthUser {
+            id: 2,
+            username: "alice".into(),
+            role: "user".into(),
+        }
+    }
+
+    fn admin() -> AuthUser {
+        AuthUser {
+            id: 1,
+            username: "admin".into(),
+            role: "admin".into(),
+        }
+    }
+
+    async fn shared_state() -> AppState {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE book_sources (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT, \
+             rules TEXT NOT NULL, content TEXT, enabled INTEGER NOT NULL DEFAULT 1, \
+             book_source_type INTEGER NOT NULL DEFAULT 0, \
+             unsupported_type INTEGER NOT NULL DEFAULT 0, updated_by TEXT, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE source_library_state (source_url TEXT PRIMARY KEY, decision TEXT, \
+             review_state TEXT, reason TEXT, incoming_hash TEXT, batch_id TEXT, updated_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rules = json!({
+            "book_source_url": "https://src.example.com",
+            "book_source_name": "示例源",
+            "header": "Cookie: SID=secret"
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO book_sources (id, name, url, rules, content, enabled) \
+             VALUES (?1, ?2, ?1, ?3, ?3, 1)",
+        )
+        .bind("https://src.example.com")
+        .bind("示例源")
+        .bind(&rules)
+        .execute(&pool)
+        .await
+        .unwrap();
+        AppState {
+            shared: pool,
+            cfg: crate::config::Config::from_env(),
+            user_pools: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn export_is_admin_only() {
+        let st = State(shared_state().await);
+        let denied = export_all(st.clone(), member(), Query(ExportTierQ::default())).await;
+        match denied {
+            Ok(_) => panic!("普通用户不应能导出书源"),
+            Err(e) => assert_eq!(
+                e.into_response().status(),
+                axum::http::StatusCode::FORBIDDEN
+            ),
+        }
+        let ok = export_all(st, admin(), Query(ExportTierQ::default()))
+            .await
+            .expect("管理员应可导出");
+        assert_eq!(
+            ok.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_is_admin_only() {
+        let st = State(shared_state().await);
+        let q = || Query(UrlQ {
+            url: "https://src.example.com".into(),
+        });
+        let denied = get_one(st.clone(), member(), q()).await;
+        match denied {
+            Ok(_) => panic!("普通用户不应能读取书源详情"),
+            Err(e) => assert_eq!(
+                e.into_response().status(),
+                axum::http::StatusCode::FORBIDDEN
+            ),
+        }
+        let ok = get_one(st, admin(), q()).await.expect("管理员应可读详情");
+        assert_eq!(
+            ok.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_is_admin_only() {
+        let st = State(shared_state().await);
+        let denied = health_check(st.clone(), member(), Query(HealthCheckQ::default())).await;
+        match denied {
+            Ok(_) => panic!("普通用户不应能触发全量体检"),
+            Err(e) => assert_eq!(
+                e.into_response().status(),
+                axum::http::StatusCode::FORBIDDEN
+            ),
+        }
+        let ok = health_check(st, admin(), Query(HealthCheckQ::default()))
+            .await
+            .expect("管理员应可触发体检");
+        assert_eq!(
+            ok.into_response().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_check_url_is_admin_only() {
+        let st = State(shared_state().await);
+        let body = || {
+            Some(Json(json!({
+                "bookSourceUrl": "https://src.example.com",
+                "bookSourceName": "示例源",
+                "check_url": true
+            })))
+        };
+        // 普通用户带 check_url=true → 403（且不会真的发起外连）
+        let denied = validate(st.clone(), member(), body()).await;
+        match denied {
+            Ok(_) => panic!("普通用户不应能触发 check_url 外连"),
+            Err(e) => assert_eq!(
+                e.into_response().status(),
+                axum::http::StatusCode::FORBIDDEN
+            ),
+        }
+        // 普通用户不带 check_url → 仍可做本地规则校验
+        let local_only = validate(
+            st.clone(),
+            member(),
+            Some(Json(json!({
+                "bookSourceUrl": "https://src.example.com",
+                "bookSourceName": "示例源"
+            }))),
+        )
+        .await
+        .expect("本地规则校验不应要求管理员");
+        assert_eq!(
+            local_only.into_response().status(),
+            axum::http::StatusCode::OK
         );
     }
 }

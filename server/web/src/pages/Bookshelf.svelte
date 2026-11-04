@@ -384,9 +384,8 @@
     groupMsg = '';
     try {
       const ids = books.filter((b) => (b.group || '') === g.group_name).map((b) => b.book_id);
+      // 后端在同一事务里改分组名并迁移 bookshelf / book_meta，避免中途失败留下半套数据
       await api.saveGroup({ id: g.group_id, name });
-      // 书的 group 是字符串字段，改名后要把原组内书一起迁到新名字
-      if (ids.length) await api.moveToGroup(ids, name);
       delete renameDraft[g.group_id];
       groupMsg = `已改名为「${name}」` + (ids.length ? `，${ids.length} 本书同步迁移` : '');
       await Promise.all([loadGroups(), load()]);
