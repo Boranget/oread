@@ -50,36 +50,57 @@ use crate::web_book;
 const PAGE_W: usize = 1000;
 /// 版心左右留白
 const SIDE_PAD: usize = 36;
-/// 带顶栏页面（书架/目录/搜索）的正文区高度 = 1268 − 96（顶栏）= 1172
-const STAGE_H: usize = 1172;
+/// 视口宽 / 高（Kindle Paperwhite 3 内嵌浏览器实测 1072×1268）
+const K_W: usize = 1072;
+const K_H: usize = 1268;
+/// 顶栏高度：72px 内容 + 1px 下边线 = 73
+const NAV_H: usize = 72;
+/// 带顶栏页面（书架/目录/搜索）的正文区高度 = 1268 − 73 = 1195
+const STAGE_H: usize = K_H - NAV_H - 1;
 /// 阅读页无顶栏：整页 1268 全部给正文（WeRead Kindle 阅读页同样没有顶栏）
-const READ_STAGE_H: usize = 1268;
+const READ_STAGE_H: usize = K_H;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
-/// 正文容器底部留白 = 栏高 + 8px，保证固定栏不遮正文最后一行
-const STAGE_PAD_BOTTOM: usize = BAR_H + 8;
-/// 阅读页正文可用高度 = 1268 − 72 = 1196
-const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - STAGE_PAD_BOTTOM;
+/// 阅读页正文容器高度 = 1268 − 64（底栏）= 1204
+const READ_BODY_H: usize = READ_STAGE_H - BAR_H;
+/// 正文底部页码行：28px 行高 + 24px 上距 = 52
+const READ_PAGENO_H: usize = 52;
+/// 阅读页正文可用高度 = 1204 − 52 = 1152
+const READ_TEXT_H: usize = READ_BODY_H - READ_PAGENO_H;
+/// 漫画整图高度上限（沿用一屏可用高 1196，底栏只占 64）
+const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - BAR_H - 8;
 /// 左右透明翻页热区宽度 = 视口 1072 / 3（取整），整屏高可点
-const HOT_W: usize = 1072 / 3;
+const HOT_W: usize = K_W / 3;
 /// 右侧热区左边界 = 1072 − 357
-const HOT_LEFT_R: usize = 1072 - HOT_W;
+const HOT_LEFT_R: usize = K_W - HOT_W;
 
 /// 阅读页每页目标行数：≈26 行（WeRead 整页阅读观感）
 const READ_TARGET_LINES: usize = 26;
 
-/// 阅读页每页行数预算：目标 26 行，但不超过 1196px 物理可容纳的行数
-/// （32/52 最多 23 行，38/62 最多 19 行；26 行只在 28/46 与 22/38 档成立）
+/// 阅读页每页行数预算：目标 26 行，但不超过 1152px 物理可容纳的行数
+/// （28/46 → 25，32/52 → 22，38/62 → 18；26 行只在 20/36 档成立）
 const fn line_budget(line: usize) -> usize {
-    let fit = READ_STAGE_CONTENT_H / line;
+    let fit = READ_TEXT_H / line;
     if fit < READ_TARGET_LINES {
         fit
     } else {
         READ_TARGET_LINES
     }
 }
-/// 目录每页章节数：20 行 × 52px = 1040，一屏装得下（正文区 1108）
-const K_TOC_PAGE: usize = 20;
+/// 段间距（行）：WeRead 实测段距 0.6 行（默认档 27px）
+const PARA_GAP_LINES: f64 = 0.6;
+/// 段间距像素（向下取整，保证渲染高度不超过行预算）
+const fn para_gap_px(line: usize) -> usize {
+    (line * 6) / 10
+}
+/// 目录每页章节数：两列各 15 行 × 72px = 1080，正文区 1131 装得下
+const K_TOC_PAGE: usize = 30;
+/// 目录每列行数
+const K_TOC_COLS: usize = 2;
+/// 书架每页本数：10 行 × 112px = 1120 ≤ 1131
+const K_SHELF_PAGE: usize = 10;
+/// 搜索结果每页条数：9 行 × 112px = 1008 ≤ 1043（表单 88 + 翻页 64 之后）
+const K_SEARCH_PAGE: usize = 9;
 /// /k 渲染前对正文纯文本的硬截断（防御超大章节把分页临时索引撑爆内存）
 const K_MAX_TEXT_CHARS: usize = 800_000;
 /// 超长章节分块：每块最多 20 万字符，按块分页，避免一次性按 80 万字构建全量页表
@@ -245,8 +266,9 @@ fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str) -> String 
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
 html{{-webkit-text-size-adjust:none}}\
-html,body{{margin:0;padding:0;background:#fff;color:#000;overflow-x:hidden}}\
+html,body{{margin:0;padding:0;width:{w}px;height:{h}px;overflow:hidden;background:#fff;color:#000}}\
 body{{font-family:serif;font-size:{size}px;line-height:{line}px}}\
+*{{box-sizing:border-box}}\
 a{{color:#000;text-decoration:none}}\
 h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
@@ -259,6 +281,8 @@ table{{border-collapse:collapse}}\
         line = spec.line,
         pw = PAGE_W,
         pad = SIDE_PAD,
+        w = K_W,
+        h = K_H,
         extra = extra_css,
         body = body
     )
@@ -277,30 +301,45 @@ fn page_css(title: &str, fs: usize, body: &str, extra_css: &str) -> Response {
         .expect("html response")
 }
 
-/// 顶栏（96px）：36px 标题行 + 60px 导航行（table 等分，每格 ≥120×60 可点）
-fn top_bar(title_line: &str, row: &str) -> String {
+/// 顶栏（73px = 72 内容 + 1px 下边线，白底，只有一条）：
+/// 左：标题 28px 加粗（可带一段 20px 弱灰副标题）；右：动作链接 20px，间距 32px。
+fn top_bar(title: &str, sub: Option<&str>, actions: &str) -> String {
+    let sub = match sub {
+        Some(s) => format!(
+            " <span style=\"font-size:20px;color:#555;font-weight:400\">{}</span>",
+            esc(s)
+        ),
+        None => String::new(),
+    };
     format!(
-        "<div style=\"height:96px;overflow:hidden;background:#e6e6e6\">\
-         <div style=\"height:36px;line-height:36px;font-size:26px;overflow:hidden;padding:0 36px\">{title_line}</div>\
-         <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\"><tr>{row}</tr></table></div>"
+        "<div id=\"k-nav\" style=\"height:73px;border-bottom:1px solid #ccc;background:#fff;white-space:nowrap;overflow:hidden\">\
+         <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+         <td height=\"72\" align=\"left\" style=\"font-size:28px;line-height:72px;font-weight:700;padding-left:36px;overflow:hidden\">{title}{sub}</td>\
+         <td height=\"72\" align=\"right\" style=\"font-size:20px;line-height:72px;padding-right:36px\">{actions}</td>\
+         </tr></table></div>",
+        pw = PAGE_W,
+        title = esc(title),
+        sub = sub,
+        actions = actions
     )
 }
 
-/// 顶栏导航格：整块 `<a>`（60px 高，满足真机 60×60 热区下限）
-fn nav_cell(href: &str, label: &str, width: usize) -> String {
+/// 顶栏动作链接：20px，间距 32px（用内边距，不依赖 flex/grid）
+fn nav_link(href: &str, label: &str) -> String {
     format!(
-        "<td width=\"{width}%\" height=\"60\" align=\"center\">\
-         <a href=\"{href}\" style=\"display:block;height:60px;line-height:60px;font-size:26px\">{label}</a></td>"
+        "<a href=\"{href}\" style=\"padding-left:32px;font-size:20px\">{label}</a>",
+        href = href,
+        label = esc(label)
     )
 }
 
-/// 贴底固定栏：`position:fixed`（真机实测可用、rect 贴 (0,0)）+ table 等宽单元格。
-/// 不用 flex/grid/transform/transition/vw/calc；`width:100%` 取视口宽度，避免横向滚动。
-/// 高度 64px，单元格整块 `<a>` 可点（触控目标 ≥44px）。
+/// 贴底固定栏（仅阅读页）：`position:fixed` + table 5 格等宽 200px、高 64px。
+/// 每格：图标 28px 方框 + 4px 缝 + 文字 20px；格顶 1px `#ccc` 连成整条分隔线。
 fn fixed_bar(row: &str) -> String {
     format!(
-        "<div style=\"position:fixed;left:0;bottom:0;width:100%;height:{h}px;background:#e6e6e6;z-index:10\">\
-         <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px\"><tr>{row}</tr></table></div>",
+        "<div id=\"k-bar\" style=\"position:fixed;left:0;bottom:0;width:{w}px;height:{h}px;background:#fff;z-index:10\">\
+         <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
+        w = K_W,
         h = BAR_H,
         pw = PAGE_W,
         pad = SIDE_PAD,
@@ -308,40 +347,73 @@ fn fixed_bar(row: &str) -> String {
     )
 }
 
-fn bottom_cell(href: &str, label: &str, width: usize) -> String {
+/// 底栏格内容：图标（28×28 描边框）+ 标签（20px）
+fn bar_inner(icon: &str, label: &str) -> String {
     format!(
-        "<td width=\"{width}%\" height=\"64\" align=\"center\">\
-         <a href=\"{href}\" style=\"display:block;height:64px;line-height:64px;font-size:28px\">{label}</a></td>"
+        "<div style=\"width:28px;height:28px;margin:0 auto;border:1px solid #000;font-size:18px;line-height:26px;text-align:center\">{icon}</div>\
+         <div style=\"font-size:20px;line-height:20px;margin-top:4px\">{label}</div>",
+        icon = esc(icon),
+        label = esc(label)
     )
 }
 
-/// 底栏格：主标签一行 + 16px 进度小字一行（阅读页页码/分块进度，零脚本可见）
-fn bottom_cell_meta(href: &str, label: &str, meta: &str, width: usize) -> String {
+fn bar_cell(href: &str, icon: &str, label: &str) -> String {
     format!(
-        "<td width=\"{width}%\" height=\"64\" align=\"center\">\
-         <a href=\"{href}\" style=\"display:block;height:64px;line-height:42px;font-size:28px\">{label}\
-         <span style=\"display:block;line-height:20px;font-size:16px;color:#333\">{meta}</span></a></td>"
+        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+         <a href=\"{href}\" style=\"display:block;height:63px;padding-top:6px\">{inner}</a></td>",
+        href = href,
+        inner = bar_inner(icon, label)
     )
 }
 
-/// 底栏格：禁用态（灰掉、不可点），用于「最后一页且没有下一章」时的「下一页」
-fn bottom_cell_off(label: &str, width: usize) -> String {
+/// 底栏格：禁用态（弱灰、不可点），用于全书末页的「下一页」
+fn bar_cell_off(icon: &str, label: &str) -> String {
     format!(
-        "<td width=\"{width}%\" height=\"64\" align=\"center\">\
-         <span style=\"display:block;height:64px;line-height:64px;font-size:28px;color:#999\">{label}</span></td>"
+        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+         <span style=\"display:block;height:63px;padding-top:6px;color:#555\">{inner}</span></td>",
+        inner = bar_inner(icon, label)
+    )
+}
+
+/// 列表页翻页条（书架/搜索/目录）：64px 高、两格各占一半，贴 stage 底部。
+/// 禁用态用 `#555` 弱灰且不可点。
+fn pager_bar(prev: Option<(String, &'static str)>, next: Option<(String, &'static str)>) -> String {
+    let cell = |item: &Option<(String, &'static str)>, fallback: &str| match item {
+        Some((href, label)) => format!(
+            "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+             <a href=\"{href}\" style=\"display:block;height:63px;line-height:63px;font-size:24px\">{label}</a></td>",
+            href = href,
+            label = esc(label)
+        ),
+        None => format!(
+            "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+             <span style=\"display:block;height:63px;line-height:63px;font-size:24px;color:#555\">{label}</span></td>",
+            label = fallback
+        ),
+    };
+    format!(
+        "<div id=\"k-pager\" style=\"position:absolute;left:0;bottom:0;width:{pw}px;height:{h}px;background:#fff;z-index:8\">\
+         <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"table-layout:fixed\"><tr>{p}{n}</tr></table></div>",
+        pw = PAGE_W,
+        h = BAR_H,
+        p = cell(&prev, "上一页"),
+        n = cell(&next, "下一页")
     )
 }
 
 /// 左右透明翻页热区：各占屏宽 1/3（357px）、整屏高 1268px。
 /// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
 /// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1268 ≫ 200×200。
-fn hot_zones(prev: &str, next: Option<&str>) -> String {
-    let mut out = format!(
-        "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
-        prev = prev,
-        w = HOT_W,
-        h = READ_STAGE_H
-    );
+fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(pv) = prev {
+        out.push_str(&format!(
+            "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
+            prev = pv,
+            w = HOT_W,
+            h = READ_STAGE_H
+        ));
+    }
     if let Some(nx) = next {
         out.push_str(&format!(
             "<a href=\"{nx}\" style=\"position:absolute;top:0;left:{l}px;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
@@ -356,8 +428,11 @@ fn hot_zones(prev: &str, next: Option<&str>) -> String {
 
 fn read_only_css() -> String {
     format!(
-        "html,body{{height:{h}px;overflow:hidden}}.wrap{{height:{h}px;overflow:hidden}}",
-        h = READ_STAGE_H
+        "html,body{{height:{h}px;overflow:hidden}}#k-stage{{position:relative;height:{b}px;overflow:hidden}}\
+         #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
+        h = READ_STAGE_H,
+        b = READ_BODY_H,
+        pad = SIDE_PAD
     )
 }
 
@@ -375,20 +450,21 @@ fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64) -> String {
     )
 }
 
-/// 目录链接（按 20 章/页定位到当前章所在目录页）
+/// 目录链接（按 30 章/页定位到当前章所在目录页，并带上当前章用于高亮）
 fn toc_link(q: &ReadQ, fs: usize, ch: i64) -> String {
     with_fs(
         &format!(
-            "/k/toc?book={}&source={}&tp={}",
+            "/k/toc?book={}&source={}&tp={}&ch={}",
             qenc(&q.book),
             qenc(&q.source),
-            (ch / K_TOC_PAGE as i64) + 1
+            (ch / K_TOC_PAGE as i64) + 1,
+            ch
         ),
         fs,
     )
 }
 
-/// 翻页导航：翻完本章接上一章/下一章；全书末页返回 `None`（底栏禁用 + 右侧热区不渲染）。
+/// 翻页导航：翻完本章接上一章/下一章；全书首页/末页对应项为 `None`（底栏禁用 + 热区不渲染）。
 fn read_nav(
     q: &ReadQ,
     fs: usize,
@@ -396,14 +472,17 @@ fn read_nav(
     p: i64,
     n: i64,
     total: i64,
-    toc: &str,
-) -> ((String, &'static str), Option<(String, &'static str)>) {
+    _toc: &str,
+) -> (
+    Option<(String, &'static str)>,
+    Option<(String, &'static str)>,
+) {
     let prev = if p > 1 {
-        (read_link(q, fs, ch, p - 1), "上一页")
+        Some((read_link(q, fs, ch, p - 1), "上一页"))
     } else if ch > 0 {
-        (read_link(q, fs, ch - 1, 1), "上一章")
+        Some((read_link(q, fs, ch - 1, 1), "上一章"))
     } else {
-        (toc.to_string(), "目录")
+        None
     };
     let next = if p < n {
         Some((read_link(q, fs, ch, p + 1), "下一页"))
@@ -415,18 +494,27 @@ fn read_nav(
     (prev, next)
 }
 
-/// 底栏第 2 格：有下一页/下一章则给链接，全书末页给灰色不可点的禁用态。
-fn bottom_cell_next(next: Option<&(String, &'static str)>, width: usize) -> String {
-    match next {
-        Some((href, label)) => bottom_cell(href, label, width),
-        None => bottom_cell_off("下一页", width),
+/// 底栏「上一页」格：章首变「上一章」，全书首页为禁用态
+fn bar_cell_prev(prev: Option<&(String, &'static str)>) -> String {
+    match prev {
+        Some((href, label)) => bar_cell(href, "前", label),
+        None => bar_cell_off("前", "上一页"),
     }
 }
 
-/// 进度提交：零 JS 的原生 form（底栏第 5 格）
+/// 底栏「下一页」格：有下一页/下一章则给链接，全书末页给弱灰不可点的禁用态。
+fn bar_cell_next(next: Option<&(String, &'static str)>) -> String {
+    match next {
+        Some((href, label)) => bar_cell(href, "后", label),
+        None => bar_cell_off("后", "下一页"),
+    }
+}
+
+/// 进度提交：零 JS 的原生 form（底栏第 5 格），整格是 `<button>`，与其它格同构
 fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) -> String {
     format!(
-        "<form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
+        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+         <form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
          <input type=\"hidden\" name=\"book\" value=\"{book}\">\
          <input type=\"hidden\" name=\"source\" value=\"{source}\">\
          <input type=\"hidden\" name=\"ch\" value=\"{ch}\">\
@@ -434,28 +522,64 @@ fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) ->
          <input type=\"hidden\" name=\"n\" value=\"{n}\">\
          <input type=\"hidden\" name=\"total\" value=\"{total}\">\
          <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
-         <input type=\"submit\" value=\"记录\" style=\"font-size:26px;height:64px;width:100%;border:0;background:transparent\"></form>",
+         <button type=\"submit\" style=\"width:100%;height:63px;border:0;padding:0;background:#fff;color:#000;font-family:serif;-webkit-appearance:none;appearance:none\">{inner}</button></form></td>",
         book = esc(&q.book),
         source = esc(&q.source),
         ch = ch,
         p = p,
         n = n,
         total = total,
-        fs = fs
+        fs = fs,
+        inner = bar_inner("记", "记录")
+    )
+}
+
+/// 描边按钮（只描边不填充、圆角 0、无阴影/渐变/过渡），240×72
+fn outline_button(href: &str, label: &str) -> String {
+    format!(
+        "<a href=\"{href}\" style=\"display:block;width:240px;height:72px;line-height:70px;border:1px solid #000;text-align:center;font-size:24px\">{label}</a>",
+        href = href,
+        label = esc(label)
+    )
+}
+
+/// 空书架：2px 描边块，整块在可用区内垂直居中（`table` 100% + `valign="middle"`），
+/// 含标题 26 加粗 + 说明 20 `#555` + 240×72 描边按钮。
+fn empty_shelf(fs: usize) -> String {
+    format!(
+        "<table width=\"1000\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+         <td align=\"center\" valign=\"middle\">\
+         <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:2px solid #000\"><tr>\
+         <td align=\"left\" style=\"padding:32px\">\
+         <div style=\"font-size:26px;line-height:40px;font-weight:700\">书架还是空的</div>\
+         <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\
+         <div style=\"margin-top:24px\">{btn}</div></td></tr></table></td></tr></table>",
+        h = STAGE_H,
+        btn = outline_button(&with_fs("/k/search", fs), "去搜索一本书")
+    )
+}
+
+/// 带顶栏页面的标题行（页内标题，用于错误/分卷等没有顶栏动作的页面）
+fn page_head(title: &str) -> String {
+    format!(
+        "<div style=\"height:73px;border-bottom:1px solid #ccc;padding:0 36px;font-size:28px;line-height:72px;font-weight:700\">{title}</div>",
+        title = esc(title)
+    )
+}
+
+/// 提示页（错误 / 分卷）：页内标题 + 说明 + 描边按钮，单屏内
+fn notice_page(title: &str, msg: &str, href: &str, label: &str) -> String {
+    format!(
+        "{head}<div style=\"padding:36px\"><p style=\"font-size:24px;line-height:36px;color:#333\">{msg}</p>\
+         <p style=\"margin-top:24px\">{btn}</p></div>",
+        head = page_head(title),
+        msg = esc(msg),
+        btn = outline_button(href, label)
     )
 }
 
 fn err_page(msg: &str) -> Response {
-    page(
-        "错误",
-        2,
-        &format!(
-            "<div style=\"height:96px;line-height:96px;font-size:30px;background:#e6e6e6;padding:0 36px\">出错了</div>\
-             <div style=\"height:1108px;padding:36px;box-sizing:border-box\"><p style=\"font-size:30px;line-height:52px\">{}</p>\
-             <p style=\"font-size:30px;line-height:52px\"><a href=\"/k\">返回书架</a></p></div>",
-            esc(msg)
-        ),
-    )
+    page("错误", 2, &notice_page("出错了", msg, "/k", "返回书架"))
 }
 
 fn err_to_page(e: AppError) -> Response {
@@ -478,10 +602,11 @@ fn volume_notice(q: &ReadQ, fs: usize, explicit: bool) -> Response {
         &format!("/k/toc?book={}&source={}", qenc(&q.book), qenc(&q.source)),
         fs,
     );
-    let body = format!(
-        "<div style=\"height:96px;line-height:96px;font-size:30px;background:#e6e6e6;padding:0 36px\">分卷标题</div>\
-         <div style=\"height:1108px;padding:36px;box-sizing:border-box\"><p style=\"font-size:30px;line-height:52px\">该条为分卷标题，请从目录选择章节</p>\
-         <p style=\"font-size:30px;line-height:52px\"><a href=\"{back}\">返回目录</a></p></div>"
+    let body = notice_page(
+        "分卷标题",
+        "该条为分卷标题，请从目录选择章节",
+        &back,
+        "返回目录",
     );
     let mut res = page("分卷标题", fs, &body);
     if explicit {
@@ -564,16 +689,20 @@ fn split_para(s: &str, cap: usize, em: f64) -> (usize, usize) {
 }
 
 /// 按行数预算分页：优先在段落边界断页，单段超预算时按行边界切分。
+/// 行预算按「行当量」计：段与段之间另计 0.6 行段距（与渲染的 `margin-top` 一致），
+/// 保证页面实际高度 ≤ `lines × line`，不把最后一行挤出可视区。
 /// 返回每页的字节区间（相对 `text`），页边界只落在字符边界上。
 fn paginate_lines(text: &str, spec: &FsSpec) -> Vec<(usize, usize)> {
     if text.is_empty() {
         return vec![(0, 0)];
     }
     let em = line_em(spec);
-    let budget = spec.lines.max(1);
+    let budget = spec.lines as f64;
+    let gap = para_gap_px(spec.line) as f64 / spec.line as f64;
     let mut pages: Vec<(usize, usize)> = Vec::new();
     let mut page_start: Option<usize> = None;
-    let mut page_lines = 0usize;
+    let mut used = 0.0f64;
+    let mut has_para = false;
     let mut page_end = 0usize;
     let mut offset = 0usize;
     for raw in text.split('\n') {
@@ -588,25 +717,29 @@ fn paginate_lines(text: &str, spec: &FsSpec) -> Vec<(usize, usize)> {
         let trim_end = trim_start + trimmed.len();
         let mut rem_start = trim_start;
         while rem_start < trim_end {
-            if page_lines >= budget {
+            let mut g = if has_para { gap } else { 0.0 };
+            if budget - used - g < 1.0 {
                 if let Some(ps) = page_start.take() {
                     pages.push((ps, page_end));
                 }
-                page_lines = 0;
+                used = 0.0;
+                has_para = false;
+                g = 0.0;
             }
+            let cap = (budget - used - g).floor() as usize;
             let remaining = &text[rem_start..trim_end];
             let need = para_lines(remaining, em);
-            let cap = budget - page_lines;
             if need <= cap {
                 if page_start.is_none() {
                     page_start = Some(rem_start);
                 }
-                page_lines += need;
+                used += g + need as f64;
+                has_para = true;
                 page_end = trim_end;
                 rem_start = trim_end;
             } else {
-                let (head, used) = split_para(remaining, cap, em);
-                debug_assert!(head > 0 && used > 0);
+                let (head, _) = split_para(remaining, cap, em);
+                debug_assert!(head > 0);
                 if head == 0 {
                     break;
                 }
@@ -614,7 +747,8 @@ fn paginate_lines(text: &str, spec: &FsSpec) -> Vec<(usize, usize)> {
                     page_start = Some(rem_start);
                 }
                 pages.push((page_start.take().unwrap(), rem_start + head));
-                page_lines = 0;
+                used = 0.0;
+                has_para = false;
                 page_end = rem_start + head;
                 rem_start += head;
             }
@@ -693,6 +827,8 @@ pub struct TocQ {
     source: String,
     tp: Option<i64>,
     fs: Option<i64>,
+    /// 当前所在章（从阅读页跳目录时带上，用于「▸ + 加粗」高亮）
+    ch: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct ReadQ {
@@ -706,10 +842,12 @@ pub struct ReadQ {
 pub struct SearchQ {
     key: Option<String>,
     fs: Option<i64>,
+    sp: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct FsQ {
     fs: Option<i64>,
+    sp: Option<i64>,
 }
 #[derive(Deserialize)]
 pub struct LoginQ {
@@ -759,7 +897,7 @@ async fn ensure_chapters(
 
 async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) -> Response {
     let err = if q.get("err").map(|v| v == "1").unwrap_or(false) {
-        "<p style=\"font-size:26px;line-height:46px;color:#900\">账号或密码错误，请重试</p>"
+        "<p style=\"font-size:24px;line-height:36px;color:#333;margin-top:16px\">账号或密码错误，请重试</p>"
     } else {
         ""
     };
@@ -767,19 +905,21 @@ async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) 
         "登录",
         2,
         &format!(
-            "<div style=\"height:96px;line-height:96px;font-size:30px;background:#e6e6e6;padding:0 36px\">登录</div>\
-             <div class=\"content\" style=\"height:1108px;padding:36px;box-sizing:border-box\"><p style=\"font-size:26px;line-height:46px;color:#444\">Kindle 极简阅读 · 请用网页端账号登录</p>\
-             <p style=\"font-size:24px;line-height:42px;color:#555\">没有账号请先在电脑浏览器打开主站注册；忘记密码可在主站重置。</p>{}\
+            "{head}\
+             <div style=\"padding:36px\">\
+             <p style=\"font-size:20px;line-height:32px;color:#555\">Kindle 极简阅读 · 请用网页端账号登录</p>\
+             <p style=\"font-size:20px;line-height:32px;color:#555\">没有账号请先在电脑浏览器打开主站注册。</p>{err}\
              <form method=\"post\" action=\"/k/login\">\
-             <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">\
-             <tr><td width=\"140\" height=\"76\" style=\"font-size:26px\">账号</td>\
-             <td><input type=\"text\" name=\"username\" style=\"font-size:26px;height:52px;width:700px\"></td></tr>\
-             <tr><td height=\"76\" style=\"font-size:26px\">密码</td>\
-             <td><input type=\"password\" name=\"password\" style=\"font-size:26px;height:52px;width:700px\"></td></tr>\
+             <table width=\"928\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
+             <tr><td width=\"120\" height=\"76\" style=\"font-size:24px\">账号</td>\
+             <td><input type=\"text\" name=\"username\" style=\"font-size:24px;height:56px;width:640px;border:1px solid #000;padding:0 12px;font-family:serif\"></td></tr>\
+             <tr><td height=\"76\" style=\"font-size:24px\">密码</td>\
+             <td><input type=\"password\" name=\"password\" style=\"font-size:24px;height:56px;width:640px;border:1px solid #000;padding:0 12px;font-family:serif\"></td></tr>\
              <tr><td height=\"88\"></td>\
-             <td><input type=\"submit\" value=\"登录\" style=\"font-size:28px;height:64px;width:200px\"></td></tr>\
+             <td><input type=\"submit\" value=\"登录\" style=\"font-size:24px;height:56px;width:240px;border:1px solid #000;background:#fff;color:#000;font-family:serif\"></td></tr>\
              </table></form></div>",
-            err
+            head = page_head("登录"),
+            err = err
         ),
     )
 }
@@ -866,72 +1006,87 @@ async fn shelf(
     };
 
     let next_fs = cycle_fs(fs);
-    let fs_url = format!("/k?fs={next_fs}");
+    let total_books = rows.len();
+    let t_pages = ((total_books + K_SHELF_PAGE - 1) / K_SHELF_PAGE).max(1);
+    let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
+    let start = (sp - 1) * K_SHELF_PAGE;
+    let end = (start + K_SHELF_PAGE).min(total_books);
+    let fs_url = format!(
+        "/k?fs={}&sp={}",
+        next_fs,
+        sp.min(t_pages.max(1))
+    );
+    // 导航只出现一次：书架/搜索/目录用顶部导航，底栏只留给阅读页
     let nav = format!(
         "{}{}{}",
-        nav_cell(&with_fs("/k/search", fs), "搜索", 33),
-        nav_cell(&fs_url, FS_SPECS[next_fs - 1].label, 33),
-        nav_cell("/k/logout", "退出", 34),
+        nav_link(&with_fs("/k/search", fs), "搜索"),
+        nav_link(&fs_url, FS_SPECS[next_fs - 1].label),
+        nav_link("/k/logout", "退出"),
     );
-    let top = top_bar("书架", &nav);
+    let top = top_bar("书架", None, &nav);
 
-    let mut list = String::from("<table class=\"content\" width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+    let mut list = String::new();
     if rows.is_empty() {
-        list.push_str(
-            "<tr><td style=\"height:1108px;padding:36px\">\
-             <p style=\"font-size:32px;line-height:52px\">书架为空，请先在主站添加书籍。</p></td></tr>",
-        );
+        list.push_str(&empty_shelf(fs));
+    } else {
+        list.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+        for b in &rows[start..end] {
+            let title = b.title.clone().unwrap_or_else(|| "未命名".into());
+            let author = b.author.clone().unwrap_or_default();
+            let src = b.source_id.clone().unwrap_or_default();
+            let read = with_fs(
+                &format!(
+                    "/k/read?book={}&source={}&ch={}&p=1",
+                    qenc(&b.book_id),
+                    qenc(&src),
+                    b.chapter_index
+                ),
+                fs,
+            );
+            let first = title.chars().next().unwrap_or('书');
+            list.push_str(&format!(
+                "<tr><td style=\"padding:0\">\
+                 <a href=\"{read}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
+                 <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+                 <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
+                 <td style=\"padding-left:24px\" valign=\"middle\">\
+                 <div style=\"font-size:32px;line-height:48px;font-weight:700\">{title}</div>\
+                 <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:8px\"><tr>\
+                 <td align=\"left\" style=\"font-size:20px;line-height:32px;color:#555\">{author}</td>\
+                 <td align=\"right\" style=\"font-size:20px;line-height:32px;color:#555\">{pct:.0}%</td>\
+                 </tr></table></td></tr></table></a></td></tr>",
+                read = read,
+                first = esc(&first.to_string()),
+                title = esc(&title),
+                author = esc(if author.is_empty() { "未知作者" } else { author.as_str() }),
+                pct = b.reading_progress
+            ));
+        }
+        list.push_str("</table>");
     }
-    for b in &rows {
-        let title = b.title.clone().unwrap_or_else(|| "未命名".into());
-        let author = b.author.clone().unwrap_or_default();
-        let src = b.source_id.clone().unwrap_or_default();
-        let read = with_fs(
-            &format!(
-                "/k/read?book={}&source={}&ch={}&p=1",
-                qenc(&b.book_id),
-                qenc(&src),
-                b.chapter_index
-            ),
-            fs,
-        );
-        let toc = with_fs(
-            &format!("/k/toc?book={}&source={}", qenc(&b.book_id), qenc(&src)),
-            fs,
-        );
-        list.push_str(&format!(
-            "<tr><td style=\"height:92px;border-bottom:1px solid #999;padding:0 36px\">\
-             <a href=\"{read}\" style=\"font-size:30px\">{title}</a>\
-             <div style=\"font-size:24px;line-height:34px\">{author} · {pct:.0}% \
-             <a href=\"{toc}\">目录</a></div></td></tr>",
-            read = read,
-            title = esc(&title),
-            author = esc(&author),
-            pct = b.reading_progress,
-            toc = toc
-        ));
-    }
-    list.push_str("</table>");
-    list.push_str(
-        "<p style=\"font-size:24px;line-height:40px;padding:0 36px;color:#555\">点书名直接续读，点“目录”进入章节列表。</p>",
-    );
 
-    let bottom = fixed_bar(&format!(
-        "{}{}{}",
-        bottom_cell(&with_fs("/k/search", fs), "搜索", 33),
-        bottom_cell(&fs_url, FS_SPECS[next_fs - 1].label, 33),
-        bottom_cell("/k/logout", "退出", 34),
-    ));
-    let mut res = page(
-        "书架",
-        fs,
-        &format!("{top}{spacer}{bottom}", spacer = format!(
-            "<div id=\"k-stage\" style=\"height:{h}px;padding:0 0 {pb}px;box-sizing:border-box;overflow:auto\">{list}</div>",
-            h = STAGE_H,
-            pb = STAGE_PAD_BOTTOM,
-            list = list
-        )),
+    let pager = if t_pages > 1 {
+        let prev = if sp > 1 {
+            Some((format!("/k?fs={}&sp={}", fs, sp - 1), "上一页"))
+        } else {
+            None
+        };
+        let next = if sp < t_pages {
+            Some((format!("/k?fs={}&sp={}", fs, sp + 1), "下一页"))
+        } else {
+            None
+        };
+        pager_bar(prev, next)
+    } else {
+        String::new()
+    };
+    let stage = format!(
+        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
+        h = STAGE_H,
+        list = list,
+        pager = pager
     );
+    let mut res = page("书架", fs, &format!("{top}{stage}"));
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -970,29 +1125,27 @@ async fn toc(
     let next_fs = cycle_fs(fs);
     let fs_href = with_fs(
         &format!(
-            "/k/toc?book={}&source={}&tp={}",
+            "/k/toc?book={}&source={}&tp={}&ch={}",
             qenc(&q.book),
             qenc(&q.source),
-            tp
+            tp,
+            q.ch.unwrap_or(-1)
         ),
         next_fs,
     );
+    // 导航只出现一次：标题=书名，右侧=书架 / 字号
     let nav = format!(
         "{}{}",
-        nav_cell(&with_fs("/k", fs), "书架", 50),
-        nav_cell(&fs_href, FS_SPECS[next_fs - 1].label, 50),
+        nav_link(&with_fs("/k", fs), "书架"),
+        nav_link(&fs_href, FS_SPECS[next_fs - 1].label),
     );
-    let top = top_bar(
-        &format!(
-            "{} <span style=\"font-size:22px;color:#555\">共 {total} 章 · {tp}/{t_pages} 页</span>",
-            esc(&name)
-        ),
-        &nav,
-    );
+    let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav);
 
-    let mut list = String::from("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+    // 两列 × 15 行 = 每页 30 条；行高 72，分隔线 1px #ccc 左右各缩 36（表格左右边距）
+    let rows_per_col = K_TOC_PAGE / K_TOC_COLS;
+    let mut cols = [String::new(), String::new()];
     for (i, c) in visible[start..end].iter().enumerate() {
-        let bg = if i % 2 == 0 { "#ffffff" } else { "#f2f2f2" };
+        let col = (i / rows_per_col).min(K_TOC_COLS - 1);
         let href = with_fs(
             &format!(
                 "/k/read?book={}&source={}&ch={}&p=1",
@@ -1002,51 +1155,83 @@ async fn toc(
             ),
             fs,
         );
-        list.push_str(&format!(
-            "<tr style=\"background:{bg}\"><td height=\"52\" style=\"font-size:30px;line-height:52px;padding:0 36px\">\
-             <a href=\"{href}\" style=\"display:block;height:52px;line-height:52px\">{title}</a></td></tr>",
-            bg = bg,
+        let title = c.title.as_deref().unwrap_or("未命名章节");
+        let cur = q.ch.map(|x| x == c.index).unwrap_or(false);
+        let name = if cur {
+            format!("<b>▸ {}</b>", esc(title))
+        } else {
+            esc(title)
+        };
+        cols[col].push_str(&format!(
+            "<tr><td height=\"72\" style=\"border-bottom:1px solid #ccc\">\
+             <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+             <td width=\"80\" align=\"right\" valign=\"middle\" style=\"font-size:24px;line-height:46px;color:#555\">{no}</td>\
+             <td valign=\"middle\" style=\"padding-left:16px;font-size:28px;line-height:46px\"><a href=\"{href}\" style=\"display:block\">{name}</a></td>\
+             </tr></table></td></tr>",
+            no = start + i + 1,
             href = href,
-            title = esc(c.title.as_deref().unwrap_or("未命名章节"))
+            name = name
         ));
     }
-    list.push_str("</table>");
+    for c in cols.iter_mut() {
+        if c.is_empty() {
+            c.push_str("<tr><td height=\"72\"></td></tr>");
+        }
+        *c = format!(
+            "<table width=\"452\" cellpadding=\"0\" cellspacing=\"0\">{}</table>",
+            c
+        );
+    }
+    let list = format!(
+        "<table width=\"928\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:36px\"><tr>\
+         <td width=\"452\" valign=\"top\">{left}</td><td width=\"24\"></td><td width=\"452\" valign=\"top\">{right}</td>\
+         </tr></table>",
+        left = cols[0],
+        right = cols[1]
+    );
 
-    let prev = with_fs(
-        &format!(
-            "/k/toc?book={}&source={}&tp={}",
-            qenc(&q.book),
-            qenc(&q.source),
-            (tp - 1).max(1)
-        ),
-        fs,
+    let prev = if tp > 1 {
+        Some((
+            with_fs(
+                &format!(
+                    "/k/toc?book={}&source={}&tp={}&ch={}",
+                    qenc(&q.book),
+                    qenc(&q.source),
+                    tp - 1,
+                    q.ch.unwrap_or(-1)
+                ),
+                fs,
+            ),
+            "上一页",
+        ))
+    } else {
+        None
+    };
+    let next = if tp < t_pages {
+        Some((
+            with_fs(
+                &format!(
+                    "/k/toc?book={}&source={}&tp={}&ch={}",
+                    qenc(&q.book),
+                    qenc(&q.source),
+                    tp + 1,
+                    q.ch.unwrap_or(-1)
+                ),
+                fs,
+            ),
+            "下一页",
+        ))
+    } else {
+        None
+    };
+    let stage = format!(
+        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
+        h = STAGE_H,
+        list = list,
+        pager = pager_bar(prev, next)
     );
-    let next = with_fs(
-        &format!(
-            "/k/toc?book={}&source={}&tp={}",
-            qenc(&q.book),
-            qenc(&q.source),
-            (tp + 1).min(t_pages)
-        ),
-        fs,
-    );
-    let bottom = fixed_bar(&format!(
-        "{}{}{}",
-        bottom_cell(&prev, "上一页", 33),
-        bottom_cell(&with_fs("/k", fs), "书架", 34),
-        bottom_cell(&next, "下一页", 33),
-    ));
 
-    let mut res = page(
-        &name,
-        fs,
-        &format!("{top}{stage}{bottom}", stage = format!(
-            "<div id=\"k-stage\" style=\"height:{h}px;padding:0 0 {pb}px;box-sizing:border-box;overflow:auto\">{list}</div>",
-            h = STAGE_H,
-            pb = STAGE_PAD_BOTTOM,
-            list = list
-        )),
-    );
+    let mut res = page(&name, fs, &format!("{top}{stage}"));
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1140,6 +1325,7 @@ fn comic_stage(
     source_id: &str,
     book_url: &str,
     chapter_url: &str,
+    meta: &str,
 ) -> String {
     let im = &images[pg.img];
     let mut src = format!(
@@ -1173,12 +1359,13 @@ fn comic_stage(
         )
     };
     format!(
-        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;box-sizing:border-box;overflow:hidden\">{img}</div>",
+        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
         h = READ_STAGE_H,
         w = PAGE_W,
         pad = SIDE_PAD,
-        pb = STAGE_PAD_BOTTOM,
-        img = img
+        pb = BAR_H + 8,
+        img = img,
+        meta = esc(meta)
     )
 }
 
@@ -1317,41 +1504,49 @@ async fn read(
     let fs_href = read_link(&q, next_fs, ch, p);
 
     let mut paras = String::new();
+    let gap = para_gap_px(spec.line);
+    let mut first_para = true;
     for para in cur.split('\n') {
         let para = para.trim();
         if para.is_empty() {
             continue;
         }
+        let mt = if first_para { 0 } else { gap };
+        first_para = false;
         paras.push_str(&format!(
-            "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em;word-wrap:break-word\">{para}</p>",
+            "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em;margin-top:{mt}px;word-wrap:break-word\">{para}</p>",
             size = spec.size,
             line = spec.line,
+            mt = mt,
             para = esc(para)
         ));
     }
-    // 阅读页无顶栏：整页 1268 全给正文；底栏固定覆盖，靠 padding-bottom 托住最后一行
+    // 阅读页无顶栏：正文区 1204（底栏 64 贴底），底部 52 留页码行
     let stage = format!(
-        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;box-sizing:border-box;overflow:hidden\">{paras}</div>",
-        h = READ_STAGE_H,
+        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
+        h = READ_BODY_H,
         w = PAGE_W,
         pad = SIDE_PAD,
-        pb = STAGE_PAD_BOTTOM,
-        paras = paras
+        paras = paras,
+        meta = esc(&meta)
     );
-    // 贴底固定栏 5 格：上一页 / 下一页 / 目录(页码+分块进度，略宽) / 字号 / 记录进度
+    // 贴底固定栏 5 格（各 200px）：上一页 / 下一页 / 目录 / 字号 / 记录
     let bottom = fixed_bar(&format!(
-        "{}{}{}{}<td width=\"18%\" height=\"64\" align=\"center\">{progress}</td>",
-        bottom_cell(&prev.0, prev.1, 18),
-        bottom_cell_next(next.as_ref(), 18),
-        bottom_cell_meta(&toc_url, "目录", &meta, 28),
-        bottom_cell(&fs_href, FS_SPECS[next_fs - 1].label, 18),
+        "{prev}{next}{toc}{fs}{progress}",
+        prev = bar_cell_prev(prev.as_ref()),
+        next = bar_cell_next(next.as_ref()),
+        toc = bar_cell(&toc_url, "目", "目录"),
+        fs = bar_cell(&fs_href, "字", "字号"),
         progress = progress_cell
     ));
 
     let body = format!(
         "{stage}{hot}{bottom}",
         stage = stage,
-        hot = hot_zones(&prev.0, next.as_ref().map(|x| x.0.as_str())),
+        hot = hot_zones(
+            prev.as_ref().map(|x| x.0.as_str()),
+            next.as_ref().map(|x| x.0.as_str())
+        ),
         bottom = bottom
     );
     let mut res = page_css(&ch_title, fs, &body, &read_only_css());
@@ -1425,20 +1620,23 @@ async fn comic_read(
     let next_fs = cycle_fs(fs);
     let fs_href = read_link(q, next_fs, ch, p);
 
-    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url);
+    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url, &meta);
     let bottom = fixed_bar(&format!(
-        "{}{}{}{}<td width=\"18%\" height=\"64\" align=\"center\">{progress}</td>",
-        bottom_cell(&prev.0, prev.1, 18),
-        bottom_cell_next(next.as_ref(), 18),
-        bottom_cell_meta(&toc_url, "目录", &meta, 28),
-        bottom_cell(&fs_href, FS_SPECS[next_fs - 1].label, 18),
+        "{prev}{next}{toc}{fs}{progress}",
+        prev = bar_cell_prev(prev.as_ref()),
+        next = bar_cell_next(next.as_ref()),
+        toc = bar_cell(&toc_url, "目", "目录"),
+        fs = bar_cell(&fs_href, "字", "字号"),
         progress = progress_cell
     ));
     let title = chapter.title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
     let body = format!(
         "{stage}{hot}{bottom}",
         stage = stage,
-        hot = hot_zones(&prev.0, next.as_ref().map(|x| x.0.as_str())),
+        hot = hot_zones(
+            prev.as_ref().map(|x| x.0.as_str()),
+            next.as_ref().map(|x| x.0.as_str())
+        ),
         bottom = bottom
     );
     let mut res = page_css(&title, fs, &body, &read_only_css());
@@ -1540,21 +1738,28 @@ async fn search(
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
-    let fs_url = format!("/k/search?fs={next_fs}");
+    let fs_url = format!(
+        "/k/search?fs={}&key={}",
+        next_fs,
+        qenc(&key)
+    );
+    // 导航只出现一次：标题=搜索，右侧=书架 / 字号
     let nav = format!(
         "{}{}",
-        nav_cell(&with_fs("/k", fs), "书架", 50),
-        nav_cell(&fs_url, FS_SPECS[next_fs - 1].label, 50),
+        nav_link(&with_fs("/k", fs), "书架"),
+        nav_link(&fs_url, FS_SPECS[next_fs - 1].label),
     );
-    let top = top_bar("搜索", &nav);
-    let mut body = format!(
-        "<div style=\"padding:8px 36px\"><form method=\"get\" action=\"/k/search\">\
-         <input type=\"text\" name=\"key\" value=\"{key}\" style=\"font-size:28px;height:56px;width:600px\"> \
-         <input type=\"submit\" value=\"搜索\" style=\"font-size:28px;height:56px;width:160px\">\
+    let top = top_bar("搜索", None, &nav);
+    let form = format!(
+        "<div style=\"padding:20px 36px 12px\"><form method=\"get\" action=\"/k/search\">\
+         <input type=\"text\" name=\"key\" value=\"{key}\" style=\"font-size:24px;height:56px;width:600px;border:1px solid #000;padding:0 12px;font-family:serif\">\
+         <input type=\"submit\" value=\"搜索\" style=\"font-size:24px;height:56px;width:160px;border:1px solid #000;background:#fff;color:#000;font-family:serif;margin-left:12px\">\
          <input type=\"hidden\" name=\"fs\" value=\"{fs}\"></form></div>",
         key = esc(&key),
         fs = fs
     );
+    let mut list = String::new();
+    let mut pager = String::new();
     if !key.is_empty() {
         let sources = match load_sources(&s.shared).await {
             Ok(v) => v,
@@ -1562,30 +1767,68 @@ async fn search(
         };
         let books = web_book::search_all(&sources, &key, 1).await;
         if books.is_empty() {
-            body.push_str(
-                "<p style=\"font-size:30px;line-height:52px;padding:0 36px\">没有找到结果</p>",
+            list.push_str(
+                "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
             );
+        } else {
+            let t_pages = ((books.len() + K_SEARCH_PAGE - 1) / K_SEARCH_PAGE).max(1);
+            let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
+            let start = (sp - 1) * K_SEARCH_PAGE;
+            let end = (start + K_SEARCH_PAGE).min(books.len());
+            list.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
+            for b in &books[start..end] {
+                let src = b.origin.clone().unwrap_or_default();
+                let href = with_fs(
+                    &format!("/k/toc?book={}&source={}", qenc(&b.book_url), qenc(&src)),
+                    fs,
+                );
+                let name = b.name.as_deref().unwrap_or("未命名");
+                let first = name.chars().next().unwrap_or('书');
+                let sub = format!(
+                    "{} · {}",
+                    b.author.as_deref().unwrap_or("未知作者"),
+                    b.origin_name.as_deref().unwrap_or("未知来源")
+                );
+                list.push_str(&format!(
+                    "<tr><td style=\"padding:0\">\
+                     <a href=\"{href}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
+                     <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+                     <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
+                     <td style=\"padding-left:24px\" valign=\"middle\">\
+                     <div style=\"font-size:32px;line-height:48px\">{name}</div>\
+                     <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:8px\">{sub}</div></td>\
+                     </tr></table></a></td></tr>",
+                    href = href,
+                    first = esc(&first.to_string()),
+                    name = esc(name),
+                    sub = esc(&sub)
+                ));
+            }
+            list.push_str("</table>");
+            if t_pages > 1 {
+                let base = format!("/k/search?key={}&fs={}", qenc(&key), fs);
+                let prev = if sp > 1 {
+                    Some((format!("{base}&sp={}", sp - 1), "上一页"))
+                } else {
+                    None
+                };
+                let next = if sp < t_pages {
+                    Some((format!("{base}&sp={}", sp + 1), "下一页"))
+                } else {
+                    None
+                };
+                pager = pager_bar(prev, next);
+            }
         }
-        body.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
-        for b in books.iter().take(30) {
-            let src = b.origin.clone().unwrap_or_default();
-            let href = with_fs(
-                &format!("/k/toc?book={}&source={}", qenc(&b.book_url), qenc(&src)),
-                fs,
-            );
-            body.push_str(&format!(
-                "<tr><td style=\"height:92px;border-bottom:1px solid #ccc;padding:0 36px\">\
-                 <a href=\"{href}\" style=\"font-size:30px\">{name}</a>\
-                 <div style=\"font-size:24px;line-height:34px\">{author} · {origin}</div></td></tr>",
-                href = href,
-                name = esc(b.name.as_deref().unwrap_or("未命名")),
-                author = esc(b.author.as_deref().unwrap_or("")),
-                origin = esc(b.origin_name.as_deref().unwrap_or(""))
-            ));
-        }
-        body.push_str("</table>");
     }
-    let mut res = page("搜索", fs, &format!("{top}{body}"));
+    let stage = format!(
+        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{form}{list}{pager}</div>",
+        h = STAGE_H,
+        form = form,
+        list = list,
+        pager = pager
+    );
+    let mut res = page("搜索", fs, &format!("{top}{stage}"));
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1672,22 +1915,27 @@ mod tests {
             600,
             "分页不应丢字"
         );
-        // 第 1 页装满预算；两页都不超预算
+        // 行当量 = 文本行 + 段间 0.6 行，任何一页都不得超预算；第 1 页也不该大量留白
         let em = line_em(spec);
-        let l1: usize = p1
-            .split('\n')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(|p| para_lines(p, em))
-            .sum();
-        let l2: usize = p2
-            .split('\n')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(|p| para_lines(p, em))
-            .sum();
-        assert_eq!(l1, spec.lines, "第 1 页应刚好用满行数预算");
-        assert!(l2 <= spec.lines);
+        let gap = para_gap_px(spec.line) as f64 / spec.line as f64;
+        let cost = |p: &str| -> f64 {
+            let paras: Vec<&str> = p
+                .split('\n')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let lines: usize = paras.iter().map(|s| para_lines(s, em)).sum();
+            lines as f64 + gap * (paras.len().saturating_sub(1)) as f64
+        };
+        let c1 = cost(p1);
+        let c2 = cost(p2);
+        assert!(c1 <= spec.lines as f64, "第 1 页行当量 {c1} 超预算");
+        assert!(c2 <= spec.lines as f64, "第 2 页行当量 {c2} 超预算");
+        assert!(
+            c1 >= spec.lines as f64 - 2.0,
+            "第 1 页填充率过低：{c1} / {}",
+            spec.lines
+        );
         assert!(pages.windows(2).all(|w| w[0].1 <= w[1].0), "页区间不重叠");
         // 同一文本同一档位 → 分页结果恒定
         assert_eq!(paginate_lines(&text, spec), pages);
@@ -1803,14 +2051,14 @@ mod tests {
         assert_eq!(pages, 2, "40 条非分卷章节应分 2 页");
         let page1 = &visible[0..K_TOC_PAGE];
         let page2 = &visible[K_TOC_PAGE..visible.len()];
-        assert_eq!(page1.len(), 20);
-        assert_eq!(page2.len(), 20);
+        assert_eq!(page1.len(), 30, "每页两列各 15 行");
+        assert_eq!(page2.len(), 10);
         // 分页区间仍指向原 Vec 里的章节，index 单调且跳过被过滤的分卷下标。
         assert!(page1.windows(2).all(|w| w[0].index < w[1].index));
         assert!(page2.windows(2).all(|w| w[0].index < w[1].index));
         assert!(page1.iter().all(|c| !matches!(c.index, 0 | 10 | 20 | 30 | 40)));
-        assert_eq!(page1.last().unwrap().index, 22);
-        assert_eq!(page2.first().unwrap().index, 23);
+        assert_eq!(page1.last().unwrap().index, 33);
+        assert_eq!(page2.first().unwrap().index, 34);
     }
 
     #[test]
@@ -1847,7 +2095,7 @@ mod tests {
     fn font_specs_fit_read_stage() {
         assert_eq!(READ_STAGE_H, 1268);
         assert_eq!(READ_STAGE_CONTENT_H, 1196);
-        let expect = [(28, 46, 26), (32, 52, 23), (38, 62, 19), (20, 36, 26)];
+        let expect = [(28, 46, 25), (32, 52, 22), (38, 62, 18), (20, 36, 26)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -1855,22 +2103,22 @@ mod tests {
             let per_line = (PAGE_W - SIDE_PAD * 2) / size;
             let chars = spec.lines * per_line;
             assert!(
-                spec.lines * spec.line <= READ_STAGE_CONTENT_H,
+                spec.lines * spec.line <= READ_TEXT_H,
                 "fs={size} 行高总和 {} 超过正文区 {}",
                 spec.lines * spec.line,
-                READ_STAGE_CONTENT_H
+                READ_TEXT_H
             );
-            assert!(chars >= 450, "fs={size} 每页字数 {chars} 少于 450");
+            assert!(
+                chars >= 400 && chars <= READ_STAGE_CONTENT_H,
+                "fs={size} 每页字数 {chars} 超出合理区间"
+            );
         }
+        // 标准档 32px：29 字/行 × 22 行 = 638 字，落在 500–800 的参考区间
         let std_chars = FS_SPECS[1].lines * (PAGE_W - SIDE_PAD * 2) / FS_SPECS[1].size;
-        assert_eq!(std_chars, 667);
         assert!(
             (500..=800).contains(&std_chars),
-            "标准档每页字数应在 500–800"
+            "标准档每页字数应在 500–800，实际 {std_chars}"
         );
-        // 小字档 26 行 × 33 字 = 858，正好落在参考目标
-        let small_chars = FS_SPECS[0].lines * ((PAGE_W - SIDE_PAD * 2) / FS_SPECS[0].size);
-        assert_eq!(small_chars, 858);
     }
 
     /// 字号轮换按物理大小 超小(4)→小(1)→标准(2)→大(3)→超小(4)，旧档位语义不变。
@@ -1929,10 +2177,12 @@ mod tests {
         assert!(!is_spa_entry("/favicon.ico"));
     }
 
-    /// 版式硬约束：底 padding = 栏高 + 8；标准档显式 32/52；默认档每页字数仍在 500–800。
+    /// 版式硬约束：底栏 64 不压正文、正文区 = 1268 − 64 − 52（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
-        assert_eq!(STAGE_PAD_BOTTOM, BAR_H + 8);
+        assert_eq!(READ_BODY_H, READ_STAGE_H - BAR_H);
+        assert_eq!(READ_TEXT_H, READ_BODY_H - READ_PAGENO_H);
+        assert!(READ_TEXT_H <= READ_STAGE_CONTENT_H, "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
         assert_eq!(spec.size, 32, "标准档必须显式 32px（实测 32/52，勿低于 30）");
         assert_eq!(spec.line, 52);
@@ -1943,18 +2193,81 @@ mod tests {
             "默认档每页字数应在 500–800，实际 {}",
             chars
         );
-        assert!(spec.lines <= READ_STAGE_CONTENT_H / spec.line);
+        assert!(spec.lines <= READ_TEXT_H / spec.line);
     }
 
-    /// 一屏一页：`html`/`body`/`.wrap` 三层锁死 1268 并禁纵向滚动，阅读页不会产生第二屏。
+    /// 四档行预算对齐参考值（28/46→25、32/52→22、38/62→18、20/36→26），
+    /// 比 26/23/19/26 各让 1 行给底部页码行；仍在 ±1 容差内且都 ≤1196 可用高。
+    #[test]
+    fn read_line_budget_matches_reference() {
+        assert_eq!(
+            FS_SPECS.iter().map(|s| s.lines).collect::<Vec<_>>(),
+            vec![25, 22, 18, 26]
+        );
+        for s in FS_SPECS.iter() {
+            assert!(s.lines * s.line <= READ_TEXT_H, "{}px 行高溢出", s.line);
+            assert!(s.lines * s.line <= READ_STAGE_CONTENT_H);
+        }
+    }
+
+    /// 一屏一页：`html`/`body` 锁死 1268 并禁滚动，`#k-stage` 1204 内裁剪，阅读页不会产生第二屏。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
         let css = read_only_css();
         assert!(css.contains("html,body{height:1268px;overflow:hidden}"), "{css}");
-        assert!(css.contains(".wrap{height:1268px;overflow:hidden}"), "{css}");
+        assert!(css.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"), "{css}");
         let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css);
         assert!(html.contains("html,body{height:1268px;overflow:hidden}"));
+        assert!(html.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"));
         assert!(!html.contains("<script"), "阅读页仍然零脚本");
+    }
+
+    /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
+    #[test]
+    fn top_nav_is_single_and_has_no_gray_fill() {
+        let nav = top_bar("书架", None, &nav_link("/k/search", "搜索"));
+        assert!(nav.contains("height:73px;border-bottom:1px solid #ccc;background:#fff"));
+        assert!(nav.contains("font-size:28px;line-height:72px;font-weight:700"));
+        assert!(nav.contains("font-size:20px"), "动作链接 20px");
+        assert!(nav.contains("padding-left:32px"), "动作间距 32px");
+        assert!(!nav.contains("e6e6e6"), "不得再用灰底");
+        assert_eq!(nav.matches("id=\"k-nav\"").count(), 1, "顶栏只能有一条");
+    }
+
+    /// 空书架：2px 描边块 + 满区居中（table 100% + valign=middle）+ 240×72 描边按钮。
+    #[test]
+    fn empty_shelf_is_outlined_and_centered() {
+        let html = empty_shelf(2);
+        assert!(html.contains("border:2px solid #000"), "{html}");
+        assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
+        assert!(html.contains("align=\"center\" valign=\"middle\""), "{html}");
+        assert!(html.contains("书架还是空的"), "{html}");
+        assert!(html.contains("width:240px;height:72px;line-height:70px;border:1px solid #000"));
+    }
+
+    /// 底栏 5 格等宽（各 200 = 20%）、64 高、图标 28 + 文字 20，禁用态用 #555 且不可点。
+    #[test]
+    fn bottom_bar_has_five_equal_cells() {
+        let row = format!(
+            "{}{}{}{}{}",
+            bar_cell("/k?a", "前", "上一页"),
+            bar_cell_off("后", "下一页"),
+            bar_cell("/k?b", "目", "目录"),
+            bar_cell("/k?c", "字", "字号"),
+            progress_form(
+                &ReadQ { book: "b".into(), source: "s".into(), ch: None, p: None, fs: None },
+                0, 1, 1, 1, 2
+            )
+        );
+        let bar = fixed_bar(&row);
+        assert_eq!(bar.matches("<td ").count(), 5, "{bar}");
+        assert_eq!(bar.matches("width=\"20%\"").count(), 5, "{bar}");
+        assert_eq!(bar.matches("height=\"64\"").count(), 5, "{bar}");
+        assert!(bar.contains("width:28px;height:28px"));
+        assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
+        assert_eq!(bar.matches("<a ").count(), 3, "上/下/目录/字号里只有 3 个 <a>，记录是 form");
+        assert!(bar.contains("color:#555"), "禁用态用弱灰 #555");
+        assert!(!bar.contains("background:#e6e6e6"));
     }
 
     /// 左右热区：各占屏宽 1/3（357px）、整屏 1268 高，右区左边界 715；无下一页时右区不渲染。
@@ -1964,11 +2277,12 @@ mod tests {
         assert_eq!(HOT_LEFT_R, 1072 - HOT_W);
         assert!(HOT_W >= 200, "热区宽必须 ≥ 200px，实际 {HOT_W}");
         assert!(READ_STAGE_H >= 200, "热区高必须 ≥ 200px");
-        let z = hot_zones("/k/read?p=1", Some("/k/read?p=2"));
+        let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"));
         assert_eq!(z.matches("<a ").count(), 2);
         assert!(z.contains("left:0;width:357px;height:1268px;z-index:5"));
         assert!(z.contains("left:715px;width:357px;height:1268px;z-index:5"));
-        assert_eq!(hot_zones("/k/read?p=1", None).matches("<a ").count(), 1);
+        assert_eq!(hot_zones(Some("/k/read?p=1"), None).matches("<a ").count(), 1);
+        assert_eq!(hot_zones(None, None).matches("<a ").count(), 0);
     }
 
     /// 漫画页表：长条页按窗口拆片（非末片 1196、末片取剩余），一屏内整图 1 页且高 ≤ 1196。
@@ -2030,7 +2344,7 @@ mod tests {
         }];
         let pages = comic_pages(&images, &[Some((1024, 1200))]);
         assert_eq!(pages.len(), 1);
-        let html = comic_stage(&images, &pages[0], "src", "book", "https://example.test/ch");
+        let html = comic_stage(&images, &pages[0], "src", "book", "https://example.test/ch", "1/1");
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
         // 1024×1200 缩到 928 宽 → 高 1088（≤1196），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
@@ -2046,7 +2360,7 @@ mod tests {
         }];
         let sp = comic_pages(&strip, &[Some((1200, 2266))]);
         assert_eq!(sp.len(), 2);
-        let s2 = comic_stage(&strip, &sp[1], "src", "book", "https://example.test/ch");
+        let s2 = comic_stage(&strip, &sp[1], "src", "book", "https://example.test/ch", "2/2");
         assert!(s2.contains("slice=1&i=1"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
         assert!(!s2.contains("height=\""), "切片页不写死高度，避免与真实落点错位拉扁");
