@@ -294,9 +294,16 @@ pub async fn auth_middleware(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let token = bearer.ok_or(AppError::Unauthorized)?;
-    let claims = verify_token(token, &state.cfg.jwt_secret)?;
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.to_string());
+    // Kindle /k 页内的 <img> 由浏览器直接发起，带不上 Authorization 头，只会有 k_session Cookie
+    let cookie_fallback = if bearer.is_none() && path == "/api/book/image" {
+        cookie_token(&req)
+    } else {
+        None
+    };
+    let token = bearer.or(cookie_fallback).ok_or(AppError::Unauthorized)?;
+    let claims = verify_token(&token, &state.cfg.jwt_secret)?;
     // 状态实时校验：账号被禁用或令牌版本已递增（改密/禁用）→ 401
     let account = match lookup_account(&state.shared, claims.sub).await? {
         Some(a) if !a.disabled && a.token_version == claims.ver => a,

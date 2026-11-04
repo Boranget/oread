@@ -30,7 +30,7 @@ use sqlx::SqlitePool;
 type Response = axum::http::Response<Body>;
 
 use crate::auth::{self, AuthUser, UserDb};
-use crate::entities::{Book, BookChapter, BookContent, BookSource};
+use crate::entities::{Book, BookChapter, BookContent, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
 use crate::models::BookshelfItem;
 use crate::routes::books::{
@@ -38,6 +38,7 @@ use crate::routes::books::{
     save_content_cached,
 };
 use crate::routes::bookshelf::SHELF_LIST_SQL;
+use crate::routes::image;
 use crate::routes::replace;
 use crate::routes::sources::{load_source, load_sources};
 use crate::routes::AppState;
@@ -59,6 +60,10 @@ const BAR_H: usize = 64;
 const STAGE_PAD_BOTTOM: usize = BAR_H + 8;
 /// 阅读页正文可用高度 = 1268 − 72 = 1196
 const READ_STAGE_CONTENT_H: usize = READ_STAGE_H - STAGE_PAD_BOTTOM;
+/// 左右透明翻页热区宽度 = 视口 1072 / 3（取整），整屏高可点
+const HOT_W: usize = 1072 / 3;
+/// 右侧热区左边界 = 1072 − 357
+const HOT_LEFT_R: usize = 1072 - HOT_W;
 
 /// 阅读页每页目标行数：≈26 行（WeRead 整页阅读观感）
 const READ_TARGET_LINES: usize = 26;
@@ -230,6 +235,11 @@ fn remember_fs(res: &mut Response, fs: usize) {
 /// 统一页面骨架：无脚本、固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大。
 /// viewport 固定 1072（与版心一致）；不写 initial-scale=1 时 Silk 会按 device-width 缩放。
 fn page_html(title: &str, fs: usize, body: &str) -> String {
+    page_html_css(title, fs, body, "")
+}
+
+/// 与 `page_html` 相同，额外拼接一段页面级 CSS（阅读页用「一屏一页」锁高，其它页不受影响）。
+fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str) -> String {
     let spec = &FS_SPECS[fs - 1];
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
@@ -241,6 +251,7 @@ a{{color:#000;text-decoration:none}}\
 h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
+{extra}\
 </style></head><body><div class=\"wrap\">{body}</div></body></html>",
         viewport = K_VIEWPORT,
         title = esc(title),
@@ -248,12 +259,17 @@ table{{border-collapse:collapse}}\
         line = spec.line,
         pw = PAGE_W,
         pad = SIDE_PAD,
+        extra = extra_css,
         body = body
     )
 }
 
 fn page(title: &str, fs: usize, body: &str) -> Response {
-    let html = page_html(title, fs, body);
+    page_css(title, fs, body, "")
+}
+
+fn page_css(title: &str, fs: usize, body: &str, extra_css: &str) -> Response {
+    let html = page_html_css(title, fs, body, extra_css);
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
@@ -305,6 +321,127 @@ fn bottom_cell_meta(href: &str, label: &str, meta: &str, width: usize) -> String
         "<td width=\"{width}%\" height=\"64\" align=\"center\">\
          <a href=\"{href}\" style=\"display:block;height:64px;line-height:42px;font-size:28px\">{label}\
          <span style=\"display:block;line-height:20px;font-size:16px;color:#333\">{meta}</span></a></td>"
+    )
+}
+
+/// 底栏格：禁用态（灰掉、不可点），用于「最后一页且没有下一章」时的「下一页」
+fn bottom_cell_off(label: &str, width: usize) -> String {
+    format!(
+        "<td width=\"{width}%\" height=\"64\" align=\"center\">\
+         <span style=\"display:block;height:64px;line-height:64px;font-size:28px;color:#999\">{label}</span></td>"
+    )
+}
+
+/// 左右透明翻页热区：各占屏宽 1/3（357px）、整屏高 1268px。
+/// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
+/// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1268 ≫ 200×200。
+fn hot_zones(prev: &str, next: Option<&str>) -> String {
+    let mut out = format!(
+        "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
+        prev = prev,
+        w = HOT_W,
+        h = READ_STAGE_H
+    );
+    if let Some(nx) = next {
+        out.push_str(&format!(
+            "<a href=\"{nx}\" style=\"position:absolute;top:0;left:{l}px;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
+            nx = nx,
+            l = HOT_LEFT_R,
+            w = HOT_W,
+            h = READ_STAGE_H
+        ));
+    }
+    out
+}
+
+fn read_only_css() -> String {
+    format!(
+        "html,body{{height:{h}px;overflow:hidden}}.wrap{{height:{h}px;overflow:hidden}}",
+        h = READ_STAGE_H
+    )
+}
+
+/// 阅读页内部链接：始终带目标档位的 `fs`，切档后不会被当前档位拼成重复参数。
+fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64) -> String {
+    with_fs(
+        &format!(
+            "/k/read?book={}&source={}&ch={}&p={}",
+            qenc(&q.book),
+            qenc(&q.source),
+            ch,
+            p
+        ),
+        fs,
+    )
+}
+
+/// 目录链接（按 20 章/页定位到当前章所在目录页）
+fn toc_link(q: &ReadQ, fs: usize, ch: i64) -> String {
+    with_fs(
+        &format!(
+            "/k/toc?book={}&source={}&tp={}",
+            qenc(&q.book),
+            qenc(&q.source),
+            (ch / K_TOC_PAGE as i64) + 1
+        ),
+        fs,
+    )
+}
+
+/// 翻页导航：翻完本章接上一章/下一章；全书末页返回 `None`（底栏禁用 + 右侧热区不渲染）。
+fn read_nav(
+    q: &ReadQ,
+    fs: usize,
+    ch: i64,
+    p: i64,
+    n: i64,
+    total: i64,
+    toc: &str,
+) -> ((String, &'static str), Option<(String, &'static str)>) {
+    let prev = if p > 1 {
+        (read_link(q, fs, ch, p - 1), "上一页")
+    } else if ch > 0 {
+        (read_link(q, fs, ch - 1, 1), "上一章")
+    } else {
+        (toc.to_string(), "目录")
+    };
+    let next = if p < n {
+        Some((read_link(q, fs, ch, p + 1), "下一页"))
+    } else if ch + 1 < total {
+        Some((read_link(q, fs, ch + 1, 1), "下一章"))
+    } else {
+        None
+    };
+    (prev, next)
+}
+
+/// 底栏第 2 格：有下一页/下一章则给链接，全书末页给灰色不可点的禁用态。
+fn bottom_cell_next(next: Option<&(String, &'static str)>, width: usize) -> String {
+    match next {
+        Some((href, label)) => bottom_cell(href, label, width),
+        None => bottom_cell_off("下一页", width),
+    }
+}
+
+/// 进度提交：零 JS 的原生 form（底栏第 5 格）
+fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize) -> String {
+    format!(
+        "<form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
+         <input type=\"hidden\" name=\"book\" value=\"{book}\">\
+         <input type=\"hidden\" name=\"source\" value=\"{source}\">\
+         <input type=\"hidden\" name=\"ch\" value=\"{ch}\">\
+         <input type=\"hidden\" name=\"p\" value=\"{p}\">\
+         <input type=\"hidden\" name=\"n\" value=\"{n}\">\
+         <input type=\"hidden\" name=\"total\" value=\"{total}\">\
+         <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
+         <input type=\"submit\" value=\"记录\" style=\"font-size:26px;height:64px;width:100%;border:0;background:transparent\"></form>",
+        book = esc(&q.book),
+        source = esc(&q.source),
+        ch = ch,
+        p = p,
+        n = n,
+        total = total,
+        fs = fs
     )
 }
 
@@ -916,6 +1053,183 @@ async fn toc(
     res
 }
 
+// ---------------- 漫画（一屏一页） ----------------
+
+/// 漫画页：某张图的整图，或该图的第 `slice` 片（0 起）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComicPage {
+    /// `images` 里的下标
+    img: usize,
+    slice: usize,
+    /// 该图总片数（1 = 整图）
+    layers: usize,
+    /// 显示宽（CSS px）
+    width: usize,
+    /// 显示高（CSS px）；0 = 尺寸未知，渲染时退化到 `max-height`
+    height: usize,
+}
+
+/// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ `READ_STAGE_CONTENT_H`。
+/// - 长条页（`slice_count_window` > 1）：一图拆 `layers` 页，非末片 1196、末片取剩余；
+/// - 一屏内：整图按版心 928 宽，显示高超过 1196 时按高度等比缩小；
+/// - 尺寸未知：整图一页，只给宽度。
+fn comic_pages(images: &[BookImage], dims: &[Option<(u32, u32)>]) -> Vec<ComicPage> {
+    let sp = image::SliceParams::default();
+    let dw = sp.dw as usize;
+    let mut pages = Vec::new();
+    for i in 0..images.len() {
+        let known = dims
+            .get(i)
+            .copied()
+            .flatten()
+            .filter(|(w, h)| *w > 0 && *h > 0);
+        let Some((w, h)) = known else {
+            pages.push(ComicPage {
+                img: i,
+                slice: 0,
+                layers: 1,
+                width: 0,
+                height: 0,
+            });
+            continue;
+        };
+        let n = image::slice_count_window(w, h, &sp);
+        if n > 1 {
+            // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1196/620），
+            // 写死 height 会把图拉扁；这里只给宽度，页面高度由固定 1268 的 stage 兜住。
+            for k in 0..n {
+                pages.push(ComicPage {
+                    img: i,
+                    slice: k,
+                    layers: n,
+                    width: dw,
+                    height: 0,
+                });
+            }
+        } else {
+            let scaled = ((h as f64) * dw as f64 / w as f64).round() as usize;
+            if scaled > READ_STAGE_CONTENT_H {
+                // 1.1 屏这类「不切但一屏放不下」的整图：按高度约束等比缩小，仍是一屏一页
+                let cw = ((READ_STAGE_CONTENT_H as f64) * w as f64 / h as f64).round() as usize;
+                pages.push(ComicPage {
+                    img: i,
+                    slice: 0,
+                    layers: 1,
+                    width: cw.max(1),
+                    height: READ_STAGE_CONTENT_H,
+                });
+            } else {
+                pages.push(ComicPage {
+                    img: i,
+                    slice: 0,
+                    layers: 1,
+                    width: dw,
+                    height: scaled.max(1),
+                });
+            }
+        }
+    }
+    pages
+}
+
+/// 渲染漫画页：`#k-stage` 与小说页同高同宽，图片给显式宽高（不用 `height:auto`，避免抖动）。
+/// 只有长条页的切片才带 `slice=1&i=k`，整图页维持旧 URL（桌面端与 `slice=0` 路径完全不受影响）。
+fn comic_stage(
+    images: &[BookImage],
+    pg: &ComicPage,
+    source_id: &str,
+    book_url: &str,
+    chapter_url: &str,
+) -> String {
+    let im = &images[pg.img];
+    let mut src = format!(
+        "/api/book/image?source={}&book_url={}&chapter_url={}&url={}&eink=1",
+        qenc(source_id),
+        qenc(book_url),
+        qenc(chapter_url),
+        qenc(&im.url)
+    );
+    if pg.layers > 1 {
+        src.push_str(&format!("&slice=1&i={}", pg.slice));
+    }
+    let img = if pg.height > 0 {
+        format!(
+            "<img src=\"{src}\" width=\"{w}\" height=\"{h}\" style=\"display:block;max-width:100%\">",
+            src = src,
+            w = pg.width,
+            h = pg.height
+        )
+    } else if pg.width > 0 {
+        // 切片：真实高度由服务端按落点决定，这里只给宽度，避免把图拉扁
+        format!(
+            "<img src=\"{src}\" width=\"{w}\" style=\"display:block;max-width:100%\">",
+            src = src,
+            w = pg.width
+        )
+    } else {
+        format!(
+            "<img src=\"{src}\" style=\"display:block;max-width:100%\">",
+            src = src
+        )
+    };
+    format!(
+        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;box-sizing:border-box;overflow:hidden\">{img}</div>",
+        h = READ_STAGE_H,
+        w = PAGE_W,
+        pad = SIDE_PAD,
+        pb = STAGE_PAD_BOTTOM,
+        img = img
+    )
+}
+
+/// 取本章图片：先读 `book_content.images` 缓存，未命中回源并按 `/api/comic/chapter` 同规则回写。
+async fn load_comic_images(
+    s: &AppState,
+    pool: &SqlitePool,
+    source: &BookSource,
+    chapter: &BookChapter,
+    book_url: &str,
+) -> Result<Vec<BookImage>, String> {
+    if let Ok(Some(c)) = crate::routes::comic::load_cached_images(pool, &chapter.url, s.cfg.content_ttl_secs).await {
+        if c.content_type == "image" {
+            let (v, _) = crate::routes::comic::decode_images(c.images_json.as_deref());
+            if !v.is_empty() {
+                return Ok(v);
+            }
+        }
+    }
+    let parsed = web_book::chapter_images(source, chapter)
+        .await
+        .map_err(|e| format!("本章图片抓取失败: {e}"))?;
+    let images = parsed.images;
+    if images.is_empty() {
+        return Ok(images);
+    }
+    let payload = serde_json::to_string(&web_book::ChapterImages {
+        images: images.clone(),
+        truncated: parsed.truncated,
+    })
+    .unwrap_or_default();
+    let c = BookContent {
+        url: chapter.url.clone(),
+        book_url: book_url.to_string(),
+        title: chapter.title.clone(),
+        content: Some(String::new()),
+        chapter_index: chapter.index,
+        content_type: "image".into(),
+        images_json: Some(payload),
+        ..Default::default()
+    };
+    let limit = match replace::user_cache_limit_mb(pool).await {
+        Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
+        None => s.cfg.cache_limit_bytes(),
+    };
+    if let Err(e) = save_content_cached(pool, &c, limit).await {
+        tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
+    }
+    Ok(images)
+}
+
 // ---------------- 正文 ----------------
 
 async fn read(
@@ -938,6 +1252,10 @@ async fn read(
     // 目录已不展示分卷行；兜底拦截直接访问（合成 URL `volume:`）时给出友好提示，不抛错误页。
     if volume_entry(chapter) {
         return volume_notice(&q, fs, explicit);
+    }
+    // 漫画源：一屏一页（整图或切片），不走正文分页
+    if source.book_source_type == 2 {
+        return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit).await;
     }
 
     let mut c: BookContent = match load_cached_content(&db.0, &chapter.url, s.cfg.content_ttl_secs).await {
@@ -981,42 +1299,8 @@ async fn read(
     let blocks = plan.chunks.len();
 
     let ch_title = title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
-    // 不带 fs 的原始链接：切档时要换成目标档位，不能被当前档位拼成重复参数
-    let raw_link = |ch: i64, p: i64| {
-        format!(
-            "/k/read?book={}&source={}&ch={}&p={}",
-            qenc(&q.book),
-            qenc(&q.source),
-            ch,
-            p
-        )
-    };
-    let base_link = |ch: i64, p: i64| with_fs(&raw_link(ch, p), fs);
-
-    let toc_url = with_fs(
-        &format!(
-            "/k/toc?book={}&source={}&tp={}",
-            qenc(&q.book),
-            qenc(&q.source),
-            (ch / K_TOC_PAGE as i64) + 1
-        ),
-        fs,
-    );
-
-    let (prev, prev_label) = if p > 1 {
-        (base_link(ch, p - 1), "上一页")
-    } else if ch > 0 {
-        (base_link(ch - 1, 1), "上一章")
-    } else {
-        (toc_url.clone(), "目录")
-    };
-    let (next, next_label) = if p < n {
-        (base_link(ch, p + 1), "下一页")
-    } else if ch + 1 < chapters.len() as i64 {
-        (base_link(ch + 1, 1), "下一章")
-    } else {
-        (toc_url.clone(), "目录")
-    };
+    let toc_url = toc_link(&q, fs, ch);
+    let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url);
     let mut meta = if blocks > 1 {
         // 超长章节按 20 万字符分块：底栏“目录”格下方同时给出页内进度、页码与分块号
         let pct = ((p as f64 * 100.0 / n as f64).round() as usize).clamp(1, 100);
@@ -1028,26 +1312,9 @@ async fn read(
         meta.push_str("·已截断");
     }
     // 进度提交：零 JS 的原生 form，放在底栏第 5 格（阅读页无顶栏）
-    let progress_form = format!(
-        "<form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
-         <input type=\"hidden\" name=\"book\" value=\"{book}\">\
-         <input type=\"hidden\" name=\"source\" value=\"{source}\">\
-         <input type=\"hidden\" name=\"ch\" value=\"{ch}\">\
-         <input type=\"hidden\" name=\"p\" value=\"{p}\">\
-         <input type=\"hidden\" name=\"n\" value=\"{n}\">\
-         <input type=\"hidden\" name=\"total\" value=\"{total}\">\
-         <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
-         <input type=\"submit\" value=\"记录\" style=\"font-size:26px;height:64px;width:100%;border:0;background:transparent\"></form>",
-        book = esc(&q.book),
-        source = esc(&q.source),
-        ch = ch,
-        p = p,
-        n = n,
-        total = chapters.len(),
-        fs = fs
-    );
+    let progress_cell = progress_form(&q, ch, p, n, chapters.len(), fs);
     let next_fs = cycle_fs(fs);
-    let fs_href = with_fs(&raw_link(ch, p), next_fs);
+    let fs_href = read_link(&q, next_fs, ch, p);
 
     let mut paras = String::new();
     for para in cur.split('\n') {
@@ -1056,7 +1323,7 @@ async fn read(
             continue;
         }
         paras.push_str(&format!(
-            "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em\">{para}</p>",
+            "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em;word-wrap:break-word\">{para}</p>",
             size = spec.size,
             line = spec.line,
             para = esc(para)
@@ -1074,14 +1341,107 @@ async fn read(
     // 贴底固定栏 5 格：上一页 / 下一页 / 目录(页码+分块进度，略宽) / 字号 / 记录进度
     let bottom = fixed_bar(&format!(
         "{}{}{}{}<td width=\"18%\" height=\"64\" align=\"center\">{progress}</td>",
-        bottom_cell(&prev, prev_label, 18),
-        bottom_cell(&next, next_label, 18),
+        bottom_cell(&prev.0, prev.1, 18),
+        bottom_cell_next(next.as_ref(), 18),
         bottom_cell_meta(&toc_url, "目录", &meta, 28),
         bottom_cell(&fs_href, FS_SPECS[next_fs - 1].label, 18),
-        progress = progress_form
+        progress = progress_cell
     ));
 
-    let mut res = page(&ch_title, fs, &format!("{stage}{bottom}"));
+    let body = format!(
+        "{stage}{hot}{bottom}",
+        stage = stage,
+        hot = hot_zones(&prev.0, next.as_ref().map(|x| x.0.as_str())),
+        bottom = bottom
+    );
+    let mut res = page_css(&ch_title, fs, &body, &read_only_css());
+    if explicit {
+        remember_fs(&mut res, fs);
+    }
+    res
+}
+
+/// 漫画阅读页：一屏一页（整图或切片），翻页/进度/字号与小说页同一套底栏与热区。
+async fn comic_read(
+    s: &AppState,
+    pool: &SqlitePool,
+    source: &BookSource,
+    chapters: &[BookChapter],
+    ch: i64,
+    q: &ReadQ,
+    fs: usize,
+    explicit: bool,
+) -> Response {
+    let chapter = &chapters[ch as usize];
+    let images = match load_comic_images(s, pool, source, chapter, &q.book).await {
+        Ok(v) => v,
+        Err(e) => return err_page(&e),
+    };
+    if images.is_empty() {
+        return err_page("本章没有图片");
+    }
+    // 尺寸：源页面已带宽高的直接用，缺失的批量探测（进程内缓存，同章重复打开不再回源）
+    let mut dims: Vec<Option<(u32, u32)>> = images
+        .iter()
+        .map(|im| match (im.width, im.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        })
+        .collect();
+    let missing: Vec<String> = images
+        .iter()
+        .zip(dims.iter())
+        .filter(|(_, d)| d.is_none())
+        .map(|(im, _)| im.url.clone())
+        .collect();
+    if !missing.is_empty() {
+        let probed = image::probe_dims(
+            source,
+            Some(&chapter.url),
+            Some(&q.book),
+            &missing,
+            s.cfg.image_max_body_bytes.max(1024),
+        )
+        .await;
+        let mut it = probed.into_iter();
+        for d in dims.iter_mut() {
+            if d.is_none() {
+                *d = it.next().flatten();
+            }
+        }
+    }
+    let pages = comic_pages(&images, &dims);
+    if pages.is_empty() {
+        return err_page("本章没有图片");
+    }
+    let n = pages.len() as i64;
+    let p = q.p.unwrap_or(1).clamp(1, n);
+    let pg = &pages[(p - 1) as usize];
+
+    let toc_url = toc_link(q, fs, ch);
+    let (prev, next) = read_nav(q, fs, ch, p, n, chapters.len() as i64, &toc_url);
+    let meta = format!("{p}/{n}");
+    let progress_cell = progress_form(q, ch, p, n, chapters.len(), fs);
+    let next_fs = cycle_fs(fs);
+    let fs_href = read_link(q, next_fs, ch, p);
+
+    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url);
+    let bottom = fixed_bar(&format!(
+        "{}{}{}{}<td width=\"18%\" height=\"64\" align=\"center\">{progress}</td>",
+        bottom_cell(&prev.0, prev.1, 18),
+        bottom_cell_next(next.as_ref(), 18),
+        bottom_cell_meta(&toc_url, "目录", &meta, 28),
+        bottom_cell(&fs_href, FS_SPECS[next_fs - 1].label, 18),
+        progress = progress_cell
+    ));
+    let title = chapter.title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
+    let body = format!(
+        "{stage}{hot}{bottom}",
+        stage = stage,
+        hot = hot_zones(&prev.0, next.as_ref().map(|x| x.0.as_str())),
+        bottom = bottom
+    );
+    let mut res = page_css(&title, fs, &body, &read_only_css());
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1584,5 +1944,111 @@ mod tests {
             chars
         );
         assert!(spec.lines <= READ_STAGE_CONTENT_H / spec.line);
+    }
+
+    /// 一屏一页：`html`/`body`/`.wrap` 三层锁死 1268 并禁纵向滚动，阅读页不会产生第二屏。
+    #[test]
+    fn read_page_locks_one_screen_and_hides_overflow() {
+        let css = read_only_css();
+        assert!(css.contains("html,body{height:1268px;overflow:hidden}"), "{css}");
+        assert!(css.contains(".wrap{height:1268px;overflow:hidden}"), "{css}");
+        let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css);
+        assert!(html.contains("html,body{height:1268px;overflow:hidden}"));
+        assert!(!html.contains("<script"), "阅读页仍然零脚本");
+    }
+
+    /// 左右热区：各占屏宽 1/3（357px）、整屏 1268 高，右区左边界 715；无下一页时右区不渲染。
+    #[test]
+    fn hot_zones_are_one_third_screen_and_clickable() {
+        assert_eq!(HOT_W, 1072 / 3);
+        assert_eq!(HOT_LEFT_R, 1072 - HOT_W);
+        assert!(HOT_W >= 200, "热区宽必须 ≥ 200px，实际 {HOT_W}");
+        assert!(READ_STAGE_H >= 200, "热区高必须 ≥ 200px");
+        let z = hot_zones("/k/read?p=1", Some("/k/read?p=2"));
+        assert_eq!(z.matches("<a ").count(), 2);
+        assert!(z.contains("left:0;width:357px;height:1268px;z-index:5"));
+        assert!(z.contains("left:715px;width:357px;height:1268px;z-index:5"));
+        assert_eq!(hot_zones("/k/read?p=1", None).matches("<a ").count(), 1);
+    }
+
+    /// 漫画页表：长条页按窗口拆片（非末片 1196、末片取剩余），一屏内整图 1 页且高 ≤ 1196。
+    #[test]
+    fn comic_pages_slice_long_strip_and_keep_one_screen() {
+        let images: Vec<BookImage> = (0..3)
+            .map(|i| BookImage {
+                index: i + 1,
+                url: format!("https://example.test/{i}.jpg"),
+                width: Some(1200),
+                height: Some(2266),
+                ..Default::default()
+            })
+            .collect();
+        let dims: Vec<Option<(u32, u32)>> = vec![Some((1200, 2266)); 3];
+        let pages = comic_pages(&images, &dims);
+        assert_eq!(pages.len(), 6, "三张两片长条页 = 6 页");
+        for (i, pg) in pages.iter().enumerate() {
+            assert_eq!(pg.layers, 2, "第 {i} 页片数");
+            assert_eq!(pg.slice, i % 2, "第 {i} 页片下标");
+            assert_eq!(pg.width, 928, "版心宽固定 928");
+            // 切片真实高度由服务端落点决定，页表只给宽度（≠0 才写 height，避免拉扁）
+            assert_eq!(pg.height, 0, "第 {i} 页不写死切片高度");
+        }
+        // 1.1 屏（1024×1471）：不切，一屏一页，按高度约束等比缩小
+        let one = vec![BookImage {
+            index: 1,
+            url: "https://example.test/one.jpg".into(),
+            width: Some(1024),
+            height: Some(1471),
+            ..Default::default()
+        }];
+        let one_dims = vec![Some((1024, 1471))];
+        let p1 = comic_pages(&one, &one_dims);
+        assert_eq!(p1.len(), 1, "1.1 屏不切");
+        assert_eq!(p1[0].layers, 1);
+        assert_eq!(p1[0].height, READ_STAGE_CONTENT_H);
+        assert!(p1[0].width <= 928, "等比缩小后不得宽于版心");
+        // 尺寸未知：整图一页，height=0（渲染退化为 max-height）
+        let unknown = vec![BookImage {
+            index: 1,
+            url: "https://example.test/x.jpg".into(),
+            ..Default::default()
+        }];
+        let u = comic_pages(&unknown, &[None]);
+        assert_eq!(u.len(), 1);
+        assert_eq!((u[0].layers, u[0].height), (1, 0));
+    }
+
+    /// 整图页 URL 不带切片参数（桌面端/`slice=0` 路径字节不变）；长条页才带 `slice=1&i=k`。
+    #[test]
+    fn comic_stage_uses_explicit_height_and_slice_only_for_long_pages() {
+        let images = vec![BookImage {
+            index: 1,
+            url: "https://example.test/a.jpg".into(),
+            width: Some(1024),
+            height: Some(1200),
+            ..Default::default()
+        }];
+        let pages = comic_pages(&images, &[Some((1024, 1200))]);
+        assert_eq!(pages.len(), 1);
+        let html = comic_stage(&images, &pages[0], "src", "book", "https://example.test/ch");
+        assert!(!html.contains("slice=1"), "整图页不得带切片参数");
+        // 1024×1200 缩到 928 宽 → 高 1088（≤1196），显式宽高防抖动
+        assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
+        assert!(html.contains("max-width:100%"), "禁止横向溢出");
+        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1268px"));
+
+        let strip = vec![BookImage {
+            index: 1,
+            url: "https://example.test/s.jpg".into(),
+            width: Some(1200),
+            height: Some(2266),
+            ..Default::default()
+        }];
+        let sp = comic_pages(&strip, &[Some((1200, 2266))]);
+        assert_eq!(sp.len(), 2);
+        let s2 = comic_stage(&strip, &sp[1], "src", "book", "https://example.test/ch");
+        assert!(s2.contains("slice=1&i=1"), "{s2}");
+        assert!(s2.contains("width=\"928\""), "{s2}");
+        assert!(!s2.contains("height=\""), "切片页不写死高度，避免与真实落点错位拉扁");
     }
 }

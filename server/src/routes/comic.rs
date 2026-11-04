@@ -143,7 +143,7 @@ async fn chapter_position(pool: &SqlitePool, book_url: &str, chapter: &BookChapt
 /// 不复用 `books::load_cached_content`：它的 SELECT 选的是列名 `images`，
 /// 而 `BookContent.images_json` 带 `#[sqlx(default)]`，列名对不上时会静默取 `None`，
 /// 导致图片章节缓存命中后拿到空列表。这里显式起别名 `images AS images_json`。
-async fn load_cached_images(
+pub(crate) async fn load_cached_images(
     pool: &SqlitePool,
     url: &str,
     ttl_secs: i64,
@@ -167,7 +167,7 @@ async fn load_cached_images(
 }
 
 /// 解析缓存里的图片 JSON：兼容 `{images,truncated}` 与旧裸数组两种形态。
-fn decode_images(raw: Option<&str>) -> (Vec<BookImage>, bool) {
+pub(crate) fn decode_images(raw: Option<&str>) -> (Vec<BookImage>, bool) {
     let Some(raw) = raw else {
         return (Vec::new(), false);
     };

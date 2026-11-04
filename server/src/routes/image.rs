@@ -19,7 +19,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use once_cell::sync::Lazy;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Json, Query, State};
@@ -1434,7 +1437,7 @@ fn err_item(url: &str, code: &str, message: &str) -> serde_json::Value {
 }
 
 /// 单个 URL 的元数据：只预读图片头部若干字节解析宽高，不下载整图。
-async fn fetch_image_meta(
+pub(crate) async fn fetch_image_meta(
     url: String,
     hdrs: HashMap<String, String>,
     max_bytes: usize,
@@ -1580,7 +1583,7 @@ async fn images_meta(
     Json(json!({"count": items.len(), "items": items})).into_response()
 }
 
-fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Option<&str>) -> HashMap<String, String> {
+pub(crate) fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Option<&str>) -> HashMap<String, String> {
     // 与正文请求一致：支持 JSON / 多行 / `@js:` 三种 header 形式
     let mut h = req::source_headers(source, &source.book_source_url);
     let referer = chapter_url
@@ -1602,6 +1605,68 @@ fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Opti
         );
     }
     h
+}
+
+/// 进程内图片尺寸缓存：`/k` 漫画一屏一页要一次拿到整章尺寸，同章重复打开不应重复回源。
+/// 只存「探测成功」的结果；失败不缓存，下次仍可重试。
+static DIM_CACHE: Lazy<Mutex<HashMap<String, (u32, u32)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// 尺寸缓存上限（条目数），超出直接清空（漫画章节数量有限，不做 LRU）
+const DIM_CACHE_MAX: usize = 2000;
+
+/// 批量探测原始图片宽高：只预读图片头，不下载整图；返回与 `urls` 等长、同序的结果。
+/// 单批并发 8，命中进程内缓存的不再回源。
+pub(crate) async fn probe_dims(
+    source: &BookSource,
+    chapter_url: Option<&str>,
+    book_url: Option<&str>,
+    urls: &[String],
+    max_bytes: usize,
+) -> Vec<Option<(u32, u32)>> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Option<(u32, u32)>> = {
+        let m = DIM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        urls.iter().map(|u| m.get(u).copied()).collect()
+    };
+    let missing: Vec<(usize, String)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.is_none())
+        .map(|(i, _)| (i, urls[i].clone()))
+        .collect();
+    if missing.is_empty() {
+        return out;
+    }
+    let hdrs = source_referer(source, chapter_url, book_url);
+    let fetched: Vec<(usize, Option<(u32, u32)>)> = futures::stream::iter(missing)
+        .map(|(i, u)| {
+            let h = hdrs.clone();
+            async move {
+                let v = fetch_image_meta(u, h, max_bytes).await;
+                let d = v
+                    .get("width")
+                    .and_then(|x| x.as_u64())
+                    .zip(v.get("height").and_then(|x| x.as_u64()))
+                    .map(|(w, h)| (w as u32, h as u32))
+                    .filter(|(w, h)| *w > 0 && *h > 0);
+                (i, d)
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    let mut cache = DIM_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, d) in fetched {
+        if let Some(dv) = d {
+            if cache.len() >= DIM_CACHE_MAX {
+                cache.clear();
+            }
+            cache.insert(urls[i].clone(), dv);
+        }
+        out[i] = d;
+    }
+    out
 }
 
 fn map_open_error(e: anyhow::Error) -> Response {
