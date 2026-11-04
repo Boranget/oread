@@ -52,6 +52,9 @@ pub struct SearchQ {
     /// 显式越权：为 `1`/`true` 时冷却中的源也参与搜索（排查用）。
     #[serde(default)]
     include_cooled: Option<String>,
+    /// 搜索范围：`curated`（默认，只搜精选源）| `all`（加强搜索，覆盖 preferred+observing）。
+    #[serde(default)]
+    scope: Option<String>,
     page: Option<i32>,
     page_size: Option<usize>,
 }
@@ -204,6 +207,16 @@ struct SearchJob {
     skipped_cooldown: usize,
     /// 候选集合中当前处于冷却的源总数（前端提示“另有 N 个源处于冷却”）
     cooldown_total: usize,
+    /// 本次请求的搜索范围：`curated` / `all`
+    scope: String,
+    /// 实际覆盖情况：`curated`（只用了精选源）/ `expanded`（退回或显式覆盖到全部可搜索源）
+    coverage: String,
+    /// 当前精选集合大小（curated_total）
+    curated_total: usize,
+    /// 单源预算
+    per_source_budget: Duration,
+    /// 整次搜索总预算
+    total_budget: Duration,
     state: Mutex<SearchJobState>,
 }
 
@@ -309,11 +322,13 @@ async fn run_search_job(
     pool: SqlitePool,
     cooldown_secs: u64,
     tier_cfg: crate::source_quality::TierConfig,
+    per_source_budget: Duration,
+    total_budget: Duration,
     health: HashMap<String, source_health::HealthRow>,
 ) {
-    let budget = crate::req::search_budget();
-    // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束（与旧版总耗时同量级）。
-    let deadline = tokio::time::Instant::now() + crate::req::search_total_budget();
+    let budget = per_source_budget;
+    // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束。
+    let deadline = tokio::time::Instant::now() + total_budget;
 
     // 两批调度：preferred 先跑，但只占一段预算，剩余时间强制留给 observing，
     // 避免优选源很多时 observing 一次都跑不到（饿死）。
@@ -591,7 +606,52 @@ async fn search_start(
     });
     let enabled_all = searchable_sources(sources, &quarantined, &health);
     let requested = parse_source_ids(q.source_ids.as_deref());
-    let (selected, ignored) = select_sources(&enabled_all, &requested);
+    let requested_scope = q
+        .scope
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "curated".to_string());
+    let mut scope = if requested_scope == "all" { "all".to_string() } else { "curated".to_string() };
+    let mut coverage = if scope == "curated" { "curated".to_string() } else { "expanded".to_string() };
+    let mut curated_total = 0usize;
+
+    let (mut selected, ignored) = select_sources(&enabled_all, &requested);
+    if !requested.is_empty() {
+        // 显式选源始终按“覆盖全部可搜索源”的语义：用户勾选的 observing 源不应被精选过滤掉。
+        scope = "all".to_string();
+        coverage = "expanded".to_string();
+    } else if scope == "curated" {
+        match crate::source_bench::curated_set(&s.shared).await {
+            Ok(set) => {
+                curated_total = set.len();
+                if set.is_empty() {
+                    // 冷启动：还没跑过体检 → 退回现有 tier 逻辑，避免“0 源”搜索。
+                    tracing::info!(target: "search_job", reason = "cold_start_no_curated", "curated empty; fallback to all");
+                    scope = "all".to_string();
+                    coverage = "expanded".to_string();
+                } else {
+                    selected.retain(|x| set.contains(&x.book_source_url));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "load curated set failed; fallback to all");
+                scope = "all".to_string();
+                coverage = "expanded".to_string();
+            }
+        }
+    }
+    if scope == "curated" && selected.is_empty() {
+        // 精选集合存在但与可搜索源交集为空：同样退回 all。
+        scope = "all".to_string();
+        coverage = "expanded".to_string();
+        selected = select_sources(&enabled_all, &[]).0;
+    }
+    // curated：单源 5s / 总 6s；all（加强搜索）：单源 6s / 总 10s。
+    let (per_source_budget, total_budget) = if scope == "curated" {
+        (Duration::from_secs(5), Duration::from_secs(6))
+    } else {
+        (Duration::from_secs(6), Duration::from_secs(10))
+    };
     let include_cooled = truthy(q.include_cooled.as_deref());
     let now = source_health::now_ms();
     let cooldown_total = source_health::cooled_count(&enabled_all, &health, now);
@@ -609,6 +669,11 @@ async fn search_start(
         source_total,
         skipped_cooldown,
         cooldown_total,
+        scope: scope.clone(),
+        coverage: coverage.clone(),
+        curated_total,
+        per_source_budget,
+        total_budget,
         state: Mutex::new(SearchJobState {
             pending: source_total,
             ..Default::default()
@@ -634,12 +699,18 @@ async fn search_start(
         s.shared.clone(),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
+        per_source_budget,
+        total_budget,
         health,
     ));
     Ok(Json(json!({
         "job_id": id,
         "source_total": source_total,
-        "deadline_ms": crate::req::search_budget().as_millis() as u64,
+        "deadline_ms": total_budget.as_millis() as u64,
+        // 本次搜索范围与实际覆盖情况（curated 空集会回退 expanded）
+        "scope": scope,
+        "coverage": coverage,
+        "curated_total": curated_total,
         // 契约变更：显式回显过滤结果，便于前端提示“哪些 id 被忽略”
         "source_ids_requested": requested,
         "ignored_source_ids": ignored,
@@ -695,7 +766,10 @@ async fn search_result(
         "pending": pending,
         "source_total": job.source_total,
         "source_failed": source_failed,
-        "deadline_ms": crate::req::search_budget().as_millis() as u64,
+        "deadline_ms": job.total_budget.as_millis() as u64,
+        "scope": &job.scope,
+        "coverage": &job.coverage,
+        "curated_total": job.curated_total,
         // 冷却统计随 job 固化，轮询期间不会变化
         "skipped_cooldown": job.skipped_cooldown,
         "cooldown_total": job.cooldown_total,
@@ -2486,6 +2560,11 @@ mod tests {
             source_total: 2,
             skipped_cooldown: 0,
             cooldown_total: 0,
+            scope: "curated".into(),
+            coverage: "curated".into(),
+            curated_total: 0,
+            per_source_budget: Duration::from_secs(5),
+            total_budget: Duration::from_secs(6),
             state: Mutex::new(SearchJobState {
                 books: vec![a, b],
                 errors: vec![],
@@ -2522,6 +2601,11 @@ mod tests {
             source_total: pending,
             skipped_cooldown: 0,
             cooldown_total: 0,
+            scope: "curated".into(),
+            coverage: "curated".into(),
+            curated_total: 0,
+            per_source_budget: Duration::from_secs(5),
+            total_budget: Duration::from_secs(6),
             state: Mutex::new(SearchJobState {
                 pending,
                 ..Default::default()
@@ -2599,6 +2683,7 @@ mod tests {
             q: Some(" 剑来 ".into()),
             source_ids: None,
             include_cooled: None,
+            scope: None,
             page: None,
             page_size: None,
         };
@@ -2609,6 +2694,7 @@ mod tests {
             q: Some("剑来".into()),
             source_ids: None,
             include_cooled: None,
+            scope: None,
             page: None,
             page_size: None,
         };
@@ -2619,6 +2705,7 @@ mod tests {
             q: None,
             source_ids: None,
             include_cooled: None,
+            scope: None,
             page: None,
             page_size: None,
         };

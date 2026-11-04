@@ -37,6 +37,12 @@
   let finishedSources = 0;
   let pendingSources = 0;
   let deadlineMs = 0;
+  // 搜索范围回显（后端 /api/search/start 返回）
+  let strengthenSearch = false; // 勾选=加强搜索（scope=all，覆盖更多源）
+  let requestedScope = 'curated'; // 本次请求携带的 scope（用户意图）
+  let searchScope = 'curated'; // 后端实际使用的 scope
+  let searchCoverage = 'curated'; // curated / expanded
+  let curatedTotal = 0;
   let failedCount = 0;
   let failedSources = []; // [{ name, reason }]
   let resultsPage = 1; // 当前卡片实际对应的页码，过期时回退显示
@@ -101,6 +107,12 @@
       shelfIds = new Set((list || []).map((b) => b.book_id));
     } catch {
       /* 书架读取失败不影响搜索 */
+    }
+    try {
+      const c = await api.curatedSources();
+      curatedTotal = Number(c.curated_total) || 0;
+    } catch {
+      /* 未生成精选集时忽略，搜索会自动回退全部源 */
     }
   });
 
@@ -344,6 +356,10 @@
     finishedSources = 0;
     pendingSources = 0;
     deadlineMs = 0;
+    searchScope = strengthenSearch ? 'all' : 'curated';
+    requestedScope = searchScope;
+    searchCoverage = searchScope;
+    curatedTotal = 0;
     failedSources = [];
     failedCount = 0;
     pollFailures = 0;
@@ -358,11 +374,14 @@
     resultRequested = requestedIds.length;
     startSearchClock();
     try {
-      const r = await api.searchStart(q, requestedIds);
+      const r = await api.searchStart(q, requestedIds, requestedScope);
       if (seq !== jobSeq) return;
       jobId = String(r.job_id || '');
       if (!jobId) throw new Error('后端未返回 job_id');
       sourceTotal = Number(r.source_total) || 0;
+      searchScope = String(r.scope || searchScope);
+      searchCoverage = String(r.coverage || searchScope);
+      curatedTotal = Number(r.curated_total) || 0;
       requestSourceCount = Array.isArray(r.source_ids_requested) ? r.source_ids_requested.length : requestedIds.length;
       ignoredSourceIds = Array.isArray(r.ignored_source_ids) ? r.ignored_source_ids.map(String) : [];
       pendingSources = sourceTotal;
@@ -657,6 +676,11 @@
     <button on:click={doSearch} disabled={starting || (sourceScope === 'custom' && !pickedSourceIds.length)}>搜索</button>
   </div>
 
+  <label class="strengthen-toggle">
+    <input type="checkbox" bind:checked={strengthenSearch} />
+    <span>加强搜索（更慢，覆盖更多源）</span>
+  </label>
+
   {#if history.length}
     <div class="hist" aria-label="搜索历史">
       <div class="hist-head">
@@ -723,7 +747,11 @@
     {/if}
 
     <p class="muted scope-hint">
-      本次范围：{sourceScope === 'all' ? `全部启用源（${enabledSources.length} 个）` : `已选 ${pickedSourceIds.length} 个源`}
+      本次范围：{sourceScope === 'all'
+        ? strengthenSearch
+          ? `全部启用源（${enabledSources.length} 个）`
+          : `精选源${curatedTotal ? `（${curatedTotal} 个）` : ''}`
+        : `已选 ${pickedSourceIds.length} 个源`}
       {#if sourceScope === 'custom' && !pickedSourceIds.length}&nbsp;· 至少选 1 个才能搜索{/if}
     </p>
   </div>
@@ -840,8 +868,23 @@
       {:else if sourceTotal}
         &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
       {/if}
+      {#if requestedScope === 'curated'}
+        &nbsp;· {searchCoverage === 'curated' ? '精选源' : '精选为空，已回退全部源'}
+      {:else}
+        &nbsp;· 加强搜索（全部源）
+      {/if}
     </span>
   </div>
+{/if}
+
+{#if mode === 'search' && searchDone && total === 0}
+  {#if requestedScope === 'curated' && searchCoverage === 'curated'}
+    <p class="muted empty-hint">精选源没有结果，可勾选「加强搜索（更慢，覆盖更多源）」再试。</p>
+  {:else if requestedScope === 'curated'}
+    <p class="muted empty-hint">精选集尚未生成（或为空），已回退搜索全部源，仍无结果；可换个关键词再试。</p>
+  {:else}
+    <p class="muted empty-hint">没有找到结果，可换个关键词再试。</p>
+  {/if}
 {/if}
 
 {#if failedCount || failedSources.length}
@@ -928,6 +971,24 @@
   .scope-hint {
     margin: 6px 0 0;
     font-size: 12px;
+  }
+  /* 加强搜索：块级 + 行内元素，墨水屏友好 */
+  .strengthen-toggle {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted, #666);
+    cursor: pointer;
+  }
+  .strengthen-toggle input {
+    width: auto;
+    min-height: auto;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .empty-hint {
+    margin: 10px 0 0;
+    font-size: 13px;
   }
   .scope-report {
     margin: 8px 0;

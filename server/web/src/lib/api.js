@@ -379,18 +379,51 @@ export const api = {
   checkSourceUpdates: (list) =>
     request('POST', '/sources/check-updates', list, { timeout: 60000 }),
 
+  // ---- 体检语料 / 精选书源 ----
+  benchCorpus: () => request('GET', '/sources/bench/corpus'),
+  addBenchCorpus: (item) =>
+    request('POST', '/sources/bench/corpus', {
+      title: item.title,
+      expected_author: item.expectedAuthor || null,
+      category: item.category,
+      type: item.type,
+      enabled: item.enabled !== false,
+    }),
+  updateBenchCorpus: (id, item) =>
+    request('POST', '/sources/bench/corpus/update', {
+      id,
+      title: item.title,
+      expected_author: item.expectedAuthor || null,
+      category: item.category,
+      type: item.type,
+      enabled: item.enabled !== false,
+    }),
+  toggleBenchCorpus: (id, enabled) =>
+    request('POST', '/sources/bench/corpus/toggle', { id, enabled: !!enabled }),
+  deleteBenchCorpus: (id) =>
+    request('DELETE', `/sources/bench/corpus?id=${encodeURIComponent(id)}`),
+  runBench: (sourceIds = 'all', limit = 5) =>
+    request(
+      'POST',
+      '/sources/bench/run',
+      { source_ids: sourceIds, limit },
+      { timeout: 120000 }
+    ),
+  curatedSources: () => request('GET', '/sources/bench/curated'),
+
   // ---- discovery / reading ----
   search: (key, page = 1, pageSize = 30) =>
     request('GET', `/search?${query({ key, page, page_size: pageSize })}`),
   // 两段式搜索：job 轮询，books 先到先渲染
   // result 轮询已完成源；后端只读 key（不是 q），翻页复用同一 job_id
   // sourceIds 可传 book_source_url 或 /api/sources 排序后的 1-based 序号（逗号分隔）
-  searchStart: (key, sourceIds = []) =>
+  searchStart: (key, sourceIds = [], scope = 'curated') =>
     request(
       'GET',
       `/search/start?${query({
         key,
         source_ids: Array.isArray(sourceIds) && sourceIds.length ? sourceIds.join(',') : undefined,
+        scope,
       })}`,
       undefined,
       { timeout: 20000 }
