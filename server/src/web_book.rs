@@ -36,6 +36,153 @@ fn make_ar(source: &BookSource) -> AnalyzeRule {
     ar
 }
 
+// ---------------- 跨请求的 book 层状态（变量 + cache） ----------------
+//
+// Legado 的 `@put`/`cache.put` 落在 Book 对象上，同书的 info→toc→content 共享；
+// 本服务是纯函数管线，因此由编排层（本模块）在请求开始时按 `book_key` 预载，
+// 请求结束时把快照交给路由层落库。存储实现（SQLite）在 `routes/books.rs`。
+
+use sha2::{Digest, Sha256};
+use std::sync::Mutex;
+
+/// `book_key = sha256(source_url + '\n' + book_url)`：不把原始长 URL 当主键。
+pub fn book_key(source: &BookSource, book_url: &str) -> String {
+    let origin = source.book_source_url.trim().trim_end_matches('/');
+    let url = book_url.trim().trim_end_matches('/');
+    let mut h = Sha256::new();
+    h.update(format!("{origin}\n{url}").as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+#[derive(Default)]
+struct StoreInner {
+    /// 请求开始时的持久化快照（用于 diff 出增量）
+    seed_vars: HashMap<String, HashMap<String, String>>,
+    seed_cache: HashMap<String, HashMap<String, String>>,
+    /// 请求结束时的快照
+    cur_vars: HashMap<String, HashMap<String, String>>,
+    cur_cache: HashMap<String, HashMap<String, String>>,
+}
+
+/// 一本书在两次请求之间的增量：变量全量快照（None 表示无变化）+ cache 增删。
+pub struct BookChange {
+    pub key: String,
+    pub vars: Option<HashMap<String, String>>,
+    pub cache_upserts: Vec<(String, String)>,
+    pub cache_deletes: Vec<String>,
+}
+
+/// 请求级的 book 状态容器（可跨并发任务共享）。
+#[derive(Default)]
+pub struct BookStore {
+    inner: Mutex<StoreInner>,
+}
+
+impl BookStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 预载某本书的持久化状态（缺失时为两个空 map）。
+    pub fn seed(&self, key: String, vars: HashMap<String, String>, cache: HashMap<String, String>) {
+        let mut g = self.inner.lock().unwrap();
+        g.seed_vars.insert(key.clone(), vars);
+        g.seed_cache.insert(key, cache);
+    }
+
+    pub fn vars(&self, key: &str) -> HashMap<String, String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .seed_vars
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn cache(&self, key: &str) -> HashMap<String, String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .seed_cache
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 记录某本书本次请求结束后的完整快照。
+    pub fn record(&self, key: String, vars: HashMap<String, String>, cache: HashMap<String, String>) {
+        let mut g = self.inner.lock().unwrap();
+        g.cur_vars.insert(key.clone(), vars);
+        g.cur_cache.insert(key, cache);
+    }
+
+    /// 取走自上次调用以来的增量（并发任务安全：每本书只由记录它的任务消费一次）。
+    pub fn take_changes(&self) -> Vec<BookChange> {
+        let mut g = self.inner.lock().unwrap();
+        let keys: HashSet<String> = g.cur_vars.keys().chain(g.cur_cache.keys()).cloned().collect();
+        let mut out = Vec::new();
+        for key in keys {
+            let cur_vars = g.cur_vars.remove(&key).unwrap_or_default();
+            let cur_cache = g.cur_cache.remove(&key).unwrap_or_default();
+            let seed_vars = g.seed_vars.get(&key).cloned().unwrap_or_default();
+            let seed_cache = g.seed_cache.get(&key).cloned().unwrap_or_default();
+            if cur_vars.is_empty() && cur_cache.is_empty() && seed_vars.is_empty() {
+                continue;
+            }
+            let vars = if !cur_vars.is_empty() && cur_vars != seed_vars {
+                Some(cur_vars.clone())
+            } else {
+                None
+            };
+            let mut cache_upserts = Vec::new();
+            for (k, v) in &cur_cache {
+                if seed_cache.get(k) != Some(v) {
+                    cache_upserts.push((k.clone(), v.clone()));
+                }
+            }
+            let cache_deletes: Vec<String> = seed_cache
+                .keys()
+                .filter(|k| !cur_cache.contains_key(*k))
+                .cloned()
+                .collect();
+            if vars.is_some() || !cache_upserts.is_empty() || !cache_deletes.is_empty() {
+                out.push(BookChange {
+                    key: key.clone(),
+                    vars,
+                    cache_upserts,
+                    cache_deletes,
+                });
+            }
+            // 已落库的状态成为新的基线，避免同一请求内重复写
+            g.seed_vars.insert(key.clone(), cur_vars);
+            g.seed_cache.insert(key, cur_cache);
+        }
+        out
+    }
+}
+
+/// 按 `book_url` 创建带 book 作用域的 AnalyzeRule（空 URL 时退化为普通请求作用域）。
+fn make_ar_book(source: &BookSource, store: Option<&BookStore>, book_url: &str) -> AnalyzeRule {
+    let ar = make_ar(source);
+    if let Some(st) = store {
+        if !book_url.trim().is_empty() {
+            let key = book_key(source, book_url);
+            ar.begin_book_scope(key.clone(), st.vars(&key), st.cache(&key));
+        }
+    }
+    ar
+}
+
+/// 把 AnalyzeRule 的 book 层变量/cache 快照登记到 store，等待落库。
+fn record_ar(ar: &AnalyzeRule, store: Option<&BookStore>) {
+    if let Some(st) = store {
+        if let Some(key) = ar.book_scope_key() {
+            st.record(key, ar.book_vars_snapshot(), ar.cache_snapshot());
+        }
+    }
+}
+
 /// 规则未命中时 JsonPath/JS 可能返回字面量 `"null"`/`"None"`/`"undefined"`。
 /// 这些值不是 URL，若不拦截会拼出 `/toc/null` 并重复追加同一目录（验收 P1）。
 fn blank_value(s: &str) -> bool {
@@ -258,6 +405,16 @@ fn type_token(t: i64) -> &'static str {
 }
 
 pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result<Vec<SearchBook>> {
+    search_book(source, key, page, None).await
+}
+
+/// 带 book 作用域的搜索：每条结果的 `@put`（如爱看的 `bid`）按 book_key 落库。
+pub async fn search_book(
+    source: &BookSource,
+    key: &str,
+    page: i32,
+    store: Option<&BookStore>,
+) -> anyhow::Result<Vec<SearchBook>> {
     let rule: &SearchRule = match &source.rule_search {
         Some(r) => r,
         None => return Ok(vec![]),
@@ -286,7 +443,12 @@ pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result
             continue;
         }
         let book_url = abs(&url, &book_url);
-        let mut sb = SearchBook {
+        // 每条结果独立作用域：先把上一条的 @put 落库，再按本书 book_key 预载。
+        if let Some(st) = store {
+            let kb = book_key(source, &book_url);
+            ar.begin_book_scope(kb.clone(), st.vars(&kb), st.cache(&kb));
+        }
+        let sb = SearchBook {
             book_url,
             origin: Some(source.book_source_url.clone()),
             origin_name: Some(source.book_source_name.clone()),
@@ -299,6 +461,7 @@ pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result
             latest_chapter_title: opt(&ar, &item, &rule.last_chapter, &url),
             ..Default::default()
         };
+        record_ar(&ar, store);
         books.push(sb);
     }
     Ok(books)
@@ -346,6 +509,15 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
 
 // ---------------- 书籍详情 ----------------
 pub async fn book_info(source: &BookSource, book: &mut Book) -> anyhow::Result<()> {
+    book_info_book(source, book, None).await
+}
+
+/// 带 book 作用域的详情：预载同书变量（如搜索阶段写入的 `bid`），结束后回写。
+pub async fn book_info_book(
+    source: &BookSource,
+    book: &mut Book,
+    store: Option<&BookStore>,
+) -> anyhow::Result<()> {
     let rule: &BookInfoRule = match &source.rule_book_info {
         Some(r) => r,
         None => return Ok(()),
@@ -353,19 +525,34 @@ pub async fn book_info(source: &BookSource, book: &mut Book) -> anyhow::Result<(
     let url = book.book_url.clone();
     let headers = req::source_headers(source, &url);
     let html = req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
-    let ar = make_ar(source);
+    let ar = make_ar_book(source, store, &url);
+    // `init` 的返回值在 Legado 里就是后续详情规则的输入内容（快看用它把
+    // `__NUXT__` JSON 设为当前文档，name 等规则再在 JSON 上求值）。
+    let mut content = html.clone();
     if let Some(init) = &rule.init {
-        let _ = ar.get_string(&html, init, false, &url);
+        if let Ok(init_out) = ar.get_string(&html, init, false, &url) {
+            let t = init_out.trim();
+            if !t.is_empty() && t != "null" && t != "undefined" {
+                content = init_out;
+            }
+        }
     }
     // Legado 语义：详情规则为空或未命中时**保留调用方带入的值**（搜索/书架已有
     // name/author），不能写成 null。错层小说网的 name/author/intro 规则就是空串。
-    assign_opt(&mut book.name, &ar, &html, &rule.name, &url);
-    assign_opt(&mut book.author, &ar, &html, &rule.author, &url);
-    assign_opt(&mut book.intro, &ar, &html, &rule.intro, &url);
-    assign_opt(&mut book.cover_url, &ar, &html, &rule.cover_url, &url);
-    assign_opt(&mut book.kind, &ar, &html, &rule.kind, &url);
-    assign_opt(&mut book.latest_chapter_title, &ar, &html, &rule.last_chapter, &url);
-    let toc_url = ar.get_string(&html, rule.toc_url.as_deref().unwrap_or(""), true, &url)?;
+    assign_opt(&mut book.name, &ar, &content, &rule.name, &url);
+    assign_opt(&mut book.author, &ar, &content, &rule.author, &url);
+    assign_opt(&mut book.intro, &ar, &content, &rule.intro, &url);
+    assign_opt(&mut book.cover_url, &ar, &content, &rule.cover_url, &url);
+    assign_opt(&mut book.kind, &ar, &content, &rule.kind, &url);
+    assign_opt(
+        &mut book.latest_chapter_title,
+        &ar,
+        &content,
+        &rule.last_chapter,
+        &url,
+    );
+    let toc_url = ar.get_string(&content, rule.toc_url.as_deref().unwrap_or(""), true, &url)?;
+    record_ar(&ar, store);
     // Legado 的 tocUrl 常直接写死绝对 URL（不是选择器），此时规则引擎会落空，需原样使用
     let literal = rule.toc_url.as_deref().map(str::trim).unwrap_or("");
     let toc_url = if toc_url.trim().is_empty()
@@ -422,6 +609,16 @@ fn next_toc_urls(
 
 // ---------------- 目录 ----------------
 pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Vec<BookChapter>> {
+    chapter_list_book(source, book, None).await
+}
+
+/// 带 book 作用域的目录：预载同书变量与 cache（快看目录要从 info 阶段缓存的
+/// `kkmh` 里 `java.setContent` 解析章节；爱看要用搜索阶段写的 `bid`）。
+pub async fn chapter_list_book(
+    source: &BookSource,
+    book: &Book,
+    store: Option<&BookStore>,
+) -> anyhow::Result<Vec<BookChapter>> {
     let rule: &TocRule = match &source.rule_toc {
         Some(r) => r,
         None => return Ok(vec![]),
@@ -436,7 +633,7 @@ pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Ve
     url = url
         .replace("{{page}}", "1")
         .replace("${page}", "1");
-    let ar = make_ar(source);
+    let ar = make_ar_book(source, store, &book.book_url);
     let mut chaps = Vec::new();
     let mut seen = HashSet::new();
     let mut queue: std::collections::VecDeque<(String, i32)> = std::collections::VecDeque::new();
@@ -503,6 +700,7 @@ pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Ve
             }
         }
     }
+    record_ar(&ar, store);
     Ok(chaps)
 }
 
@@ -547,15 +745,26 @@ pub async fn chapter_content(
     source: &BookSource,
     chapter: &BookChapter,
 ) -> anyhow::Result<BookContent> {
+    chapter_content_book(source, chapter, None).await
+}
+
+/// 带 book 作用域的正文（正文规则里的 `@get` 变量按同书预载）。
+pub async fn chapter_content_book(
+    source: &BookSource,
+    chapter: &BookChapter,
+    store: Option<&BookStore>,
+) -> anyhow::Result<BookContent> {
     let rule: &ContentRule = match &source.rule_content {
         Some(r) => r,
         None => return Ok(BookContent::default()),
     };
     let pages = fetch_html_pages(source, chapter, rule).await?;
+    let book_url = chapter.book_url.clone().unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     for (page_url, html) in &pages {
-        let ar = make_ar(source);
+        let ar = make_ar_book(source, store, &book_url);
         let part = ar.get_string(html, rule.content.as_deref().unwrap_or(""), false, page_url)?;
+        record_ar(&ar, store);
         parts.push(part);
     }
     // 书源自带的净化规则：先 sourceRegex（源清洗）再 replaceRegex（可读性替换）
@@ -809,6 +1018,15 @@ pub async fn chapter_images(
     source: &BookSource,
     chapter: &BookChapter,
 ) -> anyhow::Result<ChapterImages> {
+    chapter_images_book(source, chapter, None).await
+}
+
+/// 带 book 作用域的图片章节（正文规则里的变量/cache 按同书预载）。
+pub async fn chapter_images_book(
+    source: &BookSource,
+    chapter: &BookChapter,
+    store: Option<&BookStore>,
+) -> anyhow::Result<ChapterImages> {
     let rule: &ContentRule = match &source.rule_content {
         Some(r) => r,
         None => return Ok(ChapterImages::default()),
@@ -819,11 +1037,13 @@ pub async fn chapter_images(
         return Ok(ChapterImages::default());
     }
     let pages = fetch_html_pages(source, chapter, rule).await?;
+    let book_url = chapter.book_url.clone().unwrap_or_default();
     let mut per_page: Vec<(String, Vec<RawImage>)> = Vec::new();
     for (page_url, html) in &pages {
         // 规则本身可能直接产出多条（CSS 列表 / JS 数组），逐条归一
-        let ar = make_ar(source);
+        let ar = make_ar_book(source, store, &book_url);
         let values = ar.get_string_list_all(html, content_rule, page_url);
+        record_ar(&ar, store);
 
         let mut raws: Vec<RawImage> = if values.is_empty() {
             Vec::new()
@@ -833,6 +1053,7 @@ pub async fn chapter_images(
                 .flat_map(|v| images_from_value(v))
                 .collect()
         };
+        tracing::debug!(page_url = %page_url, values = values.len(), raws = raws.len(), "image page extracted");
         // 兼容 `class.ComicPics@img@html`：`@html` 在图片节点上是空的内层 HTML，
         // 换成 `@all`（outer HTML）再解析 `<img src>`；只在原规则零结果时兜底。
         if raws.is_empty() {
