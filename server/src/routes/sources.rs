@@ -148,6 +148,8 @@ pub async fn list(
                         .unwrap_or_else(|| crate::source_quality::TIER_OBSERVING.to_string()),
                     score: h.map(|h| h.score).unwrap_or(50),
                     last_eval_at: h.and_then(|h| h.last_eval_at),
+                    login_required: crate::entities::requires_login(&x),
+                    searchable,
                     book_source_url: x.book_source_url,
                     book_source_name: x.book_source_name,
                     enabled: x.enabled,
@@ -157,7 +159,6 @@ pub async fn list(
                     book_source_type: x.book_source_type,
                     type_name: crate::entities::source_type_name(x.book_source_type).to_string(),
                     unsupported_type: x.unsupported_type,
-                    searchable,
                 }
             })
             .collect(),
@@ -310,11 +311,12 @@ impl ProbeQ {
     }
 }
 
-/// 只有“支持的类型 + 有搜索规则与搜索地址”的源才能做搜索体检。
+/// 只有“支持的类型 + 有搜索规则与搜索地址 + 不要求登录”的源才能做搜索体检。
 fn is_probeable(src: &BookSource) -> bool {
     crate::entities::is_supported_source_type(src.book_source_type)
         && src.rule_search.is_some()
         && src.search_url.is_some()
+        && !crate::entities::requires_login(src)
 }
 
 /// 导入/单条保存后的体检：逐条结果 + 汇总。失败源**不会自动禁用**，
@@ -432,14 +434,17 @@ pub async fn upsert(
     let mut src = normalize_source(body)?;
     prepare_import(&mut src);
     store_source(&s.shared, &src).await?;
+    let login_required = crate::entities::requires_login(&src);
     let mut out = json!({
         "ok": true,
         "type": src.book_source_type,
         "type_name": crate::entities::source_type_name(src.book_source_type),
         "unsupported_type": src.unsupported_type,
         "enabled": src.enabled,
+        "login_required": login_required,
+        "searchable": crate::entities::is_searchable_source(&src),
     });
-    if pq.on() {
+    if pq.on() && !login_required {
         let (results, summary) = probe_report(
             &s.shared,
             &s.cfg,
@@ -540,6 +545,10 @@ pub async fn import(
     let mut targets: Vec<BookSource> = Vec::new();
     if !probe_disabled {
         for src in &list {
+            // 需登录源：远端搜索必然不可用，不做无意义的探测，也不进搜索池。
+            if crate::entities::requires_login(src) {
+                continue;
+            }
             let url = &src.book_source_url;
             let existing = existing_map.get(url);
             let quarantined = states.get(url).map(|st| st.is_quarantined()).unwrap_or(false);
@@ -575,6 +584,33 @@ pub async fn import(
         tracing::warn!(error = %e, "record import probe health failed");
     }
     let health_after = source_health::load_map(&s.shared).await.unwrap_or_default();
+    // 导入期的“未知失败”（超时/连接失败）不作为隔离依据：保留健康事件与失败计数，
+    // 但未达既有硬阈值前把 tier 拉回 observing，避免新用户导入后立刻搜不到。
+    let transient_probe_urls: std::collections::HashSet<String> = probes
+        .iter()
+        .filter(|p| p.probed && p.status == source_health::STATUS_FAIL)
+        .filter(|p| !source_health::is_explicit_site_rejection(p.error.as_deref()))
+        .filter(|p| {
+            health_after
+                .get(&p.source_url)
+                .map(|h| {
+                    h.consecutive_failures < source_health::FAIL_THRESHOLD
+                        && h.fail_site_count < source_health::FAIL_THRESHOLD
+                })
+                .unwrap_or(true)
+        })
+        .map(|p| p.source_url.clone())
+        .collect();
+    let mut health_after = health_after;
+    if !transient_probe_urls.is_empty() {
+        let urls: Vec<String> = transient_probe_urls.iter().cloned().collect();
+        if let Err(e) =
+            source_health::keep_observing_after_transient_probe(&s.shared, &urls).await
+        {
+            tracing::warn!(error = %e, "keep observing after transient import probe failed");
+        }
+        health_after = source_health::load_map(&s.shared).await.unwrap_or_default();
+    }
     let probe_map: std::collections::HashMap<String, source_health::Probe> = probes
         .into_iter()
         .map(|p| (p.source_url.clone(), p))
@@ -584,6 +620,7 @@ pub async fn import(
     let mut results: Vec<Value> = Vec::with_capacity(list.len());
     let (mut added, mut updated, mut unchanged, mut update_rejected, mut conflict, mut resurrected) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut skipped_login_required = 0usize;
     let mut newly_quarantined = 0usize;
     let mut probed_count = 0usize;
     let mut probe_ok = 0usize;
@@ -611,32 +648,36 @@ pub async fn import(
 
         let probe = probe_map.get(&url);
         let probed = probe.map(|p| p.probed).unwrap_or(false);
+        let login_required = crate::entities::requires_login(src);
         let probe_status = match probe {
             Some(p) if p.probed => p.status,
             _ => source_health::STATUS_NEVER,
         };
         let historical = health_after.get(&url).map(|h| h.last_status.as_str());
+        let import_probe_unknown = transient_probe_urls.contains(&url);
         let engine_limited = probe_status == source_health::STATUS_PARTIAL
             || (!probed && historical == Some(source_health::STATUS_PARTIAL));
 
         // ---- 同一条流水线：规则完整度 + 本次体检连通性 + 既有成功侧统计 → tier/score ----
         let tier_cfg = crate::source_quality::TierConfig::from_config(&s.cfg);
         let rule_complete = crate::source_quality::rule_completeness(src);
-        let incoming_network = if probed {
+        let incoming_network = if probed && !import_probe_unknown {
             source_quality::Network::from_status(probe_status, true)
         } else {
             source_quality::Network::Skipped
         };
         let revive = was_quarantined && probed && probe_status != source_health::STATUS_FAIL;
+        // 未知失败按 observing 评估：不因导入期的超时/连接失败降级或隔离。
+        let tier_override = if revive || import_probe_unknown {
+            Some(source_quality::TIER_OBSERVING)
+        } else {
+            None
+        };
         let incoming_eval = source_health::evaluate_source(
             health_after.get(&url),
             rule_complete,
             incoming_network,
-            if revive {
-                Some(source_quality::TIER_OBSERVING)
-            } else {
-                None
-            },
+            tier_override,
             &tier_cfg,
         );
         let local_score = health_before.get(&url).map(|h| h.score).unwrap_or(50);
@@ -648,14 +689,29 @@ pub async fn import(
         let mut category = "unchanged";
         let mut reason: Option<String> = None;
 
-        if local_modified && changed && !force {
+        if login_required {
+            // 导入管线内的登录墙判定：不探测、不进入可搜索池；仍保留/更新定义，不改写 enabled。
+            if local_modified && changed && !force {
+                accepted = false;
+                category = "conflict";
+                reason = Some("本地规则与账本快照不一致，已保留本地版本".into());
+            } else {
+                category = "skipped_login_required";
+                reason = Some(
+                    "login_required: 规则声明需登录（loginUrl/loginUi/loginCheckJs），已跳过搜索/体检"
+                        .into(),
+                );
+            }
+        } else if local_modified && changed && !force {
             // 人工改过的本地规则优先：不自动覆盖，等待确认
             accepted = false;
             category = "conflict";
             reason = Some("本地规则与账本快照不一致，已保留本地版本".into());
         } else if existing.is_none() {
             category = "added";
-            decision = if probed && probe_status == source_health::STATUS_FAIL
+            decision = if probed
+                && probe_status == source_health::STATUS_FAIL
+                && !import_probe_unknown
                 && !engine_limited
             {
                 source_ledger::DECISION_QUARANTINED.to_string()
@@ -664,7 +720,10 @@ pub async fn import(
             };
         } else if changed {
             if force {
-                decision = if probe_status == source_health::STATUS_FAIL && !engine_limited {
+                decision = if probe_status == source_health::STATUS_FAIL
+                    && !import_probe_unknown
+                    && !engine_limited
+                {
                     source_ledger::DECISION_QUARANTINED.to_string()
                 } else {
                     source_ledger::DECISION_ACTIVE.to_string()
@@ -681,6 +740,7 @@ pub async fn import(
                 category = "update_rejected";
                 reason = Some("新版体检未完成，暂不覆盖本地版本".into());
             } else if probe_status == source_health::STATUS_FAIL
+                && !import_probe_unknown
                 && !engine_limited
                 && local_still_usable(existing, state, health_before.get(&url))
             {
@@ -705,7 +765,10 @@ pub async fn import(
                 category = "unchanged";
                 reason = Some("本地版本不旧于上游，保留本地版本".into());
             } else {
-                decision = if probe_status == source_health::STATUS_FAIL && !engine_limited {
+                decision = if probe_status == source_health::STATUS_FAIL
+                    && !import_probe_unknown
+                    && !engine_limited
+                {
                     source_ledger::DECISION_QUARANTINED.to_string()
                 } else {
                     source_ledger::DECISION_ACTIVE.to_string()
@@ -748,6 +811,8 @@ pub async fn import(
         }
         if final_eval.tier == source_quality::TIER_QUARANTINED
             && decision == source_ledger::DECISION_ACTIVE
+            && !login_required
+            && !import_probe_unknown
         {
             decision = source_ledger::DECISION_QUARANTINED.to_string();
             if reason.is_none() {
@@ -780,6 +845,12 @@ pub async fn import(
         }
 
         let mut stored = src.clone();
+        if login_required {
+            // 登录墙只影响“能否搜索”，不得顺带改写用户的启停列。
+            if let Some(e) = existing {
+                stored.enabled = e.enabled;
+            }
+        }
         if decision == source_ledger::DECISION_QUARANTINED {
             // 隔离源不仅要有 ledger decision，还必须 enabled=0，避免任何旧路径把它带进搜索。
             stored.enabled = false;
@@ -852,6 +923,7 @@ pub async fn import(
             "update_rejected" => update_rejected += 1,
             "conflict" => conflict += 1,
             "resurrected" => resurrected += 1,
+            "skipped_login_required" => skipped_login_required += 1,
             _ => unchanged += 1,
         }
         if probed {
@@ -911,6 +983,8 @@ pub async fn import(
             "decision": decision,
             "category": category,
             "reason": reason,
+            "login_required": login_required,
+            "searchable": crate::entities::is_searchable_source(&stored),
             "tier": final_eval.tier,
             "score": final_eval.score,
             "reasons": final_eval.reasons,
@@ -941,6 +1015,7 @@ pub async fn import(
         "tier_preferred": tier_preferred,
         "tier_observing": tier_observing,
         "tier_quarantined": tier_quarantined,
+        "skipped_login_required": skipped_login_required,
     });
     let probe_summary_str = serde_json::to_string(&probe_summary).ok();
     source_ledger::record_batch(
@@ -973,6 +1048,7 @@ pub async fn import(
         "update_rejected": update_rejected,
         "conflict": conflict,
         "resurrected": resurrected,
+        "skipped_login_required": skipped_login_required,
         "local_only": local_only.len(),
         "local_only_urls": local_only,
         "newly_quarantined": newly_quarantined,
@@ -2101,15 +2177,10 @@ mod tests {
             .unwrap()
             .enabled);
 
-        // 与 search_start 相同的准入条件：source_total 只数启用源。
+        // 与 search_start 相同的准入条件：source_total 只数可搜索源。
         let eligible: Vec<BookSource> = loaded
             .iter()
-            .filter(|x| {
-                x.enabled
-                    && crate::entities::is_supported_source_type(x.book_source_type)
-                    && x.rule_search.is_some()
-                    && x.search_url.is_some()
-            })
+            .filter(|x| crate::entities::is_searchable_source(x))
             .cloned()
             .collect();
         assert_eq!(eligible.len(), 1, "source_total 不应包含停用源");
@@ -2126,6 +2197,120 @@ mod tests {
         assert!(
             out.errors.iter().all(|e| e.source != "https://off.example.com"),
             "停用源出现在搜索结果 origin 中"
+        );
+    }
+
+    /// 导入路径测试用库：真实 shared 迁移 + 空库，不依赖任何“现有源规模/已知源名”。
+    async fn import_test_state() -> AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations/shared")
+            .run(&pool)
+            .await
+            .unwrap();
+        AppState {
+            shared: pool,
+            cfg: crate::config::Config::from_env(),
+            user_pools: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_marks_login_source_skipped_and_load_derives_searchability() {
+        let s = import_test_state().await;
+        let admin = AuthUser {
+            id: 1,
+            username: "admin".into(),
+            role: "admin".into(),
+        };
+        // 空库起点 + 一次导入 1 个需登录源 + 1 个正常源；关闭探测避免外连。
+        let body = json!([
+            {
+                "bookSourceUrl": "https://login.example",
+                "bookSourceName": "登录源",
+                "loginUrl": "https://login.example/login",
+                "searchUrl": "https://login.example/search?q={key}",
+                "ruleSearch": {"bookList": ".b"}
+            },
+            {
+                "bookSourceUrl": "https://open.example",
+                "bookSourceName": "开放源",
+                "searchUrl": "https://open.example/search?q={key}",
+                "ruleSearch": {"bookList": ".b"}
+            }
+        ]);
+        let q = ProbeQ {
+            probe: Some("0".into()),
+            ..Default::default()
+        };
+        let Json(out) = import(State(s.clone()), admin, Query(q), Json(body))
+            .await
+            .unwrap();
+
+        assert_eq!(out["skipped_login_required"], 1);
+        let results = out["probe_results"].as_array().unwrap();
+        let login = results
+            .iter()
+            .find(|r| r["book_source_url"] == "https://login.example")
+            .unwrap();
+        assert_eq!(login["category"], "skipped_login_required");
+        assert_eq!(login["login_required"], true);
+        assert_eq!(login["searchable"], false);
+        let open = results
+            .iter()
+            .find(|r| r["book_source_url"] == "https://open.example")
+            .unwrap();
+        assert_eq!(open["login_required"], false);
+        assert_eq!(open["searchable"], true);
+
+        // 导入台账必须留下明确原因（不是只靠内存标记）。
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT reason FROM import_items WHERE source_url = ?1")
+                .bind("https://login.example")
+                .fetch_one(&s.shared)
+                .await
+                .unwrap();
+        assert!(
+            reason.unwrap_or_default().starts_with("skipped_login_required"),
+            "台账原因缺失或口径不一致"
+        );
+
+        // 加载路径同口径派生，且 enabled 列未被登录判定改写。
+        let loaded = load_sources(&s.shared).await.unwrap();
+        let login_loaded = loaded
+            .iter()
+            .find(|x| x.book_source_url == "https://login.example")
+            .unwrap();
+        assert!(login_loaded.enabled, "登录判定不得改写 enabled");
+        assert!(crate::entities::requires_login(login_loaded));
+        assert!(!crate::entities::is_searchable_source(login_loaded));
+        let open_loaded = loaded
+            .iter()
+            .find(|x| x.book_source_url == "https://open.example")
+            .unwrap();
+        assert!(crate::entities::is_searchable_source(open_loaded));
+
+        // 编辑规则去掉 loginUrl：不落库修复，下一次加载自动恢复可搜索。
+        let mut edited = login_loaded.clone();
+        edited.login_url = None;
+        sqlx::query("UPDATE book_sources SET rules = ?1, content = ?1 WHERE id = ?2")
+            .bind(serde_json::to_string(&edited).unwrap())
+            .bind("https://login.example")
+            .execute(&s.shared)
+            .await
+            .unwrap();
+        let reloaded = load_sources(&s.shared).await.unwrap();
+        let restored = reloaded
+            .iter()
+            .find(|x| x.book_source_url == "https://login.example")
+            .unwrap();
+        assert!(!crate::entities::requires_login(restored));
+        assert!(
+            crate::entities::is_searchable_source(restored),
+            "去掉登录字段后应在加载时自动回到可搜索池"
         );
     }
 }

@@ -132,7 +132,11 @@
     }
     return true;
   });
-  $: allSelected = filtered.length > 0 && filtered.every((s) => selected.has(s.book_source_url));
+  // 可搜索计数由后端 `searchable` 派生（enabled + 类型 + 搜索规则 + 非登录源）
+  $: searchableCount = sources.filter((s) => s.searchable).length;
+  // 全选只作用于可参与搜索的源；需登录源仍可见可编辑，但不进批量选择
+  $: selectable = filtered.filter((s) => !s.login_required);
+  $: allSelected = selectable.length > 0 && selectable.every((s) => selected.has(s.book_source_url));
 
   function toggleSelect(url) {
     const next = new Set(selected);
@@ -141,8 +145,8 @@
   }
   function toggleSelectAll() {
     selected = allSelected
-      ? new Set([...selected].filter((u) => !filtered.some((s) => s.book_source_url === u)))
-      : new Set([...selected, ...filtered.map((s) => s.book_source_url)]);
+      ? new Set([...selected].filter((u) => !selectable.some((s) => s.book_source_url === u)))
+      : new Set([...selected, ...selectable.map((s) => s.book_source_url)]);
   }
   function clearSelection() {
     selected = new Set();
@@ -592,7 +596,7 @@
 <div class="row" style="margin-bottom:10px">
   <h2 style="margin:0">书源管理</h2>
   <div class="spacer"></div>
-  <span class="muted" style="font-size:12px">{sources.length} 个书源</span>
+  <span class="muted" style="font-size:12px">{sources.length} 个书源 · 可搜索 {searchableCount}</span>
 </div>
 
 {#if !isAdmin}
@@ -808,6 +812,7 @@
               {#if s.book_source_group}<span class="badge">{s.book_source_group}</span>{/if}
               {#if s.type_name || s.type}<span class="badge">类型 {s.type_name || s.type}</span>{/if}
               <span class="badge" class:badge-off={!s.enabled}>{s.enabled ? '启用' : '禁用'}</span>
+              {#if s.login_required}<span class="badge">需登录·已跳过</span>{/if}
               <span class="badge tier-badge tier-{sourceTier(s)}">{tierText(sourceTier(s))}</span>
               {#if s.weight}<span class="badge">权重 {s.weight}</span>{/if}
             </div>

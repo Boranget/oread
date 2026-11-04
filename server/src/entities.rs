@@ -440,6 +440,30 @@ pub fn is_supported_source_type(t: i64) -> bool {
     matches!(t, 0 | 2)
 }
 
+/// 书源是否声明“需要登录”才能使用。
+///
+/// 口径（Legado 契约）：`loginUrl` / `loginUi` / `loginCheckJs` 任一非空即视为需登录。
+/// 判定完全来自规则 JSON，不落库、不改 `enabled`；规则被编辑后下一次加载自动重算。
+/// 导入管线与加载路径都调用本函数，保证只有一套口径。
+pub fn requires_login(src: &BookSource) -> bool {
+    [&src.login_url, &src.login_ui, &src.login_check_js]
+        .into_iter()
+        .flatten()
+        .any(|v| !v.trim().is_empty())
+}
+
+/// 可搜索源的唯一运行时口径（与书源规模无关，空库/单源同样适用）：
+/// 启用 + 支持的类型 + 搜索规则与搜索地址齐全 + 不要求登录。
+///
+/// 注意：隔离区与冷却由调用方按数据库状态另行过滤；本函数只做规则层的静态判定。
+pub fn is_searchable_source(src: &BookSource) -> bool {
+    src.enabled
+        && is_supported_source_type(src.book_source_type)
+        && src.rule_search.is_some()
+        && src.search_url.is_some()
+        && !requires_login(src)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +488,70 @@ mod tests {
         let json2 = r#"{"book_source_url":"https://x","book_source_name":"n"}"#;
         let s2: BookSource = serde_json::from_str(json2).unwrap();
         assert_eq!(s2.book_source_type, 0, "缺失按 0（小说）");
+    }
+
+    fn searchable_base() -> BookSource {
+        BookSource {
+            book_source_url: "https://x.example".into(),
+            book_source_name: "x".into(),
+            enabled: true,
+            search_url: Some("https://x.example/search?q={key}".into()),
+            rule_search: Some(SearchRule {
+                book_list: Some(".book".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn login_fields_make_source_unsearchable() {
+        // 任一登录字段非空 -> 判否；enabled 保持不变
+        for set in [
+            (|s: &mut BookSource| s.login_url = Some("https://x.example/login".into())) as fn(&mut BookSource),
+            |s: &mut BookSource| s.login_ui = Some("账号:${account}".into()),
+            |s: &mut BookSource| s.login_check_js = Some("cookie.getCookie('token')".into()),
+        ] {
+            let mut src = searchable_base();
+            set(&mut src);
+            assert!(requires_login(&src));
+            assert!(!is_searchable_source(&src));
+            assert!(src.enabled, "登录判定不得改写 enabled");
+        }
+    }
+
+    #[test]
+    fn source_without_login_fields_stays_searchable() {
+        let src = searchable_base();
+        assert!(!requires_login(&src));
+        assert!(is_searchable_source(&src));
+    }
+
+    #[test]
+    fn blank_login_fields_are_ignored() {
+        let mut src = searchable_base();
+        src.login_url = Some("   ".into());
+        src.login_ui = Some(String::new());
+        src.login_check_js = Some("\n\t".into());
+        assert!(!requires_login(&src), "空白登录字段不应误判");
+        assert!(is_searchable_source(&src));
+    }
+
+    #[test]
+    fn removing_login_field_restores_searchability() {
+        // 模拟用户编辑规则去掉 loginUrl：下一次加载重新派生即可恢复可搜索，无需数据修复。
+        let mut src = searchable_base();
+        src.login_url = Some("https://x.example/login".into());
+        assert!(!is_searchable_source(&src));
+        src.login_url = None;
+        assert!(is_searchable_source(&src));
+    }
+
+    #[test]
+    fn disabled_source_is_not_searchable() {
+        let mut src = searchable_base();
+        src.enabled = false;
+        assert!(!is_searchable_source(&src));
     }
 }
 

@@ -153,7 +153,7 @@ pub struct Config {
     /// 精选数量下限 / 上限（默认 8 / 14）
     pub source_bench_min: usize,
     pub source_bench_max: usize,
-    /// 漫画精选单独下限 / 上限（默认 3 / 14）：漫画源数量少，与小说共用 min=8 会长期选不出
+    /// 漫画精选单独下限 / 上限（默认 3 / 14）：按语料类型单独配额，避免与小说共用 min 时该类长期选不满
     pub source_bench_comic_min: usize,
     pub source_bench_comic_max: usize,
     /// 精选自动重算间隔（小时，默认 72）：过期后下一次搜索会后台触发一次体检

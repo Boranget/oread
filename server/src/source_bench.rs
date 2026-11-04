@@ -34,7 +34,7 @@ pub const MAX_BATCH_BUDGET_SECS: u64 = 600;
 pub const BENCH_CONCURRENCY: usize = 8;
 
 /// 整批预算：源多/样本多时按最坏情况（每条都打满单条预算）估算，
-/// 避免 139 个源只跑完前几十个就把后面的源记成 timeout（漫画源因此常年 0 命中）。
+/// 避免源较多时只跑完前几十个、后面的源被记成 timeout。
 pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 {
     let est = (source_count.saturating_mul(samples_per_source) as u64)
         .saturating_mul(PER_SAMPLE_BUDGET_SECS)
@@ -71,7 +71,7 @@ pub struct BuiltinCorpus {
 }
 
 /// 24 条：覆盖玄幻/都市/历史/科幻/出版/漫画，选长期存在的常见书名。
-/// 漫画（source_type=2）单独占 12 条：漫画可用源数量少，语料太少会导致 comic 精选长期为 0。
+/// 漫画（source_type=2）单独占 12 条：按语料类型配额，避免漫画样本不足导致该类精选长期为空。
 pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     // 玄幻（小说）
     BuiltinCorpus { title: "斗破苍穹", expected_author: Some("天蚕土豆"), category: "玄幻", source_type: TYPE_NOVEL },
@@ -1361,10 +1361,7 @@ pub async fn run_bench(
     match source_ids {
         None => {
             for s in all.iter() {
-                if s.enabled
-                    && crate::entities::is_supported_source_type(s.book_source_type)
-                    && s.rule_search.is_some()
-                    && s.search_url.is_some()
+                if crate::entities::is_searchable_source(s)
                     && !quarantined.contains(&s.book_source_url)
                 {
                     sources.push(s.clone());
@@ -1374,7 +1371,10 @@ pub async fn run_bench(
         Some(ids) => {
             for id in ids {
                 if let Some(s) = by_url.get(&id) {
-                    sources.push(s.clone());
+                    // 显式点名也不扫描需登录源：登录墙下探测只会得到噪声失败。
+                    if !crate::entities::requires_login(s) {
+                        sources.push(s.clone());
+                    }
                 }
             }
         }
