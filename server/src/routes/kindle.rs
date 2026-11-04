@@ -845,6 +845,10 @@ pub struct SearchQ {
     key: Option<String>,
     fs: Option<i64>,
     sp: Option<i64>,
+    /// 搜索范围：缺省 all（与 Web 新默认一致）；显式 curated 只跑精选源。
+    scope: Option<String>,
+    /// 是否包含冷却中的源：缺省 0；验收/对拍时可显式 1。
+    include_cooled: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct FsQ {
@@ -1734,7 +1738,7 @@ async fn progress(
 async fn search(
     State(s): State<AppState>,
     _u: AuthUser,
-    _db: UserDb,
+    db: UserDb,
     headers: HeaderMap,
     Query(q): Query<SearchQ>,
 ) -> Response {
@@ -1764,11 +1768,26 @@ async fn search(
     let mut list = String::new();
     let mut pager = String::new();
     if !key.is_empty() {
-        let sources = match load_sources(&s.shared).await {
+        let mut sources = match load_sources(&s.shared).await {
             Ok(v) => v,
             Err(e) => return err_to_page(e),
         };
-        let books = web_book::search_all(&sources, &key, 1).await;
+        crate::routes::sources::sort_sources(&mut sources);
+        // 与 `/api/search/start` 跑完全同一条 job 流水线（同源集合、同预算/并发池、
+        // 同 dedupe_and_sort + relevance 档位排序），服务端直接取最终排序结果切片。
+        let include_cooled = matches!(
+            q.include_cooled.as_deref().map(str::trim),
+            Some("1" | "true" | "yes" | "on")
+        );
+        let plan = crate::routes::books::resolve_search_sources(
+            &s.shared,
+            sources,
+            &[],
+            crate::req::SearchScope::parse(q.scope.as_deref()),
+            include_cooled,
+        )
+        .await;
+        let books = crate::routes::books::run_search_once(&s, &db, key.clone(), plan).await;
         if books.is_empty() {
             list.push_str(
                 "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",

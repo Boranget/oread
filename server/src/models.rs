@@ -34,6 +34,10 @@ pub struct BookSourceListItem {
     /// 最近一次评分时间（毫秒时间戳）
     #[serde(default)]
     pub last_eval_at: Option<i64>,
+    /// 是否可参与聚合搜索：与后端 `searchable_sources` 口径一致
+    /// （启用 + 类型支持 + 有搜索规则/地址 + 未隔离且健康档不是 quarantined）。
+    #[serde(default)]
+    pub searchable: bool,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]

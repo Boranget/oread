@@ -52,8 +52,8 @@ pub struct SearchQ {
     /// 显式越权：为 `1`/`true` 时冷却中的源也参与搜索（排查用）。
     #[serde(default)]
     include_cooled: Option<String>,
-    /// 搜索范围：`curated`（默认，只跑精选源）/ `all`（加强搜索，全量源）。
-    /// 仅 `/api/search/start` 使用；legacy 入口忽略该参数，保持旧行为。
+    /// 搜索范围：`all`（默认，全部可搜索源）/ `curated`（精选源）。
+    /// `/api/search`、`/api/search/aggregate`、`/api/search/start` 共用同一解析。
     #[serde(default)]
     scope: Option<String>,
     page: Option<i32>,
@@ -78,7 +78,7 @@ impl SearchQ {
             .to_string()
     }
 
-    /// 搜索范围：缺省 curated，未知值也按 curated（默认路径不能变慢）。
+    /// 搜索范围：缺省 all（新默认），显式 curated 才收紧。
     fn scope(&self) -> crate::req::SearchScope {
         crate::req::SearchScope::parse(self.scope.as_deref())
     }
@@ -220,6 +220,10 @@ struct SearchJob {
     cooldown_total: usize,
     /// 实际覆盖情况：`curated`（只用了精选源）/ `expanded`（退回或显式覆盖到全部可搜索源）
     coverage: String,
+    /// 源集合来源：`user` / `curated` / `curated_fallback` / `all`（结果接口回显）
+    source_mode: String,
+    /// 精选收缩排除掉的可搜索源数量（显式源为 0）
+    scope_filtered: usize,
     /// 当前精选集合大小（curated_total）
     curated_total: usize,
     state: Mutex<SearchJobState>,
@@ -432,6 +436,52 @@ async fn run_search_job(
     {
         tracing::warn!(error = %e, "record source health after search failed");
     }
+}
+
+/// 同步跑一次与 `/api/search/start` 完全相同的 job 流水线，返回最终排序结果。
+/// 供 `/k/search`（服务端渲染）使用：同一源集合、同一预算/并发池、同一
+/// `dedupe_and_sort + relevance` 档位排序，保证首屏顺序与 `/api/search` 一致。
+pub(crate) async fn run_search_once(
+    s: &AppState,
+    db: &UserDb,
+    key: String,
+    plan: SearchSourcePlan,
+) -> Vec<SearchBook> {
+    let sources = plan.active;
+    let source_total = sources.len();
+    let job = Arc::new(SearchJob {
+        id: next_job_id(),
+        key: key.clone(),
+        at: Instant::now(),
+        created_unix_ms: unix_ms(),
+        sources: sources.clone(),
+        source_total,
+        scope: plan.scope,
+        skipped_cooldown: plan.skipped_cooldown,
+        cooldown_total: plan.cooldown_total,
+        coverage: plan.coverage.to_string(),
+        source_mode: plan.source_mode.to_string(),
+        scope_filtered: plan.scope_filtered,
+        curated_total: plan.curated_total,
+        state: Mutex::new(SearchJobState {
+            pending: source_total,
+            ..Default::default()
+        }),
+    });
+    run_search_job(
+        job.clone(),
+        sources,
+        key,
+        s.shared.clone(),
+        db.0.clone(),
+        Arc::new(web_book::BookStore::new()),
+        s.cfg.source_cooldown_secs,
+        crate::source_quality::TierConfig::from_config(&s.cfg),
+        plan.health,
+        plan.scope,
+    )
+    .await;
+    job_view(&job).books
 }
 
 async fn run_search_batch(
@@ -655,6 +705,20 @@ fn select_sources(
     (selected, ignored)
 }
 
+/// 单个源是否可参与聚合搜索：所有入口（两段式 / legacy / `/k`）必须共用这一口径。
+pub(crate) fn is_searchable_source(
+    x: &crate::entities::BookSource,
+    quarantined: &HashSet<String>,
+    health: &HashMap<String, source_health::HealthRow>,
+) -> bool {
+    x.enabled
+        && crate::entities::is_supported_source_type(x.book_source_type)
+        && x.rule_search.is_some()
+        && x.search_url.is_some()
+        && !quarantined.contains(&x.book_source_url)
+        && source_health::visible_in_search(health.get(&x.book_source_url))
+}
+
 /// 聚合搜索的唯一准入闸门：先 `enabled`，再 tier（只放行 preferred / observing）。
 /// `enabled=0` 的源不会进入 source_total，也不会被 spawn，因此不可能出现在任何 origin 里。
 fn searchable_sources(
@@ -664,14 +728,7 @@ fn searchable_sources(
 ) -> Vec<crate::entities::BookSource> {
     sources
         .into_iter()
-        .filter(|x| {
-            x.enabled
-                && crate::entities::is_supported_source_type(x.book_source_type)
-                && x.rule_search.is_some()
-                && x.search_url.is_some()
-                && !quarantined.contains(&x.book_source_url)
-                && source_health::visible_in_search(health.get(&x.book_source_url))
-        })
+        .filter(|x| is_searchable_source(x, quarantined, health))
         .collect()
 }
 
@@ -703,6 +760,158 @@ fn filter_sources_by_scope(
             .filter(|s| urls.contains(&s.book_source_url))
             .collect(),
         None => candidates,
+    }
+}
+
+/// 统一源过滤结果：`/api/search/start`、legacy `/api/search`、`/k/search` 共用。
+pub(crate) struct SearchSourcePlan {
+    /// 最终参与搜索的源（scope 过滤 + 冷却分区后）
+    pub(crate) active: Vec<crate::entities::BookSource>,
+    pub(crate) health: HashMap<String, source_health::HealthRow>,
+    /// 用户显式指定的源（空 = 未指定）
+    pub(crate) requested: Vec<String>,
+    pub(crate) ignored: Vec<String>,
+    /// 实际生效的 scope（显式源会提升为 all）
+    pub(crate) scope: crate::req::SearchScope,
+    /// `user`（显式源，跳过 curated 收缩）/ `curated` / `curated_fallback` / `all`
+    pub(crate) source_mode: &'static str,
+    /// `curated` / `expanded`
+    pub(crate) coverage: &'static str,
+    pub(crate) curated_total: usize,
+    /// 可搜索源中因精选收缩/退化而未进入候选集合的数量（显式源恒为 0）
+    pub(crate) scope_filtered: usize,
+    pub(crate) skipped_cooldown: usize,
+    pub(crate) cooldown_total: usize,
+}
+
+/// 所有搜索入口唯一的源过滤链路。
+///
+/// 语义：
+/// - 显式 `source_ids`：跳过 curated 收缩（否则非优选源会被静默丢弃），`source_mode=user`；
+/// - `scope=curated`：只保留体检精选集合；集合缺失/交集为空时退化为 preferred（再为空退全量）；
+/// - `scope=all`：全部可搜索源；
+/// - 最后统一做冷却分区（`include_cooled` 为真则全部参与）。
+pub(crate) async fn resolve_search_sources(
+    pool: &SqlitePool,
+    sources: Vec<crate::entities::BookSource>,
+    requested: &[String],
+    scope: crate::req::SearchScope,
+    include_cooled: bool,
+) -> SearchSourcePlan {
+    let quarantined = source_ledger::quarantined_set(pool)
+        .await
+        .unwrap_or_default();
+    let health = source_health::load_map(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
+        HashMap::new()
+    });
+    let searchable_all = searchable_sources(sources, &quarantined, &health);
+    let explicit = !requested.is_empty();
+    let curated = if explicit || scope == crate::req::SearchScope::Curated {
+        // 显式源不需要精选集合；只有真正走 curated 才读表。
+        if explicit {
+            None
+        } else {
+            match crate::source_bench::curated_set(pool).await {
+                Ok(set) if !set.is_empty() => Some(set),
+                Ok(_) => {
+                    tracing::info!(target: "search_job", reason = "cold_start_no_curated", "curated empty; fallback to preferred");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "load curated set failed; fallback to preferred");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let curated_total = curated.as_ref().map(|s| s.len()).unwrap_or(0);
+    let searchable_total = searchable_all.len();
+    // 退化链：显式源 → 精选集合 → preferred → 全量。显式选源始终覆盖全部可搜索源。
+    let (candidates, source_mode, coverage, effective_scope) = if explicit {
+        (
+            searchable_all.clone(),
+            "user",
+            "expanded",
+            crate::req::SearchScope::All,
+        )
+    } else if scope == crate::req::SearchScope::Curated {
+        match curated.as_ref() {
+            Some(set) => {
+                let filtered = filter_sources_by_scope(searchable_all.clone(), Some(set), scope);
+                if filtered.is_empty() {
+                    tracing::info!(target: "search_job", reason = "curated_no_intersection", "fallback to preferred");
+                    (
+                        preferred_sources(searchable_all.clone(), &health),
+                        "curated_fallback",
+                        "expanded",
+                        crate::req::SearchScope::Curated,
+                    )
+                } else {
+                    (
+                        filtered,
+                        "curated",
+                        "curated",
+                        crate::req::SearchScope::Curated,
+                    )
+                }
+            }
+            None => (
+                preferred_sources(searchable_all.clone(), &health),
+                "curated_fallback",
+                "expanded",
+                crate::req::SearchScope::Curated,
+            ),
+        }
+    } else {
+        (
+            searchable_all.clone(),
+            "all",
+            "expanded",
+            crate::req::SearchScope::All,
+        )
+    };
+    let candidate_len = candidates.len();
+    let (mut selected, ignored) = select_sources(&candidates, requested);
+    let mut effective = effective_scope;
+    let mut source_mode = source_mode;
+    let mut coverage = coverage;
+    let mut scope_filtered = if explicit || effective == crate::req::SearchScope::All {
+        0
+    } else {
+        searchable_total.saturating_sub(candidate_len)
+    };
+    if !explicit && effective == crate::req::SearchScope::Curated && selected.is_empty() {
+        // 精选/preferred 与可搜索源交集为空：退回 all，避免 0 命中。
+        effective = crate::req::SearchScope::All;
+        source_mode = "all";
+        coverage = "expanded";
+        scope_filtered = 0;
+        selected = select_sources(&searchable_all, &[]).0;
+    }
+    let cooldown_base = if effective == crate::req::SearchScope::All {
+        &searchable_all
+    } else {
+        &candidates
+    };
+    let now = source_health::now_ms();
+    let cooldown_total = source_health::cooled_count(cooldown_base, &health, now);
+    let partition = source_health::partition_cooldown(selected, &health, include_cooled, now);
+    let skipped_cooldown = partition.skipped;
+    SearchSourcePlan {
+        active: partition.active,
+        health,
+        requested: requested.to_vec(),
+        ignored,
+        scope: effective,
+        source_mode,
+        coverage,
+        curated_total,
+        scope_filtered,
+        skipped_cooldown,
+        cooldown_total,
     }
 }
 
@@ -751,85 +960,21 @@ async fn search_start(
     }
     let mut sources = load_sources(&s.shared).await?;
     crate::routes::sources::sort_sources(&mut sources);
-    let quarantined = source_ledger::quarantined_set(&s.shared)
-        .await
-        .unwrap_or_default();
-    let health = source_health::load_map(&s.shared).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
-        HashMap::new()
-    });
-    let scope = q.scope();
-    let searchable_all = searchable_sources(sources, &quarantined, &health);
-    // curated 集合来自体检（source_curated 表）；冷启动/读取失败 → None，退回现有 tier 逻辑。
-    let curated = if scope == crate::req::SearchScope::Curated {
-        match crate::source_bench::curated_set(&s.shared).await {
-            Ok(set) if !set.is_empty() => Some(set),
-            Ok(_) => {
-                tracing::info!(target: "search_job", reason = "cold_start_no_curated", "curated empty; fallback to all");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "load curated set failed; fallback to all");
-                None
-            }
-        }
-    } else {
-        None
-    };
     // 精选防腐化：距上次体检超过 72h 时，后台重跑一次（不阻塞本次搜索）。
     crate::source_bench::maybe_schedule_stale_bench(s.shared.clone(), &s.cfg);
-    let curated_total = curated.as_ref().map(|s| s.len()).unwrap_or(0);
     let requested = parse_source_ids(q.source_ids.as_deref());
-    // 退化链：精选集合 → preferred → 全量。显式选源始终按“覆盖全部可搜索源”的语义。
-    let mut coverage = "curated";
-    let candidates = if !requested.is_empty() {
-        coverage = "expanded";
-        searchable_all.clone()
-    } else if scope == crate::req::SearchScope::Curated {
-        match curated.as_ref() {
-            Some(set) => {
-                let filtered =
-                    filter_sources_by_scope(searchable_all.clone(), Some(set), scope);
-                if filtered.is_empty() {
-                    tracing::info!(target: "search_job", reason = "curated_no_intersection", "fallback to preferred");
-                    coverage = "expanded";
-                    preferred_sources(searchable_all.clone(), &health)
-                } else {
-                    filtered
-                }
-            }
-            None => {
-                coverage = "expanded";
-                preferred_sources(searchable_all.clone(), &health)
-            }
-        }
-    } else {
-        coverage = "expanded";
-        searchable_all.clone()
-    };
-    let (mut selected, ignored) = select_sources(&candidates, &requested);
-    let mut effective = scope;
-    if !requested.is_empty() {
-        effective = crate::req::SearchScope::All;
-        coverage = "expanded";
-    } else if scope == crate::req::SearchScope::Curated && selected.is_empty() {
-        // 精选集合存在但与可搜索源交集为空：退回 all。
-        effective = crate::req::SearchScope::All;
-        coverage = "expanded";
-        selected = select_sources(&searchable_all, &[]).0;
-    }
-    let cooldown_base = if effective == crate::req::SearchScope::All {
-        &searchable_all
-    } else {
-        &candidates
-    };
     let include_cooled = truthy(q.include_cooled.as_deref());
-    let now = source_health::now_ms();
-    let cooldown_total = source_health::cooled_count(cooldown_base, &health, now);
-    let partition = source_health::partition_cooldown(selected, &health, include_cooled, now);
-    let skipped_cooldown = partition.skipped;
-    let enabled = partition.active;
+    let plan = resolve_search_sources(
+        &s.shared,
+        sources,
+        &requested,
+        q.scope(),
+        include_cooled,
+    )
+    .await;
+    let enabled = plan.active.clone();
     let source_total = enabled.len();
+    let effective = plan.scope;
     let id = next_job_id();
     let job = Arc::new(SearchJob {
         id: id.clone(),
@@ -839,10 +984,12 @@ async fn search_start(
         sources: enabled.clone(),
         source_total,
         scope: effective,
-        skipped_cooldown,
-        cooldown_total,
-        coverage: coverage.to_string(),
-        curated_total,
+        skipped_cooldown: plan.skipped_cooldown,
+        cooldown_total: plan.cooldown_total,
+        coverage: plan.coverage.to_string(),
+        source_mode: plan.source_mode.to_string(),
+        scope_filtered: plan.scope_filtered,
+        curated_total: plan.curated_total,
         state: Mutex::new(SearchJobState {
             pending: source_total,
             ..Default::default()
@@ -858,7 +1005,9 @@ async fn search_start(
             created_unix_ms = job.created_unix_ms,
             source_total = job.source_total,
             scope = job.scope.as_str(),
+            source_mode = job.source_mode.as_str(),
             coverage = job.coverage.as_str(),
+            scope_filtered = job.scope_filtered,
             curated_total = job.curated_total,
             known_jobs = g.len(),
             "create search job"
@@ -873,14 +1022,16 @@ async fn search_start(
         Arc::new(web_book::BookStore::new()),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
-        health,
+        plan.health,
         effective,
     ));
     Ok(Json(json!({
         "job_id": id,
         "scope": effective.as_str(),
-        "coverage": coverage,
-        "curated_total": curated_total,
+        "coverage": plan.coverage,
+        "source_mode": plan.source_mode,
+        "scope_filtered": plan.scope_filtered,
+        "curated_total": plan.curated_total,
         "source_total": source_total,
         // deadline_ms 保持旧语义：本次 scope 的单源预算；整批预算单独给出。
         "deadline_ms": crate::req::search_budget_for(effective).as_millis() as u64,
@@ -891,15 +1042,15 @@ async fn search_start(
         "scheduled_sources": 0,
         "attempted_sources": 0,
         "pending_sources": source_total,
-        // 契约变更：显式回显过滤结果，便于前端提示“哪些 id 被忽略”
-        "source_ids_requested": requested,
-        "ignored_source_ids": ignored,
-        "warning": (!ignored.is_empty())
-            .then(|| format!("已忽略无效书源 id：{}", ignored.join(", "))),
+        // 契约：显式回显过滤结果，区分「用户指定」与「被 scope 过滤」
+        "source_ids_requested": plan.requested,
+        "ignored_source_ids": plan.ignored,
+        "warning": (!plan.ignored.is_empty())
+            .then(|| format!("已忽略无效书源 id：{}", plan.ignored.join(", "))),
         // 冷却：默认跳过冷却中的源；include_cooled=1 时全部参与
         "include_cooled": include_cooled,
-        "skipped_cooldown": skipped_cooldown,
-        "cooldown_total": cooldown_total,
+        "skipped_cooldown": plan.skipped_cooldown,
+        "cooldown_total": plan.cooldown_total,
     })))
 }
 
@@ -1008,6 +1159,8 @@ async fn search_result(
         "attempted_sources": attempted,
         "pending_sources": pending_scheduled,
         "scope": job.scope.as_str(),
+        "source_mode": job.source_mode.as_str(),
+        "scope_filtered": job.scope_filtered,
         "finished": finished,
         "pending": pending,
         "source_total": job.source_total,
@@ -1022,16 +1175,27 @@ async fn search_result(
     })))
 }
 
+/// legacy `/api/search` 的源过滤与两段式共用 `resolve_search_sources`（不再有两套口径）。
+/// 现在同样尊重 `scope` 与 `source_ids`。
 async fn search(
     State(s): State<AppState>,
     _u: AuthUser,
     Query(q): Query<SearchQ>,
 ) -> AppResult<Json<Vec<SearchBook>>> {
-    let sources = load_sources(&s.shared).await?;
+    let mut sources = load_sources(&s.shared).await?;
+    crate::routes::sources::sort_sources(&mut sources);
     let page = q.page.unwrap_or(1).max(1);
     let include_cooled = truthy(q.include_cooled.as_deref());
-    let (active, _, _) = searchable_without_cooled(&s.shared, &sources, include_cooled).await;
-    let (full, _) = aggregated(&active, &q.keyword(), include_cooled).await;
+    let requested = parse_source_ids(q.source_ids.as_deref());
+    let plan = resolve_search_sources(
+        &s.shared,
+        sources,
+        &requested,
+        q.scope(),
+        include_cooled,
+    )
+    .await;
+    let (full, _) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
 
@@ -1041,13 +1205,18 @@ async fn aggregated(
     sources: &[crate::entities::BookSource],
     key: &str,
     include_cooled: bool,
+    scope: crate::req::SearchScope,
 ) -> (Vec<SearchBook>, Vec<web_book::SourceFailure>) {
-    // 冷却过滤会改变参与源集合，缓存键必须区分两种模式，避免 60s 内串用。
-    let cache_key = if include_cooled {
-        format!("{key}\u{1f}cooled")
-    } else {
-        key.to_string()
-    };
+    // 缓存键必须包含实际参与源集合（显式子集 / scope / 冷却都会改变它）与预算档位，
+    // 否则 60s 内不同请求会串用结果。
+    let mut urls: Vec<&str> = sources.iter().map(|s| s.book_source_url.as_str()).collect();
+    urls.sort_unstable();
+    let cache_key = format!(
+        "{key}\u{1e}{}\u{1e}{}\u{1e}{}",
+        scope.as_str(),
+        if include_cooled { "cooled" } else { "normal" },
+        urls.join("\u{1f}")
+    );
     let hit = {
         let mut g = agg_cache().lock().unwrap();
         prune_cache(&mut g);
@@ -1058,7 +1227,7 @@ async fn aggregated(
     if let Some(v) = hit {
         return v;
     }
-    let outcome = web_book::search_all_with_errors(sources, key, 1).await;
+    let outcome = web_book::search_all_with_errors_scoped(sources, key, 1, scope).await;
     let mut books = outcome.books;
     books.truncate(AGG_MAX_BOOKS);
     let errors = outcome.errors;
@@ -1076,34 +1245,6 @@ async fn aggregated(
     (books, errors)
 }
 
-/// 过滤出可参与搜索的源，并按健康状态剔除冷却中的源。
-async fn searchable_without_cooled(
-    pool: &SqlitePool,
-    sources: &[crate::entities::BookSource],
-    include_cooled: bool,
-) -> (Vec<crate::entities::BookSource>, usize, usize) {
-    let quarantined = source_ledger::quarantined_set(pool).await.unwrap_or_default();
-    let eligible: Vec<crate::entities::BookSource> = sources
-        .iter()
-        .filter(|x| {
-            x.enabled
-                && crate::entities::is_supported_source_type(x.book_source_type)
-                && x.rule_search.is_some()
-                && x.search_url.is_some()
-                && !quarantined.contains(&x.book_source_url)
-        })
-        .cloned()
-        .collect();
-    let health = source_health::load_map(pool).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
-        std::collections::HashMap::new()
-    });
-    let now = source_health::now_ms();
-    let cooldown_total = source_health::cooled_count(&eligible, &health, now);
-    let partition = source_health::partition_cooldown(eligible, &health, include_cooled, now);
-    (partition.active, partition.skipped, cooldown_total)
-}
-
 /// 聚合搜索明细：书籍 + 成功/失败书源统计（单源失败不影响整体返回）。
 /// 分页基于「一次完整聚合结果」的缓存，保证跨页不重复、不遗漏，且 `total` 可信。
 async fn search_aggregate(
@@ -1111,13 +1252,21 @@ async fn search_aggregate(
     _u: AuthUser,
     Query(q): Query<SearchQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let sources = load_sources(&s.shared).await?;
+    let mut sources = load_sources(&s.shared).await?;
+    crate::routes::sources::sort_sources(&mut sources);
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
     let include_cooled = truthy(q.include_cooled.as_deref());
-    let (active, skipped_cooldown, cooldown_total) =
-        searchable_without_cooled(&s.shared, &sources, include_cooled).await;
-    let (full, errors) = aggregated(&active, &q.keyword(), include_cooled).await;
+    let requested = parse_source_ids(q.source_ids.as_deref());
+    let plan = resolve_search_sources(
+        &s.shared,
+        sources,
+        &requested,
+        q.scope(),
+        include_cooled,
+    )
+    .await;
+    let (full, errors) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
 
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;
@@ -1131,10 +1280,16 @@ async fn search_aggregate(
         "total": total,
         "has_more": skip + page_size < total,
         "source_failed": source_failed,
-        "source_total": active.len(),
+        "scope": plan.scope.as_str(),
+        "source_mode": plan.source_mode,
+        "scope_filtered": plan.scope_filtered,
+        "curated_total": plan.curated_total,
+        "source_ids_requested": plan.requested,
+        "ignored_source_ids": plan.ignored,
+        "source_total": plan.active.len(),
         "include_cooled": include_cooled,
-        "skipped_cooldown": skipped_cooldown,
-        "cooldown_total": cooldown_total,
+        "skipped_cooldown": plan.skipped_cooldown,
+        "cooldown_total": plan.cooldown_total,
         "cache_ttl_secs": AGG_TTL_SECS,
     })))
 }
@@ -2649,6 +2804,8 @@ mod tests {
             skipped_cooldown: 0,
             cooldown_total: 0,
             coverage: "curated".into(),
+            source_mode: "curated".into(),
+            scope_filtered: 0,
             curated_total: 0,
             state: Mutex::new(SearchJobState {
                 books,
@@ -3032,6 +3189,8 @@ mod tests {
             skipped_cooldown: 0,
             cooldown_total: 0,
             coverage: "curated".into(),
+            source_mode: "curated".into(),
+            scope_filtered: 0,
             curated_total: 0,
             state: Mutex::new(SearchJobState {
                 books: vec![a, b],
@@ -3086,6 +3245,54 @@ mod tests {
         assert_eq!(preferred.len(), 1, "冷启动先退 preferred");
         let fallback = filter_sources_by_scope(candidates, None, SearchScope::Curated);
         assert_eq!(fallback.len(), 2, "filter 本身不做 tier 退化");
+    }
+
+    // 统一源过滤：默认 all；显式 source_ids 跳过 curated 收缩（非优选源不能被静默丢弃）；
+    // 计数口径与 /api/sources 的 searchable 一致（禁用/缺规则的不进候选）。
+    #[tokio::test]
+    async fn explicit_source_ids_skip_curated_and_searchable_gate_matches() {
+        use crate::req::SearchScope;
+        // 惰性内存池：健康/隔离表缺失时按空集合处理，正好测“无健康行=observing”。
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let mut no_rule = src("缺规则", "http://norule", 1, true);
+        no_rule.rule_search = None;
+        let sources = vec![
+            src("优选", "http://preferred", 1, true),
+            src("观察", "http://observing", 1, true),
+            src("禁用", "http://off", 1, false),
+            no_rule,
+        ];
+
+        let all = resolve_search_sources(
+            &pool,
+            sources.clone(),
+            &[],
+            SearchScope::All,
+            false,
+        )
+        .await;
+        assert_eq!(all.source_mode, "all");
+        assert_eq!(all.scope, SearchScope::All);
+        assert_eq!(all.active.len(), 2, "禁用/缺规则源不可搜索");
+        assert_eq!(all.scope_filtered, 0);
+
+        let user = resolve_search_sources(
+            &pool,
+            sources,
+            &["http://observing".to_string()],
+            SearchScope::Curated,
+            false,
+        )
+        .await;
+        assert_eq!(user.source_mode, "user");
+        assert_eq!(user.scope, SearchScope::All, "显式源跳过 curated 收缩");
+        assert_eq!(user.active.len(), 1);
+        assert_eq!(
+            user.active[0].book_source_url, "http://observing",
+            "非优选源必须真实进入执行集合"
+        );
+        assert!(user.ignored.is_empty());
+        assert_eq!(user.scope_filtered, 0, "显式源模式不存在 scope 过滤");
     }
 
     // phase：pending>0 → first（partial=true），pending==0 → final
@@ -3219,6 +3426,8 @@ mod tests {
             skipped_cooldown: 0,
             cooldown_total: 0,
             coverage: "curated".into(),
+            source_mode: "curated".into(),
+            scope_filtered: 0,
             curated_total: 0,
             state: Mutex::new(SearchJobState {
                 pending,

@@ -66,10 +66,10 @@ const DEFAULT_CONF: HttpConf = HttpConf {
 
 /// 搜索范围：决定参与源集合与总预算。
 ///
-/// - `Curated`（默认）：只跑优选源。curated 集合尚未落地时退化为“只取 preferred”，
-///   总预算 8s，保证默认路径不等 25s。
-/// - `All`（显式“加强搜索”）：全量源，总预算 25s，源级并发默认 16 槽；
-///   用户显式调低 `HTTP_CONCURRENCY` 时取 `min(配置, 16)`。
+/// - `All`（默认）：全量可搜索源。流水线调度后首条结果通常 0.5s 左右，
+///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 10s。
+/// - `Curated`（用户显式选择「精选」）：只跑体检精选源；curated 集合尚未落地时
+///   退化为“只取 preferred”，总预算 6s。显式 `source_ids` 会跳过该收缩。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchScope {
     Curated,
@@ -77,11 +77,11 @@ pub enum SearchScope {
 }
 
 impl SearchScope {
-    /// 宽松解析：缺省/未知值一律按 `curated`（默认路径不能变慢）。
+    /// 宽松解析：缺省/未知值按 `all`（新默认）；只有显式 `curated` 才收紧。
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            Some("all" | "enhanced" | "full") => Self::All,
-            _ => Self::Curated,
+            Some("curated" | "preferred" | "curated_only") => Self::Curated,
+            _ => Self::All,
         }
     }
 
@@ -1498,13 +1498,13 @@ mod tests {
         assert_eq!(h.get("X-Token").map(String::as_str), Some("t1"));
     }
 
-    // scope 解析：缺省/未知一律 curated（默认路径不能变慢）
+    // scope 解析：缺省/未知一律 all（新默认）；显式 curated 才收紧
     #[test]
-    fn scope_parse_defaults_to_curated() {
-        assert_eq!(SearchScope::parse(None), SearchScope::Curated);
-        assert_eq!(SearchScope::parse(Some("")), SearchScope::Curated);
+    fn scope_parse_defaults_to_all() {
+        assert_eq!(SearchScope::parse(None), SearchScope::All);
+        assert_eq!(SearchScope::parse(Some("")), SearchScope::All);
         assert_eq!(SearchScope::parse(Some("curated")), SearchScope::Curated);
-        assert_eq!(SearchScope::parse(Some("unknown")), SearchScope::Curated);
+        assert_eq!(SearchScope::parse(Some("unknown")), SearchScope::All);
         assert_eq!(SearchScope::parse(Some(" all ")), SearchScope::All);
         assert_eq!(SearchScope::parse(Some("ENHANCED")), SearchScope::All);
     }
