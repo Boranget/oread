@@ -140,6 +140,24 @@ pub struct Config {
     pub source_score_w_hit: i32,
     pub source_score_w_parse: i32,
     pub source_score_w_ttfb: i32,
+    /// 体检语料抽样条数（每个源每次抽几条，默认 5）
+    pub source_bench_samples: usize,
+    /// 体检评分权重：命中率（默认 60）
+    pub source_bench_w_hit: i32,
+    /// 体检评分权重：延迟分（默认 30）
+    pub source_bench_w_latency: i32,
+    /// 体检评分权重：成功率（默认 10）
+    pub source_bench_w_fail: i32,
+    /// 精选断层阈值：相邻分数差 >= 该值即截断（默认 8）
+    pub source_bench_gap: i32,
+    /// 精选数量下限 / 上限（默认 8 / 14）
+    pub source_bench_min: usize,
+    pub source_bench_max: usize,
+    /// 漫画精选单独下限 / 上限（默认 3 / 14）：漫画源数量少，与小说共用 min=8 会长期选不出
+    pub source_bench_comic_min: usize,
+    pub source_bench_comic_max: usize,
+    /// 精选自动重算间隔（小时，默认 72）：过期后下一次搜索会后台触发一次体检
+    pub source_bench_interval_hours: u64,
     /// 规则试跑预览是否允许访问回环/私网/链路本地地址（默认拒绝，防 SSRF）。
     /// 本地调试书源时可用 `PREVIEW_ALLOW_PRIVATE=true` 放行。
     pub preview_allow_private: bool,
@@ -205,6 +223,16 @@ impl Config {
             source_score_w_hit: env_u64("SOURCE_SCORE_W_HIT", 30).clamp(0, 100) as i32,
             source_score_w_parse: env_u64("SOURCE_SCORE_W_PARSE", 15).clamp(0, 100) as i32,
             source_score_w_ttfb: env_u64("SOURCE_SCORE_W_TTFB", 15).clamp(0, 100) as i32,
+            source_bench_samples: env_u64("SOURCE_BENCH_SAMPLES", 5).clamp(1, 20) as usize,
+            source_bench_w_hit: env_u64("SOURCE_BENCH_W_HIT", 60).clamp(0, 100) as i32,
+            source_bench_w_latency: env_u64("SOURCE_BENCH_W_LATENCY", 30).clamp(0, 100) as i32,
+            source_bench_w_fail: env_u64("SOURCE_BENCH_W_FAIL", 10).clamp(0, 100) as i32,
+            source_bench_gap: env_u64("SOURCE_BENCH_GAP", 8).clamp(1, 100) as i32,
+            source_bench_min: env_u64("SOURCE_BENCH_MIN", 8).clamp(1, 50) as usize,
+            source_bench_max: env_u64("SOURCE_BENCH_MAX", 14).clamp(1, 50) as usize,
+            source_bench_comic_min: env_u64("SOURCE_BENCH_COMIC_MIN", 3).clamp(1, 50) as usize,
+            source_bench_comic_max: env_u64("SOURCE_BENCH_COMIC_MAX", 14).clamp(1, 50) as usize,
+            source_bench_interval_hours: env_u64("SOURCE_BENCH_INTERVAL_HOURS", 72).clamp(1, 24 * 30),
             preview_allow_private: env_bool("PREVIEW_ALLOW_PRIVATE", false),
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())

@@ -95,8 +95,8 @@ impl SearchScope {
     /// 整批总预算默认值（秒）。
     pub fn default_total_budget_secs(self) -> u64 {
         match self {
-            Self::Curated => 8,
-            Self::All => 25,
+            Self::Curated => 6,
+            Self::All => 10,
         }
     }
 }
@@ -151,8 +151,18 @@ pub fn search_budget() -> Duration {
     Duration::from_secs(conf().search_timeout_secs)
 }
 
+/// 按 scope 的单源预算：curated 只跑精选源，给 5s；all 覆盖更广，给 6s。
+///
+/// 与 `search_budget()` 区分：后者是通用默认值（legacy 聚合等使用）。
+pub fn search_budget_for(scope: SearchScope) -> Duration {
+    match scope {
+        SearchScope::Curated => Duration::from_secs(5),
+        SearchScope::All => Duration::from_secs(6),
+    }
+}
+
 /// 一次聚合搜索的整批时长上限（含排队）。与单源预算独立：
-/// 显式覆盖优先，否则按 scope 取默认（curated 8s / all 25s）。
+/// 显式覆盖优先，否则按 scope 取默认（curated 6s / all 10s）。
 pub fn search_total_budget(scope: SearchScope) -> Duration {
     let secs = conf()
         .search_total_budget_secs
@@ -1499,21 +1509,23 @@ mod tests {
         assert_eq!(SearchScope::parse(Some("ENHANCED")), SearchScope::All);
     }
 
-    // 两个预算独立：单源默认 6s；整批默认 curated 8s / all 25s
+    // 两个预算独立：单源 curated 5s / all 6s；整批 curated 6s / all 10s
     #[test]
     fn total_budget_defaults_follow_scope_not_per_source() {
-        assert_eq!(search_budget(), Duration::from_secs(6), "单源默认 6s");
+        assert_eq!(search_budget(), Duration::from_secs(6), "通用单源默认 6s");
+        assert_eq!(search_budget_for(SearchScope::Curated), Duration::from_secs(5));
+        assert_eq!(search_budget_for(SearchScope::All), Duration::from_secs(6));
         assert_eq!(
             search_total_budget(SearchScope::Curated),
-            Duration::from_secs(8)
+            Duration::from_secs(6)
         );
         assert_eq!(
             search_total_budget(SearchScope::All),
-            Duration::from_secs(25)
+            Duration::from_secs(10)
         );
         assert_ne!(
             search_total_budget(SearchScope::All),
-            search_budget(),
+            search_budget_for(SearchScope::All),
             "整批不能等于单源（拆分前正是这个 bug）"
         );
     }

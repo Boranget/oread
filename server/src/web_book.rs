@@ -1125,22 +1125,75 @@ pub struct ExploreCategory {
     pub url: String,
 }
 
-/// 聚合去重 + 按书源权重排序（权重降序，其次 customOrder 升序）
-pub(crate) fn dedupe_and_sort(books: Vec<SearchBook>, sources: &[BookSource]) -> Vec<SearchBook> {
+/// 聚合去重 + 排序。
+///
+/// - `query` 非空（搜索结果）：先丢弃与查询词完全无关的条目，再按相关性降序排序——
+///   书名精确/前缀/包含/近似命中优先，只命中查询词片段（如「百年」之于「百年孤独」）
+///   固定为 `SCORE_PARTIAL`，严格排在所有书名命中之后。同分再按源权重降序、
+///   `customOrder` 升序、`book_url` 升序。源权重只作为同档内的小幅加分（≤3），
+///   不会让低相关的高权重源压过完整命中。
+/// - `query` 为空（发现/探索页）：保持旧的"纯源权重"排序，不做相关性过滤。
+pub(crate) fn dedupe_and_sort(
+    books: Vec<SearchBook>,
+    sources: &[BookSource],
+    query: &str,
+) -> Vec<SearchBook> {
     let order: HashMap<&str, (i64, i64)> = sources
         .iter()
         .map(|s| (s.book_source_url.as_str(), (s.weight, s.custom_order)))
         .collect();
+    let weight_order = |b: &SearchBook| -> (i64, i64) {
+        b.origin
+            .as_deref()
+            .and_then(|o| order.get(o))
+            .copied()
+            .unwrap_or((0, 0))
+    };
     let mut books = books;
-    books.sort_by(|a, b| {
-        let oa = a.origin.as_deref().and_then(|o| order.get(o)).copied();
-        let ob = b.origin.as_deref().and_then(|o| order.get(o)).copied();
-        let wa = oa.map(|x| x.0).unwrap_or(0);
-        let wb = ob.map(|x| x.0).unwrap_or(0);
-        wb.cmp(&wa)
-            .then_with(|| oa.map(|x| x.1).unwrap_or(0).cmp(&ob.map(|x| x.1).unwrap_or(0)))
-            .then_with(|| a.book_url.cmp(&b.book_url))
-    });
+    let q = crate::search_rank::normalize_title(query);
+    if !q.is_empty() {
+        books.retain(|b| {
+            crate::search_rank::search_relevance(
+                &q,
+                b.name.as_deref().unwrap_or(""),
+                b.author.as_deref().unwrap_or(""),
+            ) > 0
+        });
+        books.sort_by(|a, b| {
+            let (wa, oa) = weight_order(a);
+            let (wb, ob) = weight_order(b);
+            let sa = crate::search_rank::combined_score(
+                crate::search_rank::search_relevance(
+                    &q,
+                    a.name.as_deref().unwrap_or(""),
+                    a.author.as_deref().unwrap_or(""),
+                ),
+                wa,
+                1,
+            );
+            let sb = crate::search_rank::combined_score(
+                crate::search_rank::search_relevance(
+                    &q,
+                    b.name.as_deref().unwrap_or(""),
+                    b.author.as_deref().unwrap_or(""),
+                ),
+                wb,
+                1,
+            );
+            sb.cmp(&sa)
+                .then_with(|| wb.cmp(&wa))
+                .then_with(|| oa.cmp(&ob))
+                .then_with(|| a.book_url.cmp(&b.book_url))
+        });
+    } else {
+        books.sort_by(|a, b| {
+            let (wa, oa) = weight_order(a);
+            let (wb, ob) = weight_order(b);
+            wb.cmp(&wa)
+                .then_with(|| oa.cmp(&ob))
+                .then_with(|| a.book_url.cmp(&b.book_url))
+        });
+    }
     let mut seen = HashSet::new();
     books.retain(|b| {
         let name = b.name.as_deref().unwrap_or("").trim().to_lowercase();
@@ -1222,7 +1275,7 @@ pub async fn search_all_with_errors_budgeted(
             }),
         }
     }
-    outcome.books = dedupe_and_sort(outcome.books, sources);
+    outcome.books = dedupe_and_sort(outcome.books, sources, key);
     outcome
 }
 
@@ -1320,7 +1373,7 @@ pub async fn explore_all(sources: &[BookSource], url: &str) -> Vec<SearchBook> {
             out.append(&mut books);
         }
     }
-    dedupe_and_sort(out, sources)
+    dedupe_and_sort(out, sources, "")
 }
 
 /// 按 Legado 约定执行 `正则##替换` 形式的净化规则（多行可多条）。
@@ -1803,5 +1856,69 @@ mod tests {
                 abs(&base, &u)
             })
             .collect()
+    }
+
+    // ----- 相关性聚合排序 -----
+
+    fn sb(name: &str, author: &str, origin: &str, url: &str) -> SearchBook {
+        SearchBook {
+            name: Some(name.into()),
+            author: Some(author.into()),
+            origin: Some(origin.into()),
+            book_url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    fn src(url: &str, weight: i64, order: i64) -> BookSource {
+        BookSource {
+            book_source_url: url.into(),
+            weight,
+            custom_order: order,
+            ..Default::default()
+        }
+    }
+
+    /// 完整命中排前、部分命中降权、完全不沾丢弃；高权重源也不该压过完整命中。
+    #[test]
+    fn dedupe_and_sort_puts_full_match_first_and_drops_unrelated() {
+        let sources = vec![src("high", 9, 0), src("low", 0, 0)];
+        let books = vec![
+            sb("贯穿大明的百年世家", "某作者", "high", "u1"),
+            sb("海贼王", "尾田荣一郎", "high", "u2"),
+            sb("百年孤独", "加西亚·马尔克斯", "low", "u3"),
+            sb("新百年孤独", "某作者", "high", "u4"),
+        ];
+        let out = dedupe_and_sort(books, &sources, "百年孤独");
+        assert_eq!(out.len(), 3, "完全无关的《海贼王》应被丢弃");
+        assert_eq!(out[0].name.as_deref(), Some("百年孤独"), "完整命中排第一");
+        assert_eq!(out[1].name.as_deref(), Some("新百年孤独"), "包含命中其次");
+        assert_eq!(out[2].name.as_deref(), Some("贯穿大明的百年世家"), "部分命中排最后");
+    }
+
+    /// 同一本书（书名+作者相同）多源命中时，保留排序更靠前（相关性/权重更高）的那条。
+    #[test]
+    fn dedupe_and_sort_keeps_best_source_for_duplicate() {
+        let sources = vec![src("high", 9, 0), src("low", 0, 0)];
+        let books = vec![
+            sb("百年孤独", "加西亚·马尔克斯", "low", "u1"),
+            sb("百年孤独", "加西亚·马尔克斯", "high", "u2"),
+        ];
+        let out = dedupe_and_sort(books, &sources, "百年孤独");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].origin.as_deref(), Some("high"));
+    }
+
+    /// 空查询（发现/探索页）不做相关性过滤，仍按源权重排序。
+    #[test]
+    fn dedupe_and_sort_without_query_keeps_weight_order() {
+        let sources = vec![src("high", 9, 0), src("low", 0, 0)];
+        let books = vec![
+            sb("海贼王", "尾田荣一郎", "low", "u1"),
+            sb("斗罗大陆", "唐家三少", "high", "u2"),
+        ];
+        let out = dedupe_and_sort(books, &sources, "");
+        assert_eq!(out.len(), 2, "空查询不得丢弃任何条目");
+        assert_eq!(out[0].name.as_deref(), Some("斗罗大陆"), "高权重源仍排前");
     }
 }

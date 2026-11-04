@@ -372,6 +372,21 @@ fn apply_evaluation(
     row.evidence_json = Some(evidence.to_string());
 }
 
+/// tier 由 preferred 降级时，后台对该源做一次轻量精选重算（不阻塞当前请求）。
+fn trigger_curated_revalidate(pool: &SqlitePool, urls: Vec<String>) {
+    if urls.is_empty() {
+        return;
+    }
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        for url in urls {
+            if let Err(e) = crate::source_bench::revalidate_curated_source(&pool, &url).await {
+                tracing::warn!(error = %e, source_url = %url, "light curated recompute failed");
+            }
+        }
+    });
+}
+
 /// 批量落库：只在任务收尾时调用一次，避免每本书/每条结果写库。
 pub async fn record_outcomes(
     pool: &SqlitePool,
@@ -385,11 +400,18 @@ pub async fn record_outcomes(
     let now = now_ms();
     let existing = load_map(pool).await?;
     let mut tx = pool.begin().await?;
+    let mut demoted: Vec<String> = Vec::new();
     for o in outcomes {
         let mut row = apply_outcome(existing.get(&o.source_url), o, now, cooldown_secs);
+        let prev_tier = row.tier.clone();
         let network = Network::from_status(o.status, true);
         let eval = source_quality::evaluate(&score_input(&row, o.rule_complete, network), cfg);
         apply_evaluation(&mut row, &eval, network, o.rule_complete, now);
+        if prev_tier == source_quality::TIER_PREFERRED
+            && eval.tier != source_quality::TIER_PREFERRED
+        {
+            demoted.push(o.source_url.clone());
+        }
         sqlx::query(
             "INSERT INTO source_health \
              (source_url, last_checked_at, last_status, last_error, consecutive_failures, \
@@ -445,6 +467,7 @@ pub async fn record_outcomes(
         .await?;
     }
     tx.commit().await?;
+    trigger_curated_revalidate(pool, demoted);
     Ok(())
 }
 
@@ -498,6 +521,7 @@ pub async fn record_evaluation(
     if let Some(t) = prev_tier_override {
         input.prev_tier = t.to_string();
     }
+    let prev_tier = row.tier.clone();
     let mut eval = source_quality::evaluate(&input, cfg);
     if let Some(t) = force_tier {
         if eval.tier != t {
@@ -524,6 +548,11 @@ pub async fn record_evaluation(
     .bind(row.demote_streak)
     .execute(pool)
     .await?;
+    if prev_tier == source_quality::TIER_PREFERRED
+        && eval.tier != source_quality::TIER_PREFERRED
+    {
+        trigger_curated_revalidate(pool, vec![source_url.to_string()]);
+    }
     Ok(eval)
 }
 

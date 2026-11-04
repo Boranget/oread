@@ -22,6 +22,10 @@ pub const SCORE_CONTAINS: u8 = 66;
 pub const SCORE_APPROX_MAX: u8 = 50;
 /// 编辑距离近似命中的下限
 pub const SCORE_APPROX_MIN: u8 = 40;
+/// 只命中查询词片段（如查询「百年孤独」只命中「百年」）的固定低分。
+/// 低于 `SCORE_APPROX_MIN`，因此严格排在所有书名命中之后；
+/// 加上权重/共识加分（合计 ≤6）仍低于近似档，不会跨层。
+pub const SCORE_PARTIAL: u8 = 25;
 /// 作者匹配加分
 pub const AUTHOR_BONUS: u8 = 3;
 /// 源权重加分上限
@@ -127,6 +131,58 @@ fn author_bonus(q: &str, author: &str) -> u8 {
     } else {
         0
     }
+}
+
+/// 最长公共连续子串长度（按字符计）。标题通常很短，O(n·m) 足够。
+fn longest_common_run(a: &[char], b: &[char]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    let mut best = 0;
+    let mut prev = vec![0usize; n + 1];
+    for i in 1..=m {
+        let mut cur = vec![0usize; n + 1];
+        for j in 1..=n {
+            if a[i - 1] == b[j - 1] {
+                let v = prev[j - 1] + 1;
+                cur[j] = v;
+                if v > best {
+                    best = v;
+                }
+            }
+        }
+        prev = cur;
+    }
+    best
+}
+
+/// 部分匹配打分：书名只命中查询词的一段连续片段时给固定低分。
+///
+/// 片段长度门槛：查询词 ≥2 字时要求命中 `max(2, ceil(查询字数 × 2/5))` 个字
+/// （「百年孤独」4 字 → 2 字，「斗破苍穹之…」这类长查询按 40% 比例）；
+/// 单字查询只要求命中 1 个字。这样做是为了避免"繁荣""大门"这类单字巧合。
+fn partial_token_score(query: &str, title: &str) -> u8 {
+    let q = normalize_title(query);
+    let t = normalize_title(title);
+    if q.is_empty() || t.is_empty() {
+        return 0;
+    }
+    let q: Vec<char> = q.chars().collect();
+    let t: Vec<char> = t.chars().collect();
+    let need = if q.len() <= 1 {
+        1
+    } else {
+        ((q.len() * 2 + 4) / 5).max(2)
+    };
+    if longest_common_run(&q, &t) >= need {
+        SCORE_PARTIAL
+    } else {
+        0
+    }
+}
+
+/// 搜索结果的相关性分数：书名正规命中 / 近似命中优先，其次"只命中片段"。
+/// 返回 0 表示书名与作者均与查询词无关，聚合时应当丢弃。
+pub fn search_relevance(query: &str, title: &str, author: &str) -> u8 {
+    relevance_score(query, title, author).max(partial_token_score(query, title))
 }
 
 /// 书名 + 作者的相关性分数（0–100）。源权重与共识加分由 [`combined_score`] 追加。
@@ -539,6 +595,43 @@ mod tests {
             relevance_score("斗罗大陆", "斗罗大陆", "斗罗"),
             SCORE_EXACT + AUTHOR_BONUS
         );
+    }
+
+    // ----- 部分匹配 -----
+
+    #[test]
+    fn partial_token_match_ranks_below_all_title_tiers() {
+        // 只命中「百年」两个字的书名 → 固定低分
+        assert_eq!(search_relevance("百年孤独", "百年争战", ""), SCORE_PARTIAL);
+        assert_eq!(
+            search_relevance("百年孤独", "贯穿大明的百年世家", ""),
+            SCORE_PARTIAL
+        );
+        // 只命中后半段（「孤独」）同样算部分匹配
+        assert_eq!(search_relevance("百年孤独", "孤独生物", ""), SCORE_PARTIAL);
+        // 完整/包含命中仍走正规档，不被部分匹配覆盖
+        assert_eq!(search_relevance("百年孤独", "百年孤独", ""), SCORE_EXACT);
+        assert_eq!(search_relevance("百年孤独", "新百年孤独", ""), SCORE_CONTAINS);
+        // 单字巧合与完全不沾都不算
+        assert_eq!(search_relevance("百年孤独", "繁华", ""), 0);
+        assert_eq!(search_relevance("百年孤独", "海贼王", ""), 0);
+        // 部分匹配即使加满权重与共识，也跨不过近似档
+        assert!(SCORE_PARTIAL < SCORE_APPROX_MIN);
+        assert!(combined_score(SCORE_PARTIAL, 9, 4) < SCORE_APPROX_MIN);
+    }
+
+    #[test]
+    fn partial_token_threshold_scales_with_query_length() {
+        // 8 字查询要求至少 4 字连续片段（ceil(8×2/5)=4）
+        assert_eq!(
+            search_relevance("斗罗大陆外传唐门", "外传唐门英雄", ""),
+            SCORE_PARTIAL
+        );
+        // 只有 2 字片段不够
+        assert_eq!(search_relevance("斗罗大陆外传唐门", "唐门", ""), 0);
+        // 空查询 / 空标题不误伤
+        assert_eq!(search_relevance("", "百年孤独", ""), 0);
+        assert_eq!(search_relevance("百年孤独", "", ""), 0);
     }
 
     #[test]

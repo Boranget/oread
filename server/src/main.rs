@@ -11,6 +11,7 @@ mod rule_engine;
 mod req;
 mod search_rank;
 mod serde_util;
+mod source_bench;
 mod source_health;
 mod source_ledger;
 mod source_quality;
