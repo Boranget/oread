@@ -54,20 +54,25 @@ fn parse_source_row(rules: Option<String>, content: Option<String>) -> Option<Bo
 }
 
 /// 加载所有书源（含完整规则对象）。Legado 导出用 camelCase，导入时已统一为 snake_case。
-/// 类型列（`book_source_type`/`unsupported_type`）以数据库为准覆盖 JSON 里的值，
+/// 类型列（`book_source_type`/`unsupported_type`）与启停列（`enabled`）都以数据库为准覆盖 JSON 里的值，
 /// 这样历史存量在迁移回填后无需重写 JSON 就能被正确归类。
+///
+/// `enabled` 必须取列：迁移（0005 停用 unsupported）和维护脚本只 `UPDATE ... SET enabled=0`，
+/// 不会重写 JSON；而 JSON 里 `enabled` 缺失时反序列化默认 `true`（见 entities 的 `default_true`）。
+/// 若信任 JSON，列上已停用的源会继续进入聚合搜索（`source_total` 偏大、结果 `origin` 出现停用源）。
 pub async fn load_sources(pool: &SqlitePool) -> AppResult<Vec<BookSource>> {
-    let rows: Vec<(Option<String>, Option<String>, i64, bool)> = sqlx::query_as(
-        "SELECT rules, content, book_source_type, unsupported_type FROM book_sources",
+    let rows: Vec<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
+        "SELECT rules, content, book_source_type, unsupported_type, enabled FROM book_sources",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(rules, content, ty, unsupported)| {
+        .filter_map(|(rules, content, ty, unsupported, enabled)| {
             parse_source_row(rules, content).map(|mut src| {
                 src.book_source_type = ty;
                 src.unsupported_type = unsupported;
+                src.enabled = enabled;
                 src
             })
         })
@@ -76,18 +81,19 @@ pub async fn load_sources(pool: &SqlitePool) -> AppResult<Vec<BookSource>> {
 
 /// 按书源 ID（book_source_url）取完整书源。
 pub async fn load_source(pool: &SqlitePool, id: &str) -> AppResult<BookSource> {
-    let row: Option<(Option<String>, Option<String>, i64, bool)> = sqlx::query_as(
-        "SELECT rules, content, book_source_type, unsupported_type FROM book_sources WHERE id = ?",
+    let row: Option<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
+        "SELECT rules, content, book_source_type, unsupported_type, enabled FROM book_sources WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    let (rules, content, ty, unsupported) =
+    let (rules, content, ty, unsupported, enabled) =
         row.ok_or_else(|| AppError::NotFound("source not found".into()))?;
     let mut src = parse_source_row(rules, content)
         .ok_or_else(|| AppError::NotFound("source not found".into()))?;
     src.book_source_type = ty;
     src.unsupported_type = unsupported;
+    src.enabled = enabled;
     Ok(src)
 }
 
@@ -1657,5 +1663,87 @@ mod tests {
             ..Default::default()
         };
         assert!(suggest_comic_type(&comic).is_none());
+    }
+
+    /// 回归（真库 2026-11 实测漂移）：`book_sources.enabled=0` 但 JSON 里 `enabled` 仍为 true
+    /// （迁移 0005 与维护脚本只 `UPDATE ... SET enabled=0`，不重写 JSON）。
+    /// 停用源不得进入 `source_total`（准入集合），也不得出现在搜索结果 `origin`（errors.origin 均无）。
+    #[tokio::test]
+    async fn disabled_column_wins_over_drifted_json() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE book_sources (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT, \
+             rules TEXT NOT NULL, content TEXT, enabled INTEGER NOT NULL DEFAULT 1, \
+             book_source_type INTEGER NOT NULL DEFAULT 0, unsupported_type INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 两条规则除 URL 外完全相同（JSON 里都写 enabled=true），只有 enabled 列不同 → 模拟漂移。
+        for (id, enabled) in [("https://on.example.com", 1), ("https://off.example.com", 0)] {
+            let rules = serde_json::json!({
+                "book_source_url": id,
+                "book_source_name": id,
+                "enabled": true,
+                "search_url": "http://127.0.0.1:1/search?key=%s",
+                "rule_search": {"book_list": ""}
+            })
+            .to_string();
+            sqlx::query(
+                "INSERT INTO book_sources (id, name, url, rules, content, enabled) \
+                 VALUES (?1, ?2, ?1, ?3, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(&rules)
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let loaded = load_sources(&pool).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        let off = loaded
+            .iter()
+            .find(|s| s.book_source_url == "https://off.example.com")
+            .unwrap();
+        assert!(!off.enabled, "列 enabled=0 必须覆盖 JSON 的 enabled=true");
+        assert!(!load_source(&pool, "https://off.example.com")
+            .await
+            .unwrap()
+            .enabled);
+
+        // 与 search_start 相同的准入条件：source_total 只数启用源。
+        let eligible: Vec<BookSource> = loaded
+            .iter()
+            .filter(|x| {
+                x.enabled
+                    && crate::entities::is_supported_source_type(x.book_source_type)
+                    && x.rule_search.is_some()
+                    && x.search_url.is_some()
+            })
+            .cloned()
+            .collect();
+        assert_eq!(eligible.len(), 1, "source_total 不应包含停用源");
+        assert_eq!(eligible[0].book_source_url, "https://on.example.com");
+
+        // origin：把「加载后的全量」交给聚合搜索，停用源必须一次请求都不发。
+        let out = crate::web_book::search_all_with_errors_budgeted(
+            &loaded,
+            "test",
+            1,
+            std::time::Duration::from_millis(800),
+        )
+        .await;
+        assert!(
+            out.errors.iter().all(|e| e.source != "https://off.example.com"),
+            "停用源出现在搜索结果 origin 中"
+        );
     }
 }
