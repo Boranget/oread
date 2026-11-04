@@ -98,6 +98,17 @@ pub async fn user_pool(cfg: &Config, uid: i64) -> AppResult<SqlitePool> {
     crate::db_guard::migrate_bucket(cfg, &pool, &migrator, crate::db_guard::Scope::User(uid))
         .await
         .map_err(|f| crate::error::AppError::Internal(f.0))?;
+    // 跨请求 book 状态（book_vars / book_cache）：开库时顺手做过期清理——
+    // 变量 30 天未更新即删，cache 行按自身 expires_at 删。只删过期行，不整表清空。
+    let now = crate::source_health::now_ms();
+    let _ = sqlx::query("DELETE FROM book_vars WHERE updated_at < ?1")
+        .bind(now - 30 * 24 * 3600 * 1000)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM book_cache WHERE expires_at < ?1")
+        .bind(now)
+        .execute(&pool)
+        .await;
     if cfg.db_vacuum_convert {
         ensure_incremental(&pool).await?;
     }

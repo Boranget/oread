@@ -341,6 +341,8 @@ async fn run_search_job(
     sources: Vec<crate::entities::BookSource>,
     key: String,
     pool: SqlitePool,
+    book_pool: SqlitePool,
+    store: Arc<web_book::BookStore>,
     cooldown_secs: u64,
     tier_cfg: crate::source_quality::TierConfig,
     health: HashMap<String, source_health::HealthRow>,
@@ -376,12 +378,25 @@ async fn run_search_job(
             &health,
             &mut outcomes,
             scope,
+            &book_pool,
+            &store,
         )
         .await;
     }
     if !observing.is_empty() {
-        run_search_batch(&job, observing, &key, deadline, budget, &health, &mut outcomes, scope)
-            .await;
+        run_search_batch(
+            &job,
+            observing,
+            &key,
+            deadline,
+            budget,
+            &health,
+            &mut outcomes,
+            scope,
+            &book_pool,
+            &store,
+        )
+        .await;
     }
 
     if let Err(e) =
@@ -409,6 +424,8 @@ async fn run_search_batch(
     health: &HashMap<String, source_health::HealthRow>,
     outcomes: &mut Vec<source_health::Outcome>,
     scope: crate::req::SearchScope,
+    book_pool: &SqlitePool,
+    store: &Arc<web_book::BookStore>,
 ) {
     enum TaskOutcome {
         Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
@@ -426,6 +443,8 @@ async fn run_search_batch(
     for src in sources {
         let s = src.clone();
         let k = key.to_string();
+        let st = store.clone();
+        let bp = book_pool.clone();
         pending.push(async move {
             let comic = crate::req::is_comic_source_type(s.book_source_type);
             let queued_at = Instant::now();
@@ -447,7 +466,16 @@ async fn run_search_batch(
                     false,
                 );
             }
-            let r = tokio::time::timeout(remain.min(budget), web_book::search(&s, &k, 1)).await;
+            let r = tokio::time::timeout(
+                remain.min(budget),
+                web_book::search_book(&s, &k, 1, Some(st.as_ref())),
+            )
+            .await;
+            // 搜索阶段的 `@put`（爱看写 bid）按 book_key 落库，供后续 info/toc 读回。
+            let changes = st.take_changes();
+            if !changes.is_empty() {
+                persist_book_changes(&bp, changes).await;
+            }
             let latency_ms = started.elapsed().as_millis() as i64;
             drop(slot);
             let outcome = match r {
@@ -680,6 +708,7 @@ fn search_phase(pending: usize) -> &'static str {
 async fn search_start(
     State(s): State<AppState>,
     _u: AuthUser,
+    db: UserDb,
     Query(q): Query<SearchQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let key = q.keyword();
@@ -745,6 +774,8 @@ async fn search_start(
         enabled,
         key,
         s.shared.clone(),
+        db.0.clone(),
+        Arc::new(web_book::BookStore::new()),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
         health,
@@ -1038,7 +1069,10 @@ async fn book_info(
         book.latest_chapter_title = book.latest_chapter_title.or(m.latest_chapter_title);
         book.latest_chapter_time = m.latest_chapter_time;
     }
-    web_book::book_info(&source, &mut book).await?;
+    let key = web_book::book_key(&source, &book.book_url);
+    let store = book_store_for(&db.0, &key).await;
+    web_book::book_info_book(&source, &mut book, Some(&store)).await?;
+    persist_book_changes(&db.0, store.take_changes()).await;
     save_book_meta(&db.0, &book).await?;
     Ok(Json(book))
 }
@@ -1069,7 +1103,10 @@ async fn toc(
             if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
                 book.toc_url = m.toc_url;
             }
-            let chapters = web_book::chapter_list(&source, &book).await?;
+            let key = web_book::book_key(&source, &book.book_url);
+            let store = book_store_for(&db.0, &key).await;
+            let chapters = web_book::chapter_list_book(&source, &book, Some(&store)).await?;
+            persist_book_changes(&db.0, store.take_changes()).await;
             save_chapters(&db.0, &q.book_url, &chapters).await?;
             // 目录落库时同步总章节数，供进度百分比与书架完成度使用
             sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
@@ -1420,11 +1457,21 @@ async fn content(
             let source = load_source(&s.shared, &q.source).await?;
             let chapter = BookChapter {
                 url: q.chapter_url.clone(),
+                // 书籍地址用于按 book_key 预载跨请求变量/cache（老客户端可能不传）
+                book_url: q.book_url.clone().filter(|s| !s.trim().is_empty()),
                 ..Default::default()
+            };
+            let store = match chapter.book_url.as_deref() {
+                Some(bu) if !bu.trim().is_empty() => {
+                    let key = web_book::book_key(&source, bu);
+                    Some(book_store_for(&db.0, &key).await)
+                }
+                _ => None,
             };
             let c = if source.book_source_type == 2 {
                 // 漫画源：只抽图片列表，content 置空以保持字段类型不变
-                let imgs = web_book::chapter_images(&source, &chapter).await?;
+                let imgs =
+                    web_book::chapter_images_book(&source, &chapter, store.as_ref()).await?;
                 BookContent {
                     book_url: chapter.book_url.clone().unwrap_or_default(),
                     url: chapter.url.clone(),
@@ -1436,8 +1483,11 @@ async fn content(
                     ..Default::default()
                 }
             } else {
-                web_book::chapter_content(&source, &chapter).await?
+                web_book::chapter_content_book(&source, &chapter, store.as_ref()).await?
             };
+            if let Some(st) = &store {
+                persist_book_changes(&db.0, st.take_changes()).await;
+            }
             // 用户设置的缓存上限优先（且不超过全局上限），未设置时用全局配置
             let limit = match replace::user_cache_limit_mb(&db.0).await {
                 Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
@@ -2083,6 +2133,120 @@ pub(crate) async fn load_book_meta(pool: &SqlitePool, book_url: &str) -> anyhow:
     Ok(b)
 }
 
+// ---------------- 跨请求 book 层状态（变量 + cache） ----------------
+/// cache 的默认有效期：10 分钟（上游 CacheManager 的内存缓存同量级）。
+const BOOK_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
+/// 单本书变量 JSON 上限 64 KiB，超限截断并告警。
+const BOOK_VARS_MAX_BYTES: usize = 64 * 1024;
+
+/// 预载一本书的跨请求状态：持久化变量 + 未过期的 cache。
+async fn load_book_scope(
+    pool: &SqlitePool,
+    key: &str,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let vars_json: Option<String> =
+        sqlx::query_scalar("SELECT vars_json FROM book_vars WHERE book_key = ?1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let vars = vars_json
+        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+        .unwrap_or_default();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT cache_key, value FROM book_cache WHERE book_key = ?1 AND expires_at > ?2",
+    )
+    .bind(key)
+    .bind(source_health::now_ms())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    (vars, rows.into_iter().collect())
+}
+
+/// 把编排层收集到的增量落库（UPSERT 语义；失败只记日志，不影响主结果）。
+async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_book::BookChange>) {
+    let now = source_health::now_ms();
+    for ch in changes {
+        if let Some(vars) = ch.vars {
+            let mut json = serde_json::to_string(&vars).unwrap_or_else(|_| "{}".into());
+            if json.len() > BOOK_VARS_MAX_BYTES {
+                // 超限：按键名排序后保留尽可能多的项（不产生非法 JSON）
+                let mut keys: Vec<&String> = vars.keys().collect();
+                keys.sort();
+                let mut kept = serde_json::Map::new();
+                for k in keys {
+                    kept.insert(k.clone(), serde_json::Value::String(vars[k].clone()));
+                    if serde_json::to_string(&kept).map(|s| s.len()).unwrap_or(usize::MAX)
+                        > BOOK_VARS_MAX_BYTES
+                    {
+                        kept.remove(k);
+                        break;
+                    }
+                }
+                json = serde_json::to_string(&kept).unwrap_or_else(|_| "{}".into());
+                tracing::warn!(
+                    book_key = %ch.key,
+                    bytes = json.len(),
+                    limit = BOOK_VARS_MAX_BYTES,
+                    "book vars truncated"
+                );
+            }
+            if let Err(e) = sqlx::query(
+                "INSERT INTO book_vars (book_key, vars_json, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(book_key) DO UPDATE SET vars_json = excluded.vars_json, \
+                 updated_at = excluded.updated_at",
+            )
+            .bind(&ch.key)
+            .bind(&json)
+            .bind(now)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(error = %e, "save book vars failed");
+            }
+        }
+        for (ck, cv) in ch.cache_upserts {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO book_cache (book_key, cache_key, value, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(book_key, cache_key) DO UPDATE SET value = excluded.value, \
+                 expires_at = excluded.expires_at",
+            )
+            .bind(&ch.key)
+            .bind(&ck)
+            .bind(&cv)
+            .bind(now + BOOK_CACHE_TTL_MS)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(error = %e, "save book cache failed");
+            }
+        }
+        for ck in ch.cache_deletes {
+            if let Err(e) = sqlx::query(
+                "DELETE FROM book_cache WHERE book_key = ?1 AND cache_key = ?2",
+            )
+            .bind(&ch.key)
+            .bind(&ck)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(error = %e, "delete book cache failed");
+            }
+        }
+    }
+}
+
+/// 构造并预载一本书的作用域容器。
+async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::BookStore {
+    let (vars, cache) = load_book_scope(pool, key).await;
+    let store = web_book::BookStore::new();
+    store.seed(key.to_string(), vars, cache);
+    store
+}
+
 /// 目录缓存读取：TTL 内存在任意章节则整体命中（一次 SELECT 避免 N 次查询）。
 pub(crate) async fn load_cached_chapters(
     pool: &SqlitePool,
@@ -2723,6 +2887,9 @@ mod tests {
         let job = test_job("queue", 0, 1);
         let past = tokio::time::Instant::now() - Duration::from_secs(1);
         let mut outcomes = Vec::new();
+        // 排队阶段不会真正执行任务，这里给一个惰性池即可满足参数类型。
+        let book_pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let store = Arc::new(web_book::BookStore::new());
         run_search_batch(
             &job,
             vec![src("排队源", "http://queue.example", 1, true)],
@@ -2732,6 +2899,8 @@ mod tests {
             &HashMap::new(),
             &mut outcomes,
             crate::req::SearchScope::Curated,
+            &book_pool,
+            &store,
         )
         .await;
         let view = job_view(&job);

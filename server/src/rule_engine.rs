@@ -1,4 +1,4 @@
-//! Legado 规则引擎（AnalyzeRule 等价实现）
+﻿//! Legado 规则引擎（AnalyzeRule 等价实现）
 //!
 //! 支持：CSS 选择器(scraper) / JsonPath / XPath(sxd-xpath, XML 源) / 正则 / 变量 `${name}` 展开 /
 //! 整串 JS 段(`<js>`、`@js:`)切分 / 列表解析(get_string_list)。
@@ -109,6 +109,12 @@ fn new_js_context(conf: JsConf) -> boa_engine::Context {
         0,
         boa_engine::NativeFunction::from_fn_ptr(native_ajax),
     );
+    // java.setContent 之后的 DOM 选择器求值桥（惰性解析，见 native_select）。
+    let _ = ctx.register_global_callable(
+        boa_engine::JsString::from("__nativeSelect"),
+        0,
+        boa_engine::NativeFunction::from_fn_ptr(native_select),
+    );
     ctx
 }
 
@@ -209,6 +215,63 @@ fn ajax_error(msg: &str) -> boa_engine::JsError {
     )
 }
 
+/// `java.setContent` 之后 DOM 三件套的按需求值（`__nativeSelect(content, rule, wantList)`）。
+///
+/// 上游的 `java.setContent` 把内容设到同一个 `AnalyzeRule` 上，后续 `getElements` 在该
+/// 文档上按当前模式（HTML/CSS 或 JSON/JSONPath）求值；本服务把这一步下沉为原生函数，
+/// 惰性解析，不再依赖 eval 前的字面量选择器预抽取。
+///
+/// 只允许“纯选择器/JSONPath”规则：含 `@js:`、`<js>`、`{{…}}`、`@put/@get` 的规则会在
+/// 同一 JS 线程上再次排队，必然死锁，直接返回具名未支持错误。
+fn native_select(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let text_arg = |i: usize| -> String {
+        args.get(i)
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default()
+    };
+    let content = text_arg(0);
+    let rule = text_arg(1);
+    let want_list = args
+        .get(2)
+        .map(|v| v.to_boolean())
+        .unwrap_or(true);
+    if rule.trim().is_empty() {
+        return Err(ajax_error("java.setContent 后缺少选择器参数"));
+    }
+    if rule.contains("@js:")
+        || rule.contains("<js>")
+        || rule.contains("{{")
+        || rule.contains("@put:")
+        || rule.contains("@get:")
+    {
+        return Err(ajax_error(
+            "UNSUPPORTED_JS_API:java.setContent 后的选择器不能再含 JS/变量段",
+        ));
+    }
+    let ar = AnalyzeRule::new();
+    let json = if want_list {
+        match ar.get_string_list(&content, &rule) {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()),
+            Err(e) => {
+                return Err(ajax_error(&format!("java.setContent 选择器求值失败：{e}")));
+            }
+        }
+    } else {
+        match ar.get_string(&content, &rule, false, "") {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "\"\"".into()),
+            Err(e) => {
+                return Err(ajax_error(&format!("java.setContent 选择器求值失败：{e}")));
+            }
+        }
+    };
+    Ok(boa_engine::JsValue::from(boa_engine::JsString::from(json)))
+}
+
 /// 垫片抛出的“未支持 API”统一前缀；worker 把它翻译成用户能读懂的提示。
 const UNSUPPORTED_JS_API: &str = "UNSUPPORTED_JS_API:";
 
@@ -291,7 +354,8 @@ function __fromUtf8(bin){
 }
 // 纯 JS base64，避免依赖宿主是否提供 btoa/atob（boa 0.19 默认不带）
 var __B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function __b64enc(bin){
+function __b64enc(bin, urlSafe, pad){
+  var alpha = urlSafe ? __B64URL : __B64;
   var out = "", i;
   for (i = 0; i < bin.length; i += 3) {
     var c1 = bin.charCodeAt(i);
@@ -299,14 +363,15 @@ function __b64enc(bin){
     var c3 = i + 2 < bin.length ? bin.charCodeAt(i + 2) : 0;
     var e1 = c1 >> 2, e2 = ((c1 & 3) << 4) | (c2 >> 4);
     var e3 = ((c2 & 15) << 2) | (c3 >> 6), e4 = c3 & 63;
-    out += __B64.charAt(e1) + __B64.charAt(e2);
-    out += (i + 1 < bin.length ? __B64.charAt(e3) : "=");
-    out += (i + 2 < bin.length ? __B64.charAt(e4) : "=");
+    out += alpha.charAt(e1) + alpha.charAt(e2);
+    out += (i + 1 < bin.length ? alpha.charAt(e3) : "=");
+    out += (i + 2 < bin.length ? alpha.charAt(e4) : "=");
   }
+  if (pad === false) out = out.replace(/=+$/, "");
   return out;
 }
 function __b64dec(s){
-  s = String(s).replace(/[^A-Za-z0-9+/=]/g, "");
+  s = String(s).replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
   var bin = "", i;
   for (i = 0; i < s.length; i += 4) {
     var c1 = __B64.indexOf(s.charAt(i));
@@ -319,6 +384,36 @@ function __b64dec(s){
     if (c4 >= 0) bin += String.fromCharCode(((c3 & 3) << 6) | c4);
   }
   return bin;
+}
+// base64 变体（上游 JsExtensions.kt 签名）：
+//   base64Encode(str) / base64Encode(str, flags)      flags 默认 2(NO_WRAP)，8=URL_SAFE，1=NO_PADDING
+//   base64Decode(str) / base64Decode(str, charset) / base64Decode(str, flags)
+//   base64DecodeToByteArray(str[, flags])
+var __B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function __b64encFlags(bin, flags){
+  flags = (flags === undefined || flags === null) ? 2 : Number(flags);
+  return __b64enc(bin, (flags & 8) !== 0, (flags & 1) === 0);
+}
+function __b64Bytes(s){ var bin = __b64dec(s), a = []; for (var i = 0; i < bin.length; i++) a.push(bin.charCodeAt(i)); return a; }
+function __hexBin(h){
+  h = String(h || "").replace(/[^0-9A-Fa-f]/g, "");
+  if (h.length % 2 !== 0) return "";
+  var out = "";
+  // boa 0.19 没有实现 Annex B 的 String.prototype.substr，这里用 slice
+  for (var i = 0; i < h.length; i += 2) out += String.fromCharCode(parseInt(h.slice(i, i + 2), 16));
+  return out;
+}
+function __b64Charset(bin, charset){
+  // 只实现 Legado 源里常见的几种；GBK 等无 JS 解码表，退化为 UTF-8（与上游的 GBK 解码有差异）。
+  var c = String(charset).toUpperCase().replace(/[_-]/g, "");
+  if (c === "UTF8" || c === "") return __fromUtf8(bin);
+  if (c === "LATIN1" || c === "ISO88591" || c === "ASCII" || c === "USASCII") return bin;
+  if (c === "UTF16LE" || c === "UNICODELITTLE") {
+    var out = "";
+    for (var i = 0; i + 1 < bin.length; i += 2) out += String.fromCharCode(bin.charCodeAt(i) | (bin.charCodeAt(i + 1) << 8));
+    return out;
+  }
+  return __fromUtf8(bin);
 }
 "#;
 
@@ -410,11 +505,44 @@ function __md5(s){
 /// 简→繁常用字表（供 `java.t2s`）。只覆盖常见字；未收录字原样返回。
 const JS_T2S: &str = r#"var __T2S = {"爱":"愛","罢":"罷","摆":"擺","败":"敗","办":"辦","帮":"幫","宝":"寶","报":"報","备":"備","贝":"貝","笔":"筆","毕":"畢","边":"邊","变":"變","标":"標","表":"錶","别":"彆","宾":"賓","补":"補","参":"參","惨":"慘","灿":"燦","仓":"倉","产":"產","长":"長","尝":"嘗","车":"車","彻":"徹","尘":"塵","陈":"陳","衬":"襯","称":"稱","惩":"懲","迟":"遲","冲":"衝","丑":"醜","础":"礎","处":"處","触":"觸","传":"傳","疮":"瘡","闯":"闖","创":"創","纯":"純","词":"詞","从":"從","丛":"叢","窜":"竄","达":"達","带":"帶","贷":"貸","担":"擔","单":"單","胆":"膽","当":"當","党":"黨","荡":"蕩","档":"檔","导":"導","敌":"敵","邓":"鄧","递":"遞","点":"點","电":"電","垫":"墊","钓":"釣","调":"調","叠":"疊","东":"東","动":"動","冻":"凍","斗":"鬥","独":"獨","读":"讀","断":"斷","对":"對","队":"隊","吨":"噸","夺":"奪","堕":"墮","儿":"兒","尔":"爾","发":"發","罚":"罰","阀":"閥","飞":"飛","费":"費","废":"廢","纷":"紛","坟":"墳","奋":"奮","粪":"糞","风":"風","丰":"豐","冯":"馮","凤":"鳳","肤":"膚","妇":"婦","复":"復","该":"該","干":"乾","赶":"趕","冈":"岡","刚":"剛","岗":"崗","纲":"綱","钢":"鋼","个":"個","给":"給","巩":"鞏","沟":"溝","构":"構","购":"購","谷":"穀","顾":"顧","刮":"颳","关":"關","观":"觀","馆":"館","惯":"慣","广":"廣","归":"歸","龟":"龜","规":"規","国":"國","过":"過","汉":"漢","号":"號","轰":"轟","后":"後","胡":"鬍","壶":"壺","沪":"滬","护":"護","划":"劃","怀":"懷","坏":"壞","欢":"歡","环":"環","还":"還","回":"迴","汇":"匯","会":"會","秽":"穢","荤":"葷","浑":"渾","伙":"夥","获":"獲","击":"擊","鸡":"雞","积":"積","极":"極","际":"際","继":"繼","家":"傢","价":"價","艰":"艱","歼":"殲","舰":"艦","姜":"薑","浆":"漿","桨":"槳","奖":"獎","讲":"講","酱":"醬","胶":"膠","浇":"澆","骄":"驕","娇":"嬌","搅":"攪","缴":"繳","觉":"覺","较":"較","阶":"階","节":"節","洁":"潔","结":"結","借":"藉","仅":"僅","惊":"驚","竞":"競","旧":"舊","剧":"劇","据":"據","惧":"懼","卷":"捲","决":"決","绝":"絕","军":"軍","开":"開","克":"剋","壳":"殼","夸":"誇","矿":"礦","亏":"虧","困":"睏","腊":"臘","蜡":"蠟","来":"來","赖":"賴","兰":"蘭","拦":"攔","栏":"欄","烂":"爛","垒":"壘","类":"類","里":"裡","礼":"禮","丽":"麗","厉":"厲","励":"勵","离":"離","历":"歷","帘":"簾","联":"聯","怜":"憐","炼":"煉","练":"練","粮":"糧","两":"兩","辆":"輛","疗":"療","辽":"遼","了":"瞭","猎":"獵","临":"臨","邻":"鄰","岭":"嶺","庐":"廬","芦":"蘆","炉":"爐","陆":"陸","虏":"虜","录":"錄","虑":"慮","乱":"亂","罗":"羅","萝":"蘿","络":"絡","妈":"媽","马":"馬","骂":"罵","买":"買","麦":"麥","卖":"賣","迈":"邁","脉":"脈","猫":"貓","么":"麼","门":"門","闷":"悶","梦":"夢","弥":"彌","觅":"覓","绵":"綿","面":"麵","庙":"廟","灭":"滅","亩":"畝","恼":"惱","脑":"腦","拟":"擬","酿":"釀","鸟":"鳥","聂":"聶","宁":"寧","农":"農","齐":"齊","岂":"豈","启":"啟","气":"氣","弃":"棄","牵":"牽","签":"簽","迁":"遷","窍":"竅","窃":"竊","亲":"親","轻":"輕","庆":"慶","琼":"瓊","穷":"窮","秋":"鞦","区":"區","驱":"驅","趋":"趨","权":"權","劝":"勸","确":"確","让":"讓","扰":"擾","热":"熱","认":"認","荣":"榮","绒":"絨","洒":"灑","伞":"傘","丧":"喪","扫":"掃","涩":"澀","杀":"殺","晒":"曬","纱":"紗","设":"設","绅":"紳","审":"審","声":"聲","胜":"勝","圣":"聖","师":"師","湿":"濕","时":"時","实":"實","适":"適","势":"勢","兽":"獸","书":"書","术":"術","树":"樹","帅":"帥","双":"雙","谁":"誰","顺":"順","说":"說","丝":"絲","松":"鬆","苏":"蘇","诉":"訴","虽":"雖","随":"隨","台":"臺","态":"態","摊":"攤","滩":"灘","坛":"壇","叹":"嘆","汤":"湯","烫":"燙","涛":"濤","体":"體","条":"條","铁":"鐵","听":"聽","厅":"廳","头":"頭","图":"圖","涂":"塗","团":"團","洼":"窪","袜":"襪","弯":"彎","万":"萬","网":"網","韦":"韋","违":"違","围":"圍","为":"為","卫":"衛","温":"溫","闻":"聞","问":"問","稳":"穩","务":"務","雾":"霧","牺":"犧","习":"習","系":"係","戏":"戲","细":"細","虾":"蝦","吓":"嚇","鲜":"鮮","纤":"纖","咸":"鹹","显":"顯","险":"險","现":"現","献":"獻","乡":"鄉","详":"詳","响":"響","向":"嚮","协":"協","挟":"挾","泻":"瀉","谢":"謝","兴":"興","须":"須","许":"許","悬":"懸","选":"選","学":"學","寻":"尋","压":"壓","亚":"亞","严":"嚴","盐":"鹽","阳":"陽","养":"養","样":"樣","痒":"癢","谣":"謠","药":"藥","爷":"爺","业":"業","叶":"葉","页":"頁","义":"義","议":"議","亿":"億","忆":"憶","艺":"藝","隐":"隱","应":"應","营":"營","拥":"擁","优":"優","忧":"憂","邮":"郵","余":"餘","鱼":"魚","与":"與","屿":"嶼","语":"語","吁":"籲","郁":"鬱","誉":"譽","渊":"淵","园":"園","员":"員","圆":"圓","缘":"緣","远":"遠","愿":"願","跃":"躍","云":"雲","杂":"雜","灾":"災","赞":"讚","赃":"贓","脏":"臟","凿":"鑿","枣":"棗","灶":"竈","责":"責","择":"擇","则":"則","泽":"澤","贼":"賊","赠":"贈","扎":"紮","张":"張","帐":"帳","战":"戰","这":"這","针":"針","征":"徵","争":"爭","挣":"掙","症":"癥","证":"證","只":"隻","帜":"幟","质":"質","种":"種","众":"眾","昼":"晝","烛":"燭","筑":"築","庄":"莊","装":"裝","妆":"妝","壮":"壯","状":"狀","准":"準","浊":"濁","总":"總","钻":"鑽","纵":"縱","邹":"鄒","诅":"詛","组":"組","话":"話","记":"記","写":"寫","诗":"詩","请":"請","难":"難","乐":"樂","进":"進","岁":"歲","间":"間","见":"見","龙":"龍","颜":"顏","恋":"戀","泪":"淚","华":"華","画":"畫"};"#;
 
+/// `cache` 全局（Legado: 规则语义 `bindings["cache"] = CacheManager`）。
+/// 上游 CacheManager 的方法名是 `get / put / delete`（另有 getFromMemory / putMemory /
+/// deleteMemory，CacheManager.kt:60-160），**没有** set/remove/clear。
+/// 本实现是每作用域一份的字符串 map：`get` 未命中返回 null（同上游返回 String?），
+/// put 的对象/数组按 JSON 串存储（上游存 Any）。
+const JS_CACHE: &str = r#"
+var __cache = {};
+var cache = {
+  get: function(k){
+    k = String(k);
+    return Object.prototype.hasOwnProperty.call(__cache, k) ? __cache[k] : null;
+  },
+  getFromMemory: function(k){ return cache.get(k); },
+  put: function(k, v){
+    k = String(k);
+    if (typeof v === "string") { __cache[k] = v; return; }
+    try { __cache[k] = JSON.stringify(v); } catch (e) { __cache[k] = String(v); }
+  },
+  putMemory: function(k, v){ cache.put(k, v); },
+  delete: function(k){ delete __cache[String(k)]; },
+  deleteMemory: function(k){ cache.delete(k); }
+};
+"#;
+
+/// JS 执行结果里回传 cache 变更的分隔符（结果串 + 分隔符 + cache JSON）。
+const JS_CACHE_SENTINEL: &str = "\u{1}F1CACHE\u{1}";
+
+/// 结果串尾部的“规则自身耗时”（毫秒）：预算只该算规则代码，不该算固定垫片/lib 的解析。
+const JS_RULE_MS_SENTINEL: &str = "\u{1}F1RULEMS\u{1}";
+
 const JAVA_BOOK_SHIM: &str = r#"
 var __vars = {};
 // DOM 桥 Phase 1 的预抽取结果（由 Rust 在 eval 前按字面量选择器算好并赋值）
 var __DOM = {};
 var __DOMS = {};
+// java.setContent 设置的“当前文档”。null 表示未设置，仍走原始页面的预抽取表；
+// 设置后 java.getElements/getString/getStringList 才按需解析这个文档（惰性求值）。
+var __content = null;
 var book = {
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
@@ -439,9 +567,16 @@ var java = {
     for (var i = 0; i < s.length; i++) { out += (__T2S[s.charAt(i)] || s.charAt(i)); }
     return out;
   },
-  base64Encode: function(s){ try { return __b64enc(__utf8(s)); } catch(e){ return ""; } },
-  base64Decode: function(s){ try { return __fromUtf8(__b64dec(s)); } catch(e){ return ""; } },
+  base64Encode: function(s, flags){ try { return __b64encFlags(__utf8(s), flags); } catch(e){ return ""; } },
+  base64Decode: function(s, arg){
+    try {
+      var bin = __b64dec(s);
+      if (typeof arg === "string") return __b64Charset(bin, arg);
+      return __fromUtf8(bin);
+    } catch(e){ return ""; }
+  },
   base64DecodeToString: function(s){ return java.base64Decode(s); },
+  base64DecodeToByteArray: function(s, flags){ try { return __b64Bytes(s); } catch(e){ return []; } },
   encodeURI: function(s){ return encodeURIComponent(String(s)); },
   decodeURI: function(s){ try { return decodeURIComponent(String(s)); } catch(e){ return ""; } },
   encodeURIComponent: function(s){ return encodeURIComponent(String(s)); },
@@ -453,12 +588,15 @@ var java = {
     for (var i = 0; i < b.length; i++) { out += ("0" + b.charCodeAt(i).toString(16)).slice(-2); }
     return out;
   },
-  hexDecode: function(s){
-    s = String(s || "").replace(/\s+/g, "");
-    if (s.length % 2 !== 0) return "";
-    var pct = "";
-    for (var i = 0; i < s.length; i += 2) { pct += "%" + s.slice(i, i + 2); }
-    try { return decodeURIComponent(pct); } catch(e){ return ""; }
+  hexEncodeToString: function(s){ return java.hexEncode(s); },
+  hexDecode: function(s){ try { return __fromUtf8(__hexBin(s)); } catch(e){ return ""; } },
+  hexDecodeToString: function(s){ return java.hexDecode(s); },
+  hexDecodeToByteArray: function(s){
+    try {
+      var bin = __hexBin(s), a = [];
+      for (var i = 0; i < bin.length; i++) a.push(bin.charCodeAt(i));
+      return a;
+    } catch(e){ return []; }
   },
   random: function(max){
     if (max === undefined || max === null) return Math.random();
@@ -516,29 +654,46 @@ var java = {
   },
   post: function(url, body, headers){ return java.ajax(url, "POST", body, headers); },
   connect: function(){ throw new Error("UNSUPPORTED_JS_API:java.connect（本服务无 socket 桥接）"); },
-  // DOM 桥 Phase 1：只认 Rust 预抽取好的“字面量选择器”结果（__DOM / __DOMS），
-  // 动态拼串或页面超限不走这里，直接给出具名未支持提示。
+  // DOM 桥：`java.setContent(html)` 之后按需在“当前文档”上求值（Rust 原生解析，
+  // 不再依赖预抽取的只读表）；未 setContent 时仍用 Phase 1 的字面量选择器快路。
+  setContent: function(html){ __content = (html == null) ? "" : String(html); },
   getElements: function(rule, index){
-    if (rule == null || !__DOM.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      var arr = JSON.parse(__nativeSelect(__content, key, true));
+      if (typeof index === "number") {
+        return (index >= 0 && index < arr.length) ? arr[index] : "";
+      }
+      return arr;
+    }
+    if (rule == null || !__DOM.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getElements（仅支持字面量选择器参数）");
     }
-    var arr = __DOM[String(rule)].slice(0);
+    var arr = __DOM[key].slice(0);
     if (typeof index === "number") {
       return (index >= 0 && index < arr.length) ? arr[index] : "";
     }
     return arr;
   },
   getStringList: function(rule){
-    if (rule == null || !__DOM.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      return JSON.parse(__nativeSelect(__content, key, true));
+    }
+    if (rule == null || !__DOM.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getStringList（仅支持字面量选择器参数）");
     }
-    return __DOM[String(rule)].slice(0);
+    return __DOM[key].slice(0);
   },
   getString: function(rule){
-    if (rule == null || !__DOMS.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      return JSON.parse(__nativeSelect(__content, key, false));
+    }
+    if (rule == null || !__DOMS.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getString（仅支持字面量选择器参数）");
     }
-    return __DOMS[String(rule)];
+    return __DOMS[key];
   },
   getCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.getCookie（本服务无 Cookie 桥接）"); },
   setCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.setCookie（本服务无 Cookie 桥接）"); },
@@ -646,6 +801,16 @@ enum Mode {
 
 pub struct AnalyzeRule {
     pub variables: RefCell<HashMap<String, String>>,
+    /// Legado JS 环境里的 `cache`（上游 规则语义 `bindings["cache"] = CacheManager`）。
+    /// 最小等价版：同作用域可读写的字符串 map。上游 CacheManager 是 App 级单例 + SQLite，
+    /// 本服务**每作用域一份**（随 AnalyzeRule 存活），不共享、不持久化。
+    pub cache: RefCell<HashMap<String, String>>,
+    /// 跨请求的 book 层变量（Legado `book.putVariable`，上游 规则语义）。
+    /// `@put:{key:rule}` 除了写当前 `variables`，也写这里；路由层在请求结束后按
+    /// `book_key` 落库，下一次同书请求（info → toc → content）预载回来。
+    pub book_vars: RefCell<HashMap<String, String>>,
+    /// 当前作用域所属的 book_key（由路由层/编排层设置，None 表示没有 book 维度）。
+    pub book_key: RefCell<Option<String>>,
     pub js_lib: String,
     pub is_json: bool,
 }
@@ -654,6 +819,9 @@ impl Default for AnalyzeRule {
     fn default() -> Self {
         Self {
             variables: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
+            book_vars: RefCell::new(HashMap::new()),
+            book_key: RefCell::new(None),
             js_lib: String::new(),
             is_json: false,
         }
@@ -673,6 +841,34 @@ impl AnalyzeRule {
         self.variables.borrow_mut().extend(m);
     }
 
+    /// 进入一本书的作用域：清空请求内变量，载入该书持久化的变量与 cache 快照。
+    /// 之后 `@put` 同时写入 `variables`（本请求可见）与 `book_vars`（请求结束落库）。
+    pub fn begin_book_scope(
+        &self,
+        key: String,
+        vars: HashMap<String, String>,
+        cache: HashMap<String, String>,
+    ) {
+        let mut v = self.variables.borrow_mut();
+        v.clear();
+        v.extend(vars.iter().map(|(k, val)| (k.clone(), val.clone())));
+        self.book_vars.replace(vars);
+        self.cache.replace(cache);
+        self.book_key.replace(Some(key));
+    }
+
+    pub fn book_scope_key(&self) -> Option<String> {
+        self.book_key.borrow().clone()
+    }
+
+    pub fn book_vars_snapshot(&self) -> HashMap<String, String> {
+        self.book_vars.borrow().clone()
+    }
+
+    pub fn cache_snapshot(&self) -> HashMap<String, String> {
+        self.cache.borrow().clone()
+    }
+
     /// 变量/JSONPath 模板展开：支持 `${var}`、`{{var}}`，以及 `{{$.field}}` / `${$.field}` / `{$.field}`
     /// （JSONPath 形式按**当前规则输入** `content` 求值，用于书源里
     /// `.../read?bid={{$.id}}`、`https://api.x/topics/{$.id}` 这类“列表项字段拼进 URL/POST body”的写法）。
@@ -684,9 +880,28 @@ impl AnalyzeRule {
             None
         };
         re.replace_all(rule, |caps: &regex::Captures| {
+            // `${…}`：只在确实是引擎变量/JSONPath 时替换；未知名字原样保留——
+            // 它通常是 JS 模板字符串（快看 `x=>`<img src="${x},${headers}">``），
+            // 替换成空串会把 JS 的插值一起吃掉。
+            if let Some(m) = caps.get(1) {
+                let key = m.as_str().trim();
+                if key.starts_with("$.") || key.starts_with("$[") {
+                    if let Some(v) = json.as_ref() {
+                        if let Ok(mut vals) = json_query(v, key) {
+                            if let Some(x) = vals.pop() {
+                                return value_to_string(x);
+                            }
+                        }
+                    }
+                    return String::new();
+                }
+                if let Some(v) = self.variables.borrow().get(key).cloned() {
+                    return v;
+                }
+                return caps.get(0).unwrap().as_str().to_string();
+            }
             let key = caps
-                .get(1)
-                .or_else(|| caps.get(2))
+                .get(2)
                 .or_else(|| caps.get(3))
                 .map(|m| m.as_str())
                 .unwrap_or("");
@@ -716,7 +931,7 @@ impl AnalyzeRule {
         .to_string()
     }
 
-    fn detect_mode(rule: &str, is_json: bool) -> Mode {
+    fn detect_mode(rule: &str, is_json: bool, content: &str) -> Mode {
         // Legado 的 `@CSS:`/`@XPath:`/`@Json:` 前缀全部大小写不敏感。
         if starts_with_ci(rule, "@xpath:") {
             Mode::XPath
@@ -724,7 +939,11 @@ impl AnalyzeRule {
             Mode::Json
         } else if starts_with_ci(rule, "@css:") || rule.starts_with("@@") {
             Mode::Css
-        } else if rule.starts_with("$.") || rule.starts_with("$[") || is_json {
+        } else if rule.starts_with("$.") || rule.starts_with("$[") {
+            Mode::Json
+        } else if is_json && !content.trim_start().starts_with('<') {
+            // 源级 JSON 提示只对 JSON 内容生效：HTML 页面上的 `img@data-src`
+            // 不能被强行当成 JSONPath（快看图片规则就栽在这里）。
             Mode::Json
         } else if rule.starts_with('/') {
             // `/.../`（含替换形式 `/pat/repl/`）判定为正则；普通 XPath 不以 / 结尾
@@ -794,6 +1013,53 @@ impl AnalyzeRule {
         }
     }
 
+    /// Legado `@put:{key:rule}` / `@get:{key}`：
+    /// - 上游 `AnalyzeRule.splitPutRule`（L516，正则 L1027 `@put:(\{[^}]+?\})`，大小写不敏感）
+    ///   先把 `@put:{…}` 从规则正文里摘掉；求值时 `putRule`（L507）把每个 value 当**完整规则**
+    ///   在当前 content 上求值后 `put(key, value)`（L856；chapter→book→ruleData→source 依次落库）。
+    /// - `@get:{key}` 由 `makeUpRule`（L698/L718）替换成变量值，未命中返回空串（`get` L875）。
+    /// - key 允许下划线；`value` 走完整求值链（含 `@js:`、`$.path`）；put 失败不影响主结果。
+    ///
+    /// 本服务没有 Book/Chapter 实体，作用域退化为一次 `AnalyzeRule`（一次请求内新建）的
+    /// 变量表，不写任何全局状态，因此不同源/不同请求天然隔离。
+    fn apply_put_get(&self, rule: &str, content: &str, is_url: bool, base_url: &str) -> String {
+        if !rule.contains("@put:") && !rule.contains("@get:") && !rule.contains("@PUT:")
+            && !rule.contains("@GET:")
+        {
+            return rule.to_string();
+        }
+        let put_re = Regex::new(r"(?i)@put:\{([^}]*)\}").unwrap();
+        let mut text = rule.to_string();
+        for caps in put_re.captures_iter(rule) {
+            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            // 先摘掉操作符本身（与上游 splitPutRule 一致），失败也不影响剩余规则
+            text = text.replacen(whole, "", 1);
+            for (key, value_rule) in split_put_pairs(inner) {
+                let key = key.trim();
+                if key.is_empty() {
+                    continue;
+                }
+                let value = value_rule.trim().to_string();
+                if let Ok(v) = self.get_string_inner(content, &value, is_url, base_url) {
+                    self.variables
+                        .borrow_mut()
+                        .insert(key.to_string(), v.clone());
+                    // book 层持久化：即使本轮没有 book_key（如搜索阶段），也留在
+                    // book_vars 里等待编排层落库，不跨请求丢失。
+                    self.book_vars.borrow_mut().insert(key.to_string(), v);
+                }
+            }
+        }
+        let get_re = Regex::new(r"(?i)@get:\{([^}]*)\}").unwrap();
+        get_re
+            .replace_all(&text, |caps: &regex::Captures| {
+                let key = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                self.variables.borrow().get(key).cloned().unwrap_or_default()
+            })
+            .to_string()
+    }
+
     /// 单值入口：对应 Legado `getString(..., unescape = true)`。
     /// HTML4 实体只在**最外层**反转义一次；内部递归走 `get_string_inner`，避免重复反转义。
     pub fn get_string(
@@ -815,7 +1081,16 @@ impl AnalyzeRule {
         is_url: bool,
         base_url: &str,
     ) -> Result<String, RuleError> {
-        let rule = self.expand_vars(rule, content);
+        // 整条规则只有 `@get:{key}`：直接返回变量值（否则替换后的字面量会被当成 CSS 选择器）。
+        let raw = rule.trim();
+        let only_get = (starts_with_ci(raw, "@get:") && raw.ends_with('}'))
+            && !raw[5..].contains('@')
+            && raw[5..].starts_with('{');
+        let rule = self.apply_put_get(rule, content, is_url, base_url);
+        if only_get {
+            return Ok(rule.trim().to_string());
+        }
+        let rule = self.expand_vars(&rule, content);
         let rule = rule.trim().to_string();
         if rule.is_empty() {
             return Ok(String::new());
@@ -835,35 +1110,8 @@ impl AnalyzeRule {
         if rule.starts_with('{') && rule.ends_with('}') && rule.contains(':') {
             return Ok(rule.to_string());
         }
-        // @get:{key} / @put:{key:value} 规则级变量操作符（Legado 跨规则变量传递）
-        let trimmed = rule.trim();
-        if let Some(rest) = trimmed.strip_prefix("@get:{") {
-            if rest.ends_with('}') {
-                let key = &rest[..rest.len() - 1];
-                return Ok(self
-                    .variables
-                    .borrow()
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_default());
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("@put:{") {
-            if let Some(end) = rest.rfind('}') {
-                let inner = &rest[..end];
-                if let Some(colon) = inner.find(':') {
-                    let key = inner[..colon].trim().to_string();
-                    let mut val = inner[colon + 1..].trim();
-                    // 去掉可能的引号包裹
-                    if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                        val = &val[1..val.len() - 1];
-                    }
-                    let res = self.get_string_inner(content, val, is_url, base_url)?;
-                    self.variables.borrow_mut().insert(key, res.clone());
-                    return Ok(res);
-                }
-            }
-        }
+        // @get:{key} / @put:{key:value} 已在 `apply_put_get` 里按 Legado 的
+        // `splitPutRule` + `makeUpRule` 语义处理（可出现在规则任意位置，不只整串）。
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
         // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
         if let Some(parts) = split_outside_js(&rule, "##") {
@@ -942,7 +1190,7 @@ impl AnalyzeRule {
                 Mode::Js => self.eval_js(&input, t, base_url)?,
                 _ => {
                     let m = if mode == Mode::Default {
-                        Self::detect_mode(t, self.is_json)
+                        Self::detect_mode(t, self.is_json, &input)
                     } else {
                         mode
                     };
@@ -1143,7 +1391,8 @@ impl AnalyzeRule {
     /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
     fn js_vars(&self) -> String {
         const RESERVED: &[&str] = &[
-            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "java",
+            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "__content",
+            "__nativeSelect", "__nativeAjax", "java", "cache", "__cache", "__out",
         ];
         let mut out = String::new();
         for (k, v) in self.variables.borrow().iter() {
@@ -1187,16 +1436,21 @@ impl AnalyzeRule {
         let dom_js = serde_json::to_string(&dom).unwrap_or_else(|_| "{}".into());
         let doms_js = serde_json::to_string(&doms).unwrap_or_else(|_| "{}".into());
         let vars_js = self.js_vars();
+        let cache_init = serde_json::to_string(&self.cache.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{lib}\n{shim}\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nif (Array.isArray(__r)) {{ try {{ return JSON.stringify(__r); }} catch(__e) {{}} }}\nreturn String(__r); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{cachejs}\n{lib}\n{shim}\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {sent} + JSON.stringify(__cache) + {msent} + String(__ms); }})()",
             r = js_string_literal(input),
             b = js_string_literal(base_url),
             vars = vars_js,
+            cachejs = JS_CACHE,
             lib = self.js_lib,
             shim = shim,
+            cacheinit = cache_init,
             dom = dom_js,
             doms = doms_js,
             code = js_string_literal(code),
+            sent = js_string_literal(JS_CACHE_SENTINEL),
+            msent = js_string_literal(JS_RULE_MS_SENTINEL),
         );
         let (tx, rx) = channel::<(Result<String, String>, u64, u64)>();
         js_sender()
@@ -1205,20 +1459,52 @@ impl AnalyzeRule {
         let (result, net_ms, js_elapsed) = rx
             .recv()
             .map_err(|_| RuleError::Other("js worker dropped".into()))?;
+        // 结果串尾部依次带回 cache 变更与规则自身耗时（非法/超大都忽略，不影响主结果）
+        let mut rule_ms: Option<u64> = None;
+        let result = match result {
+            Ok(mut s) => {
+                if let Some(idx) = s.rfind(JS_RULE_MS_SENTINEL) {
+                    let tail = s[idx + JS_RULE_MS_SENTINEL.len()..].trim().to_string();
+                    if let Ok(ms) = tail.parse::<u64>() {
+                        rule_ms = Some(ms);
+                    }
+                    s.truncate(idx);
+                }
+                if let Some(idx) = s.rfind(JS_CACHE_SENTINEL) {
+                    let tail = s[idx + JS_CACHE_SENTINEL.len()..].to_string();
+                    if tail.len() <= 1_048_576 {
+                        if let Ok(map) =
+                            serde_json::from_str::<HashMap<String, String>>(&tail)
+                        {
+                            self.cache.replace(map);
+                        }
+                    }
+                    s.truncate(idx);
+                }
+                Ok(s)
+            }
+            Err(e) => Err(e),
+        };
         let (result, net_ms) = (result.map_err(RuleError::Other), net_ms);
+        // 预算只算规则自身耗时（页面里 Date.now 包裹 eval 的那段），固定垫片/lib 的
+        // 解析成本与机器负载相关，不该算到源作者头上；`java.ajax` 联网时间也扣掉。
+        // 拿不到回传耗时（脚本抛错等）时退回整段耗时，保守但不会放过慢规则。
+        let budget_ms = rule_ms.map_or(js_elapsed, |ms| ms).saturating_sub(net_ms);
         // 排队等单一 JS 线程的时间不计入预算：并发测试/并发请求下同一规则仍应通过。
         JS_LAST_MS.store(js_elapsed, Ordering::Relaxed);
-        JS_MAX_MS.fetch_max(js_elapsed, Ordering::Relaxed);
-        if js_elapsed > conf.timeout_ms {
+        JS_MAX_MS.fetch_max(budget_ms, Ordering::Relaxed);
+        // 已经报错的脚本保留原始错误（如 RuntimeLimit），不要被“超预算”盖掉
+        if result.is_ok() && budget_ms > conf.timeout_ms {
             tracing::warn!(
                 elapsed_ms = js_elapsed,
+                rule_ms = budget_ms,
                 net_ms,
                 budget_ms = conf.timeout_ms,
                 "js rule exceeded time budget"
             );
             return Err(RuleError::Other(format!(
                 "js eval exceeded {}ms budget (took {}ms)",
-                conf.timeout_ms, js_elapsed
+                conf.timeout_ms, budget_ms
             )));
         }
         result
@@ -1226,7 +1512,8 @@ impl AnalyzeRule {
 
     /// 列表：返回多个元素的字符串（HTML 取 inner_html；JSON 取数组元素字符串）
     pub fn get_string_list(&self, content: &str, rule: &str) -> Result<Vec<String>, RuleError> {
-        let rule = self.expand_vars(rule, content);
+        let rule = self.apply_put_get(rule, content, false, "");
+        let rule = self.expand_vars(&rule, content);
         // Legado 约定：规则以 `-` 开头表示「结果倒序」（多见于章节列表，如 `-$..comics.*`）。
         if let Some(rest) = rule.trim_start().strip_prefix('-') {
             let mut v = self.get_string_list(content, rest.trim_start())?;
@@ -1285,7 +1572,7 @@ impl AnalyzeRule {
             }
             return Ok(vec![res]);
         }
-        let mode = Self::detect_mode(&rule, self.is_json);
+        let mode = Self::detect_mode(&rule, self.is_json, content);
         match mode {
             Mode::Json => self.json_list(content, Self::strip_prefix(&rule, "@json:")),
             _ => self.css_list(content, Self::strip_prefix(&rule, "@css:")),
@@ -1301,7 +1588,8 @@ impl AnalyzeRule {
         rule: &str,
         base_url: &str,
     ) -> Vec<String> {
-        let rule = self.expand_vars(rule, content);
+        let rule = self.apply_put_get(rule, content, false, base_url);
+        let rule = self.expand_vars(&rule, content);
         let r = rule.trim();
         if r.is_empty() {
             return vec![];
@@ -1376,6 +1664,38 @@ impl AnalyzeRule {
         }
         // JS 段：数组按 JSON 拆项，普通字符串按 `\n` 拆（Legado getStringList 对 String 的处理）
         if starts_with_ci(r, "@js:") || contains_ci(r, "@js:") || r.contains("<js>") {
+            let js_parts = Self::split_js(r);
+            if js_parts.len() >= 2 {
+                let last = js_parts.len() - 1;
+                let mut input = content.to_string();
+                for (i, (mode, text)) in js_parts.iter().enumerate() {
+                    let t = text.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if i == last {
+                        return match self.eval_js(&input, t, base_url) {
+                            Ok(s) if !s.is_empty() => {
+                                if s.starts_with('[') {
+                                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
+                                        return arr;
+                                    }
+                                }
+                                s.split('\n').map(|x| x.to_string()).collect()
+                            }
+                            _ => vec![],
+                        };
+                    }
+                    if *mode == Mode::Js {
+                        input = self.eval_js(&input, t, base_url).unwrap_or_default();
+                    } else {
+                        // 列表语义：JSONPath 指向数组时先摊平成多项，再以 `\n` 交给 JS。
+                        // 爱看 `$.data.current_chapter.chapter_img_list@js:result.split("\n")…`
+                        // 依赖的就是「每条图片 URL 一行」的输入（上游 getStringList 的 List 语义）。
+                        input = self.eval_list(&input, t, base_url).join("\n");
+                    }
+                }
+            }
             return match self.get_string_inner(content, r, false, base_url) {
                 Ok(s) if !s.is_empty() => {
                     if s.starts_with('[') {
@@ -1388,7 +1708,7 @@ impl AnalyzeRule {
                 _ => vec![],
             };
         }
-        match Self::detect_mode(r, self.is_json) {
+        match Self::detect_mode(r, self.is_json, content) {
             Mode::Json => self
                 .json_list(content, Self::strip_prefix(r, "@json:"))
                 .unwrap_or_default(),
@@ -1740,6 +2060,9 @@ fn parse_json_path(path: &str) -> Result<Vec<JpSeg>, String> {
                     if cs.get(i) == Some(&'*') {
                         segs.push(JpSeg::Wildcard);
                         i += 1;
+                    } else if cs.get(i) == Some(&'[') {
+                        // Legado 用 Jayway json-path，容忍 `$.data.[*]` 这类多余的点
+                        continue;
                     } else {
                         let (k, ni) = read_key(i);
                         if k.is_empty() {
@@ -3129,6 +3452,82 @@ fn find_js_tag_end(rule: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// 解析 `@put:{k1:v1,k2:v2}` 的 `{…}` 内部：顶层（不在引号/括号内）按 `,` 分组，再按首个 `:`
+/// 拆 key/value。对应上游 `splitPutRule`（规则语义 L516-530）里的 GSON 宽松解析。
+fn split_put_pairs(inner: &str) -> Vec<(String, String)> {
+    let mut groups: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            cur.push(ch);
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '{' | '[' | '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '}' | ']' | ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                groups.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        groups.push(cur.trim().to_string());
+    }
+    let mut out = Vec::new();
+    for group in groups {
+        let mut quote: Option<char> = None;
+        let mut depth = 0i32;
+        let mut split_at = None;
+        for (idx, ch) in group.char_indices() {
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '"' | '\'' => quote = Some(ch),
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
+                ':' if depth == 0 => {
+                    split_at = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(idx) = split_at {
+            let key = group[..idx].trim().trim_matches('"').trim_matches('\'').trim();
+            let value = group[idx + 1..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            if !key.is_empty() {
+                out.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// 在规则串顶层按分隔符拆分，但忽略落在 `<js>…</js>` 或 `@js:` 段内的分隔符。
 /// 仅当当前字节为 ASCII 时才尝试 `starts_with`（分隔符/标记均为 ASCII），避免多字节
 /// UTF-8（如中文）字符内部切片越界。
@@ -3517,6 +3916,29 @@ nodes.filter(function (node) {
         assert!(items[0].contains("甲"));
     }
 
+    /// 快看的图片规则首段：CSS `img@data-src` 必须按列表返回每个属性值。
+    #[test]
+    fn get_list_css_attr_data_src() {
+        let html = r#"<div class="ComicPics"><img data-src="https://cdn/x1.webp?a=1&amp;t=2" src="s1"><img data-src="https://cdn/x2.webp" src="s2"></div>"#;
+        let ar = AnalyzeRule::new();
+        let vals = ar.get_string_list_all(html, "img@data-src", "");
+        assert_eq!(
+            vals,
+            vec![
+                "https://cdn/x1.webp?a=1&t=2".to_string(),
+                "https://cdn/x2.webp".to_string()
+            ]
+        );
+        // 接着 JS 段：拼成 `<img src="url,{headers}">` 形态
+        let rule = "img@data-src\n<js>\nlet headers = JSON.stringify({\"headers\":{\"Referer\":baseUrl}});\nresult.split('\\n').map(x=>`<img src=\"${x},${headers}\">`).join('\\n');\n</js>";
+        let out = ar.get_string_list_all(html, rule, "https://m.kuaikanmanhua.com/");
+        assert_eq!(out.len(), 2, "实际: {out:?}");
+        assert!(
+            out[0].starts_with("<img src=\"https://cdn/x1.webp?a=1&t=2,"),
+            "实际: {out:?}"
+        );
+    }
+
     #[test]
     fn dom_bridge_dynamic_argument_reports_unsupported() {
         // 动态拼串不预处理，必须在运行时给出具名提示，而不是静默空结果
@@ -3615,14 +4037,195 @@ nodes.filter(function (node) {
     }
 
     #[test]
-    fn put_get_variables() {
+    fn put_then_get_in_same_scope() {
         let ar = AnalyzeRule::new();
         let html = "<div><a>lit</a></div>";
-        // @put 求值后存入变量，@get 取回
-        let stored = ar.get_string(html, "@put:{x:a@text}", false, "").unwrap();
+        // 上游语义：@put 是副作用，摘掉后主体规则照常求值（快看/爱看都是嵌在规则尾部）
+        let stored = ar
+            .get_string(html, "a@text@put:{x:a@text}", false, "")
+            .unwrap();
         assert_eq!(stored, "lit");
         let got = ar.get_string(html, "@get:{x}", false, "").unwrap();
         assert_eq!(got, "lit");
+        // 纯 @put 规则自身求值为空串（Legado splitPutRule 后规则正文为空）
+        let only_put = ar.get_string(html, "@put:{y:a@text}", false, "").unwrap();
+        assert_eq!(only_put, "");
+        assert_eq!(ar.get_string("", "@get:{y}", false, "").unwrap(), "lit");
+    }
+
+    #[test]
+    fn get_missing_returns_empty() {
+        let ar = AnalyzeRule::new();
+        let got = ar.get_string("", "@get:{nope}", false, "").unwrap();
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn put_get_jsonpath_and_underscore_key() {
+        let ar = AnalyzeRule::new();
+        let json = r#"{"comic_name":"海贼王","comic_id":106492}"#;
+        // 爱看形态：name 规则尾部 put，toc_url 里 get；key 允许下划线
+        let name = ar
+            .get_string(json, "$.comic_name@put:{comic_bid:$.comic_id}", false, "")
+            .unwrap();
+        assert_eq!(name, "海贼王");
+        let url = ar
+            .get_string(
+                json,
+                "https://m.kanman.com/api/getchapterlist?comic_id=@get:{comic_bid}",
+                true,
+                "",
+            )
+            .unwrap();
+        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+        // 多个 put 键
+        let json2 = r#"{"a":1,"b":2}"#;
+        ar.get_string(json2, "@put:{k1:$.a,k2:$.b}", false, "").unwrap();
+        assert_eq!(ar.get_string("", "@get:{k1}", false, "").unwrap(), "1");
+        assert_eq!(ar.get_string("", "@get:{k2}", false, "").unwrap(), "2");
+    }
+
+    #[test]
+    fn cache_get_put_in_same_scope() {
+        let ar = AnalyzeRule::new();
+        ar.eval_js("", "cache.put('kkmh', 'payload')", "").unwrap();
+        // 同一作用域的下一次 eval 仍能读到（快看 init → chapter_list 的用法）
+        let got = ar
+            .eval_js("", "result = String(cache.get('kkmh'))", "")
+            .unwrap();
+        assert_eq!(got, "payload");
+        // 未命中返回 null（上游 CacheManager.get 返回 String?）
+        let miss = ar.eval_js("", "result = String(cache.get('nope'))", "").unwrap();
+        assert_eq!(miss, "null");
+        // 非字符串按 JSON 串存
+        ar.eval_js("", "cache.put('obj', {a:1})", "").unwrap();
+        let obj = ar.eval_js("", "result = cache.get('obj')", "").unwrap();
+        assert_eq!(obj, "{\"a\":1}");
+        // delete 后可写
+        ar.eval_js("", "cache.delete('kkmh')", "").unwrap();
+        let gone = ar.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        assert_eq!(gone, "null");
+    }
+
+    #[test]
+    fn cache_does_not_leak_across_sources() {
+        let a = AnalyzeRule::new();
+        let b = AnalyzeRule::new();
+        a.eval_js("", "cache.put('kk', 'A')", "").unwrap();
+        // 另一个源（另一个 AnalyzeRule）读不到
+        let b_got = b.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        assert_eq!(b_got, "null");
+        let a_got = a.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        assert_eq!(a_got, "A");
+        // 变量表也不跨作用域
+        assert_eq!(b.get_string("", "@get:{kk}", false, "").unwrap(), "");
+    }
+
+    #[test]
+    fn vars_do_not_leak_across_scopes() {
+        let a = AnalyzeRule::new();
+        let b = AnalyzeRule::new();
+        let html = "<a>111</a>";
+        a.get_string(html, "@put:{bid:a@text}", false, "").unwrap();
+        // 另一个源（另一个 AnalyzeRule）读不到
+        assert_eq!(b.get_string("", "@get:{bid}", false, "").unwrap(), "");
+        assert_eq!(a.get_string("", "@get:{bid}", false, "").unwrap(), "111");
+    }
+
+    /// 跨请求：搜索阶段 `@put` 的 bid 在 info/toc 的新 AnalyzeRule 上读回（爱看链路）。
+    #[test]
+    fn book_vars_survive_new_request_scope() {
+        let json = r#"{"comic_name":"海贼王","comic_id":106492}"#;
+        // 请求 1（搜索）：写入 book 层变量
+        let req1 = AnalyzeRule::new();
+        req1.begin_book_scope("bk-1".into(), HashMap::new(), HashMap::new());
+        let name = req1
+            .get_string(json, "$.comic_name@put:{bid:$.comic_id}", false, "")
+            .unwrap();
+        assert_eq!(name, "海贼王");
+        assert_eq!(req1.book_vars_snapshot().get("bid").map(|s| s.as_str()), Some("106492"));
+
+        // 请求 2（目录）：新实例预载同一 book_key 的快照后 @get 生效
+        let req2 = AnalyzeRule::new();
+        req2.begin_book_scope("bk-1".into(), req1.book_vars_snapshot(), HashMap::new());
+        let url = req2
+            .get_string(
+                "",
+                "https://m.kanman.com/api/getchapterlist?comic_id=@get:{bid}",
+                true,
+                "",
+            )
+            .unwrap();
+        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+
+        // 另一本书（不同 book_key）不会读到
+        let other = AnalyzeRule::new();
+        other.begin_book_scope("bk-2".into(), HashMap::new(), HashMap::new());
+        assert_eq!(other.get_string("", "@get:{bid}", false, "").unwrap(), "");
+    }
+
+    /// 跨请求 cache：info 阶段 `cache.put` 的 JSON，目录阶段预载后可 `cache.get`。
+    #[test]
+    fn cache_survives_new_request_scope() {
+        let req1 = AnalyzeRule::new();
+        req1.begin_book_scope("bk-1".into(), HashMap::new(), HashMap::new());
+        req1.eval_js("", "cache.put('kkmh', '{\"data\":[1,2]}')", "").unwrap();
+        let snap = req1.cache_snapshot();
+        assert_eq!(snap.get("kkmh").map(|s| s.as_str()), Some("{\"data\":[1,2]}"));
+
+        let req2 = AnalyzeRule::new();
+        req2.begin_book_scope("bk-1".into(), HashMap::new(), snap);
+        let got = req2.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        assert_eq!(got, "{\"data\":[1,2]}");
+        // 目录阶段 delete 后快照里也没了（供路由层按 diff 删库）
+        req2.eval_js("", "cache.delete('kkmh')", "").unwrap();
+        assert!(req2.cache_snapshot().is_empty());
+    }
+
+    /// 快看形态：`java.setContent(json)` → `java.getElements('$.data[*].comicList[*]')`。
+    #[test]
+    fn set_content_then_get_elements_jsonpath_like_source() {
+        let nuxt = r#"{"data":[{"comicList":[{"id":1,"title":"第1话"},{"id":2,"title":"第2话"}]},{"comicList":[{"id":3,"title":"第3话"}]}]}"#;
+        let code = format!(
+            "java.setContent({}); result = java.getElements('$.data[*].comicList[*]');",
+            serde_json::to_string(nuxt).unwrap()
+        );
+        let ar = AnalyzeRule::new();
+        let out = ar.eval_js("", &code, "").unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let arr = v.as_array().expect("应返回章节节点数组");
+        assert_eq!(arr.len(), 3, "两页 comicList 共 3 章: {out}");
+        let first: Value = serde_json::from_str(arr[0].as_str().unwrap()).unwrap();
+        assert_eq!(first["title"], "第1话");
+    }
+
+    /// setContent 也只作用于本次 eval（每次 eval 都是新的 IIFE）。
+    #[test]
+    fn set_content_scoped_to_call() {
+        let ar = AnalyzeRule::new();
+        ar.eval_js("", "java.setContent('{\"a\":[1,2]}'); result = 1", "")
+            .unwrap();
+        let err = ar
+            .eval_js("", "result = java.getElements('$.a[*]')", "")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("仅支持字面量选择器"),
+            "下一次调用不应复用上次的文档（应回落到预抽取表并报未支持）：{err}"
+        );
+    }
+
+    /// setContent 也支持 HTML 文档（CSS 选择器），下游 getString 同文档求值。
+    #[test]
+    fn set_content_html_css_selectors() {
+        let ar = AnalyzeRule::new();
+        let out = ar
+            .eval_js(
+                "",
+                "java.setContent('<div class=\"x\"><p>甲</p></div>'); result = java.getString('div.x p');",
+                "",
+            )
+            .unwrap();
+        assert_eq!(out, "甲");
     }
 
     #[test]
@@ -3864,6 +4467,49 @@ nodes.filter(function (node) {
                 .unwrap(),
             "A"
         );
+        // base64 同族（上游 JsExtensions.kt L676-730 签名）
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Decode('5Lit5paH','UTF-8')</js>", false, "")
+                .unwrap(),
+            "中文"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Decode('5Lit5paH',2)</js>", false, "")
+                .unwrap(),
+            "中文"
+        );
+        // URL-safe 变体（flags=8）编码后可原样解回
+        assert_eq!(
+            ar.get_string(
+                "",
+                "<js>var e=java.base64Encode('a?b',8); java.base64Decode(e)</js>",
+                false,
+                ""
+            )
+            .unwrap(),
+            "a?b"
+        );
+        // flags=1 去 padding
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Encode('a',1)</js>", false, "")
+                .unwrap(),
+            "YQ"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.base64DecodeToByteArray('5Lit5paH').length</js>", false, "")
+                .unwrap(),
+            "6"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.hexEncodeToString('中文')</js>", false, "")
+                .unwrap(),
+            "e4b8ade69687"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.hexDecodeToString('e4b8ade69687')</js>", false, "")
+                .unwrap(),
+            "中文"
+        );
         // 毫秒时间戳 + Java 风格 pattern
         assert_eq!(
             ar.get_string(
@@ -3913,6 +4559,18 @@ nodes.filter(function (node) {
         // 下标（含负下标）
         assert_eq!(ar.get_string(json, "$.data.books[1].id", false, "").unwrap(), "b2");
         assert_eq!(ar.get_string(json, "$.data.books[-1].id", false, "").unwrap(), "b2");
+    }
+
+    // Legado 用的 Jayway json-path 容忍 `$.data.[*]`（点与方括号混用），爱看目录规则就是这种写法
+    #[test]
+    fn jsonpath_tolerates_dot_before_bracket() {
+        let ar = AnalyzeRule::new();
+        let json = r#"{"data":[{"id":1},{"id":2}]}"#;
+        assert_eq!(ar.get_string(json, "$.data.[0].id", false, "").unwrap(), "1");
+        assert_eq!(
+            ar.get_string_list(json, "$.data.[*].id").unwrap(),
+            vec!["1", "2"]
+        );
     }
 
     // 不支持的 JSONPath 不再原样抛 PestError，而是可读中文提示
