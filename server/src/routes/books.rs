@@ -2887,6 +2887,9 @@ mod tests {
         let job = test_job("queue", 0, 1);
         let past = tokio::time::Instant::now() - Duration::from_secs(1);
         let mut outcomes = Vec::new();
+        // 排队阶段不会真正执行任务，这里给一个惰性池即可满足参数类型。
+        let book_pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let store = Arc::new(web_book::BookStore::new());
         run_search_batch(
             &job,
             vec![src("排队源", "http://queue.example", 1, true)],
@@ -2896,6 +2899,8 @@ mod tests {
             &HashMap::new(),
             &mut outcomes,
             crate::req::SearchScope::Curated,
+            &book_pool,
+            &store,
         )
         .await;
         let view = job_view(&job);
