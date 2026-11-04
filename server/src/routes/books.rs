@@ -52,7 +52,8 @@ pub struct SearchQ {
     /// 显式越权：为 `1`/`true` 时冷却中的源也参与搜索（排查用）。
     #[serde(default)]
     include_cooled: Option<String>,
-    /// 搜索范围：`curated`（默认，只搜精选源）| `all`（加强搜索，覆盖 preferred+observing）。
+    /// 搜索范围：`curated`（默认，只跑精选源）/ `all`（加强搜索，全量源）。
+    /// 仅 `/api/search/start` 使用；legacy 入口忽略该参数，保持旧行为。
     #[serde(default)]
     scope: Option<String>,
     page: Option<i32>,
@@ -75,6 +76,11 @@ impl SearchQ {
             .unwrap_or("")
             .trim()
             .to_string()
+    }
+
+    /// 搜索范围：缺省 curated，未知值也按 curated（默认路径不能变慢）。
+    fn scope(&self) -> crate::req::SearchScope {
+        crate::req::SearchScope::parse(self.scope.as_deref())
     }
 }
 
@@ -203,20 +209,16 @@ struct SearchJob {
     /// 启用中的书源快照：用于去重/按权重排序，保证与 aggregate 的排序规则一致
     sources: Vec<crate::entities::BookSource>,
     source_total: usize,
+    /// 本次搜索范围（curated / all），用于结果接口回显与预算/并发选择。
+    scope: crate::req::SearchScope,
     /// 因冷却被跳过的源数（本次请求）
     skipped_cooldown: usize,
     /// 候选集合中当前处于冷却的源总数（前端提示“另有 N 个源处于冷却”）
     cooldown_total: usize,
-    /// 本次请求的搜索范围：`curated` / `all`
-    scope: String,
     /// 实际覆盖情况：`curated`（只用了精选源）/ `expanded`（退回或显式覆盖到全部可搜索源）
     coverage: String,
     /// 当前精选集合大小（curated_total）
     curated_total: usize,
-    /// 单源预算
-    per_source_budget: Duration,
-    /// 整次搜索总预算
-    total_budget: Duration,
     state: Mutex<SearchJobState>,
 }
 
@@ -231,8 +233,14 @@ fn unix_ms() -> u64 {
 struct SearchJobState {
     books: Vec<SearchBook>,
     errors: Vec<web_book::SourceFailure>,
+    /// 已处理完的源数（含成功/失败/排队未及执行）
     finished: usize,
+    /// 尚未处理完的源数（legacy 语义；与 `scheduled` 不同）
     pending: usize,
+    /// 已进入调度的源数（两段式下逐批累加）
+    scheduled: usize,
+    /// 真正拿到并发槽并发出过至少一次请求的源数
+    attempted: usize,
 }
 
 fn job_registry() -> &'static Mutex<Vec<Arc<SearchJob>>> {
@@ -296,23 +304,40 @@ fn next_job_id() -> String {
     format!("j{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+struct JobView {
+    books: Vec<SearchBook>,
+    errors: Vec<web_book::SourceFailure>,
+    done: bool,
+    finished: usize,
+    pending: usize,
+    scheduled: usize,
+    attempted: usize,
+}
+
 /// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）
-fn job_view(
-    job: &SearchJob,
-) -> (
-    Vec<SearchBook>,
-    Vec<web_book::SourceFailure>,
-    bool,
-    usize,
-    usize,
-) {
-    let (books, errors, finished, pending) = {
+fn job_view(job: &SearchJob) -> JobView {
+    let (books, errors, finished, pending, scheduled, attempted) = {
         let st = job.state.lock().unwrap();
-        (st.books.clone(), st.errors.clone(), st.finished, st.pending)
+        (
+            st.books.clone(),
+            st.errors.clone(),
+            st.finished,
+            st.pending,
+            st.scheduled,
+            st.attempted,
+        )
     };
     let mut full = web_book::dedupe_and_sort(books, &job.sources);
     full.truncate(AGG_MAX_BOOKS);
-    (full, errors, pending == 0, finished, pending)
+    JobView {
+        books: full,
+        errors,
+        done: pending == 0,
+        finished,
+        pending,
+        scheduled,
+        attempted,
+    }
 }
 
 async fn run_search_job(
@@ -322,12 +347,13 @@ async fn run_search_job(
     pool: SqlitePool,
     cooldown_secs: u64,
     tier_cfg: crate::source_quality::TierConfig,
-    per_source_budget: Duration,
-    total_budget: Duration,
     health: HashMap<String, source_health::HealthRow>,
+    scope: crate::req::SearchScope,
 ) {
-    let budget = per_source_budget;
-    // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束。
+    // 单源与整批预算独立：curated 5s/6s，all 6s/10s（见 req::search_budget_for）。
+    let budget = crate::req::search_budget_for(scope);
+    let total_budget = crate::req::search_total_budget(scope);
+    // 排队等槽不计入单源预算，但整次搜索仍受此上限约束。
     let deadline = tokio::time::Instant::now() + total_budget;
 
     // 两批调度：preferred 先跑，但只占一段预算，剩余时间强制留给 observing，
@@ -339,17 +365,27 @@ async fn run_search_job(
         deadline
     } else {
         (tokio::time::Instant::now()
-            + preferred_phase_budget(budget, true, tier_cfg.preferred_budget_pct))
+            + preferred_phase_budget(total_budget, true, tier_cfg.preferred_budget_pct))
         .min(deadline)
     };
 
     let mut outcomes: Vec<source_health::Outcome> = Vec::new();
     if !preferred.is_empty() {
-        run_search_batch(&job, preferred, &key, preferred_deadline, budget, &health, &mut outcomes)
-            .await;
+        run_search_batch(
+            &job,
+            preferred,
+            &key,
+            preferred_deadline,
+            budget,
+            &health,
+            &mut outcomes,
+            scope,
+        )
+        .await;
     }
     if !observing.is_empty() {
-        run_search_batch(&job, observing, &key, deadline, budget, &health, &mut outcomes).await;
+        run_search_batch(&job, observing, &key, deadline, budget, &health, &mut outcomes, scope)
+            .await;
     }
 
     if let Err(e) =
@@ -376,6 +412,7 @@ async fn run_search_batch(
     budget: Duration,
     health: &HashMap<String, source_health::HealthRow>,
     outcomes: &mut Vec<source_health::Outcome>,
+    scope: crate::req::SearchScope,
 ) {
     enum TaskOutcome {
         Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
@@ -386,17 +423,21 @@ async fn run_search_batch(
     }
 
     let mut pending = futures::stream::FuturesUnordered::new();
+    {
+        let mut st = job.state.lock().unwrap();
+        st.scheduled += sources.len();
+    }
     for src in sources {
         let s = src.clone();
         let k = key.to_string();
         pending.push(async move {
             let comic = crate::req::is_comic_source_type(s.book_source_type);
             let queued_at = Instant::now();
-            let slot = match crate::req::acquire_search_slot(comic, phase_deadline).await {
+            let slot = match crate::req::acquire_search_slot(comic, phase_deadline, scope).await {
                 Ok(p) => p,
                 Err(e) => {
                     let waited = queued_at.elapsed().as_millis() as i64;
-                    return (s, TaskOutcome::Skipped(format!("{e}")), waited);
+                    return (s, TaskOutcome::Skipped(format!("{e}")), waited, false);
                 }
             };
             let started = Instant::now();
@@ -407,6 +448,7 @@ async fn run_search_batch(
                     s,
                     TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
                     started.elapsed().as_millis() as i64,
+                    false,
                 );
             }
             let r = tokio::time::timeout(remain.min(budget), web_book::search(&s, &k, 1)).await;
@@ -426,13 +468,16 @@ async fn run_search_batch(
                     TaskOutcome::Timeout(err)
                 }
             };
-            (s, outcome, latency_ms)
+            (s, outcome, latency_ms, true)
         });
     }
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
-    while let Some((src, outcome, latency_ms)) = pending.next().await {
+    while let Some((src, outcome, latency_ms, attempted)) = pending.next().await {
         let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut st = job.state.lock().unwrap();
+        if attempted {
+            st.attempted += 1;
+        }
         match outcome {
             TaskOutcome::Done(Ok(mut books)) => {
                 let hits = books.len() as i64;
@@ -586,6 +631,34 @@ fn searchable_sources(
         .collect()
 }
 
+/// 按 scope 过滤候选源：
+/// - `all`：原样返回（全量源）；
+/// - `curated`：只保留体检精选集合（`source_curated` 表）；集合为空/未就绪则退回全量。
+fn filter_sources_by_scope(
+    candidates: Vec<crate::entities::BookSource>,
+    curated: Option<&std::collections::HashSet<String>>,
+    scope: crate::req::SearchScope,
+) -> Vec<crate::entities::BookSource> {
+    if scope == crate::req::SearchScope::All {
+        return candidates;
+    }
+    match curated {
+        Some(urls) => candidates
+            .into_iter()
+            .filter(|s| urls.contains(&s.book_source_url))
+            .collect(),
+        None => candidates,
+    }
+}
+
+fn search_phase(pending: usize) -> &'static str {
+    if pending == 0 {
+        "final"
+    } else {
+        "first"
+    }
+}
+
 async fn search_start(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -604,57 +677,56 @@ async fn search_start(
         tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
         HashMap::new()
     });
-    let enabled_all = searchable_sources(sources, &quarantined, &health);
-    let requested = parse_source_ids(q.source_ids.as_deref());
-    let requested_scope = q
-        .scope
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "curated".to_string());
-    let mut scope = if requested_scope == "all" { "all".to_string() } else { "curated".to_string() };
-    let mut coverage = if scope == "curated" { "curated".to_string() } else { "expanded".to_string() };
-    let mut curated_total = 0usize;
-
-    let (mut selected, ignored) = select_sources(&enabled_all, &requested);
-    if !requested.is_empty() {
-        // 显式选源始终按“覆盖全部可搜索源”的语义：用户勾选的 observing 源不应被精选过滤掉。
-        scope = "all".to_string();
-        coverage = "expanded".to_string();
-    } else if scope == "curated" {
+    let scope = q.scope();
+    let searchable_all = searchable_sources(sources, &quarantined, &health);
+    // curated 集合来自体检（source_curated 表）；冷启动/读取失败 → None，退回现有 tier 逻辑。
+    let curated = if scope == crate::req::SearchScope::Curated {
         match crate::source_bench::curated_set(&s.shared).await {
-            Ok(set) => {
-                curated_total = set.len();
-                if set.is_empty() {
-                    // 冷启动：还没跑过体检 → 退回现有 tier 逻辑，避免“0 源”搜索。
-                    tracing::info!(target: "search_job", reason = "cold_start_no_curated", "curated empty; fallback to all");
-                    scope = "all".to_string();
-                    coverage = "expanded".to_string();
-                } else {
-                    selected.retain(|x| set.contains(&x.book_source_url));
-                }
+            Ok(set) if !set.is_empty() => Some(set),
+            Ok(_) => {
+                tracing::info!(target: "search_job", reason = "cold_start_no_curated", "curated empty; fallback to all");
+                None
             }
             Err(e) => {
                 tracing::warn!(error = %e, "load curated set failed; fallback to all");
-                scope = "all".to_string();
-                coverage = "expanded".to_string();
+                None
             }
         }
-    }
-    if scope == "curated" && selected.is_empty() {
-        // 精选集合存在但与可搜索源交集为空：同样退回 all。
-        scope = "all".to_string();
-        coverage = "expanded".to_string();
-        selected = select_sources(&enabled_all, &[]).0;
-    }
-    // curated：单源 5s / 总 6s；all（加强搜索）：单源 6s / 总 10s。
-    let (per_source_budget, total_budget) = if scope == "curated" {
-        (Duration::from_secs(5), Duration::from_secs(6))
     } else {
-        (Duration::from_secs(6), Duration::from_secs(10))
+        None
+    };
+    let curated_total = curated.as_ref().map(|s| s.len()).unwrap_or(0);
+    let requested = parse_source_ids(q.source_ids.as_deref());
+    // 显式选源始终按“覆盖全部可搜索源”的语义：用户勾选的 observing 源不应被精选过滤掉。
+    let candidates = if requested.is_empty() {
+        filter_sources_by_scope(searchable_all.clone(), curated.as_ref(), scope)
+    } else {
+        searchable_all.clone()
+    };
+    let (mut selected, ignored) = select_sources(&candidates, &requested);
+    let mut effective = scope;
+    let mut coverage = if effective == crate::req::SearchScope::All {
+        "expanded"
+    } else {
+        "curated"
+    };
+    if !requested.is_empty() {
+        effective = crate::req::SearchScope::All;
+        coverage = "expanded";
+    } else if scope == crate::req::SearchScope::Curated && selected.is_empty() {
+        // 精选集合存在但与可搜索源交集为空：退回 all。
+        effective = crate::req::SearchScope::All;
+        coverage = "expanded";
+        selected = select_sources(&searchable_all, &[]).0;
+    }
+    let cooldown_base = if effective == crate::req::SearchScope::All {
+        &searchable_all
+    } else {
+        &candidates
     };
     let include_cooled = truthy(q.include_cooled.as_deref());
     let now = source_health::now_ms();
-    let cooldown_total = source_health::cooled_count(&enabled_all, &health, now);
+    let cooldown_total = source_health::cooled_count(cooldown_base, &health, now);
     let partition = source_health::partition_cooldown(selected, &health, include_cooled, now);
     let skipped_cooldown = partition.skipped;
     let enabled = partition.active;
@@ -667,13 +739,11 @@ async fn search_start(
         created_unix_ms: unix_ms(),
         sources: enabled.clone(),
         source_total,
+        scope: effective,
         skipped_cooldown,
         cooldown_total,
-        scope: scope.clone(),
-        coverage: coverage.clone(),
+        coverage: coverage.to_string(),
         curated_total,
-        per_source_budget,
-        total_budget,
         state: Mutex::new(SearchJobState {
             pending: source_total,
             ..Default::default()
@@ -688,6 +758,9 @@ async fn search_start(
             job_id = %job.id,
             created_unix_ms = job.created_unix_ms,
             source_total = job.source_total,
+            scope = job.scope.as_str(),
+            coverage = job.coverage.as_str(),
+            curated_total = job.curated_total,
             known_jobs = g.len(),
             "create search job"
         );
@@ -699,18 +772,24 @@ async fn search_start(
         s.shared.clone(),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
-        per_source_budget,
-        total_budget,
         health,
+        effective,
     ));
     Ok(Json(json!({
         "job_id": id,
-        "source_total": source_total,
-        "deadline_ms": total_budget.as_millis() as u64,
-        // 本次搜索范围与实际覆盖情况（curated 空集会回退 expanded）
-        "scope": scope,
+        "scope": effective.as_str(),
         "coverage": coverage,
         "curated_total": curated_total,
+        "source_total": source_total,
+        // deadline_ms 保持旧语义：本次 scope 的单源预算；整批预算单独给出。
+        "deadline_ms": crate::req::search_budget_for(effective).as_millis() as u64,
+        "total_budget_ms": crate::req::search_total_budget(effective).as_millis() as u64,
+        // 首轮快照：还没调度任何源。
+        "phase": search_phase(source_total),
+        "partial": source_total > 0,
+        "scheduled_sources": 0,
+        "attempted_sources": 0,
+        "pending_sources": source_total,
         // 契约变更：显式回显过滤结果，便于前端提示“哪些 id 被忽略”
         "source_ids_requested": requested,
         "ignored_source_ids": ignored,
@@ -746,7 +825,16 @@ async fn search_result(
         found
     };
     let job = job.ok_or_else(|| AppError::NotFound("搜索任务不存在或已过期（60s TTL）".into()))?;
-    let (full, errors, done, finished, pending) = job_view(&job);
+    let view = job_view(&job);
+    let done = view.done;
+    let finished = view.finished;
+    let pending = view.pending;
+    let scheduled = view.scheduled;
+    let attempted = view.attempted;
+    // 未排上的源（两段式里尚未进入调度的批次）
+    let pending_scheduled = job.source_total.saturating_sub(scheduled);
+    let full = view.books;
+    let errors = view.errors;
 
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
@@ -762,13 +850,21 @@ async fn search_result(
         "total": total,
         "has_more": skip + page_size < total,
         "done": done,
+        // 两段式进度：scheduled=已进入调度（逐批累加），attempted=真正发过请求；
+        // pending_sources=尚未排上的源（source_total - scheduled），done 仍以“全部处理完”为准。
+        "phase": search_phase(pending),
+        "partial": !done,
+        "scheduled_sources": scheduled,
+        "attempted_sources": attempted,
+        "pending_sources": pending_scheduled,
+        "scope": job.scope.as_str(),
         "finished": finished,
         "pending": pending,
         "source_total": job.source_total,
         "source_failed": source_failed,
-        "deadline_ms": job.total_budget.as_millis() as u64,
-        "scope": &job.scope,
-        "coverage": &job.coverage,
+        "deadline_ms": crate::req::search_budget_for(job.scope).as_millis() as u64,
+        "total_budget_ms": crate::req::search_total_budget(job.scope).as_millis() as u64,
+        "coverage": job.coverage.as_str(),
         "curated_total": job.curated_total,
         // 冷却统计随 job 固化，轮询期间不会变化
         "skipped_cooldown": job.skipped_cooldown,
@@ -2558,35 +2654,170 @@ mod tests {
             created_unix_ms: 0,
             sources: vec![hi, lo],
             source_total: 2,
+            scope: crate::req::SearchScope::Curated,
             skipped_cooldown: 0,
             cooldown_total: 0,
-            scope: "curated".into(),
             coverage: "curated".into(),
             curated_total: 0,
-            per_source_budget: Duration::from_secs(5),
-            total_budget: Duration::from_secs(6),
             state: Mutex::new(SearchJobState {
                 books: vec![a, b],
                 errors: vec![],
                 finished: 1,
                 pending: 1,
+                ..Default::default()
             }),
         };
-        let (books, errors, done, finished, pending) = job_view(&job);
-        assert_eq!(books.len(), 1, "同名同作者应去重为一条");
+        let view = job_view(&job);
+        assert_eq!(view.books.len(), 1, "同名同作者应去重为一条");
         assert_eq!(
-            books[0].origin.as_deref(),
+            view.books[0].origin.as_deref(),
             Some("http://hi"),
             "权重高的源应排在前面"
         );
-        assert!(errors.is_empty());
-        assert_eq!((finished, pending), (1, 1));
-        assert!(!done, "还有源未完成时 done 必须为 false");
+        assert!(view.errors.is_empty());
+        assert_eq!((view.finished, view.pending), (1, 1));
+        assert!(!view.done, "还有源未完成时 done 必须为 false");
 
         job.state.lock().unwrap().pending = 0;
-        let (_, _, done, _, pending) = job_view(&job);
-        assert!(done);
-        assert_eq!(pending, 0);
+        let view = job_view(&job);
+        assert!(view.done);
+        assert_eq!(view.pending, 0);
+    }
+
+    // curated：只保留体检精选集合；集合为空时退回全量（退化路径，避免 0 命中）
+    #[test]
+    fn curated_scope_filters_by_bench_set_and_falls_back_to_all() {
+        use crate::req::SearchScope;
+        let candidates = vec![
+            src("精选", "http://curated", 1, true),
+            src("非精选", "http://observing", 1, true),
+        ];
+        let set: std::collections::HashSet<String> =
+            ["http://curated".to_string()].into_iter().collect();
+
+        let curated =
+            filter_sources_by_scope(candidates.clone(), Some(&set), SearchScope::Curated);
+        assert_eq!(curated.len(), 1, "curated 只跑精选源");
+        assert_eq!(curated[0].book_source_url, "http://curated");
+
+        let all = filter_sources_by_scope(candidates.clone(), Some(&set), SearchScope::All);
+        assert_eq!(all.len(), 2, "all 保留全量源");
+
+        // 无精选集合（冷启动）：curated 退化为全量，不能返回 0 源
+        let fallback = filter_sources_by_scope(candidates, None, SearchScope::Curated);
+        assert_eq!(fallback.len(), 2, "无精选源时应退化为全量");
+    }
+
+    // phase：pending>0 → first（partial=true），pending==0 → final
+    #[test]
+    fn phase_follows_pending() {
+        assert_eq!(search_phase(3), "first");
+        assert_eq!(search_phase(0), "final");
+        let job = test_job("phase", 0, 3);
+        let view = job_view(&job);
+        assert!(!view.done);
+        assert_eq!(view.pending, 3);
+        assert_eq!(search_phase(view.pending), "first");
+        assert_eq!(view.finished, 0, "没有任何源完成时 finished=0");
+        job.state.lock().unwrap().pending = 0;
+        let view = job_view(&job);
+        assert!(view.done);
+        assert_eq!(search_phase(view.pending), "final");
+    }
+
+    // 计数器算术关系：attempted <= scheduled <= source_total；pending = total - scheduled
+    #[test]
+    fn source_counters_satisfy_invariant() {
+        let job = test_job("counters", 0, 3);
+        {
+            let mut st = job.state.lock().unwrap();
+            st.scheduled = 2;
+            st.attempted = 1;
+            st.finished = 2;
+            st.pending = 1;
+        }
+        let view = job_view(&job);
+        assert!(view.attempted <= view.scheduled, "attempted 不能大于 scheduled");
+        assert!(view.scheduled <= job.source_total, "scheduled 不能大于 total");
+        assert_eq!(
+            job.source_total - view.scheduled,
+            1,
+            "pending_sources = total - scheduled"
+        );
+    }
+
+    // 排队到 deadline 仍未拿到槽：计入 scheduled/finished，但不算 attempted
+    #[tokio::test]
+    async fn queued_but_never_executed_is_not_attempted() {
+        let job = test_job("queue", 0, 1);
+        let past = tokio::time::Instant::now() - Duration::from_secs(1);
+        let mut outcomes = Vec::new();
+        run_search_batch(
+            &job,
+            vec![src("排队源", "http://queue.example", 1, true)],
+            "书",
+            past,
+            Duration::from_millis(100),
+            &HashMap::new(),
+            &mut outcomes,
+            crate::req::SearchScope::Curated,
+        )
+        .await;
+        let view = job_view(&job);
+        assert_eq!(view.scheduled, 1);
+        assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
+        assert_eq!(view.finished, 1);
+        assert_eq!(view.pending, 0);
+        assert!(outcomes.is_empty(), "排队未执行的源不写健康记录");
+    }
+
+    // 回归：legacy `/api/search` 走的 `search_all_with_errors_budgeted` 不做 tier 过滤，
+    // 非 preferred 源照常参与并被解析（默认行为/返回结构不变）。
+    #[tokio::test]
+    async fn legacy_aggregate_path_keeps_all_sources() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = srv.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = srv.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"<div class="item"><a href="/b/1">测试书</a></div>"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let mut s = crate::entities::BookSource::default();
+        s.enabled = true;
+        s.book_source_url = format!("http://{addr}");
+        s.book_source_name = "observing-only".into();
+        s.search_url = Some(format!("http://{addr}/s?q={{{{key}}}}"));
+        s.rule_search = Some(crate::entities::SearchRule {
+            book_list: Some("class.item".into()),
+            name: Some("a@text".into()),
+            book_url: Some("a@href".into()),
+            ..Default::default()
+        });
+
+        // 没有健康行（等价于 observing）：legacy 路径仍要搜它
+        let out = web_book::search_all_with_errors_budgeted(
+            &[s],
+            "书",
+            1,
+            Duration::from_millis(800),
+        )
+        .await;
+        assert!(out.errors.is_empty(), "非 preferred 源不应被过滤: {:?}", out.errors);
+        assert_eq!(out.books.len(), 1);
+        assert_eq!(out.books[0].name.as_deref(), Some("测试书"));
     }
 
     fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
@@ -2599,13 +2830,11 @@ mod tests {
             created_unix_ms: 0,
             sources: Vec::new(),
             source_total: pending,
+            scope: crate::req::SearchScope::Curated,
             skipped_cooldown: 0,
             cooldown_total: 0,
-            scope: "curated".into(),
             coverage: "curated".into(),
             curated_total: 0,
-            per_source_budget: Duration::from_secs(5),
-            total_budget: Duration::from_secs(6),
             state: Mutex::new(SearchJobState {
                 pending,
                 ..Default::default()

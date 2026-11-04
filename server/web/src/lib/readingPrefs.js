@@ -1,11 +1,11 @@
 // 页宽 / 字体族：服务端 user_settings 为准，localStorage 只做离线兜底。
 // 后端枚举：font_family 接受 serif/sans/sans-serif/kai/kaiti/song/songti/hei/heiti/mono/system；
-// page_width 为 CSS px，范围 320–2000（默认 800）。
+// page_width 为 CSS px，范围 320–2000（默认 720）。
 import { api, getToken, parseJwt } from './api.js';
 
 export const PAGE_WIDTH_PX = {
   narrow: 560,
-  normal: 800,
+  normal: 720,
   wide: 900,
   // 满屏写 2000（后端上限），阅读器按 0 宽度（不限制）渲染
   full: 2000,
@@ -35,7 +35,7 @@ export const FONT_OPTIONS = [
 const WIDTH_KEY = 'oread_read_width';
 const FONT_KEY = 'oread_font_family';
 const MIGRATED_KEY = 'oread_layout_migrated:';
-const DEFAULT_WIDTH = 800;
+const DEFAULT_WIDTH = 720;
 
 const FONT_ALIASES = {
   serif: 'serif',

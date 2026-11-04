@@ -1,18 +1,13 @@
 /* ============================================================
    响应式集中样式
    - 断点：html[data-vp=sm] <=680 / [md] <=1100 / [lg] >1100，由 lib/theme.js 写入
-   - 主题：html[data-theme=default|eink]；eink 仅 `?theme=eink` 后门，只改配色/对比度/字重
+   - 主题：html[data-theme=light|dark|sepia|eink]，四项同权，由 lib/theme.js 写入并持久化到账号设置
    - 渲染器由服务端按 UA 决定：kindle/silk → /k，其它 → SPA，前端无设备开关
    组件自身的 <style> 只保留外观，不再写 @media。
    ============================================================ */
 
-/* 与 docs/EINK_STYLE.md 对齐的 token（SPA 只取颜色/间距部分） */
+/* 与 docs/EINK_STYLE.md 对齐的 token（SPA 只取间距/控件高度，颜色走主题调色板） */
 :root {
-  --eink-paper: #fff;
-  --eink-ink: #000;
-  --eink-ink-2: #333;
-  --eink-ink-3: #555;
-  --eink-rule: #ccc;
   --space-1: 8px;
   --space-2: 12px;
   --space-3: 16px;
@@ -167,143 +162,107 @@ kbd {
   background: var(--card, #fff);
 }
 
-/* ---------- 墨水屏主题（?theme=eink） ----------
-   只改配色 / 对比度 / 字重，不改布局、字号与阅读模式；
-   现代墨水屏（Boox、海信 A5 等）默认走普通响应式，只有手动带 ?theme=eink 才进入本主题。
-   色值对齐 docs/EINK_STYLE.md：正文 #000、次级 #333、弱 #555、分隔 #ccc、底 #fff。 */
+/* ---------- 主题调色板（浅色 / 深色 / 护眼 / 墨水屏） ----------
+   四项主题共用同一套 CSS 变量，组件一律消费变量，不在组件内写死颜色。
+   选中态与持久化见 lib/theme.js：唯一真相源是账号设置，?theme=eink 只是
+   “选中墨水屏”的直达别名，不再有独立于偏好之外的第二条生效路径。
+   墨水屏只改配色/对比度/字重，不改布局、字号与阅读模式。 */
+
+/* 浅色（默认；:root 保留同值，作为 JS 执行前的首屏兜底） */
+html[data-theme='light'] {
+  --bg: #f5f5f7;
+  --fg: #1d1d1f;
+  --card: #ffffff;
+  --border: #e3e3e6;
+  --muted: #8a8a8e;
+  --accent: #b3392f;
+  --accent-d: #8f2c24;
+  --on-accent: #ffffff;
+  --accent-weak: rgba(179, 57, 47, 0.08);
+  --soft-bg: #eeeeee;
+  --soft-fg: #555555;
+  --err: #b3392f;
+  --ok: #2f7d4f;
+  --warn-bg: #fdf6ec;
+  --warn-border: #e8c7a7;
+  --warn-fg: #8a5a1f;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+/* 深色 */
+html[data-theme='dark'] {
+  --bg: #1d1d1f;
+  --fg: #f2f2f4;
+  --card: #2a2a2d;
+  --border: #3a3a3e;
+  --muted: #a3a3a8;
+  --accent: #e5655a;
+  --accent-d: #c94c41;
+  --on-accent: #ffffff;
+  --accent-weak: rgba(229, 101, 90, 0.16);
+  --soft-bg: #333338;
+  --soft-fg: #c8c8cc;
+  --err: #ff7b70;
+  --ok: #6fcf97;
+  --warn-bg: #3a2f1f;
+  --warn-border: #6b5433;
+  --warn-fg: #e8c07a;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+/* 护眼：暖米黄底 + 深褐字，正文约 11.8:1、次级约 5.0:1（WCAG 见 docs/EINK_STYLE.md） */
+html[data-theme='sepia'] {
+  --bg: #f5ecd9;
+  --fg: #2f2a22;
+  --card: #fbf6ea;
+  --border: #d8ccb6;
+  --muted: #6b6357;
+  --accent: #8a5a2b;
+  --accent-d: #6f4620;
+  --on-accent: #ffffff;
+  --accent-weak: rgba(138, 90, 43, 0.10);
+  --soft-bg: #ece2cd;
+  --soft-fg: #5a5348;
+  --err: #8f2c24;
+  --ok: #3f6b4a;
+  --warn-bg: #f7ead0;
+  --warn-border: #d8bf94;
+  --warn-fg: #8a5a1f;
+  --shadow: 0 1px 3px rgba(80, 60, 30, 0.12);
+}
+
+/* 墨水屏：纯白 #fff / 纯黑 #000（21:1），边框 #ccc、次级 #333 */
 html[data-theme='eink'] {
-  --bg: #fff;
-  --fg: #000;
-  --card: #fff;
-  --border: #ccc;
-  --muted: #333;
-  --accent: #000;
-  --accent-d: #000;
+  --bg: #ffffff;
+  --fg: #000000;
+  --card: #ffffff;
+  --border: #cccccc;
+  --muted: #333333;
+  --accent: #000000;
+  --accent-d: #000000;
+  --on-accent: #ffffff;
+  --accent-weak: rgba(0, 0, 0, 0.06);
+  --soft-bg: #ffffff;
+  --soft-fg: #333333;
+  --err: #000000;
+  --ok: #000000;
+  --warn-bg: #ffffff;
+  --warn-border: #333333;
+  --warn-fg: #000000;
   --shadow: none;
-  background: #fff;
-  color: #000;
 }
-html[data-theme='eink'] body {
-  background: #fff;
-  color: #000;
+
+html[data-theme] {
+  background: var(--bg);
+  color: var(--fg);
 }
+
+/* 墨水屏专属：无彩色时靠下划线与字重区分层级 */
 html[data-theme='eink'] a {
-  color: #000;
+  color: var(--fg);
   text-decoration: underline;
 }
-html[data-theme='eink'] .nav,
-html[data-theme='eink'] .card,
-html[data-theme='eink'] .modal,
-html[data-theme='eink'] .seg,
-html[data-theme='eink'] .chip,
-html[data-theme='eink'] .warn-box,
-html[data-theme='eink'] .rd-root,
-html[data-theme='eink'] .rd-bar,
-html[data-theme='eink'] .panel,
-html[data-theme='eink'] .toc-drawer {
-  background: var(--eink-paper);
-  color: var(--eink-ink);
-  border-color: var(--eink-rule);
-  box-shadow: none;
-}
-html[data-theme='eink'] .nav {
-  border-bottom: 1px solid var(--eink-rule);
-}
-html[data-theme='eink'] .nav .brand,
-html[data-theme='eink'] .nav .tab.active {
-  color: #000;
-}
-html[data-theme='eink'] .nav .tab.active {
-  border-bottom-color: #000;
-  font-weight: 700;
-}
-html[data-theme='eink'] button,
-html[data-theme='eink'] input,
-html[data-theme='eink'] select,
-html[data-theme='eink'] textarea {
-  background: #fff;
-  color: #000;
-  border-color: #333;
-}
-html[data-theme='eink'] button.ghost {
-  color: #000;
-  border-color: #333;
-}
-html[data-theme='eink'] .seg button.on,
-html[data-theme='eink'] .chip.on,
-html[data-theme='eink'] .rd-btn.solid {
-  background: #000;
-  color: #fff;
-  border-color: #000;
-}
-html[data-theme='eink'] .badge {
-  background: #fff;
-  color: #000;
-  border: 1px solid #333;
-}
-html[data-theme='eink'] .muted,
-html[data-theme='eink'] .rd-muted,
-html[data-theme='eink'] .author,
-html[data-theme='eink'] .rd-meta,
-html[data-theme='eink'] .kpi-label,
-html[data-theme='eink'] .bar-date {
-  color: var(--eink-ink-2);
-}
-html[data-theme='eink'] .tiny-note,
-html[data-theme='eink'] .replace-hint {
-  color: var(--eink-ink-3);
-}
-html[data-theme='eink'] .err,
-html[data-theme='eink'] .ok-line {
-  color: #000;
-}
-html[data-theme='eink'] .new-badge {
-  background: #000;
-  color: #fff;
-}
-html[data-theme='eink'] .bar,
-html[data-theme='eink'] .meter > div,
-html[data-theme='eink'] .pg-fill {
-  background: #000;
-}
-html[data-theme='eink'] .meter,
-html[data-theme='eink'] .pg-track,
-html[data-theme='eink'] .gm-panel,
-html[data-theme='eink'] .gm-row {
-  border-color: var(--eink-rule);
-}
-html[data-theme='eink'] .book .cover,
-html[data-theme='eink'] .book .cover-ph {
-  background: #fff;
-  color: #000;
-  border: 1px solid var(--eink-rule);
-}
-html[data-theme='eink'] .sel-lab {
-  background: #fff;
-  border: 1px solid var(--eink-rule);
-}
-html[data-theme='eink'] .toc-row.active {
-  background: #000;
-  color: #fff;
-}
-html[data-theme='eink'] .rd-pager {
-  background: #fff;
-  border: 1px solid var(--eink-rule);
-}
-html[data-theme='eink'] .auto-pill,
-html[data-theme='eink'] .rd-toast {
-  background: #000;
-  color: #fff;
-}
+html[data-theme='eink'] .nav .tab.active,
 html[data-theme='eink'] .rd-chapter-title {
   font-weight: 700;
-}
-/* 阅读器配色主题由 .rd-root 上的局部变量控制，主题后门在 html 层强制覆盖 */
-html[data-theme='eink'] .rd-root {
-  --rd-bg: #fff !important;
-  --rd-fg: #000 !important;
-  --rd-muted: #333 !important;
-  --rd-panel: #fff !important;
-  --rd-border: #ccc !important;
-  --rd-accent: #000 !important;
 }

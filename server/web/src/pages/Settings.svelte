@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { api, describeFailure, describeSourceError } from '../lib/api.js';
+  import { THEMES, THEME_LABELS, setTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
     PAGE_WIDTH_PX,
@@ -18,7 +19,7 @@
     image_style: 0,
     theme: 'light',
     font_size: 18,
-    line_height: 1.8,
+    line_height: 1.75,
     cache_limit_mb: 50,
     auto_refresh: true,
     read_mode: 'scroll',
@@ -194,7 +195,12 @@
   let healthErr = '';
   let healthLoading = false;
 
-  const themeName = { light: '日间', dark: '夜间', sepia: '护眼' };
+  // 主题：四项与全局主题共用同一份账号偏好，点击即生效并持久化
+  function pickTheme(t) {
+    if (!THEMES.includes(t)) return;
+    settings = { ...settings, theme: t };
+    setTheme(t);
+  }
 
   async function loadHealth() {
     healthLoading = true;
@@ -217,7 +223,7 @@
       const merged = { ...DEFAULTS, ...(s || {}) };
       // 非法枚举回退默认值，避免把脏值再提交给后端
       if (!READ_MODES.some((m) => m.id === merged.read_mode)) merged.read_mode = DEFAULTS.read_mode;
-      if (!['light', 'dark', 'sepia'].includes(merged.theme)) merged.theme = 'light';
+      if (!THEMES.includes(merged.theme)) merged.theme = DEFAULTS.theme;
       // 服务端优先；首次读取时把旧的本机页宽/字体迁移到账号（服务端仍为默认值才写）
       const layout = await syncLayoutSettings(s || {});
       merged.page_width = widthPxFromId(layout.width);
@@ -360,8 +366,8 @@
     <div class="field">
       <div class="field-label">配色主题</div>
       <div class="seg" style="margin:0">
-        {#each ['light', 'dark', 'sepia'] as t}
-          <button class:on={settings.theme === t} on:click={() => (settings.theme = t)}>{themeName[t]}</button>
+        {#each THEMES as t}
+          <button class:on={settings.theme === t} on:click={() => pickTheme(t)}>{THEME_LABELS[t]}</button>
         {/each}
       </div>
     </div>
