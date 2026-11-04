@@ -1881,6 +1881,9 @@ fn parse_json_path(path: &str) -> Result<Vec<JpSeg>, String> {
                     if cs.get(i) == Some(&'*') {
                         segs.push(JpSeg::Wildcard);
                         i += 1;
+                    } else if cs.get(i) == Some(&'[') {
+                        // Legado 用 Jayway json-path，容忍 `$.data.[*]` 这类多余的点
+                        continue;
                     } else {
                         let (k, ni) = read_key(i);
                         if k.is_empty() {
@@ -4258,6 +4261,18 @@ nodes.filter(function (node) {
         // 下标（含负下标）
         assert_eq!(ar.get_string(json, "$.data.books[1].id", false, "").unwrap(), "b2");
         assert_eq!(ar.get_string(json, "$.data.books[-1].id", false, "").unwrap(), "b2");
+    }
+
+    // Legado 用的 Jayway json-path 容忍 `$.data.[*]`（点与方括号混用），爱看目录规则就是这种写法
+    #[test]
+    fn jsonpath_tolerates_dot_before_bracket() {
+        let ar = AnalyzeRule::new();
+        let json = r#"{"data":[{"id":1},{"id":2}]}"#;
+        assert_eq!(ar.get_string(json, "$.data.[0].id", false, "").unwrap(), "1");
+        assert_eq!(
+            ar.get_string_list(json, "$.data.[*].id").unwrap(),
+            vec!["1", "2"]
+        );
     }
 
     // 不支持的 JSONPath 不再原样抛 PestError，而是可读中文提示
