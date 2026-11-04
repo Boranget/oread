@@ -425,6 +425,10 @@ pub struct BookContent {
     #[sqlx(default)]
     #[serde(skip)]
     pub images_json: Option<String>,
+    /// 写入时的解析管线指纹；旧记录为 None，读取时视为未命中并重建
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub cache_version: Option<String>,
 }
 
 /// 图片章节的单张图片。`index` 与页面顺序一致，从 1 开始。
