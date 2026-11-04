@@ -863,6 +863,43 @@ pub async fn fetch_for_source(
     fetch_text(url, method, headers, body, Some(source_key), false, false).await
 }
 
+/// 页面抓取结果：保留状态码与 Content-Type，供「按链接导入」区分登录页 / 非 HTML。
+pub struct PageResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: String,
+}
+
+/// GET 一个页面（按源 Cookie 分桶、逐跳 SSRF 校验、分级解码），不校验 2xx：
+/// 状态码与类型交给调用方判定，避免把登录页静默当成书籍详情。
+pub async fn fetch_page_for_source(
+    url: &str,
+    headers: &HashMap<String, String>,
+    source_key: &str,
+) -> anyhow::Result<PageResponse> {
+    let _permit = acquire_permit().await?;
+    let scope = cookie_scope(url, Some(source_key));
+    let resp = execute_request(
+        url,
+        "GET",
+        headers,
+        None,
+        &scope,
+        false,
+        true,
+        MAX_REDIRECTS,
+    )
+    .await
+    .map_err(|(_, e)| e)?;
+    let content_type = resp.content_type.clone();
+    let body = decode_body(&resp.body, content_type.as_deref())?;
+    Ok(PageResponse {
+        status: resp.status.as_u16(),
+        content_type,
+        body,
+    })
+}
+
 // ---------------- SSRF 防护（规则试跑预览专用） ----------------
 
 /// 判定 IP 是否属于“不应由外部输入直接访问”的地址段：

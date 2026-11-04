@@ -459,6 +459,9 @@ export const api = {
         cover_url: seed.coverUrl,
       })}`
     ),
+  // 按链接打开：粘贴书源可匿名访问的详情页 URL，导入后返回 book_url 可直接进阅读页
+  importByUrl: (sourceId, url) =>
+    request('POST', '/book/import-url', { source_id: sourceId, url }, { timeout: 45000 }),
   // 目录标题同样支持替换规则开关（缺省沿用账号设置）
   toc: (source, bookUrl, seed = {}, useReplace = null) =>
     request(
