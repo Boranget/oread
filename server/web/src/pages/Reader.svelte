@@ -3,6 +3,7 @@
   import { api, describeFailure } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
   import { convertZh, zhLabels } from '../lib/zhconvert.js';
+  import { applyTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
     FONT_STACKS,
@@ -176,7 +177,7 @@
   const statsSeen = new Set();
 
 
-  const themeName = { light: '日间', dark: '夜间', sepia: '护眼' };
+  const themeName = { light: '浅色', dark: '深色', sepia: '护眼', eink: '墨水屏' };
   const modeName = { scroll: '滚动', paged: '翻页', fade: '仿真' };
 
   const progressKey = (id) => `oread_progress:${id}`;
@@ -409,7 +410,7 @@
       if (!s) return;
       if (s.font_size) font = s.font_size;
       if (s.line_height) lineHeight = s.line_height;
-      if (['light', 'dark', 'sepia'].includes(s.theme)) theme = s.theme;
+      if (['light', 'dark', 'sepia', 'eink'].includes(s.theme)) theme = s.theme;
       if (typeof s.use_replace_rule === 'boolean') useReplaceRules = s.use_replace_rule;
       if (MODES.includes(s.read_mode) && s.read_mode !== readMode) {
         changeMode(s.read_mode, false);
@@ -1206,6 +1207,8 @@
   }
   function setTheme(t) {
     applyStyle(() => (theme = t));
+    // 与设置页共用全局主题（html[data-theme]），阅读器内选择也会同步整站配色
+    applyTheme(t);
   }
   function setWidth(w) {
     if (!WIDTH_OPTIONS.some((x) => x.id === w)) return;
@@ -1691,7 +1694,7 @@
         <div class="panel-row">
           <span>配色</span>
           <div class="seg small">
-            {#each ['light', 'dark', 'sepia'] as t}
+            {#each ['light', 'dark', 'sepia', 'eink'] as t}
               <button class:on={theme === t} on:click={() => setTheme(t)}>{themeName[t]}</button>
             {/each}
           </div>
@@ -2037,12 +2040,20 @@
     --rd-accent: #d8756b;
   }
   .theme-sepia {
-    --rd-bg: #f5eeda;
-    --rd-fg: #4a3b2a;
-    --rd-muted: #8d7a5f;
-    --rd-panel: #fbf5e6;
-    --rd-border: #e3d7bb;
-    --rd-accent: #9a6b3f;
+    --rd-bg: #f5ecd9;
+    --rd-fg: #2f2a22;
+    --rd-muted: #6b6357;
+    --rd-panel: #fbf6ea;
+    --rd-border: #d8ccb6;
+    --rd-accent: #8a5a2b;
+  }
+  .theme-eink {
+    --rd-bg: #ffffff;
+    --rd-fg: #000000;
+    --rd-muted: #333333;
+    --rd-panel: #ffffff;
+    --rd-border: #cccccc;
+    --rd-accent: #000000;
   }
   .rd-bar {
     position: relative;

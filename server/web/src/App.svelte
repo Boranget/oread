@@ -5,6 +5,7 @@
   import Discover from './pages/Discover.svelte';
   import Reader from './pages/Reader.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
+  import { syncTheme, applyTheme } from './lib/theme.js';
 
   let loggedIn = false;
   let role = 'user';
@@ -41,6 +42,7 @@
     if (getToken()) {
       loggedIn = true;
       role = getRole();
+      syncTheme();
     }
   });
 
@@ -48,6 +50,7 @@
     loggedIn = true;
     role = r || getRole();
     tab = 'bookshelf';
+    syncTheme();
   }
   function onLogout() {
     clearToken();
@@ -55,6 +58,7 @@
     role = 'user';
     reader = null;
     tab = 'bookshelf';
+    applyTheme('light');
   }
 
   function selectTab(id) {

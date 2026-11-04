@@ -545,12 +545,12 @@ async fn put_setting(db: &SqlitePool, key: &str, value: &str) -> AppResult<()> {
 }
 
 /// 服务端校验：枚举白名单 + 数值范围，非法值直接 400（验收 P1）。
-/// 范围与前端 `Settings` 页控件保持一致（theme 三档、字号 12–30、行距 1.2–2.6 等）。
+/// 范围与前端 `Settings` 页控件保持一致（theme 四档、字号 12–30、行距 1.2–2.6 等）。
 fn validate_settings(q: &SettingsQ) -> AppResult<()> {
     if let Some(v) = &q.theme {
-        if !matches!(v.as_str(), "light" | "dark" | "sepia") {
+        if !matches!(v.as_str(), "light" | "dark" | "sepia" | "eink") {
             return Err(AppError::BadRequest(
-                "theme 必须是 light/dark/sepia".into(),
+                "theme 必须是 light/dark/sepia/eink".into(),
             ));
         }
     }
