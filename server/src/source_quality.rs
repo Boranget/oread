@@ -79,8 +79,6 @@ pub struct TierConfig {
     pub demote_streak: i64,
     /// 更新覆盖闸门：新版本得分至少不低于本地旧版这么多，才允许覆盖。
     pub update_score_margin: i32,
-    /// 两批调度时 preferred 可用的总预算占比（剩余留给 observing，防饿死）。
-    pub preferred_budget_pct: u64,
     pub weights: Weights,
 }
 
@@ -92,7 +90,6 @@ impl TierConfig {
             promote_streak: c.source_tier_promote_streak,
             demote_streak: c.source_tier_demote_streak,
             update_score_margin: c.source_tier_update_margin,
-            preferred_budget_pct: c.source_tier_preferred_budget_pct,
             weights: Weights {
                 connect: c.source_score_w_connect,
                 rule: c.source_score_w_rule,
@@ -336,7 +333,6 @@ mod tests {
             promote_streak: 3,
             demote_streak: 2,
             update_score_margin: 5,
-            preferred_budget_pct: 70,
             weights: Weights::default(),
         }
     }

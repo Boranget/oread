@@ -40,7 +40,7 @@
 | `vh` | **不可用** | `declared_accepted=false`、`style_readback=""`；`20vh` 回读 `0px`（宿主高度回落），期望 `253.6px`，`fallback_used=true` |
 | `calc()` | **不可用** | `declared_accepted=false`、`style_readback=""`；`calc(100px + 20px)` 回读 `320px`（宿主宽度回落，不是计算结果），期望 `120px`，`fallback_used=true` |
 | `clamp()` | **不可用** | `declared_accepted=false`、`style_readback=""`；`clamp(40px,50px,60px)` 回读 `320px`（宿主宽度回落，不是计算结果），期望 `50px`，`fallback_used=true` |
-| `position:fixed` | **可用（仅回读）** | `computed_position=fixed`、`rect=(0,0)`；本轮未做二次视觉核验，落地时仍需真机看一眼 |
+| `position:fixed` | **可用（仅回读）** | `computed_position=fixed`、`rect=(0,0)`；已落地为 `/k` 阅读页底栏（`routes/kindle.rs`），其他页面未用 |
 | `position:sticky` | **不可用** | `computed_position=static`、`declared_readback=""`、`pass=false` |
 | `border-radius` | **可用** | `computed_radius=10px`；`-webkit-border-radius` 同样回读 `10px` |
 | `box-shadow` | **可用** | `computed_shadow=rgb(0, 0, 0) 2px 2px 2px 0px` |

@@ -68,7 +68,7 @@
 | `border` / `border-collapse` / `border-spacing` | 1px |
 | `font-family` / `font-size` / `font-weight` / `line-height` / `letter-spacing` / `text-align` / `text-indent` | 排版 |
 | `color` / `background`（纯色） | 仅第 2.1 节灰阶 |
-| `position: fixed` | **仅限阅读页底栏**（真机回读可用；需真机二次核验） |
+| `position: fixed` | **仅限阅读页底栏**（`routes/kindle.rs` 已实际使用 `position:fixed;bottom:0`；真机回读可用） |
 | `overflow: hidden` / `overflow-x: hidden` | 防横向溢出 |
 | `-webkit-text-size-adjust: none` | 防老引擎自动放大 |
 
