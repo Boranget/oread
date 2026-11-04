@@ -147,6 +147,7 @@
     book_source_type: 'bookSourceType',
     enabled: 'enabled',
     search_url: 'searchUrl',
+    timeout_millisecond: 'timeoutMillisecond',
     book_source_comment: 'bookSourceComment',
   };
 
@@ -203,6 +204,7 @@
     base = clone(src);
     // select 的 value 是字符串，数字类型先归一，避免绑定时选不中任何 option
     base.book_source_type = String(base.book_source_type ?? 0);
+    base.timeout_millisecond = Number(base.timeout_millisecond) || 0;
     values = {};
     extraKeys = {};
     modes = {};
@@ -442,6 +444,8 @@
     // 非 0/2 类型后端会强制禁用
     out.enabled = typeSupported ? !!out.enabled : false;
     out.search_url = String(out.search_url || '');
+    // 0 表示未设置（回退全局默认）；非数字按 0 处理，范围由后端夹取
+    out.timeout_millisecond = Math.max(0, Math.trunc(Number(out.timeout_millisecond) || 0));
     out.book_source_comment = String(out.book_source_comment || '');
 
     RULE_META.forEach(({ ruleKey, secIds }) => {
@@ -654,6 +658,21 @@
     <div class="bf" style="margin-top:10px">
       <div class="rf-head"><span class="rf-cn">搜索地址</span><code class="rf-key">searchUrl</code></div>
       <input bind:value={base.search_url} aria-label="搜索地址" placeholder="https://example.com/search?key=" />
+    </div>
+
+    <div class="bf" style="margin-top:10px">
+      <div class="rf-head"><span class="rf-cn">单源超时（毫秒）</span><code class="rf-key">timeoutMillisecond</code></div>
+      <input
+        type="number"
+        min="0"
+        step="1000"
+        bind:value={base.timeout_millisecond}
+        aria-label="单源超时毫秒"
+        placeholder="0 = 使用全局默认"
+      />
+      <div style="color:var(--muted,#666);font-size:12px;margin-top:4px">
+        0 表示使用全局默认；有效值 1000–60000，超出会被夹取。覆盖搜索/详情/目录/正文与图片抓取。
+      </div>
     </div>
 
     <div class="bf" style="margin-top:10px">

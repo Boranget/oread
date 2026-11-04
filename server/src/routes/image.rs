@@ -44,6 +44,15 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ITEM_MAX: usize = 2 * 1024 * 1024;
 /// 回源超时（含首字节与整体读取）；v2.1 真机实测约 313 KB/s，无需按 1.8s/张做悲观兜底
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 图片回源预算：书源显式设置 `timeout_millisecond` 时用它（夹取后），
+/// 否则沿用图片代理自身 5s 预算，避免未设置的书源回源等待被放大。
+fn image_budget(source: &BookSource) -> (Duration, Option<Duration>) {
+    match req::source_timeout(source) {
+        Some(d) => (d, Some(d)),
+        None => (IMAGE_TIMEOUT, None),
+    }
+}
 /// 流式转发前为解析宽高最多预读的字节数（JPEG 的 SOF 通常很靠前）
 const PEEK_MAX: usize = 64 * 1024;
 /// 墨水屏灰度 JPEG 的默认质量。8 页真实漫画的 Pareto 结论：q70 相比 q78
@@ -1457,18 +1466,21 @@ async fn handle_slice(
 
     // 2) 回源
     let hdrs = source_referer(source, q.chapter_url.as_deref(), q.book_url.as_deref());
-    let opened = match tokio::time::timeout(IMAGE_TIMEOUT, req::open_stream(&q.url, &hdrs, false)).await
-    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return map_open_error(e),
-        Err(_) => {
-            return error_body(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream_timeout",
-                &format!("图片回源超时（{}s）", IMAGE_TIMEOUT.as_secs()),
-            )
-        }
-    };
+    let (budget, src_timeout) = image_budget(source);
+    let opened =
+        match tokio::time::timeout(budget, req::open_stream_timed(&q.url, &hdrs, false, src_timeout))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return map_open_error(e),
+            Err(_) => {
+                return error_body(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_timeout",
+                    &format!("图片回源超时（{}s）", budget.as_secs()),
+                )
+            }
+        };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -1604,6 +1616,7 @@ pub(crate) async fn fetch_image_meta(
     url: String,
     hdrs: HashMap<String, String>,
     max_bytes: usize,
+    timeout: Option<Duration>,
 ) -> serde_json::Value {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
@@ -1618,7 +1631,12 @@ pub(crate) async fn fetch_image_meta(
         };
         return err_item(&url, code, &m);
     }
-    let opened = match tokio::time::timeout(IMAGE_TIMEOUT, req::open_stream(&url, &hdrs, false)).await
+    let budget = timeout.unwrap_or(IMAGE_TIMEOUT);
+    let opened = match tokio::time::timeout(
+        budget,
+        req::open_stream_timed(&url, &hdrs, false, timeout),
+    )
+    .await
     {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return err_item(&url, "upstream_error", &e.to_string()),
@@ -1735,10 +1753,11 @@ async fn images_meta(
     }
     let hdrs = source_referer(&source, req.chapter_url.as_deref(), req.book_url.as_deref());
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
+    let timeout = req::source_timeout(&source);
     let items: Vec<serde_json::Value> = futures::stream::iter(
         req.urls
             .into_iter()
-            .map(|u| fetch_image_meta(u, hdrs.clone(), max_bytes)),
+            .map(|u| fetch_image_meta(u, hdrs.clone(), max_bytes, timeout)),
     )
     .buffer_unordered(4)
     .collect()
@@ -1802,11 +1821,12 @@ pub(crate) async fn probe_dims(
         return out;
     }
     let hdrs = source_referer(source, chapter_url, book_url);
+    let timeout = req::source_timeout(source);
     let fetched: Vec<(usize, Option<(u32, u32)>)> = futures::stream::iter(missing)
         .map(|(i, u)| {
             let h = hdrs.clone();
             async move {
-                let v = fetch_image_meta(u, h, max_bytes).await;
+                let v = fetch_image_meta(u, h, max_bytes, timeout).await;
                 let d = v
                     .get("width")
                     .and_then(|x| x.as_u64())
@@ -1950,17 +1970,21 @@ async fn proxy(
     }
 
     let hdrs = source_referer(&source, q.chapter_url.as_deref(), q.book_url.as_deref());
-    let opened = match tokio::time::timeout(IMAGE_TIMEOUT, req::open_stream(&q.url, &hdrs, false)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return map_open_error(e),
-        Err(_) => {
-            return error_body(
-                StatusCode::GATEWAY_TIMEOUT,
-                "upstream_timeout",
-                &format!("图片回源超时（{}s）", IMAGE_TIMEOUT.as_secs()),
-            )
-        }
-    };
+    let (budget, src_timeout) = image_budget(&source);
+    let opened =
+        match tokio::time::timeout(budget, req::open_stream_timed(&q.url, &hdrs, false, src_timeout))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return map_open_error(e),
+            Err(_) => {
+                return error_body(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_timeout",
+                    &format!("图片回源超时（{}s）", budget.as_secs()),
+                )
+            }
+        };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -2267,6 +2291,24 @@ mod tests {
         assert!(!allowed_content_type("text/html"));
         assert!(!allowed_content_type("application/json"));
         assert!(!allowed_content_type(""));
+    }
+
+    #[test]
+    fn image_budget_uses_source_timeout_or_image_default() {
+        let mut s = BookSource::default();
+        assert_eq!(image_budget(&s).0, IMAGE_TIMEOUT, "未设置时保持图片 5s 预算");
+        assert_eq!(image_budget(&s).1, None);
+        s.timeout_millisecond = 2000;
+        assert_eq!(
+            image_budget(&s),
+            (Duration::from_secs(2), Some(Duration::from_secs(2)))
+        );
+        s.timeout_millisecond = 100;
+        assert_eq!(
+            image_budget(&s).0,
+            Duration::from_secs(1),
+            "低于下限按 1000ms 夹取"
+        );
     }
 
     #[test]

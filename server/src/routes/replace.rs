@@ -1082,6 +1082,31 @@ mod tests {
             .any(|(k, v)| *k == "builtin_clean" && *v == "0"));
     }
 
+    // auto_refresh 不能是假开关：设置可写，且书架页必须真的消费它（并有节流）
+    #[test]
+    fn auto_refresh_has_a_real_consumer() {
+        assert!(SETTINGS_DEFAULTS
+            .iter()
+            .any(|(k, v)| *k == "auto_refresh" && *v == "1"));
+        let bookshelf = include_str!("../../web/src/pages/Bookshelf.svelte");
+        assert!(
+            bookshelf.contains("/settings") || bookshelf.contains("api.settings"),
+            "书架页应读取 /api/settings"
+        );
+        assert!(
+            bookshelf.contains("auto_refresh"),
+            "书架页未消费 auto_refresh，开关仍是假的"
+        );
+        assert!(
+            bookshelf.contains("oread_autorefresh_last"),
+            "自动刷新必须有 24h 节流键，避免每次打开都刷"
+        );
+        assert!(
+            bookshelf.contains("enable_update !== false"),
+            "自动刷新只应作用于未停更的书"
+        );
+    }
+
     // 导出为 Legado 原生 camelCase，且不带本地自增 id
     #[test]
     fn export_uses_legado_camel_case_and_drops_id() {

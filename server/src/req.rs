@@ -29,6 +29,10 @@ use crate::entities::BookSource;
 const MAX_REDIRECTS: usize = 5;
 /// 域名解析的独立预算，避免 DNS 卡住整个预览请求
 const DNS_TIMEOUT_SECS: u64 = 5;
+/// 书源级超时（`timeout_millisecond`）允许区间：过短会把正常慢站判死，
+/// 过长会让单源卡住整批抓取。
+pub const SOURCE_TIMEOUT_MIN_MS: i64 = 1000;
+pub const SOURCE_TIMEOUT_MAX_MS: i64 = 60000;
 /// 普通抓取跟随的最大跳数（与浏览器常见的 10 跳一致）。
 /// reqwest 默认就是 limited(10)，这里显式写出来，避免以后改默认值造成 301/302 断链。
 const FOLLOW_REDIRECTS: usize = 10;
@@ -168,6 +172,21 @@ pub fn search_total_budget(scope: SearchScope) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 解析书源级超时：空/0/负数 → `None`（调用方回退全局 `HTTP_TIMEOUT_SECS`）；
+/// 否则夹取到 [`SOURCE_TIMEOUT_MIN_MS`, `SOURCE_TIMEOUT_MAX_MS`]。
+pub fn parse_source_timeout_ms(raw: i64) -> Option<Duration> {
+    if raw <= 0 {
+        return None;
+    }
+    let ms = raw.clamp(SOURCE_TIMEOUT_MIN_MS, SOURCE_TIMEOUT_MAX_MS);
+    Some(Duration::from_millis(ms as u64))
+}
+
+/// 书源实体的单源超时；未设置时返回 `None`，由请求层回退全局默认。
+pub fn source_timeout(source: &BookSource) -> Option<Duration> {
+    parse_source_timeout_ms(source.timeout_millisecond)
+}
+
 /// 漫画源（type=2）判定；聚合搜索按此分配独立并发池。
 pub fn is_comic_source_type(t: i64) -> bool {
     t == 2
@@ -249,9 +268,10 @@ fn default_headers() -> reqwest::header::HeaderMap {
 /// 因此关闭 reqwest 自带的 redirect 与 cookie store（后者无上限且跨书源共享）。
 fn client() -> &'static Client {
     CLIENT.get_or_init(|| {
-        let c = conf();
+        // 客户端只保留最大兜底；每次请求在 `build_request` 里显式设置
+        // “源级超时或全局默认”，避免单源超时受全局 15s 上限截断。
         Client::builder()
-            .timeout(Duration::from_secs(c.timeout_secs))
+            .timeout(Duration::from_millis(SOURCE_TIMEOUT_MAX_MS as u64))
             .user_agent(DEFAULT_UA)
             .default_headers(default_headers())
             .redirect(Policy::none())
@@ -276,17 +296,22 @@ async fn acquire_permit() -> anyhow::Result<tokio::sync::SemaphorePermit<'static
     .map_err(|_| anyhow!("fetch semaphore closed"))
 }
 
+/// 构造请求并设置本次请求的超时：`timeout=None` 时用全局 `HTTP_TIMEOUT_SECS`，
+/// 让“未设置单源超时”的请求行为与历史一致。
 fn build_request(
     client: &Client,
     method: &str,
     url: &str,
     headers: &HashMap<String, String>,
     body: Option<&str>,
+    timeout: Option<Duration>,
 ) -> reqwest::RequestBuilder {
+    let budget = timeout.unwrap_or_else(|| Duration::from_secs(conf().timeout_secs));
     let mut rb = match method.to_uppercase().as_str() {
         "POST" => client.post(url),
         _ => client.get(url),
-    };
+    }
+    .timeout(budget);
     let mut hm = reqwest::header::HeaderMap::new();
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
@@ -365,11 +390,20 @@ enum SendKind {
 /// 把 reqwest 的发送错误分类成可读文案。
 /// 此前一律 `request failed: {e}`，超时和非法 URL 都混在一起（预览里还会
 /// 显示 `error sending request` / `builder error`），前端无法区分。
-fn send_failure(e: reqwest::Error, url: &str) -> (SendKind, anyhow::Error) {
+fn send_failure(
+    e: reqwest::Error,
+    url: &str,
+    timeout: Option<Duration>,
+) -> (SendKind, anyhow::Error) {
     if e.is_timeout() {
+        let label = match timeout {
+            Some(d) if d.as_millis() % 1000 != 0 => format!("{}ms", d.as_millis()),
+            Some(d) => format!("{}s", d.as_secs()),
+            None => format!("{}s", conf().timeout_secs),
+        };
         (
             SendKind::Timeout,
-            anyhow!("请求超时（{}s 预算）: {url}", conf().timeout_secs),
+            anyhow!("请求超时（{label} 预算）: {url}"),
         )
     } else if e.is_builder() {
         (SendKind::Builder, anyhow!("非法请求地址: {url}"))
@@ -380,8 +414,9 @@ fn send_failure(e: reqwest::Error, url: &str) -> (SendKind, anyhow::Error) {
     }
 }
 
+#[cfg(test)]
 fn send_error(e: reqwest::Error, url: &str) -> anyhow::Error {
-    send_failure(e, url).1
+    send_failure(e, url, None).1
 }
 
 // ---------------- Cookie：按书源分桶的进程内 LRU ----------------
@@ -698,6 +733,7 @@ async fn execute_request(
     allow_private: bool,
     validate_private: bool,
     max_redirects: usize,
+    timeout: Option<Duration>,
 ) -> Result<HttpResponse, AttemptError> {
     let c = conf();
     let mut current =
@@ -726,11 +762,12 @@ async fn execute_request(
             current.as_str(),
             &req_headers,
             body.as_deref(),
+            timeout,
         )
         .send()
         .await
         .map_err(|e| {
-            let (kind, err) = send_failure(e, current.as_str());
+            let (kind, err) = send_failure(e, current.as_str(), timeout);
             // 非法 URL/请求构造属于书源配置问题，不算“站点不可达”；
             // 连接失败、超时与其他发送错误则标记为站点侧故障，供冷却判定使用。
             let err = if matches!(kind, SendKind::Builder) {
@@ -797,6 +834,7 @@ async fn fetch_text(
     source_key: Option<&str>,
     allow_private: bool,
     validate_private: bool,
+    timeout: Option<Duration>,
 ) -> anyhow::Result<String> {
     let _permit = acquire_permit().await?;
     let scope = cookie_scope(url, source_key);
@@ -816,6 +854,7 @@ async fn fetch_text(
             allow_private,
             validate_private,
             max_redirects,
+            timeout,
         )
         .await
         {
@@ -847,7 +886,7 @@ pub async fn fetch(
     headers: &HashMap<String, String>,
     body: Option<&str>,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, None, false, false).await
+    fetch_text(url, method, headers, body, None, false, false, None).await
 }
 
 /// 按书源发起请求：Cookie 按 `bookSourceUrl` 分桶，其余与 `fetch` 一致。
@@ -858,7 +897,30 @@ pub async fn fetch_for_source(
     body: Option<&str>,
     source_key: &str,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, Some(source_key), false, false).await
+    fetch_for_source_timed(url, method, headers, body, source_key, None).await
+}
+
+/// 按书源发起请求，并显式指定本次超时（`None` 回退全局 `HTTP_TIMEOUT_SECS`）。
+/// 搜索/详情/目录/正文四类抓取都通过它消费书源 `timeout_millisecond`。
+pub async fn fetch_for_source_timed(
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: Option<&str>,
+    source_key: &str,
+    timeout: Option<Duration>,
+) -> anyhow::Result<String> {
+    fetch_text(
+        url,
+        method,
+        headers,
+        body,
+        Some(source_key),
+        false,
+        false,
+        timeout,
+    )
+    .await
 }
 
 /// 页面抓取结果：保留状态码与 Content-Type，供「按链接导入」区分登录页 / 非 HTML。
@@ -875,6 +937,16 @@ pub async fn fetch_page_for_source(
     headers: &HashMap<String, String>,
     source_key: &str,
 ) -> anyhow::Result<PageResponse> {
+    fetch_page_for_source_timed(url, headers, source_key, None).await
+}
+
+/// 与 [`fetch_page_for_source`] 相同，但按书源超时（`None` 回退全局默认）。
+pub async fn fetch_page_for_source_timed(
+    url: &str,
+    headers: &HashMap<String, String>,
+    source_key: &str,
+    timeout: Option<Duration>,
+) -> anyhow::Result<PageResponse> {
     let _permit = acquire_permit().await?;
     let scope = cookie_scope(url, Some(source_key));
     let resp = execute_request(
@@ -886,6 +958,7 @@ pub async fn fetch_page_for_source(
         false,
         true,
         MAX_REDIRECTS,
+        timeout,
     )
     .await
     .map_err(|(_, e)| e)?;
@@ -1011,7 +1084,7 @@ pub async fn fetch_checked(
     body: Option<&str>,
     allow_private: bool,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, None, allow_private, true).await
+    fetch_text(url, method, headers, body, None, allow_private, true, None).await
 }
 
 /// 流式打开的响应：调用方逐块读取，不整图进内存。
@@ -1027,15 +1100,32 @@ pub async fn open_stream(
     headers: &HashMap<String, String>,
     allow_private: bool,
 ) -> anyhow::Result<StreamOpen> {
+    open_stream_timed(url, headers, allow_private, None).await
+}
+
+/// 与 [`open_stream`] 相同，但可指定单源超时（`None` 回退全局默认）。
+pub async fn open_stream_timed(
+    url: &str,
+    headers: &HashMap<String, String>,
+    allow_private: bool,
+    timeout: Option<Duration>,
+) -> anyhow::Result<StreamOpen> {
     let permit = acquire_permit().await?;
     let parsed = Url::parse(url).map_err(|e| anyhow!("URL 解析失败: {e}"))?;
     let mut current = parsed;
     for _ in 0..=MAX_REDIRECTS {
         ensure_public_url(&current, allow_private).await?;
-        let resp = build_request(checked_client(), "GET", current.as_str(), headers, None)
-            .send()
-            .await
-            .map_err(|e| send_error(e, current.as_str()))?;
+        let resp = build_request(
+            checked_client(),
+            "GET",
+            current.as_str(),
+            headers,
+            None,
+            timeout,
+        )
+        .send()
+        .await
+        .map_err(|e| send_failure(e, current.as_str(), timeout).1)?;
         let status = resp.status();
         if matches!(
             status,
@@ -1346,6 +1436,85 @@ mod tests {
         assert!(err.is_timeout(), "前置条件：应触发超时");
         let msg = send_error(err, "http://example/slow").to_string();
         assert!(msg.contains("请求超时"), "超时文案应可识别: {msg}");
+    }
+
+    #[test]
+    fn source_timeout_clamps_and_falls_back_to_global() {
+        assert_eq!(parse_source_timeout_ms(0), None, "0 表示未设置");
+        assert_eq!(parse_source_timeout_ms(-1), None, "负数表示未设置");
+        assert_eq!(parse_source_timeout_ms(1), Some(Duration::from_millis(1000)));
+        assert_eq!(
+            parse_source_timeout_ms(999),
+            Some(Duration::from_millis(1000)),
+            "低于下限夹到 1000ms"
+        );
+        assert_eq!(
+            parse_source_timeout_ms(2000),
+            Some(Duration::from_millis(2000))
+        );
+        assert_eq!(
+            parse_source_timeout_ms(60001),
+            Some(Duration::from_millis(60000)),
+            "高于上限夹到 60000ms"
+        );
+    }
+
+    #[test]
+    fn source_timeout_field_is_parsed_leniently() {
+        let base = serde_json::json!({
+            "book_source_url": "https://example.com",
+            "book_source_name": "示例"
+        });
+        let missing: BookSource = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(missing.timeout_millisecond, 0);
+        assert_eq!(source_timeout(&missing), None, "缺失时回退全局");
+
+        let mut with_string = base.clone();
+        with_string["timeout_millisecond"] = serde_json::json!("2000");
+        let s: BookSource = serde_json::from_value(with_string).unwrap();
+        assert_eq!(s.timeout_millisecond, 2000);
+        assert_eq!(source_timeout(&s), Some(Duration::from_millis(2000)));
+
+        let mut broken = base;
+        broken["timeout_millisecond"] = serde_json::json!("abc");
+        let s: BookSource = serde_json::from_value(broken).expect("非法值不应让整份书源解析失败");
+        assert_eq!(s.timeout_millisecond, 0, "非法值归 0，回退全局");
+        assert_eq!(source_timeout(&s), None);
+    }
+
+    // 源级超时必须真的落到 HTTP 请求上，而不是只解析字段
+    #[tokio::test]
+    async fn timed_fetch_applies_source_budget() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((_sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = fetch_for_source_timed(
+            &format!("http://{addr}/slow"),
+            "GET",
+            &HashMap::new(),
+            None,
+            "https://example.com",
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("请求超时"), "应报超时: {msg}");
+        assert!(msg.contains("1s"), "应带源级预算: {msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "应在 1s 左右放弃，实际 {:?}",
+            started.elapsed()
+        );
     }
 
     // ---------------- 编码嗅探 / Cookie / 重试分级 ----------------

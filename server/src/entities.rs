@@ -1,3 +1,4 @@
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -33,6 +34,10 @@ pub struct BookSource {
     pub enabled_cookie_jar: bool,
     #[serde(default)]
     pub concurrent_rate: Option<String>,
+    /// 单源请求超时（毫秒，oread 扩展字段）。0/负数/缺失/非法 → 回退全局
+    /// `HTTP_TIMEOUT_SECS`；有效值由 `req` 层夹取到 1000–60000。
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub timeout_millisecond: i64,
     #[serde(default)]
     pub header: Option<String>,
     #[serde(default)]
@@ -77,6 +82,20 @@ pub struct BookSource {
 
 fn default_true() -> bool {
     true
+}
+
+/// 宽松解析 i64：数字、数字字符串都接受；空串/非法值/其它类型一律归 0。
+/// 用于书源扩展字段——单个字段写坏不应让整份书源导入失败。
+fn lenient_i64<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -576,7 +576,7 @@
     <label class="switch-row">
       <span>
         <b>自动刷新</b>
-        <span class="muted">仅保存偏好；后端目前只存库，暂无自动刷新消费方</span>
+        <span class="muted">打开书架时自动检查更新（每 24 小时最多一次，仅刷新未停更的书）</span>
       </span>
       <input type="checkbox" bind:checked={settings.auto_refresh} />
     </label>
