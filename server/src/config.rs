@@ -44,6 +44,19 @@ fn resolve_all_slots(raw: Option<u64>) -> usize {
 /// 搜索并发硬上限：设备实测 16 槽不构成资源瓶颈（VmHWM 46–71 MB）。
 const MAX_SEARCH_CONCURRENCY: u64 = 16;
 
+/// 单段 JS 规则的默认时间预算（毫秒）。
+///
+/// 200ms 是早期按开发机估算的值：慢设备上腾讯漫画图片规则单次约 1.4s，
+/// 默认配置会把整章图片判超时（0 张）。放宽到 3s 覆盖实测最慢规则并留约 2× 余量；
+/// 预算只影响「确实跑得慢」的规则，常见规则仍是毫秒级，不会因此变慢。
+pub const DEFAULT_JS_TIMEOUT_MS: u64 = 3000;
+
+/// 夹取用户设置：默认 [`DEFAULT_JS_TIMEOUT_MS`]，范围 20–5000ms。
+/// 上限 5s 用于兜住写坏的规则，同时保证单个请求的最坏等待有界。
+fn resolve_js_timeout_ms(raw: Option<u64>) -> u64 {
+    raw.unwrap_or(DEFAULT_JS_TIMEOUT_MS).clamp(20, 5000)
+}
+
 /// 解析搜索的两个预算旋钮：返回 `(单源预算, 整批预算覆盖值)`。
 ///
 /// - `SEARCH_TIMEOUT_SECS`：单源预算，默认 6s；
@@ -125,7 +138,8 @@ pub struct Config {
     pub kindle_vh: u32,
     /// 书源 JS 规则总开关
     pub js_enabled: bool,
-    /// 单段 JS 规则的时间预算（毫秒，用于超时提示/统计）
+    /// 单段 JS 规则的时间预算（毫秒，用于超时提示/统计）。
+    /// 默认 [`DEFAULT_JS_TIMEOUT_MS`]，可用 `BORANLIB_JS_TIMEOUT_MS` 覆盖。
     pub js_timeout_ms: u64,
     /// 目录缓存 TTL（秒）
     pub toc_ttl_secs: i64,
@@ -225,7 +239,7 @@ impl Config {
             kindle_vw: env_u64("KINDLE_VW", 1072).clamp(480, 2400) as u32,
             kindle_vh: env_u64("KINDLE_VH", 1268).clamp(480, 2400) as u32,
             js_enabled: env_bool("JS_ENABLED", true),
-            js_timeout_ms: env_u64("JS_TIMEOUT_MS", 200).clamp(20, 5000),
+            js_timeout_ms: resolve_js_timeout_ms(env_u64_opt("JS_TIMEOUT_MS")),
             toc_ttl_secs: env_u64("TOC_TTL_SECS", 6 * 3600).clamp(60, 7 * 86400) as i64,
             content_ttl_secs: env_u64("CONTENT_TTL_SECS", 7 * 86400).clamp(60, 30 * 86400) as i64,
             db_max_open_users: env_u64("DB_MAX_OPEN_USERS", 8).clamp(1, 32) as usize,
@@ -386,5 +400,25 @@ mod tests {
         assert_eq!(resolve_all_slots(None), 16, "未设置时用设备建议 16");
         assert_eq!(resolve_all_slots(Some(32)), 16, "超过 16 夹回");
         assert_eq!(resolve_all_slots(Some(0)), 1);
+    }
+
+    // JS 预算：默认 3s（覆盖腾讯漫画图片规则实测 1.4s），显式值原样生效
+    #[test]
+    fn js_timeout_defaults_to_3000() {
+        assert_eq!(resolve_js_timeout_ms(None), DEFAULT_JS_TIMEOUT_MS);
+        assert_eq!(resolve_js_timeout_ms(None), 3000);
+        assert_eq!(resolve_js_timeout_ms(Some(1000)), 1000);
+        assert_eq!(resolve_js_timeout_ms(Some(3000)), 3000);
+    }
+
+    // JS 预算夹取边界：下限 20ms、上限 5000ms（写坏的规则也不至于让请求无限等）
+    #[test]
+    fn js_timeout_is_clamped_to_20_5000() {
+        assert_eq!(resolve_js_timeout_ms(Some(0)), 20);
+        assert_eq!(resolve_js_timeout_ms(Some(19)), 20);
+        assert_eq!(resolve_js_timeout_ms(Some(20)), 20);
+        assert_eq!(resolve_js_timeout_ms(Some(5000)), 5000);
+        assert_eq!(resolve_js_timeout_ms(Some(5001)), 5000);
+        assert_eq!(resolve_js_timeout_ms(Some(u64::MAX)), 5000);
     }
 }

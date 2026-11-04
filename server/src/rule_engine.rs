@@ -48,7 +48,7 @@ pub fn init_js(enabled: bool, timeout_ms: u64) {
 fn js_conf() -> JsConf {
     *JS_CONF.get().unwrap_or(&JsConf {
         enabled: true,
-        timeout_ms: 200,
+        timeout_ms: crate::config::DEFAULT_JS_TIMEOUT_MS,
         loop_iteration_limit: 500_000,
         recursion_limit: 100,
         stack_size_limit: 512,
@@ -4796,13 +4796,25 @@ nodes.filter(function (node) {
         );
     }
 
+    /// 未调用 `init_js` 时（单测/规则试跑等）必须采用配置模块的默认预算，
+    /// 不再回落到早期写死的 200ms（否则腾讯漫画图片规则会被误判超时）。
+    #[test]
+    fn uninitialized_js_conf_uses_config_default_budget() {
+        assert_eq!(
+            js_conf().timeout_ms,
+            crate::config::DEFAULT_JS_TIMEOUT_MS,
+            "JsConf 默认预算应与 config::DEFAULT_JS_TIMEOUT_MS 一致"
+        );
+    }
+
     /// 超预算行为保持不变：报错文案含 exceeded/budget，且不污染后续求值。
     /// 这里用 `#[tokio::test]`（current_thread）同时验证降级路径不会 panic。
     #[tokio::test]
     async fn slow_js_rule_reports_budget_timeout() {
-        // 测试进程未调用 init_js，默认预算 200ms
+        // 测试进程未调用 init_js：预算为默认值，慢规则比默认预算多跑 500ms 以确保超限。
+        let over_budget_ms = crate::config::DEFAULT_JS_TIMEOUT_MS + 500;
         let err = AnalyzeRule::new()
-            .get_string("", &slow_js_rule(400), false, "")
+            .get_string("", &slow_js_rule(over_budget_ms), false, "")
             .unwrap_err()
             .to_string();
         assert!(
