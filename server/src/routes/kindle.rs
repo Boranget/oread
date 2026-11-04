@@ -1738,7 +1738,7 @@ async fn progress(
 async fn search(
     State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
     headers: HeaderMap,
     Query(q): Query<SearchQ>,
 ) -> Response {
@@ -1773,8 +1773,9 @@ async fn search(
             Err(e) => return err_to_page(e),
         };
         crate::routes::sources::sort_sources(&mut sources);
-        // 与 `/api/search/start` 跑完全同一条 job 流水线（同源集合、同预算/并发池、
-        // 同 dedupe_and_sort + relevance 档位排序），服务端直接取最终排序结果切片。
+        // 与 legacy `/api/search` 共用 `aggregated`：同一源集合、同一预算/并发池、
+        // 同一 dedupe_and_sort + relevance 档位排序，并共享 60s 结果缓存；
+        // 同一实例上 /k 首屏与 `/api/search` 前 8 条顺序一致。
         let include_cooled = matches!(
             q.include_cooled.as_deref().map(str::trim),
             Some("1" | "true" | "yes" | "on")
@@ -1787,7 +1788,9 @@ async fn search(
             include_cooled,
         )
         .await;
-        let books = crate::routes::books::run_search_once(&s, &db, key.clone(), plan).await;
+        let (books, _errors) =
+            crate::routes::books::aggregated(&plan.active, &key, include_cooled, plan.scope)
+                .await;
         if books.is_empty() {
             list.push_str(
                 "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",

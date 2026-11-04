@@ -438,52 +438,6 @@ async fn run_search_job(
     }
 }
 
-/// 同步跑一次与 `/api/search/start` 完全相同的 job 流水线，返回最终排序结果。
-/// 供 `/k/search`（服务端渲染）使用：同一源集合、同一预算/并发池、同一
-/// `dedupe_and_sort + relevance` 档位排序，保证首屏顺序与 `/api/search` 一致。
-pub(crate) async fn run_search_once(
-    s: &AppState,
-    db: &UserDb,
-    key: String,
-    plan: SearchSourcePlan,
-) -> Vec<SearchBook> {
-    let sources = plan.active;
-    let source_total = sources.len();
-    let job = Arc::new(SearchJob {
-        id: next_job_id(),
-        key: key.clone(),
-        at: Instant::now(),
-        created_unix_ms: unix_ms(),
-        sources: sources.clone(),
-        source_total,
-        scope: plan.scope,
-        skipped_cooldown: plan.skipped_cooldown,
-        cooldown_total: plan.cooldown_total,
-        coverage: plan.coverage.to_string(),
-        source_mode: plan.source_mode.to_string(),
-        scope_filtered: plan.scope_filtered,
-        curated_total: plan.curated_total,
-        state: Mutex::new(SearchJobState {
-            pending: source_total,
-            ..Default::default()
-        }),
-    });
-    run_search_job(
-        job.clone(),
-        sources,
-        key,
-        s.shared.clone(),
-        db.0.clone(),
-        Arc::new(web_book::BookStore::new()),
-        s.cfg.source_cooldown_secs,
-        crate::source_quality::TierConfig::from_config(&s.cfg),
-        plan.health,
-        plan.scope,
-    )
-    .await;
-    job_view(&job).books
-}
-
 async fn run_search_batch(
     job: &Arc<SearchJob>,
     sources: Vec<crate::entities::BookSource>,
@@ -1201,7 +1155,7 @@ async fn search(
 
 /// 取一次完整聚合结果（带 60s 缓存），供 `/api/search` 与 `/api/search/aggregate` 共用，
 /// 保证两个入口的分页都基于同一份结果，不重不漏。
-async fn aggregated(
+pub(crate) async fn aggregated(
     sources: &[crate::entities::BookSource],
     key: &str,
     include_cooled: bool,
