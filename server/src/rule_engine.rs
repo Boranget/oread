@@ -291,7 +291,8 @@ function __fromUtf8(bin){
 }
 // 纯 JS base64，避免依赖宿主是否提供 btoa/atob（boa 0.19 默认不带）
 var __B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function __b64enc(bin){
+function __b64enc(bin, urlSafe, pad){
+  var alpha = urlSafe ? __B64URL : __B64;
   var out = "", i;
   for (i = 0; i < bin.length; i += 3) {
     var c1 = bin.charCodeAt(i);
@@ -299,14 +300,15 @@ function __b64enc(bin){
     var c3 = i + 2 < bin.length ? bin.charCodeAt(i + 2) : 0;
     var e1 = c1 >> 2, e2 = ((c1 & 3) << 4) | (c2 >> 4);
     var e3 = ((c2 & 15) << 2) | (c3 >> 6), e4 = c3 & 63;
-    out += __B64.charAt(e1) + __B64.charAt(e2);
-    out += (i + 1 < bin.length ? __B64.charAt(e3) : "=");
-    out += (i + 2 < bin.length ? __B64.charAt(e4) : "=");
+    out += alpha.charAt(e1) + alpha.charAt(e2);
+    out += (i + 1 < bin.length ? alpha.charAt(e3) : "=");
+    out += (i + 2 < bin.length ? alpha.charAt(e4) : "=");
   }
+  if (pad === false) out = out.replace(/=+$/, "");
   return out;
 }
 function __b64dec(s){
-  s = String(s).replace(/[^A-Za-z0-9+/=]/g, "");
+  s = String(s).replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
   var bin = "", i;
   for (i = 0; i < s.length; i += 4) {
     var c1 = __B64.indexOf(s.charAt(i));
@@ -319,6 +321,36 @@ function __b64dec(s){
     if (c4 >= 0) bin += String.fromCharCode(((c3 & 3) << 6) | c4);
   }
   return bin;
+}
+// base64 变体（上游 JsExtensions.kt 签名）：
+//   base64Encode(str) / base64Encode(str, flags)      flags 默认 2(NO_WRAP)，8=URL_SAFE，1=NO_PADDING
+//   base64Decode(str) / base64Decode(str, charset) / base64Decode(str, flags)
+//   base64DecodeToByteArray(str[, flags])
+var __B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function __b64encFlags(bin, flags){
+  flags = (flags === undefined || flags === null) ? 2 : Number(flags);
+  return __b64enc(bin, (flags & 8) !== 0, (flags & 1) === 0);
+}
+function __b64Bytes(s){ var bin = __b64dec(s), a = []; for (var i = 0; i < bin.length; i++) a.push(bin.charCodeAt(i)); return a; }
+function __hexBin(h){
+  h = String(h || "").replace(/[^0-9A-Fa-f]/g, "");
+  if (h.length % 2 !== 0) return "";
+  var out = "";
+  // boa 0.19 没有实现 Annex B 的 String.prototype.substr，这里用 slice
+  for (var i = 0; i < h.length; i += 2) out += String.fromCharCode(parseInt(h.slice(i, i + 2), 16));
+  return out;
+}
+function __b64Charset(bin, charset){
+  // 只实现 Legado 源里常见的几种；GBK 等无 JS 解码表，退化为 UTF-8（与上游的 GBK 解码有差异）。
+  var c = String(charset).toUpperCase().replace(/[_-]/g, "");
+  if (c === "UTF8" || c === "") return __fromUtf8(bin);
+  if (c === "LATIN1" || c === "ISO88591" || c === "ASCII" || c === "USASCII") return bin;
+  if (c === "UTF16LE" || c === "UNICODELITTLE") {
+    var out = "";
+    for (var i = 0; i + 1 < bin.length; i += 2) out += String.fromCharCode(bin.charCodeAt(i) | (bin.charCodeAt(i + 1) << 8));
+    return out;
+  }
+  return __fromUtf8(bin);
 }
 "#;
 
@@ -437,6 +469,9 @@ var cache = {
 /// JS 执行结果里回传 cache 变更的分隔符（结果串 + 分隔符 + cache JSON）。
 const JS_CACHE_SENTINEL: &str = "\u{1}F1CACHE\u{1}";
 
+/// 结果串尾部的“规则自身耗时”（毫秒）：预算只该算规则代码，不该算固定垫片/lib 的解析。
+const JS_RULE_MS_SENTINEL: &str = "\u{1}F1RULEMS\u{1}";
+
 const JAVA_BOOK_SHIM: &str = r#"
 var __vars = {};
 // DOM 桥 Phase 1 的预抽取结果（由 Rust 在 eval 前按字面量选择器算好并赋值）
@@ -466,9 +501,16 @@ var java = {
     for (var i = 0; i < s.length; i++) { out += (__T2S[s.charAt(i)] || s.charAt(i)); }
     return out;
   },
-  base64Encode: function(s){ try { return __b64enc(__utf8(s)); } catch(e){ return ""; } },
-  base64Decode: function(s){ try { return __fromUtf8(__b64dec(s)); } catch(e){ return ""; } },
+  base64Encode: function(s, flags){ try { return __b64encFlags(__utf8(s), flags); } catch(e){ return ""; } },
+  base64Decode: function(s, arg){
+    try {
+      var bin = __b64dec(s);
+      if (typeof arg === "string") return __b64Charset(bin, arg);
+      return __fromUtf8(bin);
+    } catch(e){ return ""; }
+  },
   base64DecodeToString: function(s){ return java.base64Decode(s); },
+  base64DecodeToByteArray: function(s, flags){ try { return __b64Bytes(s); } catch(e){ return []; } },
   encodeURI: function(s){ return encodeURIComponent(String(s)); },
   decodeURI: function(s){ try { return decodeURIComponent(String(s)); } catch(e){ return ""; } },
   encodeURIComponent: function(s){ return encodeURIComponent(String(s)); },
@@ -480,12 +522,15 @@ var java = {
     for (var i = 0; i < b.length; i++) { out += ("0" + b.charCodeAt(i).toString(16)).slice(-2); }
     return out;
   },
-  hexDecode: function(s){
-    s = String(s || "").replace(/\s+/g, "");
-    if (s.length % 2 !== 0) return "";
-    var pct = "";
-    for (var i = 0; i < s.length; i += 2) { pct += "%" + s.slice(i, i + 2); }
-    try { return decodeURIComponent(pct); } catch(e){ return ""; }
+  hexEncodeToString: function(s){ return java.hexEncode(s); },
+  hexDecode: function(s){ try { return __fromUtf8(__hexBin(s)); } catch(e){ return ""; } },
+  hexDecodeToString: function(s){ return java.hexDecode(s); },
+  hexDecodeToByteArray: function(s){
+    try {
+      var bin = __hexBin(s), a = [];
+      for (var i = 0; i < bin.length; i++) a.push(bin.charCodeAt(i));
+      return a;
+    } catch(e){ return []; }
   },
   random: function(max){
     if (max === undefined || max === null) return Math.random();
@@ -1246,7 +1291,7 @@ impl AnalyzeRule {
         let vars_js = self.js_vars();
         let cache_init = serde_json::to_string(&self.cache.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{cachejs}\n{lib}\n{shim}\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {sent} + JSON.stringify(__cache); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{cachejs}\n{lib}\n{shim}\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {sent} + JSON.stringify(__cache) + {msent} + String(__ms); }})()",
             r = js_string_literal(input),
             b = js_string_literal(base_url),
             vars = vars_js,
@@ -1258,6 +1303,7 @@ impl AnalyzeRule {
             doms = doms_js,
             code = js_string_literal(code),
             sent = js_string_literal(JS_CACHE_SENTINEL),
+            msent = js_string_literal(JS_RULE_MS_SENTINEL),
         );
         let (tx, rx) = channel::<(Result<String, String>, u64, u64)>();
         js_sender()
@@ -1266,39 +1312,52 @@ impl AnalyzeRule {
         let (result, net_ms, js_elapsed) = rx
             .recv()
             .map_err(|_| RuleError::Other("js worker dropped".into()))?;
-        // 结果串尾部带回 cache 变更：合并回本作用域的 cache（非法/超大则忽略，不影响主结果）
+        // 结果串尾部依次带回 cache 变更与规则自身耗时（非法/超大都忽略，不影响主结果）
+        let mut rule_ms: Option<u64> = None;
         let result = match result {
-            Ok(s) => match s.rfind(JS_CACHE_SENTINEL) {
-                Some(idx) => {
-                    let body = s[..idx].to_string();
-                    let tail = &s[idx + JS_CACHE_SENTINEL.len()..];
+            Ok(mut s) => {
+                if let Some(idx) = s.rfind(JS_RULE_MS_SENTINEL) {
+                    let tail = s[idx + JS_RULE_MS_SENTINEL.len()..].trim().to_string();
+                    if let Ok(ms) = tail.parse::<u64>() {
+                        rule_ms = Some(ms);
+                    }
+                    s.truncate(idx);
+                }
+                if let Some(idx) = s.rfind(JS_CACHE_SENTINEL) {
+                    let tail = s[idx + JS_CACHE_SENTINEL.len()..].to_string();
                     if tail.len() <= 1_048_576 {
                         if let Ok(map) =
-                            serde_json::from_str::<HashMap<String, String>>(tail)
+                            serde_json::from_str::<HashMap<String, String>>(&tail)
                         {
                             self.cache.replace(map);
                         }
                     }
-                    Ok(body)
+                    s.truncate(idx);
                 }
-                None => Ok(s),
-            },
+                Ok(s)
+            }
             Err(e) => Err(e),
         };
         let (result, net_ms) = (result.map_err(RuleError::Other), net_ms);
+        // 预算只算规则自身耗时（页面里 Date.now 包裹 eval 的那段），固定垫片/lib 的
+        // 解析成本与机器负载相关，不该算到源作者头上；`java.ajax` 联网时间也扣掉。
+        // 拿不到回传耗时（脚本抛错等）时退回整段耗时，保守但不会放过慢规则。
+        let budget_ms = rule_ms.map_or(js_elapsed, |ms| ms).saturating_sub(net_ms);
         // 排队等单一 JS 线程的时间不计入预算：并发测试/并发请求下同一规则仍应通过。
         JS_LAST_MS.store(js_elapsed, Ordering::Relaxed);
-        JS_MAX_MS.fetch_max(js_elapsed, Ordering::Relaxed);
-        if js_elapsed > conf.timeout_ms {
+        JS_MAX_MS.fetch_max(budget_ms, Ordering::Relaxed);
+        // 已经报错的脚本保留原始错误（如 RuntimeLimit），不要被“超预算”盖掉
+        if result.is_ok() && budget_ms > conf.timeout_ms {
             tracing::warn!(
                 elapsed_ms = js_elapsed,
+                rule_ms = budget_ms,
                 net_ms,
                 budget_ms = conf.timeout_ms,
                 "js rule exceeded time budget"
             );
             return Err(RuleError::Other(format!(
                 "js eval exceeded {}ms budget (took {}ms)",
-                conf.timeout_ms, js_elapsed
+                conf.timeout_ms, budget_ms
             )));
         }
         result
@@ -4106,6 +4165,49 @@ nodes.filter(function (node) {
             ar.get_string("", "<js>java.hexDecode('41')</js>", false, "")
                 .unwrap(),
             "A"
+        );
+        // base64 同族（上游 JsExtensions.kt L676-730 签名）
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Decode('5Lit5paH','UTF-8')</js>", false, "")
+                .unwrap(),
+            "中文"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Decode('5Lit5paH',2)</js>", false, "")
+                .unwrap(),
+            "中文"
+        );
+        // URL-safe 变体（flags=8）编码后可原样解回
+        assert_eq!(
+            ar.get_string(
+                "",
+                "<js>var e=java.base64Encode('a?b',8); java.base64Decode(e)</js>",
+                false,
+                ""
+            )
+            .unwrap(),
+            "a?b"
+        );
+        // flags=1 去 padding
+        assert_eq!(
+            ar.get_string("", "<js>java.base64Encode('a',1)</js>", false, "")
+                .unwrap(),
+            "YQ"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.base64DecodeToByteArray('5Lit5paH').length</js>", false, "")
+                .unwrap(),
+            "6"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.hexEncodeToString('中文')</js>", false, "")
+                .unwrap(),
+            "e4b8ade69687"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>java.hexDecodeToString('e4b8ade69687')</js>", false, "")
+                .unwrap(),
+            "中文"
         );
         // 毫秒时间戳 + Java 风格 pattern
         assert_eq!(
