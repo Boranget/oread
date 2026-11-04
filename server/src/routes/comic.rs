@@ -18,6 +18,7 @@ use crate::auth::{AuthUser, UserDb};
 use crate::entities::{BookChapter, BookContent, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
 use crate::routes::books::{load_book_meta, save_content_cached};
+use crate::routes::image;
 use crate::routes::sources::load_source;
 use crate::routes::AppState;
 use crate::web_book;
@@ -279,6 +280,23 @@ async fn chapter_images(
 
     let (ordinal, total) = chapter_position(&db.0, &book_url, &chapter).await;
     let placeholder_suspected = !images.is_empty() && (chapter.is_pay || chapter.is_vip);
+    // 每张图附 `slices`：>1 表示该图超长条页、需要按屏切片翻页；0 表示整图一屏。
+    // 只按源页面给的 width/height 预判（未知尺寸按 1 屏处理，交给 `/k` 打开时再算）。
+    let slice_params = image::SliceParams::default();
+    let images_out: Vec<serde_json::Value> = images
+        .iter()
+        .map(|im| {
+            let n = match (im.width, im.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    image::slice_count_window(w, h, &slice_params)
+                }
+                _ => 1,
+            };
+            let mut v = serde_json::to_value(im).unwrap_or_else(|_| json!({}));
+            v["slices"] = json!(if n > 1 { n } else { 0 });
+            v
+        })
+        .collect();
     Ok(Json(json!({
         "book_url": book_url,
         "source": source.book_source_url,
@@ -289,7 +307,7 @@ async fn chapter_images(
         "chapter_index": ordinal,
         "chapter_count": total,
         "content_type": "image",
-        "images": images,
+        "images": images_out,
         "count": images.len(),
         "truncated": truncated,
         "cached": from_cache,
