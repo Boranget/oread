@@ -62,6 +62,12 @@ jobs:
         working-directory: .
         run: node scripts/check-budget.mjs --frontend-only
 
+      # /k 墨水屏样式门禁：只扫 server/src/routes/kindle.rs 的内联 CSS，
+      # 排除 fn selftest 诊断样例；SPA（web/src）不在此约束内。
+      - name: Eink CSS gate (/k only)
+        working-directory: .
+        run: node scripts/eink-lint.mjs
+
       # 迁移字节门禁（构建前）：索引/工作区全 LF，且工作区字节与索引 blob 完全一致。
       # 内嵌字节（sqlx::migrate! 的 include_str!）由 tests/migrations_lf.rs 在 cargo test 中断言。
       - name: Migrations LF gate
