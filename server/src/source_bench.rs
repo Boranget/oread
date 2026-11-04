@@ -45,6 +45,20 @@ pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
 pub const MIN_CURATED_SAMPLES: i64 = 2;
 
+/// 精选资格：体检命中率必须 > 0。0 命中的源即使分数够、下限 min 未满也不入选，
+/// 不拿低分源凑数——让“加强搜索”只跑真的能搜到书的源。
+pub fn curated_hit_ok(hit_rate: f64) -> bool {
+    hit_rate > 0.0
+}
+
+/// 从 `source_curated.meta_json` 读取上一次体检的命中率；缺失或解析失败按 0 处理（不具备资格）。
+pub fn meta_hit_rate(meta_json: Option<&str>) -> f64 {
+    meta_json
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("hit_rate").and_then(|h| h.as_f64()))
+        .unwrap_or(0.0)
+}
+
 pub const CATEGORY_FALLBACK: &str = "未分类";
 
 /// 内置语料条目。标题/作者/分类只从这里读取，数据库里的 builtin 行仅承载 enabled 覆盖。
@@ -1282,6 +1296,7 @@ fn select_curated(rows: &[SourceBenchRow], cfg: &Config, eligible: &HashSet<Stri
         let mut pool: Vec<&SourceBenchRow> = rows
             .iter()
             .filter(|r| r.source_type == source_type && r.samples >= MIN_CURATED_SAMPLES)
+            .filter(|r| curated_hit_ok(r.hit_rate))
             .filter(|r| eligible.contains(&r.source_url))
             .collect();
         pool.sort_by(|a, b| {
@@ -1577,27 +1592,29 @@ struct StoredScoreRow {
     source_type: i64,
     bench_score: i32,
     samples: i64,
+    hit_rate: f64,
     fail_streak: i64,
     tier: Option<String>,
 }
 
 /// 从库内状态重算精选并回写 curated 标记。
 async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<CuratedItem>, Vec<CuratedItem>)> {
-    let rows: Vec<(String, i64, i64, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64, i64, i64, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT c.source_url, c.source_type, c.bench_score, c.samples, c.fail_streak, h.tier, \
-                (SELECT b.name FROM book_sources b WHERE b.id = c.source_url) \
+                (SELECT b.name FROM book_sources b WHERE b.id = c.source_url), c.meta_json \
          FROM source_curated c LEFT JOIN source_health h ON h.source_url = c.source_url",
     )
     .fetch_all(pool)
     .await?;
     let stored: Vec<StoredScoreRow> = rows
         .into_iter()
-        .map(|(source_url, source_type, bench_score, samples, fail_streak, tier, name)| StoredScoreRow {
+        .map(|(source_url, source_type, bench_score, samples, fail_streak, tier, name, meta_json)| StoredScoreRow {
             name: name.unwrap_or_else(|| source_url.clone()),
             source_url,
             source_type,
             bench_score: bench_score as i32,
             samples,
+            hit_rate: meta_hit_rate(meta_json.as_deref()),
             fail_streak,
             tier,
         })
@@ -1618,6 +1635,7 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
             .iter()
             .filter(|r| r.source_type == source_type)
             .filter(|r| r.samples >= MIN_CURATED_SAMPLES && r.fail_streak < 2)
+            .filter(|r| curated_hit_ok(r.hit_rate))
             .filter(|r| r.tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED))
             .collect();
         pool_rows.sort_by(|a, b| b.bench_score.cmp(&a.bench_score).then_with(|| a.source_url.cmp(&b.source_url)));
@@ -1665,8 +1683,8 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
 /// 轻量重算：只针对一个源，把它是否仍该留在精选写回 `source_curated`。
 /// 只负责“降级/样本不足/连续失败的源及时退出”，不会强行把源加进来（避免绕过断层与上限）。
 pub async fn revalidate_curated_source(pool: &SqlitePool, source_url: &str) -> AppResult<()> {
-    let row: Option<(i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT c.samples, c.fail_streak, h.tier \
+    let row: Option<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT c.samples, c.fail_streak, h.tier, c.meta_json \
          FROM source_curated c LEFT JOIN source_health h ON h.source_url = c.source_url \
          WHERE c.source_url = ?",
     )
@@ -1675,9 +1693,10 @@ pub async fn revalidate_curated_source(pool: &SqlitePool, source_url: &str) -> A
     .await?;
     let now = now_ms();
     match row {
-        Some((samples, fail_streak, tier)) => {
+        Some((samples, fail_streak, tier, meta_json)) => {
             let eligible = samples >= MIN_CURATED_SAMPLES
                 && fail_streak < 2
+                && curated_hit_ok(meta_hit_rate(meta_json.as_deref()))
                 && tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED);
             if eligible {
                 sqlx::query("UPDATE source_curated SET last_run_at = ? WHERE source_url = ?")
@@ -1731,8 +1750,8 @@ pub fn maybe_schedule_stale_bench(pool: SqlitePool, cfg: &Config) {
 /// 只读：当前 curated 集合（供搜索 scope=curated 使用）。
 /// 读时兜底再校验 tier：即使降级后轻量重算还没跑完，也不会继续拿已降级的源去搜。
 pub async fn curated_set(pool: &SqlitePool) -> AppResult<HashSet<String>> {
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT c.source_url, h.tier FROM source_curated c \
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT c.source_url, h.tier, c.meta_json FROM source_curated c \
          LEFT JOIN source_health h ON h.source_url = c.source_url \
          WHERE c.curated = 1",
     )
@@ -1740,8 +1759,10 @@ pub async fn curated_set(pool: &SqlitePool) -> AppResult<HashSet<String>> {
     .await?;
     let mut set = HashSet::new();
     let mut stale = Vec::new();
-    for (url, tier) in rows {
-        if tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED) {
+    for (url, tier, meta_json) in rows {
+        if tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED)
+            && curated_hit_ok(meta_hit_rate(meta_json.as_deref()))
+        {
             set.insert(url);
         } else {
             stale.push(url);
@@ -1762,9 +1783,9 @@ pub async fn curated_set(pool: &SqlitePool) -> AppResult<HashSet<String>> {
 
 /// 只读：精选清单（前端展示用）。
 pub async fn curated_lists(pool: &SqlitePool) -> AppResult<(Vec<CuratedItem>, Vec<CuratedItem>)> {
-    let rows: Vec<(String, i64, i64, i64, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(String, i64, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT c.source_url, c.source_type, c.bench_score, c.samples, \
-                (SELECT b.name FROM book_sources b WHERE b.id = c.source_url) \
+                (SELECT b.name FROM book_sources b WHERE b.id = c.source_url), c.meta_json \
          FROM source_curated c LEFT JOIN source_health h ON h.source_url = c.source_url \
          WHERE c.curated = 1 AND h.tier = 'preferred' \
          ORDER BY c.source_type, c.bench_score DESC, c.source_url",
@@ -1773,7 +1794,10 @@ pub async fn curated_lists(pool: &SqlitePool) -> AppResult<(Vec<CuratedItem>, Ve
     .await?;
     let mut novel = Vec::new();
     let mut comic = Vec::new();
-    for (source_url, source_type, bench_score, samples, name) in rows {
+    for (source_url, source_type, bench_score, samples, name, meta_json) in rows {
+        if !curated_hit_ok(meta_hit_rate(meta_json.as_deref())) {
+            continue;
+        }
         let item = CuratedItem {
             rank: 0,
             source_url: source_url.clone(),
@@ -2082,5 +2106,68 @@ mod tests {
         let urls: Vec<&str> = sel.novel.iter().map(|i| i.source_url.as_str()).collect();
         assert_eq!(urls, vec!["https://a"], "b 非 preferred、c 样本不足都不参与");
         let _ = scores;
+    }
+
+    fn srow(url: &str, ty: i64, score: i32, hit_rate: f64) -> SourceBenchRow {
+        SourceBenchRow {
+            source_url: url.into(),
+            name: url.into(),
+            source_type: ty,
+            samples: 5,
+            hits: (hit_rate * 5.0).round() as i64,
+            hit_rate,
+            avg_latency_ms: 300,
+            errors: 0,
+            error_kinds: serde_json::json!({}),
+            bench_score: score,
+            curated: false,
+            excluded_samples: 0,
+            per_category_hit_rate: vec![],
+        }
+    }
+
+    #[test]
+    fn curated_requires_nonzero_hit_rate() {
+        let cfg = Config::from_env();
+        let eligible: HashSet<String> = ["https://h1", "https://h2", "https://z"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = vec![
+            srow("https://h1", TYPE_COMIC, 86, 0.8),
+            srow("https://h2", TYPE_COMIC, 85, 0.8),
+            srow("https://z", TYPE_COMIC, 29, 0.0),
+        ];
+        let sel = select_curated(&rows, &cfg, &eligible);
+        let urls: Vec<&str> = sel.comic.iter().map(|i| i.source_url.as_str()).collect();
+        assert_eq!(urls, vec!["https://h1", "https://h2"], "0 命中源不入选，comic min=3 也不拿它凑数");
+        assert!(!sel.flags.get("https://z").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn low_score_but_hitting_source_still_selected() {
+        let cfg = Config::from_env();
+        let eligible: HashSet<String> = ["https://a", "https://b", "https://c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = vec![
+            srow("https://a", TYPE_NOVEL, 31, 0.2),
+            srow("https://b", TYPE_NOVEL, 30, 0.2),
+            srow("https://c", TYPE_NOVEL, 29, 0.2),
+        ];
+        let sel = select_curated(&rows, &cfg, &eligible);
+        let urls: Vec<&str> = sel.novel.iter().map(|i| i.source_url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a", "https://b", "https://c"], "命中率>0 的低分源仍可入选，断层规则不变");
+    }
+
+    #[test]
+    fn meta_hit_rate_reads_last_bench_rate() {
+        assert_eq!(meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0.8}"#)), 0.8);
+        assert_eq!(meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0}"#)), 0.0);
+        assert_eq!(meta_hit_rate(None), 0.0, "无 meta 视为未体检，不具备资格");
+        assert_eq!(meta_hit_rate(Some("not json")), 0.0);
+        assert!(!curated_hit_ok(0.0));
+        assert!(curated_hit_ok(0.2), "1/5 命中仍算有命中，只是分数低");
     }
 }
