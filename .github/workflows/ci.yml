@@ -55,6 +55,11 @@ jobs:
         working-directory: server/web
         run: npm run build
 
+      # Svelte 类型/模板检查：0 error 才通过（现存 a11y 类 warning 不阻断）。
+      - name: Svelte check
+        working-directory: server/web
+        run: npm run check
+
       # 首屏体积门禁：口径 = 入口 chunk + 其静态 import 的 chunk（gzip），
       # 不是 dist/*.js 总量。阈值在 scripts/budget.json。
       # 脚本与 budget.json 在仓库根目录的 scripts/，必须显式覆盖 job 级的 server/。
@@ -92,6 +97,14 @@ jobs:
             }
           done
           echo "migrations LF gate: PASS"
+
+      # 代码洁净度门禁：格式化与 clippy 全部零容忍（-D warnings）。
+      # 迁移文件为 .sql，cargo fmt 只处理 .rs，不会改动 migrations 的血缘字节。
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo build --release
         run: cargo build --release --locked

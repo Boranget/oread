@@ -120,6 +120,8 @@ fn write_canonical(v: &Value, out: &mut String) {
     }
 }
 
+/// 书库状态行（映射 `library_state` 表）；部分列只用于入库/审计，当前读取路径未全部消费。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, FromRow)]
 pub struct LibraryState {
     pub source_url: String,
@@ -345,6 +347,7 @@ pub async fn record_batch(
     Ok(())
 }
 
+#[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，便于对照默认值。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +443,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(last_batch_sha(&pool, "boranlib-sources.json").await.unwrap(), Some("abc".into()));
+        assert_eq!(
+            last_batch_sha(&pool, "boranlib-sources.json")
+                .await
+                .unwrap(),
+            Some("abc".into())
+        );
         assert!(last_batch_urls(&pool, "boranlib-sources.json")
             .await
             .unwrap()
@@ -450,16 +458,30 @@ mod tests {
         quarantine(&pool, "https://a.com", Some("site_unreachable"), 2000)
             .await
             .unwrap();
-        assert!(quarantined_set(&pool).await.unwrap().contains("https://a.com"));
+        assert!(quarantined_set(&pool)
+            .await
+            .unwrap()
+            .contains("https://a.com"));
         let states = load_states(&pool).await.unwrap();
         let st = states.get("https://a.com").unwrap();
         assert!(st.is_quarantined());
 
         // 复活：再次写回 active
-        upsert_state(&pool, "https://a.com", DECISION_ACTIVE, None, Some("sha-a"), "b2", 3000)
+        upsert_state(
+            &pool,
+            "https://a.com",
+            DECISION_ACTIVE,
+            None,
+            Some("sha-a"),
+            "b2",
+            3000,
+        )
+        .await
+        .unwrap();
+        assert!(!quarantined_set(&pool)
             .await
-            .unwrap();
-        assert!(!quarantined_set(&pool).await.unwrap().contains("https://a.com"));
+            .unwrap()
+            .contains("https://a.com"));
         let states = load_states(&pool).await.unwrap();
         assert!(!states.get("https://a.com").unwrap().is_quarantined());
     }

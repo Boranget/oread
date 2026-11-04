@@ -168,7 +168,8 @@ pub fn classify(err: &Error) -> FailureKind {
     }
 }
 
-/// 构造一个“站点不可达”错误（用于搜索超时等外部判定）。
+/// 构造一个“站点不可达”错误（用于搜索超时等外部判定）。仅单测使用。
+#[allow(dead_code)]
 pub fn site_error(msg: impl Into<String>) -> Error {
     Error::new(SourceUnavailable(msg.into()))
 }
@@ -255,7 +256,8 @@ pub fn apply_outcome(
             row.fail_site_count = row.fail_site_count.saturating_add(1);
             if row.consecutive_failures >= FAIL_THRESHOLD {
                 let until = now.saturating_add((cooldown_secs as i64).saturating_mul(1000));
-                row.cooldown_until = Some(row.cooldown_until.map(|t| t.max(until)).unwrap_or(until));
+                row.cooldown_until =
+                    Some(row.cooldown_until.map(|t| t.max(until)).unwrap_or(until));
             }
         }
         // partial（引擎故障）：不计站点失败、不清零、不改冷却，只累计引擎失败证据
@@ -512,10 +514,9 @@ pub async fn record_evaluation(
     .bind(source_url)
     .fetch_optional(pool)
     .await?;
-    let mut row = row.unwrap_or_else(|| {
-        let mut r = HealthRow::default();
-        r.source_url = source_url.to_string();
-        r
+    let mut row = row.unwrap_or_else(|| HealthRow {
+        source_url: source_url.to_string(),
+        ..Default::default()
     });
     let mut input = score_input(&row, rule_complete, network);
     if let Some(t) = prev_tier_override {
@@ -548,9 +549,7 @@ pub async fn record_evaluation(
     .bind(row.demote_streak)
     .execute(pool)
     .await?;
-    if prev_tier == source_quality::TIER_PREFERRED
-        && eval.tier != source_quality::TIER_PREFERRED
-    {
+    if prev_tier == source_quality::TIER_PREFERRED && eval.tier != source_quality::TIER_PREFERRED {
         trigger_curated_revalidate(pool, vec![source_url.to_string()]);
     }
     Ok(eval)
@@ -572,7 +571,11 @@ pub fn visible_in_search(row: Option<&HealthRow>) -> bool {
 /// 导入期只有这类失败参与阻断性判定；超时/连接失败属于“未知”，不能据此把源判死。
 pub fn is_explicit_site_rejection(error: Option<&str>) -> bool {
     error
-        .map(|e| e.trim_start().to_ascii_lowercase().starts_with("http status "))
+        .map(|e| {
+            e.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("http status ")
+        })
         .unwrap_or(false)
 }
 
@@ -612,7 +615,9 @@ pub fn is_preferred(row: Option<&HealthRow>) -> bool {
 /// 清空某源或全部健康记录，返回清理行数。
 pub async fn reset(pool: &SqlitePool, source_ids: &[String]) -> AppResult<u64> {
     if source_ids.is_empty() {
-        let r = sqlx::query("DELETE FROM source_health").execute(pool).await?;
+        let r = sqlx::query("DELETE FROM source_health")
+            .execute(pool)
+            .await?;
         return Ok(r.rows_affected());
     }
     let mut cleared = 0u64;
@@ -671,11 +676,9 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
             let latency_ms = started.elapsed().as_millis() as i64;
             let (status, error, hits) = match r {
                 // 规则跑通但 0 条结果：引擎/关键词问题，不判站点坏。
-                Ok(Ok(v)) if v.is_empty() => (
-                    STATUS_PARTIAL,
-                    Some("规则未产出结果".to_string()),
-                    0,
-                ),
+                Ok(Ok(v)) if v.is_empty() => {
+                    (STATUS_PARTIAL, Some("规则未产出结果".to_string()), 0)
+                }
                 Ok(Ok(v)) => (STATUS_OK, None, v.len() as i64),
                 Ok(Err(e)) => {
                     let kind = classify(&e);
@@ -740,7 +743,11 @@ pub fn outcomes_from_probes(probes: &[Probe]) -> Vec<Outcome> {
 }
 
 /// 统计候选源里处于冷却中的数量（用于“另有 N 个源处于冷却”）。
-pub fn cooled_count(sources: &[BookSource], health: &HashMap<String, HealthRow>, now: i64) -> usize {
+pub fn cooled_count(
+    sources: &[BookSource],
+    health: &HashMap<String, HealthRow>,
+    now: i64,
+) -> usize {
     sources
         .iter()
         .filter(|s| {
@@ -788,6 +795,7 @@ pub fn partition_cooldown(
     Partition { active, skipped }
 }
 
+#[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，便于对照默认值。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,7 +838,12 @@ mod tests {
     fn site_failures_cool_at_threshold() {
         let mut row: Option<HealthRow> = None;
         for i in 1..=3 {
-            let next = apply_outcome(row.as_ref(), &outcome("https://a.com", STATUS_FAIL), 1000, 86400);
+            let next = apply_outcome(
+                row.as_ref(),
+                &outcome("https://a.com", STATUS_FAIL),
+                1000,
+                86400,
+            );
             if i < FAIL_THRESHOLD {
                 assert!(next.cooldown_until.is_none(), "第 {i} 次不应冷却");
             }
@@ -845,10 +858,25 @@ mod tests {
     #[test]
     fn success_resets_failures_and_cooldown() {
         let mut row = apply_outcome(None, &outcome("https://a.com", STATUS_FAIL), 1000, 86400);
-        row = apply_outcome(Some(&row), &outcome("https://a.com", STATUS_FAIL), 2000, 86400);
-        row = apply_outcome(Some(&row), &outcome("https://a.com", STATUS_FAIL), 3000, 86400);
+        row = apply_outcome(
+            Some(&row),
+            &outcome("https://a.com", STATUS_FAIL),
+            2000,
+            86400,
+        );
+        row = apply_outcome(
+            Some(&row),
+            &outcome("https://a.com", STATUS_FAIL),
+            3000,
+            86400,
+        );
         assert!(row.cooling(3000));
-        let row = apply_outcome(Some(&row), &outcome("https://a.com", STATUS_OK), 4000, 86400);
+        let row = apply_outcome(
+            Some(&row),
+            &outcome("https://a.com", STATUS_OK),
+            4000,
+            86400,
+        );
         assert_eq!(row.consecutive_failures, 0);
         assert_eq!(row.cooldown_until, None);
         assert_eq!(row.last_ok_at, Some(4000));
@@ -858,10 +886,20 @@ mod tests {
     #[test]
     fn engine_failures_do_not_cool() {
         let mut row = apply_outcome(None, &outcome("https://a.com", STATUS_FAIL), 1000, 86400);
-        row = apply_outcome(Some(&row), &outcome("https://a.com", STATUS_FAIL), 2000, 86400);
+        row = apply_outcome(
+            Some(&row),
+            &outcome("https://a.com", STATUS_FAIL),
+            2000,
+            86400,
+        );
         assert_eq!(row.consecutive_failures, 2);
         for _ in 0..10 {
-            row = apply_outcome(Some(&row), &outcome("https://a.com", STATUS_PARTIAL), 3000, 86400);
+            row = apply_outcome(
+                Some(&row),
+                &outcome("https://a.com", STATUS_PARTIAL),
+                3000,
+                86400,
+            );
         }
         assert_eq!(row.consecutive_failures, 2, "引擎失败不应累加");
         assert_eq!(row.last_status, STATUS_PARTIAL);
@@ -871,7 +909,11 @@ mod tests {
     // 冷却中的源默认跳过；include_cooled 时全部参与
     #[test]
     fn partition_skips_cooled_by_default() {
-        let sources = vec![src("https://a.com", "A"), src("https://b.com", "B"), src("https://c.com", "C")];
+        let sources = vec![
+            src("https://a.com", "A"),
+            src("https://b.com", "B"),
+            src("https://c.com", "C"),
+        ];
         let mut health = HashMap::new();
         let mut cooled = HealthRow::default();
         cooled.source_url = "https://b.com".into();
@@ -881,7 +923,10 @@ mod tests {
         let p = partition_cooldown(sources.clone(), &health, false, 5_000);
         assert_eq!(p.active.len(), 2);
         assert_eq!(p.skipped, 1);
-        assert!(p.active.iter().all(|s| s.book_source_url != "https://b.com"));
+        assert!(p
+            .active
+            .iter()
+            .all(|s| s.book_source_url != "https://b.com"));
 
         let p = partition_cooldown(sources.clone(), &health, true, 5_000);
         assert_eq!(p.active.len(), 3);
@@ -1049,8 +1094,12 @@ mod tests {
 
     #[test]
     fn explicit_site_rejection_only_matches_http_status() {
-        assert!(is_explicit_site_rejection(Some("http status 403 Forbidden")));
-        assert!(is_explicit_site_rejection(Some("HTTP status 503 Service Unavailable")));
+        assert!(is_explicit_site_rejection(Some(
+            "http status 403 Forbidden"
+        )));
+        assert!(is_explicit_site_rejection(Some(
+            "HTTP status 503 Service Unavailable"
+        )));
         assert!(!is_explicit_site_rejection(Some(
             "搜索超时（单源 10s 预算）"
         )));
@@ -1152,6 +1201,10 @@ mod tests {
             .unwrap();
         let map = load_map(&pool).await.unwrap();
         let row = map.get("https://dead.example").unwrap();
-        assert_eq!(row.tier, source_quality::TIER_QUARANTINED, "达到阈值仍应隔离");
+        assert_eq!(
+            row.tier,
+            source_quality::TIER_QUARANTINED,
+            "达到阈值仍应隔离"
+        );
     }
 }

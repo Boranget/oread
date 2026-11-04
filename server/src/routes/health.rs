@@ -82,11 +82,10 @@ pub fn rss_bytes() -> Option<u64> {
 
 /// 正文缓存占用（字节 + 行数）
 async fn cache_usage(pool: &SqlitePool) -> (i64, i64) {
-    let bytes: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content")
         .fetch_one(pool)
         .await

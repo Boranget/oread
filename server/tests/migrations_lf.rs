@@ -12,8 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn collect_sql(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("读取目录失败 {}: {e}", dir.display()));
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("读取目录失败 {}: {e}", dir.display()));
     for entry in entries {
         let path = entry.expect("读取目录项失败").path();
         if path.is_dir() {
@@ -68,7 +68,11 @@ fn migrations_on_disk_have_no_cr() {
     for path in &files {
         let bytes = fs::read(path).unwrap_or_else(|e| panic!("读取失败 {}: {e}", path.display()));
         if let Some(pos) = bytes.iter().position(|b| *b == b'\r') {
-            failures.push(format!("{}：首个 \\r 在 {}", path.display(), describe_cr(&bytes, pos)));
+            failures.push(format!(
+                "{}：首个 \\r 在 {}",
+                path.display(),
+                describe_cr(&bytes, pos)
+            ));
         }
     }
     assert!(
@@ -103,7 +107,8 @@ fn assert_embedded_lf(migrator: &sqlx::migrate::Migrator, dir: &Path, label: &st
         }
 
         if let Some(path) = find_migration_file(dir, migration.version) {
-            let disk = fs::read(&path).unwrap_or_else(|e| panic!("读取失败 {}: {e}", path.display()));
+            let disk =
+                fs::read(&path).unwrap_or_else(|e| panic!("读取失败 {}: {e}", path.display()));
             if disk != sql.as_bytes() {
                 failures.push(format!(
                     "{label} {:04}_{}：内嵌字节与磁盘文件不一致（内嵌 {} / 磁盘 {}）",

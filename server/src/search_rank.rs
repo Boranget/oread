@@ -100,9 +100,7 @@ fn capped_levenshtein(a: &[char], b: &[char], max_dist: usize) -> Option<usize> 
         let hi = (i + max_dist).min(n);
         for j in lo..=hi {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            cur[j] = (prev[j] + 1)
-                .min(cur[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         prev = cur;
     }
@@ -179,7 +177,7 @@ fn partial_token_score(query: &str, title: &str) -> u8 {
     let need = if q.len() <= 1 {
         1
     } else {
-        ((q.len() * 2 + 4) / 5).max(2)
+        (q.len() * 2).div_ceil(5).max(2)
     };
     if longest_common_run(&q, &t) >= need {
         SCORE_PARTIAL
@@ -331,9 +329,7 @@ impl RankItem {
 
 /// 全序：分数桶降序，桶内 `seq` 升序。`seq` 唯一，故排序结果确定。
 pub fn compare(a: &RankItem, b: &RankItem) -> Ordering {
-    b.bucket()
-        .cmp(&a.bucket())
-        .then_with(|| a.seq.cmp(&b.seq))
+    b.bucket().cmp(&a.bucket()).then_with(|| a.seq.cmp(&b.seq))
 }
 
 pub fn sort_ranked(items: &mut [RankItem]) {
@@ -342,10 +338,10 @@ pub fn sort_ranked(items: &mut [RankItem]) {
 
 /// 取一页：跳过游标及之前的条目，按全序取前 `limit` 条。
 /// 先调用 [`sort_ranked`]，再对本函数返回的切片取值。
-pub fn page<'a>(items: &'a [RankItem], after: Option<Cursor>, limit: usize) -> Vec<&'a RankItem> {
+pub fn page(items: &[RankItem], after: Option<Cursor>, limit: usize) -> Vec<&RankItem> {
     items
         .iter()
-        .filter(|it| after.map_or(true, |c| c.item_after(it)))
+        .filter(|it| after.is_none_or(|c| c.item_after(it)))
         .take(limit)
         .collect()
 }
@@ -462,10 +458,7 @@ fn effective_cap(tier: SourceTier, policy: &QuotaPolicy) -> usize {
 }
 
 fn tier_of(tiers: &HashMap<String, SourceTier>, source: &str) -> SourceTier {
-    tiers
-        .get(source)
-        .copied()
-        .unwrap_or(SourceTier::Observing)
+    tiers.get(source).copied().unwrap_or(SourceTier::Observing)
 }
 
 /// 按分层配额截断。输入须已按 [`compare`] 排序。
@@ -620,7 +613,10 @@ mod tests {
             SCORE_AUTHOR_ONLY
         );
         // 书名精确命中不因作者字段额外加分（作者没命中查询词）
-        assert_eq!(relevance_score("斗罗大陆", "斗罗大陆", "唐家三少"), SCORE_EXACT);
+        assert_eq!(
+            relevance_score("斗罗大陆", "斗罗大陆", "唐家三少"),
+            SCORE_EXACT
+        );
         // 作者命中时仅在书名档位上追加 3 分
         assert_eq!(
             relevance_score("斗罗大陆", "斗罗大陆", "斗罗"),
@@ -628,14 +624,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::assertions_on_constants)]
+    // 该断言用于锁定常量档位关系（作者档介于精确与近似之间），值本身必须编译期可核对。
     #[test]
     fn author_only_ranks_before_any_partial_but_below_approx() {
         assert!(SCORE_AUTHOR_ONLY < SCORE_APPROX_MIN);
         assert!(SCORE_AUTHOR_ONLY > SCORE_PARTIAL);
         // 作者全名命中（35）排在任意 partial（25，即使加满权重+共识 31）之前
-        assert!(
-            combined_score(SCORE_AUTHOR_ONLY, 0, 1) > combined_score(SCORE_PARTIAL, 9, 4)
-        );
+        assert!(combined_score(SCORE_AUTHOR_ONLY, 0, 1) > combined_score(SCORE_PARTIAL, 9, 4));
         // 典型误伤场景：4 字作者名 vs 只含「百年」的无关标题
         let author_hit = relevance_score("烽火戏诸侯", "剑来", "烽火戏诸侯");
         let partial = search_relevance("百年孤独", "百年争战", "");
@@ -659,6 +655,7 @@ mod tests {
 
     // ----- 部分匹配 -----
 
+    #[allow(clippy::assertions_on_constants)] // 该断言锁定 partial 与近似档的常量关系，属有意为之。
     #[test]
     fn partial_token_match_ranks_below_all_title_tiers() {
         // 只命中「百年」两个字的书名 → 固定低分
@@ -671,7 +668,10 @@ mod tests {
         assert_eq!(search_relevance("百年孤独", "孤独生物", ""), SCORE_PARTIAL);
         // 完整/包含命中仍走正规档，不被部分匹配覆盖
         assert_eq!(search_relevance("百年孤独", "百年孤独", ""), SCORE_EXACT);
-        assert_eq!(search_relevance("百年孤独", "新百年孤独", ""), SCORE_CONTAINS);
+        assert_eq!(
+            search_relevance("百年孤独", "新百年孤独", ""),
+            SCORE_CONTAINS
+        );
         // 单字巧合与完全不沾都不算
         assert_eq!(search_relevance("百年孤独", "繁华", ""), 0);
         assert_eq!(search_relevance("百年孤独", "海贼王", ""), 0);
@@ -764,7 +764,14 @@ mod tests {
         items.push(item(3, 55, "C", "s1"));
         sort_ranked(&mut items);
         let after: Vec<u64> = items.iter().map(|i| i.seq).collect();
-        assert_eq!(after.iter().filter(|s| **s != 3).copied().collect::<Vec<_>>(), before);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|s| **s != 3)
+                .copied()
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     // ----- 合并 -----
@@ -818,7 +825,10 @@ mod tests {
 
         let policy = QuotaPolicy::default();
         let out = apply_quota(items, &tier_map, &policy);
-        assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "pref").count(), 60);
+        assert_eq!(
+            out.kept.iter().filter(|i| i.sources[0] == "pref").count(),
+            60
+        );
         assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "obs").count(), 2);
         assert_eq!(out.kept.iter().filter(|i| i.sources[0] == "bad").count(), 0);
         assert_eq!(out.capped_out, 21); // 20 条优选超额 + 1 条隔离

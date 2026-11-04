@@ -11,7 +11,6 @@ use axum::{
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
 
 use crate::auth::{AuthUser, UserDb};
 use crate::error::AppResult;
@@ -42,12 +41,10 @@ pub struct OverviewQ {
 }
 
 /// `days` 缺省：保持旧行为，最近 50 本，不做区间过滤
-const BOOKS_ALL_SQL: &str =
-    "SELECT book_id, name, total_chapters, read_chapters, last_read_at \
+const BOOKS_ALL_SQL: &str = "SELECT book_id, name, total_chapters, read_chapters, last_read_at \
      FROM book_stats ORDER BY last_read_at DESC LIMIT 50";
 /// `days` 显式给出：按 `last_read_at` 的日期部分过滤
-const BOOKS_SINCE_SQL: &str =
-    "SELECT book_id, name, total_chapters, read_chapters, last_read_at \
+const BOOKS_SINCE_SQL: &str = "SELECT book_id, name, total_chapters, read_chapters, last_read_at \
      FROM book_stats WHERE substr(last_read_at, 1, 10) >= ?1 \
      ORDER BY last_read_at DESC LIMIT 50";
 
@@ -97,13 +94,13 @@ pub async fn record(
     };
     let name = match q.name.clone() {
         Some(n) => Some(n),
-        None => sqlx::query_scalar::<_, Option<String>>(
-            "SELECT name FROM book_meta WHERE book_url = ?",
-        )
-        .bind(&q.book_id)
-        .fetch_optional(&db.0)
-        .await?
-        .flatten(),
+        None => {
+            sqlx::query_scalar::<_, Option<String>>("SELECT name FROM book_meta WHERE book_url = ?")
+                .bind(&q.book_id)
+                .fetch_optional(&db.0)
+                .await?
+                .flatten()
+        }
     };
     let read = q.chapter_index.map(|i| i + 1).unwrap_or(0);
     sqlx::query(
@@ -122,10 +119,11 @@ pub async fn record(
     .await?;
 
     // 连续天数：昨天读过则 +1，否则重置为 1
-    let cur: Option<(i64, Option<String>, i64)> =
-        sqlx::query_as("SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1")
-            .fetch_optional(&db.0)
-            .await?;
+    let cur: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1",
+    )
+    .fetch_optional(&db.0)
+    .await?;
     let (mut current, last_day, longest) = cur.unwrap_or((0, None, 0));
     if last_day.as_deref() != Some(day.as_str()) {
         let yesterday = day_str(today() - Duration::days(1));
@@ -195,10 +193,11 @@ pub async fn overview(
         }
     }
 
-    let streak: Option<(i64, Option<String>, i64)> =
-        sqlx::query_as("SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1")
-            .fetch_optional(&db.0)
-            .await?;
+    let streak: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1",
+    )
+    .fetch_optional(&db.0)
+    .await?;
     let (current, last_day, longest) = streak.unwrap_or((0, None, 0));
     // 昨天之前没读过则连续天数已中断
     let active_streak = match last_day.as_deref() {
@@ -297,12 +296,11 @@ mod tests {
     #[tokio::test]
     async fn overview_books_with_days_filters_by_date() {
         let p = pool().await;
-        let rows: Vec<(String, Option<String>, i64, i64, String)> =
-            sqlx::query_as(BOOKS_SINCE_SQL)
-                .bind("2026-11-01")
-                .fetch_all(&p)
-                .await
-                .unwrap();
+        let rows: Vec<(String, Option<String>, i64, i64, String)> = sqlx::query_as(BOOKS_SINCE_SQL)
+            .bind("2026-11-01")
+            .fetch_all(&p)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2, "只保留 11-01 及之后");
         let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert!(ids.contains(&"recent"));

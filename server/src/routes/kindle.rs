@@ -113,7 +113,11 @@ impl Vp {
 
 impl Default for Vp {
     fn default() -> Self {
-        Self { w: K_W, h: K_H, fixed: true }
+        Self {
+            w: K_W,
+            h: K_H,
+            fixed: true,
+        }
     }
 }
 
@@ -123,6 +127,8 @@ fn line_budget(vp: Vp, line: usize) -> usize {
     (vp.text_h() / line.max(1)).max(1)
 }
 /// 段间距（行）：WeRead 实测段距 0.6 行（默认档 27px）
+/// 实际排版用 `para_gap_px`（整数 px）；本常量保留为换算基准，仅单测引用。
+#[allow(dead_code)]
 const PARA_GAP_LINES: f64 = 0.6;
 /// 段间距像素（向下取整，保证渲染高度不超过行预算）
 const fn para_gap_px(line: usize) -> usize {
@@ -161,12 +167,28 @@ struct FsSpec {
 
 const FS_SPECS: [FsSpec; 4] = [
     // 927/28 ≈ 33 字/行；行数 = 正文可用高 ÷ 46。
-    FsSpec { size: 28, line: 46, label: "小" },
+    FsSpec {
+        size: 28,
+        line: 46,
+        label: "小",
+    },
     // 字号口径：真机实测 32px/52px，保留 32px。此处显式写死 32，且全局
     // `-webkit-text-size-adjust:none` 已关闭老引擎的字号自动放大——实测 32/52，勿低于 30。
-    FsSpec { size: 32, line: 52, label: "标准" },
-    FsSpec { size: 38, line: 62, label: "大" },
-    FsSpec { size: 20, line: 36, label: "超小" },
+    FsSpec {
+        size: 32,
+        line: 52,
+        label: "标准",
+    },
+    FsSpec {
+        size: 38,
+        line: 62,
+        label: "大",
+    },
+    FsSpec {
+        size: 20,
+        line: 36,
+        label: "超小",
+    },
 ];
 
 pub fn routes() -> Router<AppState> {
@@ -304,6 +326,8 @@ fn remember_fs(res: &mut Response, fs: usize) {
 /// 统一页面骨架：固定版心、`-webkit-text-size-adjust:none` 防老引擎自动放大。
 /// viewport 宽度随请求视口（`vw`），缺参时回落到默认 1072；不写 initial-scale=1
 /// 时 Silk 会按 device-width 缩放。
+/// 生产渲染走 `page_html_css`（需要页面级 CSS）；本函数为无额外 CSS 的便捷封装，仅单测使用。
+#[allow(dead_code)]
 fn page_html(title: &str, fs: usize, body: &str, vp: Vp) -> String {
     page_html_css(title, fs, body, "", vp)
 }
@@ -313,7 +337,10 @@ fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) ->
     let spec = &FS_SPECS[fs - 1];
     // 显式 vw → 锁死版心宽（1:1 不缩放）；缺参 → device-width，交给补参脚本量出真实宽度
     let viewport = if vp.fixed {
-        format!("width={},initial-scale=1,maximum-scale=1,user-scalable=0", vp.w)
+        format!(
+            "width={},initial-scale=1,maximum-scale=1,user-scalable=0",
+            vp.w
+        )
     } else {
         "width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0".to_string()
     };
@@ -438,7 +465,8 @@ fn pager_bar(
     next: Option<(String, &'static str)>,
     vp: Vp,
 ) -> String {
-    let cell = |item: &Option<(String, &'static str)>, fallback: &str| match item {
+    let cell = |item: &Option<(String, &'static str)>, fallback: &str| {
+        match item {
         Some((href, label)) => format!(
             "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
              <a href=\"{href}\" style=\"display:block;height:63px;line-height:63px;font-size:24px\">{label}</a></td>",
@@ -450,6 +478,7 @@ fn pager_bar(
              <span style=\"display:block;height:63px;line-height:63px;font-size:24px;color:#555\">{label}</span></td>",
             label = fallback
         ),
+    }
     };
     format!(
         "<div id=\"k-pager\" style=\"position:absolute;left:0;bottom:0;width:{pw}px;height:{h}px;background:#fff;z-index:8\">\
@@ -527,6 +556,7 @@ fn toc_link(q: &ReadQ, fs: usize, ch: i64, vp: Vp) -> String {
 }
 
 /// 翻页导航：翻完本章接上一章/下一章；全书首页/末页对应项为 `None`（底栏禁用 + 热区不渲染）。
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // 导航参数均为标量；返回类型是 (上一项, 下一项) 二元组，本身语义清晰。
 fn read_nav(
     q: &ReadQ,
     fs: usize,
@@ -691,9 +721,8 @@ fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp) -> Response {
 
 // ---------------- 正文纯文本化与分页 ----------------
 
-static RE_BLOCK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)<\s*(br|/p|/div|/li|/h[1-6]|p|div|li|h[1-6])[^>]*>").unwrap()
-});
+static RE_BLOCK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)<\s*(br|/p|/div|/li|/h[1-6]|p|div|li|h[1-6])[^>]*>").unwrap());
 static RE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
 
@@ -968,11 +997,7 @@ pub struct ProgressQ {
 
 /// 解析请求视口：`vw`/`vh` 参数优先，缺参/越界回落到环境默认（默认 1072×1268）。
 fn vp_of(s: &AppState, vw: Option<i64>, vh: Option<i64>) -> Vp {
-    Vp::resolve(
-        vw,
-        vh,
-        (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize),
-    )
+    Vp::resolve(vw, vh, (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize))
 }
 
 /// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
@@ -1034,16 +1059,13 @@ async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) 
 }
 
 async fn login_post(State(s): State<AppState>, Form(q): Form<LoginQ>) -> Response {
-    let row: Option<(i64, String, String, i64, i64)> = match sqlx::query_as(
+    let row: Option<(i64, String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, password_hash, role, disabled, token_version FROM users WHERE username = ?",
     )
     .bind(&q.username)
     .fetch_optional(&s.shared)
     .await
-    {
-        Ok(r) => r,
-        Err(_) => None,
-    };
+    .unwrap_or_default();
     // 禁用账号与普通账号一样登录失败（不泄漏具体原因）
     let ok = match row {
         Some((_, ref hash, _, disabled, _)) => {
@@ -1117,15 +1139,11 @@ async fn shelf(
 
     let next_fs = cycle_fs(fs);
     let total_books = rows.len();
-    let t_pages = ((total_books + K_SHELF_PAGE - 1) / K_SHELF_PAGE).max(1);
+    let t_pages = total_books.div_ceil(K_SHELF_PAGE).max(1);
     let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
     let start = (sp - 1) * K_SHELF_PAGE;
     let end = (start + K_SHELF_PAGE).min(total_books);
-    let fs_url = format!(
-        "/k?fs={}&sp={}",
-        next_fs,
-        sp.min(t_pages.max(1))
-    );
+    let fs_url = format!("/k?fs={}&sp={}", next_fs, sp.min(t_pages.max(1)));
     // 导航只出现一次：书架/搜索/目录用顶部导航，底栏只留给阅读页
     let nav = format!(
         "{}{}{}",
@@ -1182,12 +1200,18 @@ async fn shelf(
 
     let pager = if t_pages > 1 {
         let prev = if sp > 1 {
-            Some((with_vp(&format!("/k?fs={}&sp={}", fs, sp - 1), vp), "上一页"))
+            Some((
+                with_vp(&format!("/k?fs={}&sp={}", fs, sp - 1), vp),
+                "上一页",
+            ))
         } else {
             None
         };
         let next = if sp < t_pages {
-            Some((with_vp(&format!("/k?fs={}&sp={}", fs, sp + 1), vp), "下一页"))
+            Some((
+                with_vp(&format!("/k?fs={}&sp={}", fs, sp + 1), vp),
+                "下一页",
+            ))
         } else {
             None
         };
@@ -1456,6 +1480,7 @@ fn comic_pages(
 
 /// 渲染漫画页：`#k-stage` 与小说页同高同宽，图片给显式宽高（不用 `height:auto`，避免抖动）。
 /// 只有长条页的切片才带 `slice=1&i=k`，整图页维持旧 URL（桌面端与 `slice=0` 路径完全不受影响）。
+#[allow(clippy::too_many_arguments)] // 漫画渲染上下文（图集/页码/源/书/章/meta/视口），拆分会把同一屏的数据分散到多处。
 fn comic_stage(
     images: &[BookImage],
     pg: &ComicPage,
@@ -1520,7 +1545,9 @@ async fn load_comic_images(
     chapter: &BookChapter,
     book_url: &str,
 ) -> Result<Vec<BookImage>, String> {
-    if let Ok(Some(c)) = crate::routes::comic::load_cached_images(pool, &chapter.url, s.cfg.content_ttl_secs).await {
+    if let Ok(Some(c)) =
+        crate::routes::comic::load_cached_images(pool, &chapter.url, s.cfg.content_ttl_secs).await
+    {
         if c.content_type == "image" {
             let (v, _) = crate::routes::comic::decode_images(c.images_json.as_deref());
             if !v.is_empty() {
@@ -1589,21 +1616,22 @@ async fn read(
         return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp).await;
     }
 
-    let mut c: BookContent = match load_cached_content(&db.0, &chapter.url, s.cfg.content_ttl_secs).await {
-        Ok(Some(c)) => c,
-        _ => {
-            let fetched = match web_book::chapter_content(&source, chapter).await {
-                Ok(c) => c,
-                Err(e) => return err_page(&format!("正文抓取失败: {e}")),
-            };
-            let limit = match replace::user_cache_limit_mb(&db.0).await {
-                Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                None => s.cfg.cache_limit_bytes(),
-            };
-            let _ = save_content_cached(&db.0, &fetched, limit).await;
-            fetched
-        }
-    };
+    let mut c: BookContent =
+        match load_cached_content(&db.0, &chapter.url, s.cfg.content_ttl_secs).await {
+            Ok(Some(c)) => c,
+            _ => {
+                let fetched = match web_book::chapter_content(&source, chapter).await {
+                    Ok(c) => c,
+                    Err(e) => return err_page(&format!("正文抓取失败: {e}")),
+                };
+                let limit = match replace::user_cache_limit_mb(&db.0).await {
+                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
+                    None => s.cfg.cache_limit_bytes(),
+                };
+                let _ = save_content_cached(&db.0, &fetched, limit).await;
+                fetched
+            }
+        };
     if c.book_url.trim().is_empty() {
         c.book_url = q.book.clone();
     }
@@ -1617,8 +1645,14 @@ async fn read(
         .flatten()
         .and_then(|b| b.name)
         .unwrap_or_default();
-    let (title, body_html) =
-        replace::purify(&db.0, &book_name, &q.source, c.title.clone(), c.content.clone()).await;
+    let (title, body_html) = replace::purify(
+        &db.0,
+        &book_name,
+        &q.source,
+        c.title.clone(),
+        c.content.clone(),
+    )
+    .await;
     let mut text = html_to_text(body_html.as_deref().unwrap_or(""));
     let truncated = truncate_to_chars(&mut text, K_MAX_TEXT_CHARS);
     let spec = &FS_SPECS[fs - 1];
@@ -1678,14 +1712,17 @@ async fn read(
         meta = esc(&meta)
     );
     // 贴底固定栏 5 格（各 200px）：上一页 / 下一页 / 目录 / 字号 / 记录
-    let bottom = fixed_bar(&format!(
-        "{prev}{next}{toc}{fs}{progress}",
-        prev = bar_cell_prev(prev.as_ref()),
-        next = bar_cell_next(next.as_ref()),
-        toc = bar_cell(&toc_url, "目", "目录"),
-        fs = bar_cell(&fs_href, "字", "字号"),
-        progress = progress_cell
-    ), vp);
+    let bottom = fixed_bar(
+        &format!(
+            "{prev}{next}{toc}{fs}{progress}",
+            prev = bar_cell_prev(prev.as_ref()),
+            next = bar_cell_next(next.as_ref()),
+            toc = bar_cell(&toc_url, "目", "目录"),
+            fs = bar_cell(&fs_href, "字", "字号"),
+            progress = progress_cell
+        ),
+        vp,
+    );
 
     let body = format!(
         "{stage}{hot}{bottom}",
@@ -1705,6 +1742,7 @@ async fn read(
 }
 
 /// 漫画阅读页：一屏一页（整图或切片），翻页/进度/字号与小说页同一套底栏与热区。
+#[allow(clippy::too_many_arguments)] // 阅读页渲染上下文（状态/池/源/目录/章/查询/字号），与小说页保持同一组参数。
 async fn comic_read(
     s: &AppState,
     pool: &SqlitePool,
@@ -1776,16 +1814,31 @@ async fn comic_read(
     let next_fs = cycle_fs(fs);
     let fs_href = read_link(q, next_fs, ch, p, vp);
 
-    let stage = comic_stage(&images, pg, &q.source, &q.book, &chapter.url, &meta, vp, &sp);
-    let bottom = fixed_bar(&format!(
-        "{prev}{next}{toc}{fs}{progress}",
-        prev = bar_cell_prev(prev.as_ref()),
-        next = bar_cell_next(next.as_ref()),
-        toc = bar_cell(&toc_url, "目", "目录"),
-        fs = bar_cell(&fs_href, "字", "字号"),
-        progress = progress_cell
-    ), vp);
-    let title = chapter.title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
+    let stage = comic_stage(
+        &images,
+        pg,
+        &q.source,
+        &q.book,
+        &chapter.url,
+        &meta,
+        vp,
+        &sp,
+    );
+    let bottom = fixed_bar(
+        &format!(
+            "{prev}{next}{toc}{fs}{progress}",
+            prev = bar_cell_prev(prev.as_ref()),
+            next = bar_cell_next(next.as_ref()),
+            toc = bar_cell(&toc_url, "目", "目录"),
+            fs = bar_cell(&fs_href, "字", "字号"),
+            progress = progress_cell
+        ),
+        vp,
+    );
+    let title = chapter
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("第 {} 章", ch + 1));
     let body = format!(
         "{stage}{hot}{bottom}",
         stage = stage,
@@ -1897,11 +1950,7 @@ async fn search(
     let vp = vp_of(&s, q.vw, q.vh);
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
-    let fs_url = format!(
-        "/k/search?fs={}&key={}",
-        next_fs,
-        qenc(&key)
-    );
+    let fs_url = format!("/k/search?fs={}&key={}", next_fs, qenc(&key));
     // 导航只出现一次：标题=搜索，右侧=书架 / 字号
     let nav = format!(
         "{}{}",
@@ -1944,8 +1993,7 @@ async fn search(
         )
         .await;
         let (books, _errors) =
-            crate::routes::books::aggregated(&plan.active, &key, include_cooled, plan.scope)
-                .await;
+            crate::routes::books::aggregated(&plan.active, &key, include_cooled, plan.scope).await;
         let strong_total = books
             .iter()
             .filter(|b| b.relevance.as_deref() == Some("strong"))
@@ -1993,7 +2041,7 @@ async fn search(
                 );
             }
         } else {
-            let t_pages = ((books.len() + per_page - 1) / per_page).max(1);
+            let t_pages = books.len().div_ceil(per_page).max(1);
             let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
             let start = (sp - 1) * per_page;
             let end = (start + per_page).min(books.len());
@@ -2124,10 +2172,22 @@ async fn selftest(_u: AuthUser) -> Response {
         "{}{}{}{}{}{}",
         cell("table 布局", demo_table, "应显示：并排两格"),
         cell("float", demo_float, "应显示：左右各一块 + 清浮动行"),
-        cell("-webkit-box / flex", demo_flex, "预期：三块并排（flex 不可用时会竖排）"),
+        cell(
+            "-webkit-box / flex",
+            demo_flex,
+            "预期：三块并排（flex 不可用时会竖排）"
+        ),
         cell("vw 单位", demo_vw, "预期：20vw 不生效，宽度塌陷"),
-        cell("border-radius", demo_radius, "预期无效；若照片仍是圆角，说明探测假阴"),
-        cell("position:fixed", demo_fixed, "预期不可靠；角标应留在文档流里")
+        cell(
+            "border-radius",
+            demo_radius,
+            "预期无效；若照片仍是圆角，说明探测假阴"
+        ),
+        cell(
+            "position:fixed",
+            demo_fixed,
+            "预期不可靠；角标应留在文档流里"
+        )
     );
     let body = format!(
         "<div style=\"height:96px;line-height:96px;background:#e6e6e6;padding:0 36px;font-size:30px\">\
@@ -2286,12 +2346,7 @@ mod tests {
         assert_eq!(&text[chunks[0].0..chunks[0].1].chars().count(), &200_000);
         assert_eq!(&text[chunks[1].0..chunks[1].1].chars().count(), &100_000);
 
-        let plan = plan_pages(
-            &text,
-            &FS_SPECS[1],
-            budget(&FS_SPECS[1]),
-            vp().page_w(),
-        );
+        let plan = plan_pages(&text, &FS_SPECS[1], budget(&FS_SPECS[1]), vp().page_w());
         assert_eq!(plan.chunks.len(), 2);
         assert!(plan.pages.len() > 2);
         assert_eq!(plan.pages[0].0, 0);
@@ -2305,7 +2360,10 @@ mod tests {
     #[test]
     fn truncate_to_chars_is_in_place_and_char_safe() {
         let mut text = "字".repeat(900_000);
-        assert!(truncate_to_chars(&mut text, K_MAX_TEXT_CHARS), "90 万字应触发截断");
+        assert!(
+            truncate_to_chars(&mut text, K_MAX_TEXT_CHARS),
+            "90 万字应触发截断"
+        );
         assert_eq!(text.chars().count(), K_MAX_TEXT_CHARS);
         assert!(text.is_char_boundary(text.len()));
 
@@ -2349,7 +2407,9 @@ mod tests {
         // 分页区间仍指向原 Vec 里的章节，index 单调且跳过被过滤的分卷下标。
         assert!(page1.windows(2).all(|w| w[0].index < w[1].index));
         assert!(page2.windows(2).all(|w| w[0].index < w[1].index));
-        assert!(page1.iter().all(|c| !matches!(c.index, 0 | 10 | 20 | 30 | 40)));
+        assert!(page1
+            .iter()
+            .all(|c| !matches!(c.index, 0 | 10 | 20 | 30 | 40)));
         assert_eq!(page1.last().unwrap().index, 33);
         assert_eq!(page2.first().unwrap().index, 34);
     }
@@ -2403,7 +2463,7 @@ mod tests {
                 vp().text_h()
             );
             assert!(
-                chars >= 400 && chars <= 1500,
+                (400..=1500).contains(&chars),
                 "fs={size} 每页字数 {chars} 超出合理区间"
             );
         }
@@ -2419,7 +2479,11 @@ mod tests {
     #[test]
     fn font_cycle_keeps_existing_tiers() {
         assert_eq!(resolve_fs(&HeaderMap::new(), Some(4)).0, 4);
-        assert_eq!(resolve_fs(&HeaderMap::new(), Some(9)).0, 2, "越界回落标准档");
+        assert_eq!(
+            resolve_fs(&HeaderMap::new(), Some(9)).0,
+            2,
+            "越界回落标准档"
+        );
         assert_eq!(cycle_fs(4), 1);
         assert_eq!(cycle_fs(1), 2);
         assert_eq!(cycle_fs(2), 3);
@@ -2436,9 +2500,17 @@ mod tests {
         );
         // 视图宽跟着请求参数走：同一骨架换 1024 视口，viewport 也要跟着变
         let html_small = page_html("测试", 2, "<div>正文</div>", vps(1024, 1200));
-        assert!(html_small.contains("content=\"width=1024,initial-scale=1"), "{html_small}");
+        assert!(
+            html_small.contains("content=\"width=1024,initial-scale=1"),
+            "{html_small}"
+        );
         // 缺参首屏：meta 必须放开给设备真实宽度（否则 innerWidth 恒等 vw，补参永远量不出真尺寸）
-        let html_naked = page_html("测试", 2, "<div>正文</div>", Vp::resolve(None, None, (K_W, K_H)));
+        let html_naked = page_html(
+            "测试",
+            2,
+            "<div>正文</div>",
+            Vp::resolve(None, None, (K_W, K_H)),
+        );
         assert!(
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
@@ -2446,7 +2518,10 @@ mod tests {
         // 唯一的脚本是视口补参（ES5、带 kfix 防循环标记），不是业务 JS
         assert_eq!(html.matches("<script").count(), 1, "只允许视口补参脚本");
         assert!(html.contains("kfix=1"), "补参脚本必须带防循环标记");
-        assert!(html.contains("location.replace"), "补参用 replace，不产生历史记录");
+        assert!(
+            html.contains("location.replace"),
+            "补参用 replace，不产生历史记录"
+        );
         assert!(!html.contains("<link"), "不允许子资源");
         assert!(!html.contains("<img"), "不允许子资源");
     }
@@ -2490,7 +2565,10 @@ mod tests {
         assert_eq!(vp().text_h(), vp().body_h() - READ_PAD_TOP - READ_PAGENO_H);
         assert!(vp().text_h() <= vp().content_h(), "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
-        assert_eq!(spec.size, 32, "标准档必须显式 32px（实测 32/52，勿低于 30）");
+        assert_eq!(
+            spec.size, 32,
+            "标准档必须显式 32px（实测 32/52，勿低于 30）"
+        );
         assert_eq!(spec.line, 52);
         let per_line = (vp().page_w() - SIDE_PAD * 2) / spec.size;
         let chars = budget(spec) * per_line;
@@ -2507,7 +2585,10 @@ mod tests {
     #[test]
     fn read_line_budget_matches_reference() {
         assert_eq!(
-            FS_SPECS.iter().map(|s| line_budget(vp(), s.line)).collect::<Vec<_>>(),
+            FS_SPECS
+                .iter()
+                .map(|s| line_budget(vp(), s.line))
+                .collect::<Vec<_>>(),
             vec![24, 21, 17, 30]
         );
         for s in FS_SPECS.iter() {
@@ -2520,7 +2601,11 @@ mod tests {
             .iter()
             .map(|s| line_budget(small, s.line))
             .collect();
-        assert_eq!(small_lines, vec![22, 20, 16, 29], "1024×1200 行预算应按可用高重算");
+        assert_eq!(
+            small_lines,
+            vec![22, 20, 16, 29],
+            "1024×1200 行预算应按可用高重算"
+        );
         for s in FS_SPECS.iter() {
             assert!(line_budget(small, s.line) * s.line <= small.text_h());
         }
@@ -2530,14 +2615,23 @@ mod tests {
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
         let css = read_only_css(vp());
-        assert!(css.contains("html,body{height:1268px;overflow:hidden}"), "{css}");
-        assert!(css.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"), "{css}");
+        assert!(
+            css.contains("html,body{height:1268px;overflow:hidden}"),
+            "{css}"
+        );
+        assert!(
+            css.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"),
+            "{css}"
+        );
         let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp());
         assert!(html.contains("html,body{height:1268px;overflow:hidden}"));
         assert!(html.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"));
         // 换尺寸后仍然锁一屏（1200 − 64 = 1136）
         let small = read_only_css(vps(1024, 1200));
-        assert!(small.contains("html,body{height:1200px;overflow:hidden}"), "{small}");
+        assert!(
+            small.contains("html,body{height:1200px;overflow:hidden}"),
+            "{small}"
+        );
         assert!(small.contains("height:1136px;overflow:hidden}"), "{small}");
     }
 
@@ -2559,7 +2653,10 @@ mod tests {
         let html = empty_shelf(2, vp());
         assert!(html.contains("border:1px solid #000"), "{html}");
         assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
-        assert!(html.contains("align=\"center\" valign=\"middle\""), "{html}");
+        assert!(
+            html.contains("align=\"center\" valign=\"middle\""),
+            "{html}"
+        );
         assert!(html.contains("书架还是空的"), "{html}");
         assert!(html.contains("width:240px;height:72px;line-height:70px;border:1px solid #000"));
     }
@@ -2583,7 +2680,12 @@ mod tests {
                     vw: None,
                     vh: None,
                 },
-                0, 1, 1, 1, 2, vp()
+                0,
+                1,
+                1,
+                1,
+                2,
+                vp()
             )
         );
         let bar = fixed_bar(&row, vp());
@@ -2591,10 +2693,17 @@ mod tests {
         assert_eq!(bar.matches("width=\"20%\"").count(), 5, "{bar}");
         assert_eq!(bar.matches("height=\"64\"").count(), 5, "{bar}");
         assert!(bar.contains("width:28px;height:28px"));
-        assert!(bar.contains("font-size:28px;line-height:28px;font-weight:700"), "{bar}");
+        assert!(
+            bar.contains("font-size:28px;line-height:28px;font-weight:700"),
+            "{bar}"
+        );
         assert!(!bar.contains("border:1px solid #000"), "字符不得再套方框");
         assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
-        assert_eq!(bar.matches("<a ").count(), 3, "上/下/目录/字号里只有 3 个 <a>，记录是 form");
+        assert_eq!(
+            bar.matches("<a ").count(),
+            3,
+            "上/下/目录/字号里只有 3 个 <a>，记录是 form"
+        );
         assert!(bar.contains("color:#555"), "禁用态用弱灰 #555");
         assert!(!bar.contains("background:#e6e6e6"));
     }
@@ -2610,7 +2719,12 @@ mod tests {
         assert_eq!(z.matches("<a ").count(), 2);
         assert!(z.contains("left:0;width:357px;height:1268px;z-index:5"));
         assert!(z.contains("left:715px;width:357px;height:1268px;z-index:5"));
-        assert_eq!(hot_zones(Some("/k/read?p=1"), None, vp()).matches("<a ").count(), 1);
+        assert_eq!(
+            hot_zones(Some("/k/read?p=1"), None, vp())
+                .matches("<a ")
+                .count(),
+            1
+        );
         assert_eq!(hot_zones(None, None, vp()).matches("<a ").count(), 0);
     }
 
@@ -2651,12 +2765,18 @@ mod tests {
             vh: None,
         };
         let next = read_link(&q, 2, 3, 3, vp());
-        assert!(next.contains("vw=1072") && next.contains("vh=1268"), "{next}");
+        assert!(
+            next.contains("vw=1072") && next.contains("vh=1268"),
+            "{next}"
+        );
         let toc = toc_link(&q, 2, 3, vp());
         assert!(toc.contains("vw=1072") && toc.contains("vh=1268"), "{toc}");
         // 换尺寸后链接里的参数跟着变
         let small = read_link(&q, 2, 3, 3, vps(1024, 1200));
-        assert!(small.contains("vw=1024") && small.contains("vh=1200"), "{small}");
+        assert!(
+            small.contains("vw=1024") && small.contains("vh=1200"),
+            "{small}"
+        );
         assert!(!small.contains("vw=1072"), "不得残留默认尺寸");
     }
 
@@ -2701,11 +2821,7 @@ mod tests {
         let off = comic_pages(&images, &dims, &test_cfg(false), &sp);
         assert_eq!(off.len(), 3, "关闭时三张图各一页");
         assert!(off.iter().all(|p| p.layers == 1 && p.slice == 0));
-        assert_eq!(
-            off[0].height,
-            vp().content_h(),
-            "整图按高度约束缩到一屏"
-        );
+        assert_eq!(off[0].height, vp().content_h(), "整图按高度约束缩到一屏");
         // 1.1 屏（1024×1471）：不切，一屏一页，按高度约束等比缩小
         let one = vec![BookImage {
             index: 1,
@@ -2745,7 +2861,14 @@ mod tests {
         let pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(true), &sp0);
         assert_eq!(pages.len(), 1);
         let html = comic_stage(
-            &images, &pages[0], "src", "book", "https://example.test/ch", "1/1", vp(), &sp0,
+            &images,
+            &pages[0],
+            "src",
+            "book",
+            "https://example.test/ch",
+            "1/1",
+            vp(),
+            &sp0,
         );
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
         // 1024×1200 缩到 928 宽 → 高 1088（≤1196），显式宽高防抖动
@@ -2756,7 +2879,14 @@ mod tests {
         let off_html = {
             let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false), &sp0);
             comic_stage(
-                &images, &off_pages[0], "src", "book", "https://example.test/ch", "1/1", vp(), &sp0,
+                &images,
+                &off_pages[0],
+                "src",
+                "book",
+                "https://example.test/ch",
+                "1/1",
+                vp(),
+                &sp0,
             )
         };
         assert_eq!(html, off_html, "短图在切片开关两种模式下必须字节一致");
@@ -2771,12 +2901,22 @@ mod tests {
         let sp1 = comic_pages(&strip, &[Some((1200, 2266))], &test_cfg(true), &sp0);
         assert_eq!(sp1.len(), 2);
         let s2 = comic_stage(
-            &strip, &sp1[1], "src", "book", "https://example.test/ch", "2/2", vp(), &sp0,
+            &strip,
+            &sp1[1],
+            "src",
+            "book",
+            "https://example.test/ch",
+            "2/2",
+            vp(),
+            &sp0,
         );
         assert!(s2.contains("slice=1&i=1"), "{s2}");
         // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离
         assert!(s2.contains("dw=928") && s2.contains("vh=1196"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
-        assert!(!s2.contains("height=\""), "切片页不写死高度，避免与真实落点错位拉扁");
+        assert!(
+            !s2.contains("height=\""),
+            "切片页不写死高度，避免与真实落点错位拉扁"
+        );
     }
 }

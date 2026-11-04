@@ -505,7 +505,8 @@ mod tests {
 
     #[test]
     fn book_source_type_accepts_legado_string() {
-        let json = r#"{"book_source_url":"https://x","book_source_name":"n","book_source_type":"2"}"#;
+        let json =
+            r#"{"book_source_url":"https://x","book_source_name":"n","book_source_type":"2"}"#;
         let s: BookSource = serde_json::from_str(json).unwrap();
         assert_eq!(s.book_source_type, 2);
         let json2 = r#"{"book_source_url":"https://x","book_source_name":"n"}"#;
@@ -531,7 +532,8 @@ mod tests {
     fn login_fields_make_source_unsearchable() {
         // 任一登录字段非空 -> 判否；enabled 保持不变
         for set in [
-            (|s: &mut BookSource| s.login_url = Some("https://x.example/login".into())) as fn(&mut BookSource),
+            (|s: &mut BookSource| s.login_url = Some("https://x.example/login".into()))
+                as fn(&mut BookSource),
             |s: &mut BookSource| s.login_ui = Some("账号:${account}".into()),
             |s: &mut BookSource| s.login_check_js = Some("cookie.getCookie('token')".into()),
         ] {
@@ -578,6 +580,8 @@ mod tests {
     }
 }
 
+/// 书籍分组的数据模型（对应数据库表结构），路由尚未接入；保留以对齐 schema。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BookGroup {
@@ -630,6 +634,8 @@ pub struct ReplaceRule {
 }
 
 /// 服务端只保留解析相关的阅读配置
+/// 阅读配置的数据模型（对应 preferences 表），路由尚未接入；保留以对齐 schema。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct UserSettings {

@@ -98,7 +98,8 @@ impl SearchScope {
         }
     }
 
-    /// 整批总预算默认值（秒）。实际生效值见 `search_total_budget()`。
+    /// 整批总预算默认值（秒）。实际生效值见 `search_total_budget()`；本方法仅单测使用。
+    #[allow(dead_code)]
     pub fn default_total_budget_secs(self) -> u64 {
         match self {
             Self::Curated => 6,
@@ -200,7 +201,8 @@ fn novel_search_slots_all() -> &'static Arc<Semaphore> {
     SEARCH_NOVEL_ALL.get_or_init(|| Arc::new(Semaphore::new(conf().all_concurrency)))
 }
 
-/// `scope=all` 最终生效的源级并发槽（用户显式调低时小于 16）。
+/// `scope=all` 最终生效的源级并发槽（用户显式调低时小于 16）。仅单测断言使用。
+#[allow(dead_code)]
 pub fn all_search_slots() -> usize {
     conf().all_concurrency
 }
@@ -215,9 +217,8 @@ fn comic_search_slots() -> &'static Arc<Semaphore> {
 }
 
 fn comic_search_slots_all() -> &'static Arc<Semaphore> {
-    SEARCH_COMIC_ALL.get_or_init(|| {
-        Arc::new(Semaphore::new(comic_slot_count(conf().all_concurrency)))
-    })
+    SEARCH_COMIC_ALL
+        .get_or_init(|| Arc::new(Semaphore::new(comic_slot_count(conf().all_concurrency))))
 }
 
 /// 在全局 deadline 之前拿一个“源级”搜索槽：
@@ -287,13 +288,10 @@ fn checked_client() -> &'static Client {
 
 async fn acquire_permit() -> anyhow::Result<tokio::sync::SemaphorePermit<'static>> {
     let c = conf();
-    tokio::time::timeout(
-        Duration::from_secs(c.timeout_secs),
-        c.semaphore().acquire(),
-    )
-    .await
-    .map_err(|_| anyhow!("fetch queue timeout after {}s", c.timeout_secs))?
-    .map_err(|_| anyhow!("fetch semaphore closed"))
+    tokio::time::timeout(Duration::from_secs(c.timeout_secs), c.semaphore().acquire())
+        .await
+        .map_err(|_| anyhow!("fetch queue timeout after {}s", c.timeout_secs))?
+        .map_err(|_| anyhow!("fetch semaphore closed"))
 }
 
 /// 构造请求并设置本次请求的超时：`timeout=None` 时用全局 `HTTP_TIMEOUT_SECS`，
@@ -473,6 +471,8 @@ fn cookies_to_header(pairs: &[(String, String)]) -> Option<String> {
 }
 
 /// 取出当前会话的 Cookie 请求头（`a=b; c=d`），无内容时返回 None。
+/// 实际请求走 `cookie_header_for_request`（按 host 分桶）；本函数仅单测使用。
+#[allow(dead_code)]
 fn cookie_header_for(scope: &str) -> Option<String> {
     cookies_to_header(&cookie_pairs(scope))
 }
@@ -603,9 +603,7 @@ fn meta_charset(buf: &[u8]) -> Option<String> {
         let pos = from + rel + "charset=".len();
         let rest = &text[pos..];
         let rest = rest.trim_start_matches('"').trim_start_matches('\'');
-        let end = rest
-            .find(|c: char| c == ';' || c == '"' || c == '\'' || c == '>' || c == '/')
-            .unwrap_or(rest.len());
+        let end = rest.find([';', '"', '\'', '>', '/']).unwrap_or(rest.len());
         let label = rest[..end].trim();
         if !label.is_empty() {
             return Some(label.to_string());
@@ -616,13 +614,7 @@ fn meta_charset(buf: &[u8]) -> Option<String> {
 }
 
 fn encoding_for_label(label: &str) -> Option<&'static Encoding> {
-    Encoding::for_label(
-        label
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .as_bytes(),
-    )
+    Encoding::for_label(label.trim().trim_matches('"').trim_matches('\'').as_bytes())
 }
 
 fn decode_with(enc: &'static Encoding, buf: &[u8]) -> (String, bool) {
@@ -650,8 +642,7 @@ fn plausibility(text: &str) -> f64 {
             good += 1.0;
         } else if ('\u{4E00}'..='\u{9FFF}').contains(&ch) {
             good += if COMMON_HAN.contains(ch) { 3.0 } else { 1.0 };
-        } else if ('\u{3000}'..='\u{303F}').contains(&ch)
-            || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
+        } else if ('\u{3000}'..='\u{303F}').contains(&ch) || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
         {
             good += 2.0;
         }
@@ -724,6 +715,7 @@ fn is_redirect(status: StatusCode) -> bool {
 
 /// 执行一次完整请求（含重定向链）。每跳都按源注入 Cookie、回写 Set-Cookie，
 /// 需要时逐跳做私网校验（预览/图片代理场景）。
+#[allow(clippy::too_many_arguments)] // 请求上下文（方法/体/头/Cookie/超时等）逐项传入；收拢成结构体会引入不必要的生命周期与可变借用的复杂度。
 async fn execute_request(
     url: &str,
     method: &str,
@@ -748,10 +740,7 @@ async fn execute_request(
                 .map_err(|e| (SendKind::Other, e))?;
         }
         let mut req_headers = headers.clone();
-        if !req_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("cookie"))
-        {
+        if !req_headers.keys().any(|k| k.eq_ignore_ascii_case("cookie")) {
             if let Some(cookie) = cookie_header_for_request(cookie_key, current.as_str()) {
                 req_headers.insert("Cookie".to_string(), cookie);
             }
@@ -819,13 +808,11 @@ async fn execute_request(
             content_type,
         });
     }
-    Err((
-        SendKind::Other,
-        anyhow!("重定向超过 {max_redirects} 跳"),
-    ))
+    Err((SendKind::Other, anyhow!("重定向超过 {max_redirects} 跳")))
 }
 
 /// 统一的文本抓取入口：按源 Cookie 分桶 + 分级重试 + 具名解码。
+#[allow(clippy::too_many_arguments)] // 与 `execute_request` 同源参数集，保持逐项传入以便调用点显式可见。
 async fn fetch_text(
     url: &str,
     method: &str,
@@ -880,6 +867,8 @@ async fn fetch_text(
 
 /// 发起 HTTP 请求，返回响应文本（未指定书源，Cookie 按目标 host 分桶）。
 /// 失败原因（超时/并发等待超时/响应超限/解码失败）都会带明确文案。
+/// 生产路径调用 `fetch_text`/`fetch_page_for_source_timed`；本便捷封装仅单测使用。
+#[allow(dead_code)]
 pub async fn fetch(
     url: &str,
     method: &str,
@@ -932,6 +921,8 @@ pub struct PageResponse {
 
 /// GET 一个页面（按源 Cookie 分桶、逐跳 SSRF 校验、分级解码），不校验 2xx：
 /// 状态码与类型交给调用方判定，避免把登录页静默当成书籍详情。
+/// 生产路径使用带超时的 `fetch_page_for_source_timed`；本封装保留默认超时语义。
+#[allow(dead_code)]
 pub async fn fetch_page_for_source(
     url: &str,
     headers: &HashMap<String, String>,
@@ -1090,11 +1081,15 @@ pub async fn fetch_checked(
 /// 流式打开的响应：调用方逐块读取，不整图进内存。
 pub struct StreamOpen {
     pub response: reqwest::Response,
+    // 重定向后的最终地址；当前调用方只用 response，字段保留给诊断输出。
+    #[allow(dead_code)]
     pub final_url: String,
 }
 
 /// 带 SSRF 防护的流式 GET（图片代理用）：逐跳校验重定向，返回未读尽的上游响应。
 /// 非 2xx 也原样返回，由调用方区分 403/404/5xx；网络错误/超时已归类到错误信息。
+/// 生产路径使用带超时的 `open_stream_timed`；本封装保留默认超时语义。
+#[allow(dead_code)]
 pub async fn open_stream(
     url: &str,
     headers: &HashMap<String, String>,
@@ -1156,11 +1151,7 @@ pub async fn open_stream_timed(
 }
 
 /// POST 携带 body 且未显式声明 `Content-Type` 时补默认表单头（Legado AnalyzeUrl 等价行为）。
-fn ensure_form_content_type(
-    hm: &mut reqwest::header::HeaderMap,
-    method: &str,
-    has_body: bool,
-) {
+fn ensure_form_content_type(hm: &mut reqwest::header::HeaderMap, method: &str, has_body: bool) {
     if has_body
         && method.eq_ignore_ascii_case("POST")
         && !hm.contains_key(reqwest::header::CONTENT_TYPE)
@@ -1217,8 +1208,7 @@ pub fn source_headers(source: &BookSource, base_url: &str) -> HashMap<String, St
         None => HashMap::new(),
     };
     // 漫画源大多是移动站：未显式声明 UA 时补移动端 UA，避免只拿到桌面 JS 框架页
-    if source.book_source_type == 2
-        && !headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent"))
+    if source.book_source_type == 2 && !headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent"))
     {
         headers.insert(
             "User-Agent".to_string(),
@@ -1442,7 +1432,10 @@ mod tests {
     fn source_timeout_clamps_and_falls_back_to_global() {
         assert_eq!(parse_source_timeout_ms(0), None, "0 表示未设置");
         assert_eq!(parse_source_timeout_ms(-1), None, "负数表示未设置");
-        assert_eq!(parse_source_timeout_ms(1), Some(Duration::from_millis(1000)));
+        assert_eq!(
+            parse_source_timeout_ms(1),
+            Some(Duration::from_millis(1000))
+        );
         assert_eq!(
             parse_source_timeout_ms(999),
             Some(Duration::from_millis(1000)),
@@ -1691,8 +1684,7 @@ mod tests {
             ..Default::default()
         };
         source.header = Some(
-            r#"@js: JSON.stringify({"Referer":"https://header.example/","X-Token":"t1"})"#
-                .into(),
+            r#"@js: JSON.stringify({"Referer":"https://header.example/","X-Token":"t1"})"#.into(),
         );
         let h = source_headers(&source, &source.book_source_url);
         assert_eq!(
@@ -1717,7 +1709,10 @@ mod tests {
     #[test]
     fn total_budget_defaults_follow_scope_not_per_source() {
         assert_eq!(search_budget(), Duration::from_secs(8), "通用单源默认 8s");
-        assert_eq!(search_budget_for(SearchScope::Curated), Duration::from_secs(8));
+        assert_eq!(
+            search_budget_for(SearchScope::Curated),
+            Duration::from_secs(8)
+        );
         assert_eq!(search_budget_for(SearchScope::All), Duration::from_secs(8));
         assert_eq!(
             search_budget_for(SearchScope::Curated),

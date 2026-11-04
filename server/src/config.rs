@@ -227,8 +227,8 @@ impl Config {
         let http_concurrency_raw = env_u64_opt("HTTP_CONCURRENCY");
         // 切片参数有跨字段约束：overlap 不得超过可用高的 1/4（与 SliceParams 的夹取一致）。
         let comic_slice_vh = env_u64("COMIC_SLICE_VH", 1196).clamp(320, 2000) as u32;
-        let comic_slice_ov = env_u64("COMIC_SLICE_OV", 64)
-            .clamp(0, (comic_slice_vh / 4) as u64) as u32;
+        let comic_slice_ov =
+            env_u64("COMIC_SLICE_OV", 64).clamp(0, (comic_slice_vh / 4) as u64) as u32;
         Self {
             host: env_prefixed("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port: env_prefixed("PORT")
@@ -249,7 +249,9 @@ impl Config {
             search_all_budget_secs,
             http_max_body_bytes: env_u64("HTTP_MAX_BODY_MB", 5).clamp(1, 32) as usize * 1024 * 1024,
             image_cache_mb: env_u64("IMAGE_CACHE_MB", 64).clamp(4, 256),
-            image_max_body_bytes: env_u64("IMAGE_MAX_BODY_MB", 8).clamp(1, 32) as usize * 1024 * 1024,
+            image_max_body_bytes: env_u64("IMAGE_MAX_BODY_MB", 8).clamp(1, 32) as usize
+                * 1024
+                * 1024,
             comic_slice: env_bool("COMIC_SLICE", false),
             comic_slice_dw: env_u64("COMIC_SLICE_DW", 928).clamp(320, 2000) as u32,
             comic_slice_vh,
@@ -268,21 +270,15 @@ impl Config {
             db_vacuum_convert: env_bool("DB_VACUUM_CONVERT", false),
             db_backup_keep: env_u64("DB_BACKUP_KEEP", 5).clamp(1, 50) as usize,
             migration_repair: env_bool("MIGRATION_REPAIR", true),
-            source_cooldown_secs: env_u64("SOURCE_COOLDOWN_SECS", 24 * 3600)
-                .clamp(60, 30 * 86400),
+            source_cooldown_secs: env_u64("SOURCE_COOLDOWN_SECS", 24 * 3600).clamp(60, 30 * 86400),
             source_tier_preferred_min_score: env_u64("SOURCE_TIER_PREFERRED_MIN_SCORE", 70)
                 .clamp(0, 100) as i32,
-            source_tier_quarantine_below_score: env_u64(
-                "SOURCE_TIER_QUARANTINE_BELOW_SCORE",
-                30,
-            )
-            .clamp(0, 100) as i32,
-            source_tier_promote_streak: env_u64("SOURCE_TIER_PROMOTE_STREAK", 3)
-                .clamp(1, 20) as i64,
-            source_tier_demote_streak: env_u64("SOURCE_TIER_DEMOTE_STREAK", 2)
-                .clamp(1, 20) as i64,
-            source_tier_update_margin: env_u64("SOURCE_TIER_UPDATE_MARGIN", 5)
-                .clamp(0, 50) as i32,
+            source_tier_quarantine_below_score: env_u64("SOURCE_TIER_QUARANTINE_BELOW_SCORE", 30)
+                .clamp(0, 100) as i32,
+            source_tier_promote_streak: env_u64("SOURCE_TIER_PROMOTE_STREAK", 3).clamp(1, 20)
+                as i64,
+            source_tier_demote_streak: env_u64("SOURCE_TIER_DEMOTE_STREAK", 2).clamp(1, 20) as i64,
+            source_tier_update_margin: env_u64("SOURCE_TIER_UPDATE_MARGIN", 5).clamp(0, 50) as i32,
             source_score_w_connect: env_u64("SOURCE_SCORE_W_CONNECT", 25).clamp(0, 100) as i32,
             source_score_w_rule: env_u64("SOURCE_SCORE_W_RULE", 15).clamp(0, 100) as i32,
             source_score_w_hit: env_u64("SOURCE_SCORE_W_HIT", 30).clamp(0, 100) as i32,
@@ -297,7 +293,8 @@ impl Config {
             source_bench_max: env_u64("SOURCE_BENCH_MAX", 14).clamp(1, 50) as usize,
             source_bench_comic_min: env_u64("SOURCE_BENCH_COMIC_MIN", 3).clamp(1, 50) as usize,
             source_bench_comic_max: env_u64("SOURCE_BENCH_COMIC_MAX", 14).clamp(1, 50) as usize,
-            source_bench_interval_hours: env_u64("SOURCE_BENCH_INTERVAL_HOURS", 72).clamp(1, 24 * 30),
+            source_bench_interval_hours: env_u64("SOURCE_BENCH_INTERVAL_HOURS", 72)
+                .clamp(1, 24 * 30),
             preview_allow_private: env_bool("PREVIEW_ALLOW_PRIVATE", false),
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())
@@ -336,10 +333,7 @@ mod tests {
     // 新前缀优先：BORANLIB_HOST 与 LEGADO_HOST 同时存在时取前者
     #[test]
     fn boranlib_prefix_wins_over_legacy() {
-        let map = HashMap::from([
-            ("BORANLIB_HOST", "127.0.0.1"),
-            ("LEGADO_HOST", "0.0.0.0"),
-        ]);
+        let map = HashMap::from([("BORANLIB_HOST", "127.0.0.1"), ("LEGADO_HOST", "0.0.0.0")]);
         assert_eq!(
             lookup_prefixed("HOST", lookup_from(&map)).as_deref(),
             Some("127.0.0.1")
@@ -366,10 +360,7 @@ mod tests {
     // 新前缀只设了空串时视为“未设置”，继续回落到 LEGADO_
     #[test]
     fn blank_boranlib_value_falls_back_to_legacy() {
-        let map = HashMap::from([
-            ("BORANLIB_PORT", "   "),
-            ("LEGADO_PORT", "3000"),
-        ]);
+        let map = HashMap::from([("BORANLIB_PORT", "   "), ("LEGADO_PORT", "3000")]);
         assert_eq!(
             lookup_prefixed("PORT", lookup_from(&map)).as_deref(),
             Some("3000")

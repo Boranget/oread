@@ -1,3 +1,4 @@
+use axum::http::request::Parts;
 use axum::{
     extract::{FromRequestParts, Request, State},
     http::{header::AUTHORIZATION, StatusCode},
@@ -5,7 +6,6 @@ use axum::{
     response::Response,
     Json,
 };
-use axum::http::request::Parts;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use crate::config::Config;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
@@ -22,6 +21,8 @@ use crate::routes::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub id: i64,
+    // 登录态保留用户名供审计/展示；当前路由暂未读取，但属于对外身份字段，保留。
+    #[allow(dead_code)]
     pub username: String,
     pub role: String, // "user" | "admin"
 }
@@ -34,7 +35,11 @@ where
 {
     type Rejection = AppError;
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<AuthUser>().cloned().ok_or(AppError::Unauthorized)
+        parts
+            .extensions
+            .get::<AuthUser>()
+            .cloned()
+            .ok_or(AppError::Unauthorized)
     }
 }
 
@@ -50,7 +55,11 @@ where
 {
     type Rejection = AppError;
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<UserDb>().cloned().ok_or(AppError::Unauthorized)
+        parts
+            .extensions
+            .get::<UserDb>()
+            .cloned()
+            .ok_or(AppError::Unauthorized)
     }
 }
 
@@ -116,18 +125,19 @@ struct AccountRow {
 }
 
 async fn lookup_account(pool: &SqlitePool, uid: i64) -> AppResult<Option<AccountRow>> {
-    let row: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT username, role, disabled, token_version FROM users WHERE id = ?",
+    let row: Option<(String, String, i64, i64)> =
+        sqlx::query_as("SELECT username, role, disabled, token_version FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?;
+    Ok(
+        row.map(|(username, role, disabled, token_version)| AccountRow {
+            username,
+            role,
+            disabled: disabled != 0,
+            token_version,
+        }),
     )
-    .bind(uid)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(username, role, disabled, token_version)| AccountRow {
-        username,
-        role,
-        disabled: disabled != 0,
-        token_version,
-    }))
 }
 
 #[derive(Deserialize)]
@@ -166,12 +176,12 @@ pub fn create_token_days(
         ver,
         exp,
     };
-    Ok(encode(
+    encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map_err(AppError::Jwt)?)
+    .map_err(AppError::Jwt)
 }
 
 /// 从 Cookie 头里取 k_session（Kindle /k 端会话）
@@ -353,12 +363,11 @@ pub async fn change_password(
             "新密码长度需在 6–128 个字符之间".into(),
         ));
     }
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT password_hash, token_version FROM users WHERE id = ?",
-    )
-    .bind(user.id)
-    .fetch_optional(&state.shared)
-    .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT password_hash, token_version FROM users WHERE id = ?")
+            .bind(user.id)
+            .fetch_optional(&state.shared)
+            .await?;
     let (pw_hash, ver) = row.ok_or(AppError::Unauthorized)?;
     if !verify(&q.old_password, &pw_hash).map_err(AppError::Bcrypt)? {
         return Err(AppError::BadRequest("旧密码不正确".into()));
@@ -438,11 +447,10 @@ pub async fn admin_set_user_status(
             .await?;
     let (role, disabled) = target.ok_or_else(|| AppError::BadRequest("用户不存在".into()))?;
     if q.disabled {
-        let enabled_admins: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0",
-        )
-        .fetch_one(&state.shared)
-        .await?;
+        let enabled_admins: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0")
+                .fetch_one(&state.shared)
+                .await?;
         if let Err(msg) = can_disable_user(q.user_id, user.id, &role, enabled_admins) {
             return Err(AppError::BadRequest(msg.into()));
         }
@@ -467,6 +475,8 @@ pub async fn admin_set_user_status(
     })))
 }
 
+// 单测模块之后仍有鉴权辅助函数（历史排布）；不重排生产代码，就地放行该风格 lint。
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{can_disable_user, valid_password};

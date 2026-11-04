@@ -219,7 +219,7 @@ fn spawn_write(dir: PathBuf, line: KLine) {
             Err(e) => warn!(error = %e, "k-metrics: 打开文件失败"),
         }
         let n = WRITES.fetch_add(1, Ordering::Relaxed);
-        if n % PRUNE_EVERY == 0 {
+        if n.is_multiple_of(PRUNE_EVERY) {
             let logs = logs.clone();
             tokio::task::spawn_blocking(move || prune_with(&logs, KEEP_DAYS, MAX_BYTES));
         }
@@ -328,12 +328,9 @@ pub async fn metrics(
     if !valid_date(&date) {
         return Err(AppError::BadRequest("date 需为 YYYY-MM-DD".into()));
     }
-    let text = tokio::fs::read_to_string(metrics_file(
-        Path::new(&state.cfg.data_dir),
-        &date,
-    ))
-    .await
-    .unwrap_or_default();
+    let text = tokio::fs::read_to_string(metrics_file(Path::new(&state.cfg.data_dir), &date))
+        .await
+        .unwrap_or_default();
     let lines: Vec<KLine> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<KLine>(l).ok())
@@ -343,9 +340,17 @@ pub async fn metrics(
     for line in &lines {
         let entry = stats.entry(line.path.clone()).or_insert_with(|| Stat {
             count: 0,
-            render_ms: Pct { p50: 0, p95: 0, max: 0 },
+            render_ms: Pct {
+                p50: 0,
+                p95: 0,
+                max: 0,
+            },
             bytes_avg: 0.0,
-            since_prev_ms: Pct { p50: 0, p95: 0, max: 0 },
+            since_prev_ms: Pct {
+                p50: 0,
+                p95: 0,
+                max: 0,
+            },
             ua_class: BTreeMap::new(),
         });
         entry.count += 1;
@@ -414,12 +419,9 @@ pub async fn export(
     if !valid_date(&date) {
         return Err(AppError::BadRequest("date 需为 YYYY-MM-DD".into()));
     }
-    let body = tokio::fs::read_to_string(metrics_file(
-        Path::new(&state.cfg.data_dir),
-        &date,
-    ))
-    .await
-    .map_err(|_| AppError::NotFound(format!("该日没有埋点文件：{date}")))?;
+    let body = tokio::fs::read_to_string(metrics_file(Path::new(&state.cfg.data_dir), &date))
+        .await
+        .map_err(|_| AppError::NotFound(format!("该日没有埋点文件：{date}")))?;
     Ok((
         StatusCode::OK,
         [
@@ -466,8 +468,24 @@ mod tests {
         let line = sample_line();
         let v = serde_json::to_value(&line).unwrap();
         for key in [
-            "ts", "path", "status", "render_ms", "bytes", "key", "book", "ch", "p", "fs", "vw",
-            "vh", "scope", "tag", "ua_class", "ua", "sid", "since_prev_ms",
+            "ts",
+            "path",
+            "status",
+            "render_ms",
+            "bytes",
+            "key",
+            "book",
+            "ch",
+            "p",
+            "fs",
+            "vw",
+            "vh",
+            "scope",
+            "tag",
+            "ua_class",
+            "ua",
+            "sid",
+            "since_prev_ms",
         ] {
             assert!(v.get(key).is_some(), "缺字段 {key}");
         }
@@ -493,8 +511,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for i in 1..=9 {
-            std::fs::write(dir.join(format!("k-metrics-2026010{i}.jsonl")), "x".repeat(600))
-                .unwrap();
+            std::fs::write(
+                dir.join(format!("k-metrics-2026010{i}.jsonl")),
+                "x".repeat(600),
+            )
+            .unwrap();
         }
         // 保留 7 天 → 删最旧 2 个
         prune_with(&dir, 7, MAX_BYTES);

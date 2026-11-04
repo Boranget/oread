@@ -76,11 +76,18 @@ async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> 
             "目录未缓存，请先调用 GET /api/book/toc".into(),
         ));
     }
-    let meta: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT name, author, origin_name, origin FROM book_meta WHERE book_url = ?1")
-            .bind(book_url)
-            .fetch_optional(pool)
-            .await?;
+    #[allow(clippy::type_complexity)] // 元数据行与 SQL 列一一对应，保持就地元组便于核对。
+    let meta: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT name, author, origin_name, origin FROM book_meta WHERE book_url = ?1",
+    )
+    .bind(book_url)
+    .fetch_optional(pool)
+    .await?;
     let (name, author, origin_name, origin) = meta.unwrap_or_default();
     let name = name
         .filter(|s| !s.trim().is_empty())
@@ -373,8 +380,12 @@ async fn export_txt(
     );
     h.insert(
         "x-missing-chapters",
-        HeaderValue::from_str(&(out.plan.total_chapters - out.plan.cached_chapters).max(0).to_string())
-            .expect("数字 header"),
+        HeaderValue::from_str(
+            &(out.plan.total_chapters - out.plan.cached_chapters)
+                .max(0)
+                .to_string(),
+        )
+        .expect("数字 header"),
     );
     h.insert(
         "x-written-chapters",

@@ -102,6 +102,8 @@ impl ImageLru {
         (self.used, self.entries.len(), self.limit)
     }
 
+    /// 仅供单测重置全局 LRU；生产路径不调用（进程重启即清空）。
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
@@ -134,10 +136,7 @@ pub fn put(key: &str, data: Vec<u8>, content_type: String) {
 
 /// `(已用字节, 条目数, 容量字节)`
 pub fn stats() -> (usize, usize, usize) {
-    global()
-        .lock()
-        .map(|c| c.stats())
-        .unwrap_or((0, 0, 0))
+    global().lock().map(|c| c.stats()).unwrap_or((0, 0, 0))
 }
 
 #[cfg(test)]
