@@ -5,6 +5,7 @@ mod db_guard;
 mod entities;
 mod error;
 mod image_cache;
+mod k_metrics;
 mod models;
 mod routes;
 mod rule_engine;

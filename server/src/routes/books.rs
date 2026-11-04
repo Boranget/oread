@@ -669,6 +669,11 @@ pub(crate) fn is_searchable_source(
         && crate::entities::is_supported_source_type(x.book_source_type)
         && x.rule_search.is_some()
         && x.search_url.is_some()
+        // 带 login_url 的源需要登录态，匿名聚合搜索无法使用，不参与可搜索统计。
+        && x.login_url
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
         && !quarantined.contains(&x.book_source_url)
         && source_health::visible_in_search(health.get(&x.book_source_url))
 }
@@ -736,11 +741,13 @@ pub(crate) struct SearchSourcePlan {
     pub(crate) ignored: Vec<String>,
     /// 实际生效的 scope（显式源会提升为 all）
     pub(crate) scope: crate::req::SearchScope,
-    /// `user`（显式源，跳过 curated 收缩）/ `curated` / `curated_fallback` / `all`
+    /// `user`（显式源，跳过 curated 收缩）/ `curated` / `curated_fallback` / `all_fallback` / `all`
     pub(crate) source_mode: &'static str,
     /// `curated` / `expanded`
     pub(crate) coverage: &'static str,
     pub(crate) curated_total: usize,
+    /// 生效源集合大小（冷却分区之前；0 表示确实没有可搜索的源）
+    pub(crate) source_total: usize,
     /// 可搜索源中因精选收缩/退化而未进入候选集合的数量（显式源恒为 0）
     pub(crate) scope_filtered: usize,
     pub(crate) skipped_cooldown: usize,
@@ -858,13 +865,14 @@ pub(crate) async fn resolve_search_sources(
         searchable_total.saturating_sub(candidate_len)
     };
     if !explicit && effective == crate::req::SearchScope::Curated && selected.is_empty() {
-        // 精选/preferred 与可搜索源交集为空：退回 all，避免 0 命中。
+        // preferred 也为空（全新部署/新导入源默认 observing）：退到最后一层「全部可搜索源」。
         effective = crate::req::SearchScope::All;
-        source_mode = "all";
+        source_mode = "all_fallback";
         coverage = "expanded";
         scope_filtered = 0;
         selected = select_sources(&searchable_all, &[]).0;
     }
+    let source_total = selected.len();
     let cooldown_base = if effective == crate::req::SearchScope::All {
         &searchable_all
     } else {
@@ -883,6 +891,7 @@ pub(crate) async fn resolve_search_sources(
         source_mode,
         coverage,
         curated_total,
+        source_total,
         scope_filtered,
         skipped_cooldown,
         cooldown_total,
@@ -3350,6 +3359,60 @@ mod tests {
         assert_eq!(kindle.active.len(), 1, "只跑 preferred 层");
         assert_eq!(kindle.active[0].book_source_url, "http://preferred");
         assert_eq!(kindle.curated_total, 0);
+    }
+
+    // 全新部署：精选与 preferred 都为空时，`/k` 退到最后一层「全部可搜索源」；
+    // 带 login_url 的源不参与，不算进 source_total。
+    #[tokio::test]
+    async fn preferred_empty_falls_back_to_all_and_skips_login_sources() {
+        use crate::req::SearchScope;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut login_only = src("需登录", "http://login", 1, true);
+        login_only.login_url = Some("http://login/login".into());
+        let sources = vec![src("正常源", "http://normal", 1, true), login_only];
+
+        let plan = resolve_search_sources(
+            &pool,
+            sources,
+            &[],
+            SearchScope::Curated,
+            true,
+            CuratedMissingFallback::Preferred,
+        )
+        .await;
+        assert_eq!(plan.source_mode, "all_fallback", "preferred 为空退全部源");
+        assert_eq!(plan.scope, SearchScope::All);
+        assert_eq!(plan.source_total, 1, "login_url 源不参与可搜索统计");
+        assert_eq!(plan.active.len(), 1);
+        assert_eq!(plan.active[0].book_source_url, "http://normal");
+        assert_eq!(plan.curated_total, 0);
+    }
+
+    // 0 源（全新空库）不 panic：返回空计划，source_total=0，页面据此显示明确文案。
+    #[tokio::test]
+    async fn zero_sources_returns_empty_plan_without_panic() {
+        use crate::req::SearchScope;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let plan = resolve_search_sources(
+            &pool,
+            Vec::new(),
+            &[],
+            SearchScope::Curated,
+            false,
+            CuratedMissingFallback::Preferred,
+        )
+        .await;
+        assert_eq!(plan.source_total, 0);
+        assert!(plan.active.is_empty());
+        assert_eq!(plan.curated_total, 0);
     }
 
     // phase：pending>0 → first（partial=true），pending==0 → final

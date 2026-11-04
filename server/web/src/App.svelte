@@ -38,12 +38,19 @@
     { id: 'settings', label: '设置' },
   ];
 
+  // 其它页面（如 Discover 的空态引导）用事件请求切换 tab
+  function onTabRequest(e) {
+    const id = e && e.detail;
+    if (id && TABS.some((t) => t.id === id)) selectTab(id);
+  }
   onMount(() => {
+    window.addEventListener('oread:tab', onTabRequest);
     if (getToken()) {
       loggedIn = true;
       role = getRole();
       syncTheme();
     }
+    return () => window.removeEventListener('oread:tab', onTabRequest);
   });
 
   function onLogin(r) {

@@ -1807,30 +1807,48 @@ async fn search(
             .iter()
             .filter(|b| b.relevance.as_deref() == Some("strong"))
             .count();
-        // 精选集合不可用（curated_total=0 或交集为空）时，页面顶部给一行回退说明，
-        // 沿用现有次级文字样式（20px/32px/#555），不加新视觉 token。
-        let fallback_note = requested_scope == crate::req::SearchScope::Curated
-            && plan.source_mode == "curated_fallback";
-        if fallback_note {
+        // 三层退化链的页面说明（复用现有次级文字样式，不加新视觉 token）：
+        // curated_fallback = 精选不可用已退常用源；all_fallback = 常用源也为空、已退全部可搜索源。
+        let fallback_note = if plan.source_total == 0 {
+            None
+        } else {
+            match plan.source_mode {
+                "curated_fallback" => Some(format!(
+                    "精选源当前不可用，已改用常用源（{n} 个源）。",
+                    n = plan.source_total
+                )),
+                "all_fallback" => Some(format!(
+                    "精选/常用源暂不可用，已改用全部 {n} 个源。",
+                    n = plan.source_total
+                )),
+                _ => None,
+            }
+        };
+        if let Some(note) = &fallback_note {
             list.push_str(&format!(
-                "<p style=\"font-size:20px;line-height:32px;color:#555;padding:8px 36px 0\">\
-                 精选源当前不可用，已改用常用源（{n} 个源）。</p>",
-                n = plan.active.len()
+                "<p style=\"font-size:20px;line-height:32px;color:#555;padding:8px 36px 0\">{note}</p>"
             ));
         }
         // 结果不足（0 条或 strong < 5）时给「用全部源搜索」的主动升级入口，不是默认路径。
         let upgrade_link = plan.scope == crate::req::SearchScope::Curated
             && (books.is_empty() || strong_total < crate::search_rank::STRONG_MIN_RESULTS);
         // 回退说明 / 升级按钮要占纵向空间：多一行时少放一条结果，避免被贴底栏盖住。
-        let per_page = if fallback_note || upgrade_link {
+        let per_page = if fallback_note.is_some() || upgrade_link {
             K_SEARCH_PAGE - 1
         } else {
             K_SEARCH_PAGE
         };
         if books.is_empty() {
-            list.push_str(
-                "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
-            );
+            if plan.source_total == 0 {
+                list.push_str(
+                    "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">\
+                     当前没有可搜索的源，请先在书源设置中导入并启用。</p>",
+                );
+            } else {
+                list.push_str(
+                    "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
+                );
+            }
         } else {
             let t_pages = ((books.len() + per_page - 1) / per_page).max(1);
             let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;

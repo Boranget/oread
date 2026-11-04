@@ -44,10 +44,14 @@
     sourceScope = 'all';
     doSearch();
   }
+  // 空态引导：切到「书源管理」（App.svelte 监听 oread:tab 事件）
+  function goSources() {
+    window.dispatchEvent(new CustomEvent('oread:tab', { detail: 'sources' }));
+  }
   let requestedScope = 'all'; // 本次请求携带的 scope（用户意图）
   let searchScope = 'all'; // 后端实际使用的 scope
   let searchCoverage = 'expanded'; // curated / expanded
-  let sourceMode = ''; // user / curated / curated_fallback / all（后端回显）
+  let sourceMode = ''; // user / curated / curated_fallback / all_fallback / all（后端回显）
   let scopeFiltered = 0; // 精选收缩排除掉的可搜索源数量
   let curatedTotal = 0;
   let failedCount = 0;
@@ -56,6 +60,7 @@
 
   // 发现模式
   let sources = [];
+  let sourcesReady = false; // /api/sources 是否已成功返回（区分“还没加载”与“确实 0 个源”）
   let selectedSource = '';
   let categories = [];
   let selectedCat = null;
@@ -104,6 +109,7 @@
     history = readHistory();
     try {
       sources = await api.sources();
+      sourcesReady = true;
       if (sources.length) {
         selectedSource = sources[0].book_source_url;
         await loadCategories();
@@ -819,6 +825,8 @@
       精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
     {:else if sourceMode === 'curated_fallback'}
       （精选集不可用，已回退；实际 {sourceTotal} 个源）
+    {:else if sourceMode === 'all_fallback'}
+      （精选/常用源不可用，已改用全部 {sourceTotal} 个源）
     {:else}
       （全部可搜索源）
     {/if}
@@ -893,6 +901,8 @@
         &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
       {:else if sourceMode === 'curated_fallback'}
         &nbsp;· 精选集不可用，已回退
+      {:else if sourceMode === 'all_fallback'}
+        &nbsp;· 精选/常用源不可用，已改用全部源
       {:else if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
         &nbsp;· 指定源
       {:else}
@@ -903,7 +913,11 @@
 {/if}
 
 {#if mode === 'search' && searchDone && total === 0}
-  {#if requestedScope === 'curated' && searchCoverage === 'curated'}
+  {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
+    <p class="muted empty-hint">
+      当前还没有可用的书源，请先到<button class="ghost empty-retry" on:click={goSources}>书源管理</button>导入并启用书源。
+    </p>
+  {:else if requestedScope === 'curated' && searchCoverage === 'curated'}
     <p class="muted empty-hint">
       精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用全部可搜索源重试</button>，或把上方范围切到「全部可搜索源」再试。
     </p>
@@ -982,7 +996,11 @@
     {#if failedSources.length || failedCount}
       <div class="empty">没有拿到结果，且有 {failedCount || failedSources.length} 个书源失败，原因见上方。<br />换关键词、稍后重试，或到「书源管理」检查这些书源。</div>
     {:else if !jobExpired && !error}
-      <div class="empty">书源正常返回，但没有匹配的书。<br />换个关键词，或到「书源管理」确认书源是否启用。</div>
+      {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
+        <div class="empty">当前还没有可用的书源，请先到「书源管理」导入并启用书源。<br /><button class="ghost" on:click={goSources}>去书源管理</button></div>
+      {:else}
+        <div class="empty">书源正常返回，但没有匹配的书。<br />换个关键词，或到「书源管理」确认书源是否启用。</div>
+      {/if}
     {/if}
   {/if}
 {:else if !loading && !searched}
