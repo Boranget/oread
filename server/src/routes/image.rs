@@ -396,9 +396,10 @@ fn band_stats(raw: &[u8], w: usize, h: usize, y: usize) -> Option<(u8, f64)> {
 
 /// 纯函数切点规划：返回升序切点，首尾必为 `0` 与 `h`。
 ///
-/// 目标切点是 `start + win − ov`；在 `[target − r, target + r]` 内找近白行
-/// （3 行带 × 64 列采样，μ ≥ `mu` 且 σ ≤ `sd`，取最亮的一行）；找不到就硬切在 `target`。
-/// 上界夹在 `start + win`，保证每片显示高 ≤ `vh`；同一图同一参数结果恒定。
+/// 目标切点是本片最远端 `start + win`（再往下就超过屏高）；在 `[target − r, target + r]`
+/// 内找近白行（3 行带 × 64 列采样，μ ≥ `mu` 且 σ ≤ `sd`），取**离 target 最近**的一行；
+/// 找不到就硬切在 `target`。切点不超过 `start + win`，保证每片显示高 ≤ `vh`；
+/// 同一图同一参数结果恒定。
 pub fn plan_cuts(
     luma: &image::GrayImage,
     win_src: usize,
@@ -423,18 +424,27 @@ pub fn plan_cuts(
     let mut guard = 0usize;
     while start + win < h && guard < 512 {
         guard += 1;
-        let target = start + win - ov;
+        // 目标切点是「本片最远端」：再往下就超过窗高，所以搜索只向上回退
+        let target = start + win;
         let lo = target.saturating_sub(r_src).max(start + 1);
         let hi = (target + r_src).min(start + win).min(h - 1);
-        let mut best: Option<(usize, u8)> = None;
+        // 取离 target 最近的近白行；等距时取更亮的那行
+        let mut best: Option<(usize, usize, u8)> = None;
         for y in lo..=hi {
             if let Some((m, s)) = band_stats(raw, w, h, y) {
-                if m >= mu && s <= sd && best.map(|(_, bm)| m > bm).unwrap_or(true) {
-                    best = Some((y, m));
+                if m >= mu && s <= sd {
+                    let d = y.abs_diff(target);
+                    let better = match best {
+                        None => true,
+                        Some((bd, _, bm)) => d < bd || (d == bd && m > bm),
+                    };
+                    if better {
+                        best = Some((d, y, m));
+                    }
                 }
             }
         }
-        let cut = best.map(|(y, _)| y).unwrap_or(target).clamp(start + 1, h);
+        let cut = best.map(|(_, y, _)| y).unwrap_or(target).clamp(start + 1, h);
         cuts.push(cut);
         if cut + ov >= h {
             break;
@@ -2361,13 +2371,13 @@ mod tests {
 
     #[test]
     fn plan_cuts_snaps_to_white_row_within_radius() {
-        // 1200×2266 的源像素空间：win≈1547、ov≈83、r≈124，target≈1464
+        // 1200×2266 的源像素空间：win≈1547、ov≈83、r≈124，target≈1547
         let luma = luma_with_white_band(1200, 2266, 1480..1491);
         let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD);
         assert_eq!(cuts.len(), 3, "两片 + 首尾切点");
         assert_eq!(cuts[0], 0);
-        // 白带内最靠上的一行就是切点（同亮度时取先遇到的）
-        assert!(cuts[1] >= 1480 && cuts[1] <= 1490, "切点应落在白带内: {cuts:?}");
+        // 白带内离 target 最近的近白行（带的下沿）就是切点
+        assert!(cuts[1] >= 1480 && cuts[1] <= 1498, "切点应落在白带内: {cuts:?}");
         assert_eq!(cuts[2], 2266);
         // 上界保证：每片显示高 ≤ vh
         assert!(cuts[1] <= 1547, "切点不得超过窗口上界");
@@ -2375,10 +2385,13 @@ mod tests {
 
     #[test]
     fn plan_cuts_hard_cuts_when_no_white_row() {
-        // 全暗图：窗口内没有近白行，硬切在 target = 1547 − 83 = 1464
+        // 全暗图：窗口内没有近白行，硬切在本片最远端 target = win = 1547
         let luma = luma_with_white_band(1200, 2266, 0..0);
         let cuts = plan_cuts(&luma, 1547, 83, 124, SLICE_MU, SLICE_SD);
-        assert_eq!(cuts, vec![0, 1464, 2266]);
+        assert_eq!(cuts, vec![0, 1547, 2266]);
+        // 第二片从 1547 − 83 开始，与上片重叠 83 行
+        let ranges = slice_ranges(&cuts, 83, 2266);
+        assert_eq!(ranges[1].0, 1464);
     }
 
     #[test]
