@@ -32,6 +32,15 @@ fn clamp_http_concurrency(n: u64) -> usize {
     n.clamp(1, MAX_SEARCH_CONCURRENCY) as usize
 }
 
+/// `scope=all` 的源级并发槽：显式设置 `HTTP_CONCURRENCY` 时尊重用户（min(配置,16)），
+/// 未设置时用设备建议值 16。
+fn resolve_all_slots(raw: Option<u64>) -> usize {
+    match raw {
+        Some(n) => n.clamp(1, MAX_SEARCH_CONCURRENCY) as usize,
+        None => MAX_SEARCH_CONCURRENCY as usize,
+    }
+}
+
 /// 搜索并发硬上限：设备实测 16 槽不构成资源瓶颈（VmHWM 46–71 MB）。
 const MAX_SEARCH_CONCURRENCY: u64 = 16;
 
@@ -86,6 +95,9 @@ pub struct Config {
     /// 整批搜索总预算（秒）：`None` 表示按 scope 取默认（curated 8s / all 25s）。
     /// 两者此前是同一个值，导致“单源超时”被整批上限放大成排队饥饿。
     pub search_total_budget_secs: Option<u64>,
+    /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
+    /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
+    pub search_all_slots: usize,
     /// 单响应体大小上限（字节）
     pub http_max_body_bytes: usize,
     /// 图片代理进程内 LRU 缓存上限（MiB）
@@ -142,6 +154,7 @@ impl Config {
             env_u64_opt("SEARCH_TIMEOUT_SECS"),
             env_u64_opt("SEARCH_TOTAL_BUDGET_SECS"),
         );
+        let http_concurrency_raw = env_u64_opt("HTTP_CONCURRENCY");
         Self {
             host: env_prefixed("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port: env_prefixed("PORT")
@@ -152,7 +165,9 @@ impl Config {
 
             cache_limit_mb: env_u64("CACHE_LIMIT_MB", 50).clamp(4, 512),
             // 并发默认 8（设备实测 16 可行但默认保守）；上限放宽到 16，允许按机器调高。
-            http_concurrency: clamp_http_concurrency(env_u64("HTTP_CONCURRENCY", 8)),
+            http_concurrency: clamp_http_concurrency(http_concurrency_raw.unwrap_or(8)),
+            // all 范围：显式设置时尊重用户（min(配置,16)），未设置时用设备建议的 16。
+            search_all_slots: resolve_all_slots(http_concurrency_raw),
             http_timeout_secs: env_u64("HTTP_TIMEOUT_SECS", 15).clamp(3, 60),
             // 单源预算与整批预算分开：单源默认 6s，整批由 scope 决定（curated 8s / all 25s）。
             search_timeout_secs,
@@ -305,5 +320,14 @@ mod tests {
         assert_eq!(clamp_http_concurrency(16), 16, "16 应被允许");
         assert_eq!(clamp_http_concurrency(17), 16, "17 应夹到 16");
         assert_eq!(clamp_http_concurrency(0), 1);
+    }
+
+    // all 范围的并发：用户设 4 → 4；未设置 → 16；设 32 → 16
+    #[test]
+    fn all_scope_slots_respect_explicit_setting() {
+        assert_eq!(resolve_all_slots(Some(4)), 4, "用户显式调低应生效");
+        assert_eq!(resolve_all_slots(None), 16, "未设置时用设备建议 16");
+        assert_eq!(resolve_all_slots(Some(32)), 16, "超过 16 夹回");
+        assert_eq!(resolve_all_slots(Some(0)), 1);
     }
 }

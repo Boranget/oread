@@ -46,6 +46,8 @@ const COOKIE_BUCKET_MAX_BYTES: usize = 8 * 1024;
 #[derive(Clone, Copy)]
 struct HttpConf {
     concurrency: usize,
+    /// `scope=all` 的源级槽：min(用户配置,16)，未设置时 16。
+    all_concurrency: usize,
     timeout_secs: u64,
     search_timeout_secs: u64,
     /// 整批搜索总预算的显式覆盖值；`None` 时按 scope 取默认。
@@ -55,6 +57,7 @@ struct HttpConf {
 
 const DEFAULT_CONF: HttpConf = HttpConf {
     concurrency: 8,
+    all_concurrency: 16,
     timeout_secs: 15,
     search_timeout_secs: 6,
     search_total_budget_secs: None,
@@ -65,7 +68,8 @@ const DEFAULT_CONF: HttpConf = HttpConf {
 ///
 /// - `Curated`（默认）：只跑优选源。curated 集合尚未落地时退化为“只取 preferred”，
 ///   总预算 8s，保证默认路径不等 25s。
-/// - `All`（显式“加强搜索”）：全量源，总预算 25s，源级并发固定 16 槽。
+/// - `All`（显式“加强搜索”）：全量源，总预算 25s，源级并发默认 16 槽；
+///   用户显式调低 `HTTP_CONCURRENCY` 时取 `min(配置, 16)`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchScope {
     Curated,
@@ -95,14 +99,6 @@ impl SearchScope {
             Self::All => 25,
         }
     }
-
-    /// 源级并发槽数：curated 沿用配置（默认 8，夹 1..16）；all 固定 16。
-    pub fn source_slots(self, configured: usize) -> usize {
-        match self {
-            Self::Curated => configured.clamp(1, 16),
-            Self::All => 16,
-        }
-    }
 }
 
 static CONF: OnceCell<HttpConf> = OnceCell::new();
@@ -121,6 +117,7 @@ static SEARCH_COMIC_ALL: OnceCell<Arc<Semaphore>> = OnceCell::new();
 pub fn init(cfg: &Config) {
     let _ = CONF.set(HttpConf {
         concurrency: cfg.http_concurrency,
+        all_concurrency: cfg.search_all_slots,
         timeout_secs: cfg.http_timeout_secs,
         search_timeout_secs: cfg.search_timeout_secs,
         search_total_budget_secs: cfg.search_total_budget_secs,
@@ -140,6 +137,7 @@ pub fn init(cfg: &Config) {
         total_curated_secs = curated,
         total_all_secs = all,
         source_slots = cfg.http_concurrency,
+        all_source_slots = cfg.search_all_slots,
         "search budgets resolved"
     );
 }
@@ -172,9 +170,12 @@ fn novel_search_slots() -> &'static Arc<Semaphore> {
 }
 
 fn novel_search_slots_all() -> &'static Arc<Semaphore> {
-    SEARCH_NOVEL_ALL.get_or_init(|| {
-        Arc::new(Semaphore::new(SearchScope::All.source_slots(conf().concurrency)))
-    })
+    SEARCH_NOVEL_ALL.get_or_init(|| Arc::new(Semaphore::new(conf().all_concurrency)))
+}
+
+/// `scope=all` 最终生效的源级并发槽（用户显式调低时小于 16）。
+pub fn all_search_slots() -> usize {
+    conf().all_concurrency
 }
 
 /// 漫画槽数量：并发的 1/4（至少 1 个）。默认 8 → 2 个；all 16 槽 → 4 个。
@@ -188,9 +189,7 @@ fn comic_search_slots() -> &'static Arc<Semaphore> {
 
 fn comic_search_slots_all() -> &'static Arc<Semaphore> {
     SEARCH_COMIC_ALL.get_or_init(|| {
-        Arc::new(Semaphore::new(comic_slot_count(
-            SearchScope::All.source_slots(conf().concurrency),
-        )))
+        Arc::new(Semaphore::new(comic_slot_count(conf().all_concurrency)))
     })
 }
 
@@ -198,7 +197,7 @@ fn comic_search_slots_all() -> &'static Arc<Semaphore> {
 /// - 漫画源走独立小池，不排在小说源后面；
 /// - 排队时间不计入单源请求预算；
 /// - 到 deadline 仍未拿到 → 明确报“全局搜索预算耗尽”，不伪装成源超时。
-/// - `scope=all`（加强搜索）使用 16 槽的独立池，不影响默认路径的 8 槽。
+/// - `scope=all`（加强搜索）使用独立池：未显式设置并发时 16 槽，显式设置时尊重用户配置。
 pub async fn acquire_search_slot(
     comic: bool,
     deadline: tokio::time::Instant,
@@ -1519,12 +1518,9 @@ mod tests {
         );
     }
 
-    // 并发槽：curated 沿用配置并夹在 1..16；all 固定 16
+    // all 范围的并发槽：未初始化（用户未显式设置）时默认 16
     #[test]
-    fn scope_source_slots_are_capped_at_16() {
-        assert_eq!(SearchScope::Curated.source_slots(8), 8);
-        assert_eq!(SearchScope::Curated.source_slots(16), 16, "16 应允许");
-        assert_eq!(SearchScope::Curated.source_slots(17), 16, "17 应夹到 16");
-        assert_eq!(SearchScope::All.source_slots(8), 16, "all 固定 16 槽");
+    fn all_scope_slots_default_to_16() {
+        assert_eq!(all_search_slots(), 16, "未显式设置时 all 用 16 槽");
     }
 }

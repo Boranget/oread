@@ -229,8 +229,14 @@ fn unix_ms() -> u64 {
 struct SearchJobState {
     books: Vec<SearchBook>,
     errors: Vec<web_book::SourceFailure>,
+    /// 已处理完的源数（含成功/失败/排队未及执行）
     finished: usize,
+    /// 尚未处理完的源数（legacy 语义；与 `scheduled` 不同）
     pending: usize,
+    /// 已进入调度的源数（两段式下逐批累加）
+    scheduled: usize,
+    /// 真正拿到并发槽并发出过至少一次请求的源数
+    attempted: usize,
 }
 
 fn job_registry() -> &'static Mutex<Vec<Arc<SearchJob>>> {
@@ -294,23 +300,40 @@ fn next_job_id() -> String {
     format!("j{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+struct JobView {
+    books: Vec<SearchBook>,
+    errors: Vec<web_book::SourceFailure>,
+    done: bool,
+    finished: usize,
+    pending: usize,
+    scheduled: usize,
+    attempted: usize,
+}
+
 /// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）
-fn job_view(
-    job: &SearchJob,
-) -> (
-    Vec<SearchBook>,
-    Vec<web_book::SourceFailure>,
-    bool,
-    usize,
-    usize,
-) {
-    let (books, errors, finished, pending) = {
+fn job_view(job: &SearchJob) -> JobView {
+    let (books, errors, finished, pending, scheduled, attempted) = {
         let st = job.state.lock().unwrap();
-        (st.books.clone(), st.errors.clone(), st.finished, st.pending)
+        (
+            st.books.clone(),
+            st.errors.clone(),
+            st.finished,
+            st.pending,
+            st.scheduled,
+            st.attempted,
+        )
     };
     let mut full = web_book::dedupe_and_sort(books, &job.sources);
     full.truncate(AGG_MAX_BOOKS);
-    (full, errors, pending == 0, finished, pending)
+    JobView {
+        books: full,
+        errors,
+        done: pending == 0,
+        finished,
+        pending,
+        scheduled,
+        attempted,
+    }
 }
 
 async fn run_search_job(
@@ -396,6 +419,10 @@ async fn run_search_batch(
     }
 
     let mut pending = futures::stream::FuturesUnordered::new();
+    {
+        let mut st = job.state.lock().unwrap();
+        st.scheduled += sources.len();
+    }
     for src in sources {
         let s = src.clone();
         let k = key.to_string();
@@ -406,7 +433,7 @@ async fn run_search_batch(
                 Ok(p) => p,
                 Err(e) => {
                     let waited = queued_at.elapsed().as_millis() as i64;
-                    return (s, TaskOutcome::Skipped(format!("{e}")), waited);
+                    return (s, TaskOutcome::Skipped(format!("{e}")), waited, false);
                 }
             };
             let started = Instant::now();
@@ -417,6 +444,7 @@ async fn run_search_batch(
                     s,
                     TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
                     started.elapsed().as_millis() as i64,
+                    false,
                 );
             }
             let r = tokio::time::timeout(remain.min(budget), web_book::search(&s, &k, 1)).await;
@@ -436,13 +464,16 @@ async fn run_search_batch(
                     TaskOutcome::Timeout(err)
                 }
             };
-            (s, outcome, latency_ms)
+            (s, outcome, latency_ms, true)
         });
     }
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
-    while let Some((src, outcome, latency_ms)) = pending.next().await {
+    while let Some((src, outcome, latency_ms, attempted)) = pending.next().await {
         let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut st = job.state.lock().unwrap();
+        if attempted {
+            st.attempted += 1;
+        }
         match outcome {
             TaskOutcome::Done(Ok(mut books)) => {
                 let hits = books.len() as i64;
@@ -596,10 +627,31 @@ fn searchable_sources(
         .collect()
 }
 
+/// 精选集合的唯一接入点（**替换点**）：
+/// `8535ed2219ad104bc381a476` 的 curated/bench 落地后，把这里的实现换成读取精选集合；
+/// 当前先按 `tier=preferred` 近似“精选”，不自行实现精选算法。
+///
+/// 返回允许参与 curated 搜索的 `book_source_url` 白名单；
+/// `None` 表示还没有精选/tier 数据，调用方退回全量，避免默认路径 0 命中。
+fn curated_source_urls(
+    candidates: &[crate::entities::BookSource],
+    health: &HashMap<String, source_health::HealthRow>,
+) -> Option<std::collections::HashSet<String>> {
+    let urls: std::collections::HashSet<String> = candidates
+        .iter()
+        .filter(|s| source_health::is_preferred(health.get(&s.book_source_url)))
+        .map(|s| s.book_source_url.clone())
+        .collect();
+    if urls.is_empty() {
+        None
+    } else {
+        Some(urls)
+    }
+}
+
 /// 按 scope 过滤候选源：
 /// - `all`：原样返回（全量源）；
-/// - `curated`：只保留 preferred。curated 集合尚未落地时这就是退化路径；
-///   若一个 preferred 都没有（tier 数据未建立），退回全量，避免默认路径 0 命中。
+/// - `curated`：只保留 `curated_source_urls()` 给出的集合；未就绪则退回全量。
 fn filter_sources_by_scope(
     candidates: Vec<crate::entities::BookSource>,
     health: &HashMap<String, source_health::HealthRow>,
@@ -608,15 +660,12 @@ fn filter_sources_by_scope(
     if scope == crate::req::SearchScope::All {
         return candidates;
     }
-    let preferred: Vec<crate::entities::BookSource> = candidates
-        .iter()
-        .filter(|s| source_health::is_preferred(health.get(&s.book_source_url)))
-        .cloned()
-        .collect();
-    if preferred.is_empty() {
-        candidates
-    } else {
-        preferred
+    match curated_source_urls(&candidates, health) {
+        Some(urls) => candidates
+            .into_iter()
+            .filter(|s| urls.contains(&s.book_source_url))
+            .collect(),
+        None => candidates,
     }
 }
 
@@ -708,10 +757,11 @@ async fn search_start(
         // deadline_ms 保持旧语义：单源预算；整批预算单独给出。
         "deadline_ms": crate::req::search_budget().as_millis() as u64,
         "total_budget_ms": crate::req::search_total_budget(scope).as_millis() as u64,
-        // 首轮快照：一个源都没跑完，必然 partial。
+        // 首轮快照：还没调度任何源。
         "phase": search_phase(source_total),
         "partial": source_total > 0,
-        "executed_sources": 0,
+        "scheduled_sources": 0,
+        "attempted_sources": 0,
         "pending_sources": source_total,
         // 契约变更：显式回显过滤结果，便于前端提示“哪些 id 被忽略”
         "source_ids_requested": requested,
@@ -748,7 +798,16 @@ async fn search_result(
         found
     };
     let job = job.ok_or_else(|| AppError::NotFound("搜索任务不存在或已过期（60s TTL）".into()))?;
-    let (full, errors, done, finished, pending) = job_view(&job);
+    let view = job_view(&job);
+    let done = view.done;
+    let finished = view.finished;
+    let pending = view.pending;
+    let scheduled = view.scheduled;
+    let attempted = view.attempted;
+    // 未排上的源（两段式里尚未进入调度的批次）
+    let pending_scheduled = job.source_total.saturating_sub(scheduled);
+    let full = view.books;
+    let errors = view.errors;
 
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
@@ -764,11 +823,13 @@ async fn search_result(
         "total": total,
         "has_more": skip + page_size < total,
         "done": done,
-        // 两段式进度：pending_sources 为 0 即 final；executed_sources = finished（已处理源数）
+        // 两段式进度：scheduled=已进入调度（逐批累加），attempted=真正发过请求；
+        // pending_sources=尚未排上的源（source_total - scheduled），done 仍以“全部处理完”为准。
         "phase": search_phase(pending),
         "partial": !done,
-        "executed_sources": finished,
-        "pending_sources": pending,
+        "scheduled_sources": scheduled,
+        "attempted_sources": attempted,
+        "pending_sources": pending_scheduled,
         "scope": job.scope.as_str(),
         "finished": finished,
         "pending": pending,
@@ -2572,23 +2633,24 @@ mod tests {
                 errors: vec![],
                 finished: 1,
                 pending: 1,
+                ..Default::default()
             }),
         };
-        let (books, errors, done, finished, pending) = job_view(&job);
-        assert_eq!(books.len(), 1, "同名同作者应去重为一条");
+        let view = job_view(&job);
+        assert_eq!(view.books.len(), 1, "同名同作者应去重为一条");
         assert_eq!(
-            books[0].origin.as_deref(),
+            view.books[0].origin.as_deref(),
             Some("http://hi"),
             "权重高的源应排在前面"
         );
-        assert!(errors.is_empty());
-        assert_eq!((finished, pending), (1, 1));
-        assert!(!done, "还有源未完成时 done 必须为 false");
+        assert!(view.errors.is_empty());
+        assert_eq!((view.finished, view.pending), (1, 1));
+        assert!(!view.done, "还有源未完成时 done 必须为 false");
 
         job.state.lock().unwrap().pending = 0;
-        let (_, _, done, _, pending) = job_view(&job);
-        assert!(done);
-        assert_eq!(pending, 0);
+        let view = job_view(&job);
+        assert!(view.done);
+        assert_eq!(view.pending, 0);
     }
 
     // curated：只保留 preferred；一个都没有时退回全量（退化路径，避免 0 命中）
@@ -2623,14 +2685,61 @@ mod tests {
         assert_eq!(search_phase(3), "first");
         assert_eq!(search_phase(0), "final");
         let job = test_job("phase", 0, 3);
-        let (_, _, done, finished, pending) = job_view(&job);
-        assert_eq!((done, pending), (false, 3));
-        assert_eq!(search_phase(pending), "first");
-        assert_eq!(finished, 0, "没有任何源完成时 executed_sources=0");
+        let view = job_view(&job);
+        assert!(!view.done);
+        assert_eq!(view.pending, 3);
+        assert_eq!(search_phase(view.pending), "first");
+        assert_eq!(view.finished, 0, "没有任何源完成时 finished=0");
         job.state.lock().unwrap().pending = 0;
-        let (_, _, done, _, pending) = job_view(&job);
-        assert!(done);
-        assert_eq!(search_phase(pending), "final");
+        let view = job_view(&job);
+        assert!(view.done);
+        assert_eq!(search_phase(view.pending), "final");
+    }
+
+    // 计数器算术关系：attempted <= scheduled <= source_total；pending = total - scheduled
+    #[test]
+    fn source_counters_satisfy_invariant() {
+        let job = test_job("counters", 0, 3);
+        {
+            let mut st = job.state.lock().unwrap();
+            st.scheduled = 2;
+            st.attempted = 1;
+            st.finished = 2;
+            st.pending = 1;
+        }
+        let view = job_view(&job);
+        assert!(view.attempted <= view.scheduled, "attempted 不能大于 scheduled");
+        assert!(view.scheduled <= job.source_total, "scheduled 不能大于 total");
+        assert_eq!(
+            job.source_total - view.scheduled,
+            1,
+            "pending_sources = total - scheduled"
+        );
+    }
+
+    // 排队到 deadline 仍未拿到槽：计入 scheduled/finished，但不算 attempted
+    #[tokio::test]
+    async fn queued_but_never_executed_is_not_attempted() {
+        let job = test_job("queue", 0, 1);
+        let past = tokio::time::Instant::now() - Duration::from_secs(1);
+        let mut outcomes = Vec::new();
+        run_search_batch(
+            &job,
+            vec![src("排队源", "http://queue.example", 1, true)],
+            "书",
+            past,
+            Duration::from_millis(100),
+            &HashMap::new(),
+            &mut outcomes,
+            crate::req::SearchScope::Curated,
+        )
+        .await;
+        let view = job_view(&job);
+        assert_eq!(view.scheduled, 1);
+        assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
+        assert_eq!(view.finished, 1);
+        assert_eq!(view.pending, 0);
+        assert!(outcomes.is_empty(), "排队未执行的源不写健康记录");
     }
 
     // 回归：legacy `/api/search` 走的 `search_all_with_errors_budgeted` 不做 tier 过滤，
