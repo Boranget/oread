@@ -48,7 +48,7 @@ const MAX_SEARCH_CONCURRENCY: u64 = 16;
 ///
 /// - `SEARCH_TIMEOUT_SECS`：单源预算，默认 6s；
 /// - `SEARCH_TOTAL_BUDGET_SECS`：整批总预算；未设置时返回 `None`，由 scope 取默认值
-///   （curated 8s / all 25s）。
+///   （curated 6s / all 10s）。
 ///
 /// 兼容旧部署：只显式设置了旧变量 `SEARCH_TIMEOUT_SECS` 时，整批预算回落到同值，
 /// 保持“两者同值”的历史语义；两个都不设置时才按 scope 分开。
@@ -92,7 +92,7 @@ pub struct Config {
     /// 单源搜索预算（秒）：聚合搜索按“每个书源”独立计时，超时只丢该源、不影响整体。
     /// 与整批总预算解耦（见 `search_total_budget_secs`）。
     pub search_timeout_secs: u64,
-    /// 整批搜索总预算（秒）：`None` 表示按 scope 取默认（curated 8s / all 25s）。
+    /// 整批搜索总预算（秒）：`None` 表示按 scope 取默认（curated 6s / all 10s）。
     /// 两者此前是同一个值，导致“单源超时”被整批上限放大成排队饥饿。
     pub search_total_budget_secs: Option<u64>,
     /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
@@ -208,7 +208,7 @@ impl Config {
             // all 范围：显式设置时尊重用户（min(配置,16)），未设置时用设备建议的 16。
             search_all_slots: resolve_all_slots(http_concurrency_raw),
             http_timeout_secs: env_u64("HTTP_TIMEOUT_SECS", 15).clamp(3, 60),
-            // 单源预算与整批预算分开：单源默认 6s，整批由 scope 决定（curated 8s / all 25s）。
+            // 单源预算与整批预算分开：单源默认 6s，整批由 scope 决定（curated 6s / all 10s）。
             search_timeout_secs,
             search_total_budget_secs,
             http_max_body_bytes: env_u64("HTTP_MAX_BODY_MB", 5).clamp(1, 32) as usize * 1024 * 1024,
