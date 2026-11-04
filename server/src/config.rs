@@ -71,6 +71,24 @@ pub struct Config {
     pub migration_repair: bool,
     /// 书源连续失败进入冷却的时长（秒，默认 24h）
     pub source_cooldown_secs: u64,
+    /// 源质量：升入 preferred 的最低分（默认 70）
+    pub source_tier_preferred_min_score: i32,
+    /// 源质量：跌破该分且已有真实使用证据后进入 quarantined（默认 30）
+    pub source_tier_quarantine_below_score: i32,
+    /// 源质量：连续 N 次达标才升 preferred（默认 3）
+    pub source_tier_promote_streak: i64,
+    /// 源质量：连续 N 次不达标才降级（默认 2）
+    pub source_tier_demote_streak: i64,
+    /// 源质量：覆盖旧版本时新评分允许的最低差值（默认 5）
+    pub source_tier_update_margin: i32,
+    /// 搜索调度：preferred 批次可占用的总预算百分比（默认 70，其余留给 observing）
+    pub source_tier_preferred_budget_pct: u64,
+    /// 评分权重（合计 100）
+    pub source_score_w_connect: i32,
+    pub source_score_w_rule: i32,
+    pub source_score_w_hit: i32,
+    pub source_score_w_parse: i32,
+    pub source_score_w_ttfb: i32,
     /// 规则试跑预览是否允许访问回环/私网/链路本地地址（默认拒绝，防 SSRF）。
     /// 本地调试书源时可用 `PREVIEW_ALLOW_PRIVATE=true` 放行。
     pub preview_allow_private: bool,
@@ -109,6 +127,26 @@ impl Config {
             migration_repair: env_bool("MIGRATION_REPAIR", true),
             source_cooldown_secs: env_u64("SOURCE_COOLDOWN_SECS", 24 * 3600)
                 .clamp(60, 30 * 86400),
+            source_tier_preferred_min_score: env_u64("SOURCE_TIER_PREFERRED_MIN_SCORE", 70)
+                .clamp(0, 100) as i32,
+            source_tier_quarantine_below_score: env_u64(
+                "SOURCE_TIER_QUARANTINE_BELOW_SCORE",
+                30,
+            )
+            .clamp(0, 100) as i32,
+            source_tier_promote_streak: env_u64("SOURCE_TIER_PROMOTE_STREAK", 3)
+                .clamp(1, 20) as i64,
+            source_tier_demote_streak: env_u64("SOURCE_TIER_DEMOTE_STREAK", 2)
+                .clamp(1, 20) as i64,
+            source_tier_update_margin: env_u64("SOURCE_TIER_UPDATE_MARGIN", 5)
+                .clamp(0, 50) as i32,
+            source_tier_preferred_budget_pct: env_u64("SOURCE_TIER_PREFERRED_BUDGET_PCT", 70)
+                .clamp(20, 95),
+            source_score_w_connect: env_u64("SOURCE_SCORE_W_CONNECT", 25).clamp(0, 100) as i32,
+            source_score_w_rule: env_u64("SOURCE_SCORE_W_RULE", 15).clamp(0, 100) as i32,
+            source_score_w_hit: env_u64("SOURCE_SCORE_W_HIT", 30).clamp(0, 100) as i32,
+            source_score_w_parse: env_u64("SOURCE_SCORE_W_PARSE", 15).clamp(0, 100) as i32,
+            source_score_w_ttfb: env_u64("SOURCE_SCORE_W_TTFB", 15).clamp(0, 100) as i32,
             preview_allow_private: env_bool("PREVIEW_ALLOW_PRIVATE", false),
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())

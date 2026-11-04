@@ -13,6 +13,7 @@ mod search_rank;
 mod serde_util;
 mod source_health;
 mod source_ledger;
+mod source_quality;
 mod web_book;
 
 use axum::Router;

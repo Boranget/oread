@@ -18,6 +18,7 @@ use sqlx::{FromRow, SqlitePool};
 use crate::entities::BookSource;
 use crate::error::AppResult;
 use crate::req::SourceUnavailable;
+use crate::source_quality::{self, Evaluation, Network, ScoreInput, TierConfig};
 use crate::web_book;
 
 /// 连续站点失败达到该值后进入冷却。
@@ -43,7 +44,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, Default, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub struct HealthRow {
     pub source_url: String,
     pub last_checked_at: Option<i64>,
@@ -54,6 +55,49 @@ pub struct HealthRow {
     pub cooldown_until: Option<i64>,
     pub avg_latency_ms: Option<i64>,
     pub check_total: i64,
+    // ---- 源质量分层（0008）----
+    pub tier: String,
+    pub score: i64,
+    pub evidence_json: Option<String>,
+    pub last_eval_at: Option<i64>,
+    pub search_count: i64,
+    pub hit_count: i64,
+    pub parse_ok_count: i64,
+    pub fail_site_count: i64,
+    pub fail_engine_count: i64,
+    pub ttfb_ms_p90: Option<i64>,
+    pub ttfb_samples_json: Option<String>,
+    pub promote_streak: i64,
+    pub demote_streak: i64,
+}
+
+impl Default for HealthRow {
+    fn default() -> Self {
+        Self {
+            source_url: String::new(),
+            last_checked_at: None,
+            last_status: STATUS_NEVER.to_string(),
+            last_error: None,
+            consecutive_failures: 0,
+            last_ok_at: None,
+            cooldown_until: None,
+            avg_latency_ms: None,
+            check_total: 0,
+            tier: source_quality::TIER_OBSERVING.to_string(),
+            score: 50,
+            evidence_json: None,
+            last_eval_at: None,
+            search_count: 0,
+            hit_count: 0,
+            parse_ok_count: 0,
+            fail_site_count: 0,
+            fail_engine_count: 0,
+            ttfb_ms_p90: None,
+            ttfb_samples_json: None,
+            promote_streak: 0,
+            demote_streak: 0,
+        }
+    }
 }
 
 impl HealthRow {
@@ -81,6 +125,14 @@ pub struct Outcome {
     pub status: &'static str,
     pub latency_ms: i64,
     pub error: Option<String>,
+    /// 本次搜索返回的命中条数（体检时同样记录，但不算真实使用）。
+    pub hits: i64,
+    /// 规则解析是否成功（拿得到结构化结果）。
+    pub parsed: bool,
+    /// true = 真实搜索使用；false = 导入/巡检体检。
+    pub usage: bool,
+    /// 静态规则完整度（0–1），用于评分。
+    pub rule_complete: f32,
 }
 
 /// 批量探测的逐源结果。
@@ -94,6 +146,8 @@ pub struct Probe {
     pub error: Option<String>,
     /// false 表示因总预算用尽等原因未实际体检。
     pub probed: bool,
+    /// 体检时规则实际返回的命中条数（ok 要求 ≥1）。
+    pub hits: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +205,10 @@ pub fn distinct_host_count(sources: &[BookSource]) -> usize {
 pub async fn load_map(pool: &SqlitePool) -> AppResult<HashMap<String, HealthRow>> {
     let rows: Vec<HealthRow> = sqlx::query_as(
         "SELECT source_url, last_checked_at, last_status, last_error, \
-         consecutive_failures, last_ok_at, cooldown_until, avg_latency_ms, check_total \
+         consecutive_failures, last_ok_at, cooldown_until, avg_latency_ms, check_total, \
+         tier, score, evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+         fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
+         promote_streak, demote_streak \
          FROM source_health",
     )
     .fetch_all(pool)
@@ -195,15 +252,113 @@ pub fn apply_outcome(
         }
         STATUS_FAIL => {
             row.consecutive_failures = row.consecutive_failures.saturating_add(1);
+            row.fail_site_count = row.fail_site_count.saturating_add(1);
             if row.consecutive_failures >= FAIL_THRESHOLD {
                 let until = now.saturating_add((cooldown_secs as i64).saturating_mul(1000));
                 row.cooldown_until = Some(row.cooldown_until.map(|t| t.max(until)).unwrap_or(until));
             }
         }
-        // partial（引擎故障）：不计失败、不清零、不改冷却
+        // partial（引擎故障）：不计站点失败、不清零、不改冷却，只累计引擎失败证据
+        STATUS_PARTIAL => {
+            row.fail_engine_count = row.fail_engine_count.saturating_add(1);
+        }
         _ => {}
     }
+    if o.usage {
+        row.search_count = row.search_count.saturating_add(1);
+        row.hit_count = row.hit_count.saturating_add(o.hits.max(0));
+        if o.parsed {
+            row.parse_ok_count = row.parse_ok_count.saturating_add(1);
+        }
+        let (samples, p90) = push_ttfb_sample(row.ttfb_samples_json.as_deref(), o.latency_ms);
+        row.ttfb_samples_json = Some(samples);
+        row.ttfb_ms_p90 = p90;
+    }
     row
+}
+
+/// TTFB 环形样本（最多 32 条）+ p90；只用于评分，不做长期存储。
+fn push_ttfb_sample(raw: Option<&str>, latency_ms: i64) -> (String, Option<i64>) {
+    let mut samples: Vec<i64> = raw
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if latency_ms > 0 {
+        samples.push(latency_ms);
+    }
+    if samples.len() > 32 {
+        samples.drain(0..samples.len() - 32);
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    let p90 = if sorted.is_empty() {
+        None
+    } else {
+        let idx = ((sorted.len() - 1) as f32 * 0.9).round() as usize;
+        Some(sorted[idx.min(sorted.len() - 1)])
+    };
+    (
+        serde_json::to_string(&samples).unwrap_or_else(|_| "[]".to_string()),
+        p90,
+    )
+}
+
+fn score_input(row: &HealthRow, rule_complete: f32, network: Network) -> ScoreInput {
+    ScoreInput {
+        rule_completeness: rule_complete,
+        network,
+        consecutive_failures: row.consecutive_failures,
+        search_count: row.search_count,
+        hit_count: row.hit_count,
+        parse_ok_count: row.parse_ok_count,
+        fail_site_count: row.fail_site_count,
+        fail_engine_count: row.fail_engine_count,
+        avg_ttfb_ms: row.avg_latency_ms,
+        p90_ttfb_ms: row.ttfb_ms_p90,
+        prev_tier: if row.tier.trim().is_empty() {
+            source_quality::TIER_OBSERVING.to_string()
+        } else {
+            row.tier.clone()
+        },
+        promote_streak: row.promote_streak,
+        demote_streak: row.demote_streak,
+    }
+}
+
+fn apply_evaluation(
+    row: &mut HealthRow,
+    eval: &Evaluation,
+    network: Network,
+    rule_complete: f32,
+    now: i64,
+) {
+    row.tier = eval.tier.clone();
+    row.score = eval.score as i64;
+    row.promote_streak = eval.promote_streak;
+    row.demote_streak = eval.demote_streak;
+    row.last_eval_at = Some(now);
+    let evidence = serde_json::json!({
+        "network": network.as_str(),
+        "rule_completeness": (rule_complete * 100.0).round() / 100.0,
+        "search_count": row.search_count,
+        "hit_count": row.hit_count,
+        "hit_rate": if row.search_count > 0 {
+            (row.hit_count as f64 / row.search_count as f64 * 1000.0).round() / 1000.0
+        } else { 0.0 },
+        "parse_ok_count": row.parse_ok_count,
+        "parse_rate": if row.search_count > 0 {
+            (row.parse_ok_count as f64 / row.search_count as f64 * 1000.0).round() / 1000.0
+        } else { 0.0 },
+        "avg_ttfb_ms": row.avg_latency_ms,
+        "p90_ttfb_ms": row.ttfb_ms_p90,
+        "fail_site_count": row.fail_site_count,
+        "fail_engine_count": row.fail_engine_count,
+        "consecutive_failures": row.consecutive_failures,
+        "score": eval.score,
+        "tier": eval.tier,
+        "reasons": eval.reasons,
+        "last_eval_at": now,
+    });
+    row.evidence_json = Some(evidence.to_string());
 }
 
 /// 批量落库：只在任务收尾时调用一次，避免每本书/每条结果写库。
@@ -211,6 +366,7 @@ pub async fn record_outcomes(
     pool: &SqlitePool,
     outcomes: &[Outcome],
     cooldown_secs: u64,
+    cfg: &TierConfig,
 ) -> AppResult<()> {
     if outcomes.is_empty() {
         return Ok(());
@@ -219,12 +375,19 @@ pub async fn record_outcomes(
     let existing = load_map(pool).await?;
     let mut tx = pool.begin().await?;
     for o in outcomes {
-        let row = apply_outcome(existing.get(&o.source_url), o, now, cooldown_secs);
+        let mut row = apply_outcome(existing.get(&o.source_url), o, now, cooldown_secs);
+        let network = Network::from_status(o.status, true);
+        let eval = source_quality::evaluate(&score_input(&row, o.rule_complete, network), cfg);
+        apply_evaluation(&mut row, &eval, network, o.rule_complete, now);
         sqlx::query(
             "INSERT INTO source_health \
              (source_url, last_checked_at, last_status, last_error, consecutive_failures, \
-              last_ok_at, cooldown_until, avg_latency_ms, check_total) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+              last_ok_at, cooldown_until, avg_latency_ms, check_total, tier, score, \
+              evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+              fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
+              promote_streak, demote_streak) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+              ?17, ?18, ?19, ?20, ?21, ?22) \
              ON CONFLICT(source_url) DO UPDATE SET \
               last_checked_at=excluded.last_checked_at, \
               last_status=excluded.last_status, \
@@ -233,7 +396,17 @@ pub async fn record_outcomes(
               last_ok_at=excluded.last_ok_at, \
               cooldown_until=excluded.cooldown_until, \
               avg_latency_ms=excluded.avg_latency_ms, \
-              check_total=excluded.check_total",
+              check_total=excluded.check_total, \
+              tier=excluded.tier, score=excluded.score, \
+              evidence_json=excluded.evidence_json, last_eval_at=excluded.last_eval_at, \
+              search_count=excluded.search_count, hit_count=excluded.hit_count, \
+              parse_ok_count=excluded.parse_ok_count, \
+              fail_site_count=excluded.fail_site_count, \
+              fail_engine_count=excluded.fail_engine_count, \
+              ttfb_ms_p90=excluded.ttfb_ms_p90, \
+              ttfb_samples_json=excluded.ttfb_samples_json, \
+              promote_streak=excluded.promote_streak, \
+              demote_streak=excluded.demote_streak",
         )
         .bind(&row.source_url)
         .bind(row.last_checked_at)
@@ -244,11 +417,89 @@ pub async fn record_outcomes(
         .bind(row.cooldown_until)
         .bind(row.avg_latency_ms)
         .bind(row.check_total)
+        .bind(&row.tier)
+        .bind(row.score)
+        .bind(&row.evidence_json)
+        .bind(row.last_eval_at)
+        .bind(row.search_count)
+        .bind(row.hit_count)
+        .bind(row.parse_ok_count)
+        .bind(row.fail_site_count)
+        .bind(row.fail_engine_count)
+        .bind(row.ttfb_ms_p90)
+        .bind(&row.ttfb_samples_json)
+        .bind(row.promote_streak)
+        .bind(row.demote_streak)
         .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// 对“没有新观测”的源做静态评估（导入时 network=skipped，不因测不到判坏）。
+/// 已隔离的源只有显式 `prev_tier_override=Some("observing")` 才会重评复活。
+pub async fn record_evaluation(
+    pool: &SqlitePool,
+    source_url: &str,
+    rule_complete: f32,
+    network: Network,
+    prev_tier_override: Option<&str>,
+    cfg: &TierConfig,
+) -> AppResult<Evaluation> {
+    let row: Option<HealthRow> = sqlx::query_as(
+        "SELECT source_url, last_checked_at, last_status, last_error, \
+         consecutive_failures, last_ok_at, cooldown_until, avg_latency_ms, check_total, \
+         tier, score, evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+         fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
+         promote_streak, demote_streak \
+         FROM source_health WHERE source_url = ?",
+    )
+    .bind(source_url)
+    .fetch_optional(pool)
+    .await?;
+    let mut row = row.unwrap_or_else(|| {
+        let mut r = HealthRow::default();
+        r.source_url = source_url.to_string();
+        r
+    });
+    let mut input = score_input(&row, rule_complete, network);
+    if let Some(t) = prev_tier_override {
+        input.prev_tier = t.to_string();
+    }
+    let eval = source_quality::evaluate(&input, cfg);
+    apply_evaluation(&mut row, &eval, network, rule_complete, now_ms());
+    sqlx::query(
+        "INSERT INTO source_health \
+         (source_url, tier, score, evidence_json, last_eval_at, promote_streak, demote_streak) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(source_url) DO UPDATE SET \
+          tier=excluded.tier, score=excluded.score, evidence_json=excluded.evidence_json, \
+          last_eval_at=excluded.last_eval_at, promote_streak=excluded.promote_streak, \
+          demote_streak=excluded.demote_streak",
+    )
+    .bind(source_url)
+    .bind(&row.tier)
+    .bind(row.score)
+    .bind(&row.evidence_json)
+    .bind(row.last_eval_at)
+    .bind(row.promote_streak)
+    .bind(row.demote_streak)
+    .execute(pool)
+    .await?;
+    Ok(eval)
+}
+
+/// 搜索准入：缺失健康行按 observing 兼容历史数据；quarantined 不参与聚合。
+pub fn visible_in_search(row: Option<&HealthRow>) -> bool {
+    row.map(|h| h.tier.as_str() != source_quality::TIER_QUARANTINED)
+        .unwrap_or(true)
+}
+
+/// 该源当前是否 preferred（用于两批调度的第一批）。
+pub fn is_preferred(row: Option<&HealthRow>) -> bool {
+    row.map(|h| h.tier.as_str() == source_quality::TIER_PREFERRED)
+        .unwrap_or(false)
 }
 
 /// 清空某源或全部健康记录，返回清理行数。
@@ -303,6 +554,7 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
                         latency_ms: 0,
                         error: Some("未体检：批量预算已用尽".into()),
                         probed: false,
+                        hits: 0,
                     },
                 );
             }
@@ -310,8 +562,14 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
             let started = Instant::now();
             let r = tokio::time::timeout(budget, web_book::search(&src, &key, 1)).await;
             let latency_ms = started.elapsed().as_millis() as i64;
-            let (status, error) = match r {
-                Ok(Ok(_)) => (STATUS_OK, None),
+            let (status, error, hits) = match r {
+                // 规则跑通但 0 条结果：引擎/关键词问题，不判站点坏。
+                Ok(Ok(v)) if v.is_empty() => (
+                    STATUS_PARTIAL,
+                    Some("规则未产出结果".to_string()),
+                    0,
+                ),
+                Ok(Ok(v)) => (STATUS_OK, None, v.len() as i64),
                 Ok(Err(e)) => {
                     let kind = classify(&e);
                     (
@@ -321,6 +579,7 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
                             STATUS_PARTIAL
                         },
                         Some(e.to_string()),
+                        0,
                     )
                 }
                 Err(_) => (
@@ -329,6 +588,7 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
                         "搜索超时（单源 {}s 预算）",
                         budget.as_secs().max(1)
                     )),
+                    0,
                 ),
             };
             (
@@ -340,6 +600,7 @@ pub async fn probe_many(sources: Vec<BookSource>, key: &str) -> Vec<Probe> {
                     latency_ms,
                     error,
                     probed: true,
+                    hits,
                 },
             )
         }
@@ -363,6 +624,10 @@ pub fn outcomes_from_probes(probes: &[Probe]) -> Vec<Outcome> {
             status: p.status,
             latency_ms: p.latency_ms,
             error: p.error.clone(),
+            hits: p.hits,
+            parsed: p.status == STATUS_OK,
+            usage: false,
+            rule_complete: 1.0,
         })
         .collect()
 }
@@ -434,6 +699,23 @@ mod tests {
             status,
             latency_ms: 12,
             error: None,
+            hits: 0,
+            parsed: status == STATUS_OK,
+            usage: false,
+            rule_complete: 1.0,
+        }
+    }
+
+    fn test_tier_cfg() -> TierConfig {
+        use crate::source_quality::Weights;
+        TierConfig {
+            preferred_min_score: 70,
+            quarantine_below_score: 30,
+            promote_streak: 3,
+            demote_streak: 2,
+            update_score_margin: 5,
+            preferred_budget_pct: 70,
+            weights: Weights::default(),
         }
     }
 
@@ -523,7 +805,16 @@ mod tests {
              source_url TEXT PRIMARY KEY, last_checked_at INTEGER, \
              last_status TEXT NOT NULL DEFAULT 'never', last_error TEXT, \
              consecutive_failures INTEGER NOT NULL DEFAULT 0, last_ok_at INTEGER, \
-             cooldown_until INTEGER, avg_latency_ms INTEGER, check_total INTEGER NOT NULL DEFAULT 0)",
+             cooldown_until INTEGER, avg_latency_ms INTEGER, check_total INTEGER NOT NULL DEFAULT 0, \
+             tier TEXT NOT NULL DEFAULT 'observing', score INTEGER NOT NULL DEFAULT 50, \
+             evidence_json TEXT, last_eval_at INTEGER, \
+             search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+             parse_ok_count INTEGER NOT NULL DEFAULT 0, \
+             fail_site_count INTEGER NOT NULL DEFAULT 0, \
+             fail_engine_count INTEGER NOT NULL DEFAULT 0, \
+             ttfb_ms_p90 INTEGER, ttfb_samples_json TEXT, \
+             promote_streak INTEGER NOT NULL DEFAULT 0, \
+             demote_streak INTEGER NOT NULL DEFAULT 0)",
         )
         .execute(&pool)
         .await
@@ -542,8 +833,13 @@ mod tests {
                     status: STATUS_FAIL,
                     latency_ms: 30,
                     error: Some("http status 404".into()),
+                    hits: 0,
+                    parsed: false,
+                    usage: false,
+                    rule_complete: 1.0,
                 }],
                 86400,
+                &test_tier_cfg(),
             )
             .await
             .unwrap();
@@ -560,8 +856,13 @@ mod tests {
                 status: STATUS_OK,
                 latency_ms: 12,
                 error: None,
+                hits: 0,
+                parsed: true,
+                usage: false,
+                rule_complete: 1.0,
             }],
             86400,
+            &test_tier_cfg(),
         )
         .await
         .unwrap();
@@ -583,8 +884,13 @@ mod tests {
                     status: STATUS_FAIL,
                     latency_ms: 20,
                     error: None,
+                    hits: 0,
+                    parsed: false,
+                    usage: false,
+                    rule_complete: 1.0,
                 }],
                 86400,
+                &test_tier_cfg(),
             )
             .await
             .unwrap();
@@ -597,8 +903,13 @@ mod tests {
                     status: STATUS_PARTIAL,
                     latency_ms: 20,
                     error: Some("selector miss".into()),
+                    hits: 0,
+                    parsed: false,
+                    usage: false,
+                    rule_complete: 1.0,
                 }],
                 86400,
+                &test_tier_cfg(),
             )
             .await
             .unwrap();

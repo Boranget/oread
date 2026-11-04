@@ -308,6 +308,7 @@ async fn run_search_job(
     key: String,
     pool: SqlitePool,
     cooldown_secs: u64,
+    tier_cfg: crate::source_quality::TierConfig,
 ) {
     let budget = crate::req::search_budget();
     // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束（与旧版总耗时同量级）。
@@ -368,9 +369,11 @@ async fn run_search_job(
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
     let mut outcomes: Vec<source_health::Outcome> = Vec::new();
     while let Some((src, outcome, latency_ms)) = pending.next().await {
+        let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut st = job.state.lock().unwrap();
         match outcome {
             TaskOutcome::Done(Ok(mut books)) => {
+                let hits = books.len() as i64;
                 books.truncate(SEARCH_PER_SOURCE_MAX);
                 st.books.append(&mut books);
                 outcomes.push(source_health::Outcome {
@@ -378,6 +381,10 @@ async fn run_search_job(
                     status: source_health::STATUS_OK,
                     latency_ms,
                     error: None,
+                    hits,
+                    parsed: true,
+                    usage: true,
+                    rule_complete,
                 });
             }
             TaskOutcome::Done(Err(e)) => {
@@ -396,6 +403,10 @@ async fn run_search_job(
                     status,
                     latency_ms,
                     error: Some(format!("{e}")),
+                    hits: 0,
+                    parsed: false,
+                    usage: true,
+                    rule_complete,
                 });
             }
             TaskOutcome::Timeout(err) => {
@@ -409,6 +420,10 @@ async fn run_search_job(
                     status: source_health::STATUS_FAIL,
                     latency_ms,
                     error: Some(err),
+                    hits: 0,
+                    parsed: false,
+                    usage: true,
+                    rule_complete,
                 });
             }
             TaskOutcome::Skipped(err) => {
@@ -424,7 +439,9 @@ async fn run_search_job(
         st.pending = st.pending.saturating_sub(1);
         drop(st);
     }
-    if let Err(e) = source_health::record_outcomes(&pool, &outcomes, cooldown_secs).await {
+    if let Err(e) =
+        source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
+    {
         tracing::warn!(error = %e, "record source health after search failed");
     }
 }
@@ -549,6 +566,7 @@ async fn search_start(
         key,
         s.shared.clone(),
         s.cfg.source_cooldown_secs,
+        crate::source_quality::TierConfig::from_config(&s.cfg),
     ));
     Ok(Json(json!({
         "job_id": id,

@@ -289,7 +289,7 @@ fn is_probeable(src: &BookSource) -> bool {
 /// 只通过 `suggested_enabled` 给出建议；引擎性失败（partial）建议保持启用。
 async fn probe_report(
     pool: &SqlitePool,
-    cooldown_secs: u64,
+    cfg: &crate::config::Config,
     list: &[BookSource],
     key: &str,
 ) -> (Vec<Value>, Value) {
@@ -300,7 +300,8 @@ async fn probe_report(
     if let Err(e) = source_health::record_outcomes(
         pool,
         &source_health::outcomes_from_probes(&probes),
-        cooldown_secs,
+        cfg.source_cooldown_secs,
+        &crate::source_quality::TierConfig::from_config(cfg),
     )
     .await
     {
@@ -409,7 +410,7 @@ pub async fn upsert(
     if pq.on() {
         let (results, summary) = probe_report(
             &s.shared,
-            s.cfg.source_cooldown_secs,
+            &s.cfg,
             std::slice::from_ref(&src),
             source_health::DEFAULT_PROBE_KEY,
         )
@@ -535,6 +536,7 @@ pub async fn import(
         &s.shared,
         &source_health::outcomes_from_probes(&probes),
         s.cfg.source_cooldown_secs,
+        &crate::source_quality::TierConfig::from_config(&s.cfg),
     )
     .await
     {
@@ -1185,6 +1187,7 @@ pub async fn health_check(
         &s.shared,
         &source_health::outcomes_from_probes(&probes),
         s.cfg.source_cooldown_secs,
+        &crate::source_quality::TierConfig::from_config(&s.cfg),
     )
     .await
     {
