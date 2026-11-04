@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -309,11 +309,57 @@ async fn run_search_job(
     pool: SqlitePool,
     cooldown_secs: u64,
     tier_cfg: crate::source_quality::TierConfig,
+    health: HashMap<String, source_health::HealthRow>,
 ) {
     let budget = crate::req::search_budget();
     // 全局截止时间：排队等槽不计入单源预算，但整次搜索仍受此上限约束（与旧版总耗时同量级）。
     let deadline = tokio::time::Instant::now() + crate::req::search_total_budget();
 
+    // 两批调度：preferred 先跑，但只占一段预算，剩余时间强制留给 observing，
+    // 避免优选源很多时 observing 一次都跑不到（饿死）。
+    let (preferred, observing): (Vec<_>, Vec<_>) = sources
+        .into_iter()
+        .partition(|s| source_health::is_preferred(health.get(&s.book_source_url)));
+    let preferred_deadline = if observing.is_empty() {
+        deadline
+    } else {
+        (tokio::time::Instant::now()
+            + preferred_phase_budget(budget, true, tier_cfg.preferred_budget_pct))
+        .min(deadline)
+    };
+
+    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
+    if !preferred.is_empty() {
+        run_search_batch(&job, preferred, &key, preferred_deadline, budget, &mut outcomes).await;
+    }
+    if !observing.is_empty() {
+        run_search_batch(&job, observing, &key, deadline, budget, &mut outcomes).await;
+    }
+
+    if let Err(e) =
+        source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
+    {
+        tracing::warn!(error = %e, "record source health after search failed");
+    }
+}
+
+/// preferred 批次的预算上限：有 observing 等待时只占 `pct`，其余强制留给第二批。
+fn preferred_phase_budget(total: Duration, has_observing: bool, pct: u64) -> Duration {
+    if has_observing {
+        total.mul_f64(pct.clamp(1, 99) as f64 / 100.0)
+    } else {
+        total
+    }
+}
+
+async fn run_search_batch(
+    job: &Arc<SearchJob>,
+    sources: Vec<crate::entities::BookSource>,
+    key: &str,
+    phase_deadline: tokio::time::Instant,
+    budget: Duration,
+    outcomes: &mut Vec<source_health::Outcome>,
+) {
     enum TaskOutcome {
         Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
         /// 拿到槽后真实请求超时（或全局剩余时间不足被截断）
@@ -325,11 +371,11 @@ async fn run_search_job(
     let mut pending = futures::stream::FuturesUnordered::new();
     for src in sources {
         let s = src.clone();
-        let k = key.clone();
+        let k = key.to_string();
         pending.push(async move {
             let comic = crate::req::is_comic_source_type(s.book_source_type);
             let queued_at = Instant::now();
-            let slot = match crate::req::acquire_search_slot(comic, deadline).await {
+            let slot = match crate::req::acquire_search_slot(comic, phase_deadline).await {
                 Ok(p) => p,
                 Err(e) => {
                     let waited = queued_at.elapsed().as_millis() as i64;
@@ -337,7 +383,7 @@ async fn run_search_job(
                 }
             };
             let started = Instant::now();
-            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remain = phase_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remain.is_zero() {
                 drop(slot);
                 return (
@@ -367,7 +413,6 @@ async fn run_search_job(
         });
     }
     // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
-    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
     while let Some((src, outcome, latency_ms)) = pending.next().await {
         let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut st = job.state.lock().unwrap();
@@ -439,11 +484,6 @@ async fn run_search_job(
         st.pending = st.pending.saturating_sub(1);
         drop(st);
     }
-    if let Err(e) =
-        source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
-    {
-        tracing::warn!(error = %e, "record source health after search failed");
-    }
 }
 
 /// 解析逗号分隔的 source_ids，去空、去重并保留用户输入顺序。
@@ -495,6 +535,26 @@ fn select_sources(
     (selected, ignored)
 }
 
+/// 聚合搜索的唯一准入闸门：先 `enabled`，再 tier（只放行 preferred / observing）。
+/// `enabled=0` 的源不会进入 source_total，也不会被 spawn，因此不可能出现在任何 origin 里。
+fn searchable_sources(
+    sources: Vec<crate::entities::BookSource>,
+    quarantined: &HashSet<String>,
+    health: &HashMap<String, source_health::HealthRow>,
+) -> Vec<crate::entities::BookSource> {
+    sources
+        .into_iter()
+        .filter(|x| {
+            x.enabled
+                && crate::entities::is_supported_source_type(x.book_source_type)
+                && x.rule_search.is_some()
+                && x.search_url.is_some()
+                && !quarantined.contains(&x.book_source_url)
+                && source_health::visible_in_search(health.get(&x.book_source_url))
+        })
+        .collect()
+}
+
 async fn search_start(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -509,23 +569,14 @@ async fn search_start(
     let quarantined = source_ledger::quarantined_set(&s.shared)
         .await
         .unwrap_or_default();
-    let enabled_all: Vec<crate::entities::BookSource> = sources
-        .into_iter()
-        .filter(|x| {
-            x.enabled
-                && crate::entities::is_supported_source_type(x.book_source_type)
-                && x.rule_search.is_some()
-                && x.search_url.is_some()
-                && !quarantined.contains(&x.book_source_url)
-        })
-        .collect();
+    let health = source_health::load_map(&s.shared).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
+        HashMap::new()
+    });
+    let enabled_all = searchable_sources(sources, &quarantined, &health);
     let requested = parse_source_ids(q.source_ids.as_deref());
     let (selected, ignored) = select_sources(&enabled_all, &requested);
     let include_cooled = truthy(q.include_cooled.as_deref());
-    let health = source_health::load_map(&s.shared).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
-        std::collections::HashMap::new()
-    });
     let now = source_health::now_ms();
     let cooldown_total = source_health::cooled_count(&enabled_all, &health, now);
     let partition = source_health::partition_cooldown(selected, &health, include_cooled, now);
@@ -567,6 +618,7 @@ async fn search_start(
         s.shared.clone(),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
+        health,
     ));
     Ok(Json(json!({
         "job_id": id,
@@ -2095,6 +2147,55 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    // 搜索调度：两批预算分配
+    #[test]
+    fn observing_keeps_a_reserved_budget_share() {
+        let total = Duration::from_millis(10_000);
+        assert_eq!(
+            preferred_phase_budget(total, true, 70),
+            Duration::from_millis(7_000)
+        );
+        assert_eq!(preferred_phase_budget(total, false, 70), total);
+        assert_eq!(
+            preferred_phase_budget(total, true, 99),
+            Duration::from_millis(9_900)
+        );
+    }
+
+    // 回归：enabled=0 与 quarantined 都不能进入搜索池（source_total / origin 的源头）。
+    #[test]
+    fn disabled_and_quarantined_sources_never_enter_search_pool() {
+        let mk = |name: &str, enabled: bool| {
+            let mut s = crate::entities::BookSource::default();
+            s.book_source_url = format!("https://{name}.example");
+            s.book_source_name = name.into();
+            s.enabled = enabled;
+            s.book_source_type = 0;
+            s.search_url = Some(format!("https://{name}.example/search?q={{key}}"));
+            s.rule_search = Some(crate::entities::SearchRule::default());
+            s
+        };
+        let mut quarantined = HashSet::new();
+        quarantined.insert("https://quarantined.example".to_string());
+        let mut health = HashMap::new();
+        let mut h = source_health::HealthRow::default();
+        h.tier = crate::source_quality::TIER_QUARANTINED.to_string();
+        health.insert("https://quality.example".to_string(), h);
+
+        let pool = searchable_sources(
+            vec![
+                mk("enabled", true),
+                mk("disabled", false),
+                mk("quarantined", true),
+                mk("quality", true),
+            ],
+            &quarantined,
+            &health,
+        );
+        let names: Vec<&str> = pool.iter().map(|s| s.book_source_name.as_str()).collect();
+        assert_eq!(names, vec!["enabled"], "停用/隔离源不得进入搜索池");
     }
 
     // 预算预占：并发下必须原子扣减，且耗尽后不再放行

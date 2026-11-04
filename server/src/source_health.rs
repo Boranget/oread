@@ -516,10 +516,16 @@ pub async fn record_evaluation(
     Ok(eval)
 }
 
-/// 搜索准入：缺失健康行按 observing 兼容历史数据；quarantined 不参与聚合。
+/// 搜索准入：只允许 `preferred` / `observing`；缺失健康行按 observing 兼容历史数据。
+/// 用白名单而不是“非 quarantined”，避免未知/历史脏值（如空串）混进聚合。
 pub fn visible_in_search(row: Option<&HealthRow>) -> bool {
-    row.map(|h| h.tier.as_str() != source_quality::TIER_QUARANTINED)
-        .unwrap_or(true)
+    row.map(|h| {
+        matches!(
+            h.tier.as_str(),
+            source_quality::TIER_PREFERRED | source_quality::TIER_OBSERVING
+        )
+    })
+    .unwrap_or(true)
 }
 
 /// 该源当前是否 preferred（用于两批调度的第一批）。
