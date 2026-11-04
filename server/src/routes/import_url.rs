@@ -398,7 +398,13 @@ async fn import_url(
     }
 
     let headers = req::source_headers(&source, &book_url);
-    let page = req::fetch_page_for_source(&book_url, &headers, &source.book_source_url).await?;
+    let page = req::fetch_page_for_source_timed(
+        &book_url,
+        &headers,
+        &source.book_source_url,
+        req::source_timeout(&source),
+    )
+    .await?;
     check_page(page.status, page.content_type.as_deref(), &page.body)?;
 
     let key = web_book::book_key(&source, &book_url);

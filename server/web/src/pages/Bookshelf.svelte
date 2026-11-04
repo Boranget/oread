@@ -261,6 +261,12 @@
     )
       return;
     const targets = books.filter((b) => selectedIds.includes(b.book_id));
+    await refreshToc(targets);
+  }
+
+  // 真正的目录刷新执行器：手动「更新目录」与「自动刷新」共用。
+  async function refreshToc(targets) {
+    if (!targets.length || tocBusy) return;
     tocBusy = true;
     tocResult = null;
     tocError = '';
@@ -426,9 +432,32 @@
     loadGroups();
   }
 
-  onMount(() => {
-    load();
+  // 自动刷新（对应设置页 auto_refresh；Legado 语义是“打开软件时自动更新书籍”）：
+  // 打开书架即在本机检查一次，24 小时内最多触发一次，只刷新未停更的书。
+  const AUTO_REFRESH_KEY = 'oread_autorefresh_last';
+  const AUTO_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+  async function maybeAutoRefresh() {
+    if (tocBusy) return;
+    try {
+      const s = await api.settings();
+      if (!s || !s.auto_refresh) return;
+      const last = Number(localStorage.getItem(AUTO_REFRESH_KEY) || 0);
+      if (last > 0 && Date.now() - last < AUTO_REFRESH_INTERVAL_MS) return;
+      const targets = books.filter((b) => b.enable_update !== false);
+      if (!targets.length) return;
+      // 先落时间戳，避免多标签页同时打开书架时重复刷新
+      localStorage.setItem(AUTO_REFRESH_KEY, String(Date.now()));
+      await refreshToc(targets);
+    } catch (e) {
+      // 自动刷新属于后台行为，失败不打断书架浏览
+    }
+  }
+
+  onMount(async () => {
+    await load();
     loadGroups();
+    maybeAutoRefresh();
   });
 </script>
 

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use url::Url;
 use serde_json::Value;
@@ -420,12 +421,13 @@ pub async fn search_book(
         None => return Ok(vec![]),
     };
     let (url, method, headers, body) = build_search_request(source, key, page);
-    let html = req::fetch_for_source(
+    let html = req::fetch_for_source_timed(
         &url,
         &method,
         &headers,
         body.as_deref(),
         &source.book_source_url,
+        req::source_timeout(source),
     )
     .await?;
     let ar = make_ar(source);
@@ -474,7 +476,15 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
         None => return Ok(vec![]),
     };
     let headers = req::source_headers(source, &source.book_source_url);
-    let html = req::fetch_for_source(url, "GET", &headers, None, &source.book_source_url).await?;
+    let html = req::fetch_for_source_timed(
+        url,
+        "GET",
+        &headers,
+        None,
+        &source.book_source_url,
+        req::source_timeout(source),
+    )
+    .await?;
     let ar = make_ar(source);
     let items = ar.get_string_list(&html, rule.book_list.as_deref().unwrap_or(""))?;
     let mut books = Vec::new();
@@ -524,7 +534,15 @@ pub async fn book_info_book(
     }
     let url = book.book_url.clone();
     let headers = req::source_headers(source, &url);
-    let html = req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
+    let html = req::fetch_for_source_timed(
+        &url,
+        "GET",
+        &headers,
+        None,
+        &source.book_source_url,
+        req::source_timeout(source),
+    )
+    .await?;
     parse_book_info_html(source, book, &html, store)
 }
 
@@ -662,8 +680,15 @@ pub async fn chapter_list_book(
         seen.insert(url.clone());
         // 让规则里的 `${page}` / `{{page}}` 拿到当前页号
         ar.set_var("page", page.to_string());
-        let html =
-            req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
+        let html = req::fetch_for_source_timed(
+            &url,
+            "GET",
+            &headers,
+            None,
+            &source.book_source_url,
+            req::source_timeout(source),
+        )
+        .await?;
         let rule_text = rule.chapter_list.as_deref().unwrap_or("");
         // Legado 目录规则前缀 `-` 表示倒序（如 `-class.list@tag.li`）；直接当选择器会抓空。
         let (list_rule, reverse) = match rule_text.trim().strip_prefix('-') {
@@ -739,8 +764,15 @@ async fn fetch_html_pages(
         }
         guard += 1;
         seen.insert(url.clone());
-        let html =
-            req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
+        let html = req::fetch_for_source_timed(
+            &url,
+            "GET",
+            &headers,
+            None,
+            &source.book_source_url,
+            req::source_timeout(source),
+        )
+        .await?;
         let ar = make_ar(source);
         let next =
             ar.get_string(&html, rule.next_content_url.as_deref().unwrap_or(""), true, &url)?;
@@ -2220,5 +2252,97 @@ mod tests {
         let out = dedupe_and_sort(many, &sources, "百年孤独");
         assert_eq!(out.len(), 5, "strong=5 ≥ 5，partial 应被折叠");
         assert!(out.iter().all(|b| b.relevance.as_deref() == Some("strong")));
+    }
+
+    // ----- 单源超时：四类抓取都必须带上 timeout_millisecond -----
+
+    /// 起一个“只接受连接、故意不回包”的本地服务；请求应被源级超时提前打断。
+    async fn slow_source(timeout_ms: i64) -> (BookSource, String) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut s = BookSource::default();
+        s.book_source_url = base.clone();
+        s.timeout_millisecond = timeout_ms;
+        (s, base)
+    }
+
+    fn assert_source_timeout(err: anyhow::Error) {
+        let msg = err.to_string();
+        assert!(msg.contains("请求超时"), "应报源级超时: {msg}");
+        assert!(msg.contains("1s"), "应带源级预算: {msg}");
+    }
+
+    #[tokio::test]
+    async fn search_fetch_uses_source_timeout() {
+        let (mut s, base) = slow_source(1000).await;
+        s.search_url = Some(format!("{base}/search?kw={{{{key}}}}"));
+        s.rule_search = Some(SearchRule {
+            book_list: Some("class.list".into()),
+            ..Default::default()
+        });
+        assert_source_timeout(search(&s, "abc", 1).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn book_info_fetch_uses_source_timeout() {
+        let (source, base) = slow_source(1000).await;
+        let mut s = source;
+        s.rule_book_info = Some(BookInfoRule::default());
+        let mut book = Book {
+            book_url: format!("{base}/book"),
+            ..Default::default()
+        };
+        assert_source_timeout(book_info(&s, &mut book).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn toc_fetch_uses_source_timeout() {
+        let (source, base) = slow_source(1000).await;
+        let mut s = source;
+        s.rule_toc = Some(TocRule {
+            chapter_list: Some("class.list".into()),
+            ..Default::default()
+        });
+        let book = Book {
+            book_url: format!("{base}/book"),
+            toc_url: Some(format!("{base}/toc")),
+            ..Default::default()
+        };
+        assert_source_timeout(chapter_list(&s, &book).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn content_fetch_uses_source_timeout() {
+        let (source, base) = slow_source(1000).await;
+        let mut s = source;
+        s.rule_content = Some(ContentRule {
+            content: Some("class.text".into()),
+            ..Default::default()
+        });
+        let chapter = BookChapter {
+            url: format!("{base}/ch1"),
+            book_url: Some(format!("{base}/book")),
+            ..Default::default()
+        };
+        assert_source_timeout(chapter_content(&s, &chapter).await.unwrap_err());
     }
 }
