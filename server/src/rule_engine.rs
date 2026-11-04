@@ -92,9 +92,8 @@ fn js_sender() -> &'static SyncSender<JsJob> {
     })
 }
 
-/// 专用线程主循环：只创建一次 Context，之后复用处理所有任务。
-fn js_worker(rx: Receiver<JsJob>) {
-    let conf = js_conf();
+/// 创建 JS 执行上下文（含预算配置与 `java.ajax` 网络桥）。
+fn new_js_context(conf: JsConf) -> boa_engine::Context {
     let mut ctx = boa_engine::Context::default();
     {
         let l = ctx.runtime_limits_mut();
@@ -110,23 +109,53 @@ fn js_worker(rx: Receiver<JsJob>) {
         0,
         boa_engine::NativeFunction::from_fn_ptr(native_ajax),
     );
+    ctx
+}
+
+/// 专用线程主循环：复用 Context 处理任务；**仅在 RuntimeLimit 失败后重建**。
+///
+/// boa 0.19 的 runtime-limit 错误是不可被 JS `catch` 的，且其栈解绑逻辑在顶层
+/// （`exit_early`）帧上会提前 break，`vm.stack` 可能停在溢出时的长度不回收。
+/// 而后续每次求值都会先用 `vm.stack.len()` 做上限检查，于是“一次深递归”会让
+/// 这个单一 Context 之后**所有** JS 规则都报同一个 RuntimeLimit，直到重启进程。
+/// 因此出错（仅此类错误）后重建 Context，保证坏脚本不污染后续规则；正常路径
+/// 不创建任何新对象，成本与改动前一致。
+fn js_worker(rx: Receiver<JsJob>) {
+    let conf = js_conf();
+    let mut ctx = new_js_context(conf);
     while let Ok(job) = rx.recv() {
         JS_AJAX_NET_MS.store(0, Ordering::Relaxed);
         let started = Instant::now();
+        let mut poisoned = false;
         let res = ctx
             .eval(boa_engine::Source::from_bytes(job.script.as_bytes()))
             // `{e:?}` 对 opaque Error 只会打印 ErrorObject 地址，书源作者看不懂。
             // 用 Display 取出 message；垫片抛出的未支持 API 显式给出特性名。
-            .map_err(|e| js_error_message(&e.to_string()))
+            .map_err(|e| {
+                poisoned = e
+                    .as_native()
+                    .map(|n| n.is_runtime_limit())
+                    .unwrap_or(false);
+                js_error_message(&e.to_string())
+            })
             .and_then(|v| {
-                v.to_string(&mut ctx)
-                    .map_err(|e| format!("js to_string: {e}"))
+                let mut to_string_failed = false;
+                let out = v.to_string(&mut ctx).map_err(|e| {
+                    to_string_failed = true;
+                    format!("js to_string: {e}")
+                });
+                // to_string 失败同样说明 Context 状态不可信
+                poisoned |= to_string_failed;
+                out
             })
             .map(|s| s.to_std_string().unwrap_or_default());
         let net_ms = JS_AJAX_NET_MS.load(Ordering::Relaxed);
         // 只统计真正花在这条规则上的时间；排队等 Context 的时间不计入预算。
         let js_ms = (started.elapsed().as_millis() as u64).saturating_sub(net_ms);
         let _ = job.reply.send((res, net_ms, js_ms));
+        if poisoned {
+            ctx = new_js_context(conf);
+        }
     }
 }
 
@@ -3719,6 +3748,35 @@ nodes.filter(function (node) {
             .get_string("", "@js: JSON.stringify([{title:'a',url:'u'}])", false, "")
             .unwrap();
         assert!(out.starts_with('['), "unexpected js result: {out}");
+    }
+
+    #[test]
+    fn js_runtime_limit_does_not_poison_following_rules() {
+        // 单例 Context 复用会让「出错脚本留下的全局状态」污染后续规则；
+        // 修复方式是 RuntimeLimit 后重建 Context。这里用全局变量探针固住：
+        // 出错脚本先写 `globalThis.__P=1` 再栈溢出，随后必须读不到这个变量。
+        let ar = AnalyzeRule::new();
+        let bad = "@js:(globalThis.__P=1,(function f(){return f();})())";
+        let err = ar.get_string("", bad, false, "").unwrap_err();
+        assert!(
+            err.to_string().contains("RuntimeLimit"),
+            "expected RuntimeLimit, got: {err}"
+        );
+        // 旧实现会返回 \"number\"（Context 被复用），修复后必须是 \"undefined\"
+        assert_eq!(
+            ar.get_string("", "@js:typeof __P", false, "").unwrap(),
+            "undefined"
+        );
+        assert_eq!(ar.get_string("", "@js:1+1", false, "").unwrap(), "2");
+        // 连续 3 轮：每次都从污染中恢复，不累积
+        for round in 0..3 {
+            let _ = ar.get_string("", bad, false, "");
+            assert_eq!(
+                ar.get_string("", "@js:1+1", false, "").unwrap(),
+                "2",
+                "round {round}: js context still poisoned"
+            );
+        }
     }
 
     #[test]
