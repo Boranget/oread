@@ -2453,7 +2453,7 @@ async fn load_book_scope(
 }
 
 /// 把编排层收集到的增量落库（UPSERT 语义；失败只记日志，不影响主结果）。
-async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_book::BookChange>) {
+pub(crate) async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_book::BookChange>) {
     let now = source_health::now_ms();
     for ch in changes {
         if let Some(vars) = ch.vars {
@@ -2527,7 +2527,7 @@ async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_book::BookChan
 }
 
 /// 构造并预载一本书的作用域容器。
-async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::BookStore {
+pub(crate) async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::BookStore {
     let (vars, cache) = load_book_scope(pool, key).await;
     let store = web_book::BookStore::new();
     store.seed(key.to_string(), vars, cache);

@@ -9,6 +9,7 @@ pub mod health;
 pub mod kindle;
 pub mod image;
 pub mod comic;
+pub mod import_url;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -68,6 +69,7 @@ pub fn build_router(shared: SqlitePool, cfg: Config) -> Router {
         .merge(stats::routes())
         .merge(kindle::routes())
         .merge(comic::routes())
+        .merge(import_url::routes())
         .merge(image::routes());
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),

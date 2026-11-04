@@ -10,6 +10,11 @@
   let notice = '';
   let searched = false;
 
+  // 按链接打开（无需搜索）：选择书源 + 粘贴详情页 URL
+  let importSourceId = '';
+  let importUrl = '';
+  let importing = false;
+
   // 两段式搜索：start 建 job → 轮询 result；拿到 books 先渲染，不等 done
   let jobId = '';
   let jobSeq = 0; // 递增序号：换词/换页/切模式时让旧响应失效
@@ -112,6 +117,7 @@
       sourcesReady = true;
       if (sources.length) {
         selectedSource = sources[0].book_source_url;
+        if (!importSourceId) importSourceId = sources[0].book_source_url;
         await loadCategories();
       }
     } catch (e) {
@@ -683,6 +689,37 @@
       error = '加入书架失败：' + e.message;
     }
   }
+
+  // 按链接打开：后端抓详情页并用书源规则解析，落库后直接进阅读页
+  async function doImport() {
+    const url = importUrl.trim();
+    if (!importSourceId || !url) {
+      error = '请选择书源并粘贴书籍详情页链接';
+      return;
+    }
+    importing = true;
+    error = '';
+    notice = '';
+    try {
+      const r = await api.importByUrl(importSourceId, url);
+      shelfIds = new Set([...shelfIds, r.book_url]);
+      notice = r.created ? `已导入《${r.name}》，正在打开…` : `已打开已有书籍《${r.name}》`;
+      importUrl = '';
+      dispatch('open', {
+        bookUrl: r.book_url,
+        sourceId: r.source_id,
+        name: r.name,
+        author: r.author,
+        coverUrl: r.cover_url,
+        intro: r.intro,
+        bookType: r.book_type,
+      });
+    } catch (e) {
+      error = '按链接打开失败：' + e.message;
+    } finally {
+      importing = false;
+    }
+  }
 </script>
 
 <div class="seg" role="tablist">
@@ -772,6 +809,22 @@
           : `已选 ${pickedSourceIds.length} 个源`}
       {#if sourceScope === 'custom' && !pickedSourceIds.length}&nbsp;· 至少选 1 个才能搜索{/if}
     </p>
+  </div>
+
+  <div class="row" style="margin-top:10px">
+    <select bind:value={importSourceId} style="flex:0 0 34%;min-width:0" aria-label="按链接打开的书源">
+      {#each sources as s (s.book_source_url)}
+        <option value={s.book_source_url}>{s.book_source_name}{s.enabled ? '' : '（已禁用）'}</option>
+      {/each}
+    </select>
+    <input
+      placeholder="粘贴书籍详情页链接（需与书源同域名）"
+      bind:value={importUrl}
+      on:keydown={(e) => e.key === 'Enter' && doImport()}
+    />
+    <button on:click={doImport} disabled={importing || !importSourceId || !importUrl.trim()}>
+      {importing ? '导入中…' : '按链接打开'}
+    </button>
   </div>
 {:else}
   <div class="row">

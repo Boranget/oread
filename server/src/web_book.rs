@@ -518,19 +518,35 @@ pub async fn book_info_book(
     book: &mut Book,
     store: Option<&BookStore>,
 ) -> anyhow::Result<()> {
+    // 无详情规则时不抓页面（与原行为一致，避免额外请求）
+    if source.rule_book_info.is_none() {
+        return Ok(());
+    }
+    let url = book.book_url.clone();
+    let headers = req::source_headers(source, &url);
+    let html = req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
+    parse_book_info_html(source, book, &html, store)
+}
+
+/// 对已抓取的详情页 HTML 应用详情规则（不发请求）。
+/// 「按链接导入」复用它，避免为了兜底再抓一次同一页面。
+pub fn parse_book_info_html(
+    source: &BookSource,
+    book: &mut Book,
+    html: &str,
+    store: Option<&BookStore>,
+) -> anyhow::Result<()> {
     let rule: &BookInfoRule = match &source.rule_book_info {
         Some(r) => r,
         None => return Ok(()),
     };
     let url = book.book_url.clone();
-    let headers = req::source_headers(source, &url);
-    let html = req::fetch_for_source(&url, "GET", &headers, None, &source.book_source_url).await?;
     let ar = make_ar_book(source, store, &url);
     // `init` 的返回值在 Legado 里就是后续详情规则的输入内容（快看用它把
     // `__NUXT__` JSON 设为当前文档，name 等规则再在 JSON 上求值）。
-    let mut content = html.clone();
+    let mut content = html.to_string();
     if let Some(init) = &rule.init {
-        if let Ok(init_out) = ar.get_string(&html, init, false, &url) {
+        if let Ok(init_out) = ar.get_string(html, init, false, &url) {
             let t = init_out.trim();
             if !t.is_empty() && t != "null" && t != "undefined" {
                 content = init_out;
