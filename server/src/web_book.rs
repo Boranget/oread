@@ -964,7 +964,12 @@ pub async fn search_all_with_errors_budgeted(
         let comic = crate::req::is_comic_source_type(src.book_source_type);
         let fut = async move {
             // 先排队拿源级并发槽（不计入单源预算），再开始计时。
-            let _slot = crate::req::acquire_search_slot(comic, deadline).await?;
+            let _slot = crate::req::acquire_search_slot(
+                comic,
+                deadline,
+                crate::req::SearchScope::Curated,
+            )
+            .await?;
             let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remain.is_zero() {
                 anyhow::bail!("全局搜索预算耗尽（排队未及执行）");

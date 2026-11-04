@@ -48,24 +48,74 @@ struct HttpConf {
     concurrency: usize,
     timeout_secs: u64,
     search_timeout_secs: u64,
+    /// 整批搜索总预算的显式覆盖值；`None` 时按 scope 取默认。
+    search_total_budget_secs: Option<u64>,
     max_body_bytes: usize,
 }
 
 const DEFAULT_CONF: HttpConf = HttpConf {
     concurrency: 8,
     timeout_secs: 15,
-    search_timeout_secs: 10,
+    search_timeout_secs: 6,
+    search_total_budget_secs: None,
     max_body_bytes: 5 * 1024 * 1024,
 };
+
+/// 搜索范围：决定参与源集合与总预算。
+///
+/// - `Curated`（默认）：只跑优选源。curated 集合尚未落地时退化为“只取 preferred”，
+///   总预算 8s，保证默认路径不等 25s。
+/// - `All`（显式“加强搜索”）：全量源，总预算 25s，源级并发固定 16 槽。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScope {
+    Curated,
+    All,
+}
+
+impl SearchScope {
+    /// 宽松解析：缺省/未知值一律按 `curated`（默认路径不能变慢）。
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("all" | "enhanced" | "full") => Self::All,
+            _ => Self::Curated,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Curated => "curated",
+            Self::All => "all",
+        }
+    }
+
+    /// 整批总预算默认值（秒）。
+    pub fn default_total_budget_secs(self) -> u64 {
+        match self {
+            Self::Curated => 8,
+            Self::All => 25,
+        }
+    }
+
+    /// 源级并发槽数：curated 沿用配置（默认 8，夹 1..16）；all 固定 16。
+    pub fn source_slots(self, configured: usize) -> usize {
+        match self {
+            Self::Curated => configured.clamp(1, 16),
+            Self::All => 16,
+        }
+    }
+}
 
 static CONF: OnceCell<HttpConf> = OnceCell::new();
 static CLIENT: OnceCell<Client> = OnceCell::new();
 static SEM: OnceCell<Arc<Semaphore>> = OnceCell::new();
 /// 聚合搜索的“源级并发槽”：拿到槽之后才开始计单源预算，
-/// 排队时间不再吃掉 10s，避免几百个源里排后面的源全部报超时。
+/// 排队时间不再吃掉单源预算，避免几百个源里排后面的源全部报超时。
 static SEARCH_NOVEL: OnceCell<Arc<Semaphore>> = OnceCell::new();
+/// `scope=all` 的源级槽：设备实测 16 并发可行（4 核、VmHWM < 71 MB）。
+static SEARCH_NOVEL_ALL: OnceCell<Arc<Semaphore>> = OnceCell::new();
 /// 漫画源专用小池（数量少、单源耗时长），保证不被小说源排队饿死。
 static SEARCH_COMIC: OnceCell<Arc<Semaphore>> = OnceCell::new();
+static SEARCH_COMIC_ALL: OnceCell<Arc<Semaphore>> = OnceCell::new();
 
 /// 由 main 在启动时调用一次；未初始化时使用默认预算（单测/工具函数场景）。
 pub fn init(cfg: &Config) {
@@ -73,8 +123,25 @@ pub fn init(cfg: &Config) {
         concurrency: cfg.http_concurrency,
         timeout_secs: cfg.http_timeout_secs,
         search_timeout_secs: cfg.search_timeout_secs,
+        search_total_budget_secs: cfg.search_total_budget_secs,
         max_body_bytes: cfg.http_max_body_bytes,
     });
+    let per_source = cfg.search_timeout_secs;
+    let curated = cfg
+        .search_total_budget_secs
+        .unwrap_or(SearchScope::Curated.default_total_budget_secs());
+    let all = cfg
+        .search_total_budget_secs
+        .unwrap_or(SearchScope::All.default_total_budget_secs());
+    // 启动日志：两个生效值必须一眼可见，避免又回到“两者同值”的隐式 bug。
+    tracing::info!(
+        target: "search_budget",
+        per_source_secs = per_source,
+        total_curated_secs = curated,
+        total_all_secs = all,
+        source_slots = cfg.http_concurrency,
+        "search budgets resolved"
+    );
 }
 
 fn conf() -> HttpConf {
@@ -86,10 +153,13 @@ pub fn search_budget() -> Duration {
     Duration::from_secs(conf().search_timeout_secs)
 }
 
-/// 一次聚合搜索的全局时长上限（含排队）：与单源预算同值，
-/// 保证排队不计入单源预算的同时，整次搜索总耗时不会比以前更差。
-pub fn search_total_budget() -> Duration {
-    search_budget()
+/// 一次聚合搜索的整批时长上限（含排队）。与单源预算独立：
+/// 显式覆盖优先，否则按 scope 取默认（curated 8s / all 25s）。
+pub fn search_total_budget(scope: SearchScope) -> Duration {
+    let secs = conf()
+        .search_total_budget_secs
+        .unwrap_or(scope.default_total_budget_secs());
+    Duration::from_secs(secs)
 }
 
 /// 漫画源（type=2）判定；聚合搜索按此分配独立并发池。
@@ -101,27 +171,44 @@ fn novel_search_slots() -> &'static Arc<Semaphore> {
     SEARCH_NOVEL.get_or_init(|| Arc::new(Semaphore::new(conf().concurrency)))
 }
 
-/// 漫画槽数量：并发的 1/4（至少 1 个）。默认 8 → 2 个。
-fn comic_slot_count() -> usize {
-    (conf().concurrency / 4).max(1)
+fn novel_search_slots_all() -> &'static Arc<Semaphore> {
+    SEARCH_NOVEL_ALL.get_or_init(|| {
+        Arc::new(Semaphore::new(SearchScope::All.source_slots(conf().concurrency)))
+    })
+}
+
+/// 漫画槽数量：并发的 1/4（至少 1 个）。默认 8 → 2 个；all 16 槽 → 4 个。
+fn comic_slot_count(slots: usize) -> usize {
+    (slots / 4).max(1)
 }
 
 fn comic_search_slots() -> &'static Arc<Semaphore> {
-    SEARCH_COMIC.get_or_init(|| Arc::new(Semaphore::new(comic_slot_count())))
+    SEARCH_COMIC.get_or_init(|| Arc::new(Semaphore::new(comic_slot_count(conf().concurrency))))
+}
+
+fn comic_search_slots_all() -> &'static Arc<Semaphore> {
+    SEARCH_COMIC_ALL.get_or_init(|| {
+        Arc::new(Semaphore::new(comic_slot_count(
+            SearchScope::All.source_slots(conf().concurrency),
+        )))
+    })
 }
 
 /// 在全局 deadline 之前拿一个“源级”搜索槽：
 /// - 漫画源走独立小池，不排在小说源后面；
 /// - 排队时间不计入单源请求预算；
 /// - 到 deadline 仍未拿到 → 明确报“全局搜索预算耗尽”，不伪装成源超时。
+/// - `scope=all`（加强搜索）使用 16 槽的独立池，不影响默认路径的 8 槽。
 pub async fn acquire_search_slot(
     comic: bool,
     deadline: tokio::time::Instant,
+    scope: SearchScope,
 ) -> anyhow::Result<tokio::sync::SemaphorePermit<'static>> {
-    let sem = if comic {
-        comic_search_slots()
-    } else {
-        novel_search_slots()
+    let sem = match (scope, comic) {
+        (SearchScope::Curated, true) => comic_search_slots(),
+        (SearchScope::Curated, false) => novel_search_slots(),
+        (SearchScope::All, true) => comic_search_slots_all(),
+        (SearchScope::All, false) => novel_search_slots_all(),
     };
     match tokio::time::timeout_at(deadline, sem.acquire()).await {
         Ok(Ok(p)) => Ok(p),
@@ -1400,5 +1487,44 @@ mod tests {
             Some("https://header.example/")
         );
         assert_eq!(h.get("X-Token").map(String::as_str), Some("t1"));
+    }
+
+    // scope 解析：缺省/未知一律 curated（默认路径不能变慢）
+    #[test]
+    fn scope_parse_defaults_to_curated() {
+        assert_eq!(SearchScope::parse(None), SearchScope::Curated);
+        assert_eq!(SearchScope::parse(Some("")), SearchScope::Curated);
+        assert_eq!(SearchScope::parse(Some("curated")), SearchScope::Curated);
+        assert_eq!(SearchScope::parse(Some("unknown")), SearchScope::Curated);
+        assert_eq!(SearchScope::parse(Some(" all ")), SearchScope::All);
+        assert_eq!(SearchScope::parse(Some("ENHANCED")), SearchScope::All);
+    }
+
+    // 两个预算独立：单源默认 6s；整批默认 curated 8s / all 25s
+    #[test]
+    fn total_budget_defaults_follow_scope_not_per_source() {
+        assert_eq!(search_budget(), Duration::from_secs(6), "单源默认 6s");
+        assert_eq!(
+            search_total_budget(SearchScope::Curated),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            search_total_budget(SearchScope::All),
+            Duration::from_secs(25)
+        );
+        assert_ne!(
+            search_total_budget(SearchScope::All),
+            search_budget(),
+            "整批不能等于单源（拆分前正是这个 bug）"
+        );
+    }
+
+    // 并发槽：curated 沿用配置并夹在 1..16；all 固定 16
+    #[test]
+    fn scope_source_slots_are_capped_at_16() {
+        assert_eq!(SearchScope::Curated.source_slots(8), 8);
+        assert_eq!(SearchScope::Curated.source_slots(16), 16, "16 应允许");
+        assert_eq!(SearchScope::Curated.source_slots(17), 16, "17 应夹到 16");
+        assert_eq!(SearchScope::All.source_slots(8), 16, "all 固定 16 槽");
     }
 }
