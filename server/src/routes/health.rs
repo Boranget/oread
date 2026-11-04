@@ -124,6 +124,13 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
             "all_source_slots": state.cfg.search_all_slots,
             "comic_slots": (state.cfg.http_concurrency / 4).max(1),
             "comic_slots_all": (state.cfg.search_all_slots / 4).max(1),
+            // 每源在飞上限：书源未声明 concurrentRate 时的默认值，1–8。
+            "source_concurrency_default": state.cfg.source_concurrency_default,
+            "source_concurrency_min": crate::config::SOURCE_CONCURRENCY_MIN,
+            "source_concurrency_max": crate::config::SOURCE_CONCURRENCY_MAX,
+            // 按源限流导致的等待次数 / 累计等待毫秒（进程生命周期内累计）。
+            "source_limit_waits": crate::req::source_limit_metrics().0,
+            "source_limit_wait_ms": crate::req::source_limit_metrics().1,
         },
         // 图片代理进程内 LRU（与正文缓存分开，但同属缓存预算）
         "image_cache": {

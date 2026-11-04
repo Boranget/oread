@@ -1527,7 +1527,14 @@ async fn handle_slice(
     let (budget, src_timeout) = image_budget(source);
     let opened = match tokio::time::timeout(
         budget,
-        req::open_stream_timed(&q.url, &hdrs, false, src_timeout),
+        req::open_stream_for_source_timed(
+            &q.url,
+            &hdrs,
+            false,
+            src_timeout,
+            Some(&source.book_source_url),
+            req::source_concurrency(source),
+        ),
     )
     .await
     {
@@ -1678,6 +1685,8 @@ pub(crate) async fn fetch_image_meta(
     hdrs: HashMap<String, String>,
     max_bytes: usize,
     timeout: Option<Duration>,
+    source_key: Option<&str>,
+    source_limit: usize,
 ) -> serde_json::Value {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
@@ -1693,14 +1702,16 @@ pub(crate) async fn fetch_image_meta(
         return err_item(&url, code, &m);
     }
     let budget = timeout.unwrap_or(IMAGE_TIMEOUT);
-    let opened =
-        match tokio::time::timeout(budget, req::open_stream_timed(&url, &hdrs, false, timeout))
-            .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return err_item(&url, "upstream_error", &e.to_string()),
-            Err(_) => return err_item(&url, "upstream_timeout", "图片回源超时"),
-        };
+    let opened = match tokio::time::timeout(
+        budget,
+        req::open_stream_for_source_timed(&url, &hdrs, false, timeout, source_key, source_limit),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return err_item(&url, "upstream_error", &e.to_string()),
+        Err(_) => return err_item(&url, "upstream_timeout", "图片回源超时"),
+    };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -1817,11 +1828,17 @@ async fn images_meta(
     let hdrs = source_referer(&source, req.chapter_url.as_deref(), req.book_url.as_deref());
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
     let timeout = req::source_timeout(&source);
-    let items: Vec<serde_json::Value> = futures::stream::iter(
-        req.urls
-            .into_iter()
-            .map(|u| fetch_image_meta(u, hdrs.clone(), max_bytes, timeout)),
-    )
+    let source_limit = req::source_concurrency(&source);
+    let items: Vec<serde_json::Value> = futures::stream::iter(req.urls.into_iter().map(|u| {
+        fetch_image_meta(
+            u,
+            hdrs.clone(),
+            max_bytes,
+            timeout,
+            Some(&source.book_source_url),
+            source_limit,
+        )
+    }))
     .buffer_unordered(4)
     .collect()
     .await;
@@ -1890,11 +1907,14 @@ pub(crate) async fn probe_dims(
     }
     let hdrs = source_referer(source, chapter_url, book_url);
     let timeout = req::source_timeout(source);
+    let source_limit = req::source_concurrency(source);
+    let source_key = source.book_source_url.clone();
     let fetched: Vec<(usize, Option<(u32, u32)>)> = futures::stream::iter(missing)
         .map(|(i, u)| {
             let h = hdrs.clone();
+            let sk = source_key.clone();
             async move {
-                let v = fetch_image_meta(u, h, max_bytes, timeout).await;
+                let v = fetch_image_meta(u, h, max_bytes, timeout, Some(&sk), source_limit).await;
                 let d = v
                     .get("width")
                     .and_then(|x| x.as_u64())
@@ -2042,7 +2062,14 @@ async fn proxy(
     let (budget, src_timeout) = image_budget(&source);
     let opened = match tokio::time::timeout(
         budget,
-        req::open_stream_timed(&q.url, &hdrs, false, src_timeout),
+        req::open_stream_for_source_timed(
+            &q.url,
+            &hdrs,
+            false,
+            src_timeout,
+            Some(&source.book_source_url),
+            req::source_concurrency(&source),
+        ),
     )
     .await
     {

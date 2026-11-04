@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +23,9 @@ use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use tokio::sync::Semaphore;
 
-use crate::config::Config;
+use crate::config::{
+    Config, SOURCE_CONCURRENCY_DEFAULT, SOURCE_CONCURRENCY_MAX, SOURCE_CONCURRENCY_MIN,
+};
 use crate::entities::BookSource;
 
 /// 预览抓取最多跟随的跳数（每跳都重新做一次私网校验）
@@ -57,6 +60,8 @@ struct HttpConf {
     /// 整批搜索总预算：curated / all 两档。
     search_curated_budget_secs: u64,
     search_all_budget_secs: u64,
+    /// 书源未声明 `concurrentRate` 时的每源在飞上限。
+    source_concurrency_default: usize,
     max_body_bytes: usize,
 }
 
@@ -67,6 +72,7 @@ const DEFAULT_CONF: HttpConf = HttpConf {
     search_timeout_secs: 8,
     search_curated_budget_secs: 6,
     search_all_budget_secs: 10,
+    source_concurrency_default: SOURCE_CONCURRENCY_DEFAULT,
     max_body_bytes: 5 * 1024 * 1024,
 };
 
@@ -129,6 +135,7 @@ pub fn init(cfg: &Config) {
         search_timeout_secs: cfg.search_timeout_secs,
         search_curated_budget_secs: cfg.search_curated_budget_secs,
         search_all_budget_secs: cfg.search_all_budget_secs,
+        source_concurrency_default: cfg.source_concurrency_default,
         max_body_bytes: cfg.http_max_body_bytes,
     });
     let per_source = cfg.search_timeout_secs;
@@ -142,6 +149,7 @@ pub fn init(cfg: &Config) {
         total_all_secs = all,
         source_slots = cfg.http_concurrency,
         all_source_slots = cfg.search_all_slots,
+        source_concurrency_default = cfg.source_concurrency_default,
         "search budgets resolved"
     );
 }
@@ -186,6 +194,87 @@ pub fn parse_source_timeout_ms(raw: i64) -> Option<Duration> {
 /// 书源实体的单源超时；未设置时返回 `None`，由请求层回退全局默认。
 pub fn source_timeout(source: &BookSource) -> Option<Duration> {
     parse_source_timeout_ms(source.timeout_millisecond)
+}
+
+/// 解析 Legado 兼容的 `concurrentRate`：只取整数部分（`"3/1"` → 3、`"2.5"` → 2），
+/// 缺省/非法/0 → `default`；有效值夹取到 1–8。
+///
+/// Legado 的完整语义是「次数/间隔」，我们只借用其中的「同时在飞次数」上限：
+/// 间隔用不上（搜索/阅读的请求节奏由调度与预算控制）。
+pub fn parse_source_concurrency(raw: Option<&str>, default: usize) -> usize {
+    let digits: String = match raw {
+        Some(v) => v
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect(),
+        None => String::new(),
+    };
+    match digits.parse::<usize>() {
+        Ok(0) | Err(_) => default,
+        Ok(n) => n.clamp(SOURCE_CONCURRENCY_MIN, SOURCE_CONCURRENCY_MAX),
+    }
+}
+
+/// 书源的每源在飞上限：`concurrentRate` 的整数部分，未声明时用全局默认。
+pub fn source_concurrency(source: &BookSource) -> usize {
+    parse_source_concurrency(
+        source.concurrent_rate.as_deref(),
+        conf().source_concurrency_default,
+    )
+}
+
+/// 每源在飞信号量：键是 `bookSourceUrl`，值带上限（源规则改动后自动重建）。
+type SourceSlots = HashMap<String, (usize, Arc<Semaphore>)>;
+static SOURCE_SLOTS: Lazy<Mutex<SourceSlots>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// 按源限流导致的等待次数 / 累计等待毫秒（`/healthz` 暴露）。
+static SOURCE_LIMIT_WAITS: AtomicU64 = AtomicU64::new(0);
+static SOURCE_LIMIT_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn source_semaphore(source_key: &str, limit: usize) -> Arc<Semaphore> {
+    let mut map = SOURCE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(source_key) {
+        Some((l, sem)) if *l == limit => sem.clone(),
+        _ => {
+            let sem = Arc::new(Semaphore::new(limit));
+            map.insert(source_key.to_string(), (limit, sem.clone()));
+            sem
+        }
+    }
+}
+
+/// 拿一个「同一书源」的在飞许可；超限时排队并计数。
+/// 先拿按源许可再拿全局许可，保证某个源的排队不会占住全局 16 槽（其他源照常推进）。
+async fn acquire_source_slot(
+    source_key: &str,
+    limit: usize,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    let limit = limit.clamp(SOURCE_CONCURRENCY_MIN, SOURCE_CONCURRENCY_MAX);
+    let sem = source_semaphore(source_key, limit);
+    if let Ok(p) = sem.clone().try_acquire_owned() {
+        return Ok(p);
+    }
+    SOURCE_LIMIT_WAITS.fetch_add(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let p = sem
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("source semaphore closed"))?;
+    SOURCE_LIMIT_WAIT_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    Ok(p)
+}
+
+/// `(等待次数, 累计等待毫秒)`：按源限流指标，供 `/healthz` 与排障使用。
+pub fn source_limit_metrics() -> (u64, u64) {
+    (
+        SOURCE_LIMIT_WAITS.load(Ordering::Relaxed),
+        SOURCE_LIMIT_WAIT_MS.load(Ordering::Relaxed),
+    )
+}
+
+/// 全局默认的每源上限（供未持有 `BookSource` 的调用点使用）。
+pub fn source_concurrency_default() -> usize {
+    conf().source_concurrency_default
 }
 
 /// 漫画源（type=2）判定；聚合搜索按此分配独立并发池。
@@ -822,7 +911,13 @@ async fn fetch_text(
     allow_private: bool,
     validate_private: bool,
     timeout: Option<Duration>,
+    source_limit: usize,
 ) -> anyhow::Result<String> {
+    // 先按源限流，再抢全局 16 槽：某个源的排队不会把全局槽占死。
+    let _source_permit = match source_key {
+        Some(k) => Some(acquire_source_slot(k, source_limit).await?),
+        None => None,
+    };
     let _permit = acquire_permit().await?;
     let scope = cookie_scope(url, source_key);
     let max_redirects = if validate_private {
@@ -875,7 +970,7 @@ pub async fn fetch(
     headers: &HashMap<String, String>,
     body: Option<&str>,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, None, false, false, None).await
+    fetch_text(url, method, headers, body, None, false, false, None, 0).await
 }
 
 /// 按书源发起请求：Cookie 按 `bookSourceUrl` 分桶，其余与 `fetch` 一致。
@@ -908,6 +1003,31 @@ pub async fn fetch_for_source_timed(
         false,
         false,
         timeout,
+        source_concurrency_default(),
+    )
+    .await
+}
+
+/// 与 [`fetch_for_source_timed`] 相同，但调用方已知书源的在飞上限（`concurrentRate`）。
+pub async fn fetch_for_source_limited(
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body: Option<&str>,
+    source_key: &str,
+    timeout: Option<Duration>,
+    source_limit: usize,
+) -> anyhow::Result<String> {
+    fetch_text(
+        url,
+        method,
+        headers,
+        body,
+        Some(source_key),
+        false,
+        false,
+        timeout,
+        source_limit,
     )
     .await
 }
@@ -938,6 +1058,19 @@ pub async fn fetch_page_for_source_timed(
     source_key: &str,
     timeout: Option<Duration>,
 ) -> anyhow::Result<PageResponse> {
+    let source_limit = source_concurrency_default();
+    fetch_page_for_source_limited(url, headers, source_key, timeout, source_limit).await
+}
+
+/// 与 [`fetch_page_for_source_timed`] 相同，但显式指定书源的在飞上限。
+pub async fn fetch_page_for_source_limited(
+    url: &str,
+    headers: &HashMap<String, String>,
+    source_key: &str,
+    timeout: Option<Duration>,
+    source_limit: usize,
+) -> anyhow::Result<PageResponse> {
+    let _source_permit = acquire_source_slot(source_key, source_limit).await?;
     let _permit = acquire_permit().await?;
     let scope = cookie_scope(url, Some(source_key));
     let resp = execute_request(
@@ -1075,7 +1208,18 @@ pub async fn fetch_checked(
     body: Option<&str>,
     allow_private: bool,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, None, allow_private, true, None).await
+    fetch_text(
+        url,
+        method,
+        headers,
+        body,
+        None,
+        allow_private,
+        true,
+        None,
+        0,
+    )
+    .await
 }
 
 /// 流式打开的响应：调用方逐块读取，不整图进内存。
@@ -1084,6 +1228,8 @@ pub struct StreamOpen {
     // 重定向后的最终地址；当前调用方只用 response，字段保留给诊断输出。
     #[allow(dead_code)]
     pub final_url: String,
+    /// 按源在飞许可：随 `StreamOpen` 一起存活到响应体读完，避免同一源被并发打满。
+    _source_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// 带 SSRF 防护的流式 GET（图片代理用）：逐跳校验重定向，返回未读尽的上游响应。
@@ -1105,6 +1251,22 @@ pub async fn open_stream_timed(
     allow_private: bool,
     timeout: Option<Duration>,
 ) -> anyhow::Result<StreamOpen> {
+    open_stream_for_source_timed(url, headers, allow_private, timeout, None, 0).await
+}
+
+/// 与 [`open_stream_timed`] 相同，但按书源限流（图片代理等多请求场景）。
+pub async fn open_stream_for_source_timed(
+    url: &str,
+    headers: &HashMap<String, String>,
+    allow_private: bool,
+    timeout: Option<Duration>,
+    source_key: Option<&str>,
+    source_limit: usize,
+) -> anyhow::Result<StreamOpen> {
+    let source_permit = match source_key {
+        Some(k) => Some(acquire_source_slot(k, source_limit).await?),
+        None => None,
+    };
     let permit = acquire_permit().await?;
     let parsed = Url::parse(url).map_err(|e| anyhow!("URL 解析失败: {e}"))?;
     let mut current = parsed;
@@ -1145,6 +1307,7 @@ pub async fn open_stream_timed(
         return Ok(StreamOpen {
             response: resp,
             final_url: current.to_string(),
+            _source_permit: source_permit,
         });
     }
     Err(anyhow!("重定向超过 {MAX_REDIRECTS} 跳"))
@@ -1473,6 +1636,91 @@ mod tests {
         let s: BookSource = serde_json::from_value(broken).expect("非法值不应让整份书源解析失败");
         assert_eq!(s.timeout_millisecond, 0, "非法值归 0，回退全局");
         assert_eq!(source_timeout(&s), None);
+    }
+
+    // 每源在飞上限：Legado `concurrentRate` 取整数部分；缺省/0/非法回退默认；夹取 1–8
+    #[test]
+    fn concurrent_rate_parsing_clamps_and_defaults() {
+        assert_eq!(parse_source_concurrency(None, 2), 2, "无字段 → 默认");
+        assert_eq!(parse_source_concurrency(Some(""), 2), 2, "空串 → 默认");
+        assert_eq!(parse_source_concurrency(Some("0"), 2), 2, "0 → 默认");
+        assert_eq!(parse_source_concurrency(Some("abc"), 2), 2, "非法 → 默认");
+        assert_eq!(parse_source_concurrency(Some("-3"), 2), 2, "负数 → 默认");
+        assert_eq!(parse_source_concurrency(Some("1"), 2), 1);
+        assert_eq!(
+            parse_source_concurrency(Some("3/1"), 2),
+            3,
+            "取斜杠前整数部分"
+        );
+        assert_eq!(
+            parse_source_concurrency(Some(" 2.5 "), 2),
+            2,
+            "小数取整数部分"
+        );
+        assert_eq!(parse_source_concurrency(Some("9"), 2), 8, "超过 8 夹回");
+        assert_eq!(parse_source_concurrency(Some("100/200"), 2), 8);
+    }
+
+    // 字段缺失时使用全局默认 2；字段存在时按书源生效
+    #[test]
+    fn source_concurrency_reads_field_or_default() {
+        let json = r#"{"book_source_url":"https://x","book_source_name":"x"}"#;
+        let mut s: BookSource = serde_json::from_str(json).unwrap();
+        assert_eq!(source_concurrency(&s), 2, "缺省时默认值生效");
+        s.concurrent_rate = Some("4/2".into());
+        assert_eq!(source_concurrency(&s), 4);
+        s.concurrent_rate = Some("0".into());
+        assert_eq!(source_concurrency(&s), 2, "0 回退默认");
+        // 原始 Legado JSON（camelCase）也应被接受
+        let raw =
+            r#"{"book_source_url":"https://y","book_source_name":"y","concurrentRate":"3/5"}"#;
+        let s2: BookSource = serde_json::from_str(raw).unwrap();
+        assert_eq!(source_concurrency(&s2), 3, "camelCase concurrentRate 生效");
+    }
+
+    // 同源超限必须排队，释放许可后立刻放行
+    #[tokio::test]
+    async fn same_source_over_limit_queues_until_release() {
+        let key = "https://tests.oread/same-source";
+        let p1 = acquire_source_slot(key, 2).await.unwrap();
+        let _p2 = acquire_source_slot(key, 2).await.unwrap();
+        let waits_before = source_limit_metrics().0;
+        let blocked = tokio::spawn(async move { acquire_source_slot(key, 2).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!blocked.is_finished(), "第三个同源请求应排队");
+        drop(p1);
+        let p3 = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("释放许可后应放行")
+            .unwrap();
+        assert!(p3.is_ok());
+        assert!(
+            source_limit_metrics().0 > waits_before,
+            "等待次数指标应随排队增加"
+        );
+    }
+
+    // 一个源排队不应阻塞其他源（跨源独立）
+    #[tokio::test]
+    async fn cross_source_is_not_blocked() {
+        let a = "https://tests.oread/cross-a";
+        let b = "https://tests.oread/cross-b";
+        let _hold_a = acquire_source_slot(a, 1).await.unwrap();
+        let got_b = tokio::time::timeout(Duration::from_millis(200), acquire_source_slot(b, 1))
+            .await
+            .expect("其他源不应被 A 的限流阻塞");
+        assert!(got_b.is_ok());
+    }
+
+    // 上限变更后按源信号量重建（源规则被编辑时不会沿用旧上限）
+    #[tokio::test]
+    async fn source_limit_rebuilds_when_changed() {
+        let key = "https://tests.oread/rebuild";
+        let _p = acquire_source_slot(key, 1).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_millis(200), acquire_source_slot(key, 2))
+            .await
+            .expect("上限提高后应立即可用");
+        assert!(got.is_ok());
     }
 
     // 源级超时必须真的落到 HTTP 请求上，而不是只解析字段
