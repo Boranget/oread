@@ -30,6 +30,7 @@ pub const PER_SAMPLE_BUDGET_SECS: u64 = 5;
 pub const BATCH_BUDGET_SECS: u64 = 60;
 /// 体检源的并发数；真正的 HTTP 并发仍由 `req` 全局信号量（HTTP_CONCURRENCY）兜底。
 pub const BENCH_CONCURRENCY: usize = 8;
+
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
 pub const MIN_CURATED_SAMPLES: i64 = 2;
 

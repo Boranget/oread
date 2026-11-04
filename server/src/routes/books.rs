@@ -631,6 +631,17 @@ fn searchable_sources(
         .collect()
 }
 
+/// 精选集合不可用时的第一级退化：只保留 preferred 档。
+fn preferred_sources(
+    candidates: Vec<crate::entities::BookSource>,
+    health: &HashMap<String, source_health::HealthRow>,
+) -> Vec<crate::entities::BookSource> {
+    candidates
+        .into_iter()
+        .filter(|s| source_health::is_preferred(health.get(&s.book_source_url)))
+        .collect()
+}
+
 /// 按 scope 过滤候选源：
 /// - `all`：原样返回（全量源）；
 /// - `curated`：只保留体检精选集合（`source_curated` 表）；集合为空/未就绪则退回全量。
@@ -697,19 +708,35 @@ async fn search_start(
     };
     let curated_total = curated.as_ref().map(|s| s.len()).unwrap_or(0);
     let requested = parse_source_ids(q.source_ids.as_deref());
-    // 显式选源始终按“覆盖全部可搜索源”的语义：用户勾选的 observing 源不应被精选过滤掉。
-    let candidates = if requested.is_empty() {
-        filter_sources_by_scope(searchable_all.clone(), curated.as_ref(), scope)
+    // 退化链：精选集合 → preferred → 全量。显式选源始终按“覆盖全部可搜索源”的语义。
+    let mut coverage = "curated";
+    let candidates = if !requested.is_empty() {
+        coverage = "expanded";
+        searchable_all.clone()
+    } else if scope == crate::req::SearchScope::Curated {
+        match curated.as_ref() {
+            Some(set) => {
+                let filtered =
+                    filter_sources_by_scope(searchable_all.clone(), Some(set), scope);
+                if filtered.is_empty() {
+                    tracing::info!(target: "search_job", reason = "curated_no_intersection", "fallback to preferred");
+                    coverage = "expanded";
+                    preferred_sources(searchable_all.clone(), &health)
+                } else {
+                    filtered
+                }
+            }
+            None => {
+                coverage = "expanded";
+                preferred_sources(searchable_all.clone(), &health)
+            }
+        }
     } else {
+        coverage = "expanded";
         searchable_all.clone()
     };
     let (mut selected, ignored) = select_sources(&candidates, &requested);
     let mut effective = scope;
-    let mut coverage = if effective == crate::req::SearchScope::All {
-        "expanded"
-    } else {
-        "curated"
-    };
     if !requested.is_empty() {
         effective = crate::req::SearchScope::All;
         coverage = "expanded";
@@ -2703,9 +2730,15 @@ mod tests {
         let all = filter_sources_by_scope(candidates.clone(), Some(&set), SearchScope::All);
         assert_eq!(all.len(), 2, "all 保留全量源");
 
-        // 无精选集合（冷启动）：curated 退化为全量，不能返回 0 源
+        // 无精选集合（冷启动）：先按 preferred 退化，仍为空再退全量（由调用方处理）
+        let mut health = HashMap::new();
+        let mut h = source_health::HealthRow::default();
+        h.tier = crate::source_quality::TIER_PREFERRED.to_string();
+        health.insert("http://curated".to_string(), h);
+        let preferred = preferred_sources(candidates.clone(), &health);
+        assert_eq!(preferred.len(), 1, "冷启动先退 preferred");
         let fallback = filter_sources_by_scope(candidates, None, SearchScope::Curated);
-        assert_eq!(fallback.len(), 2, "无精选源时应退化为全量");
+        assert_eq!(fallback.len(), 2, "filter 本身不做 tier 退化");
     }
 
     // phase：pending>0 → first（partial=true），pending==0 → final

@@ -39,6 +39,10 @@
   let deadlineMs = 0;
   // 搜索范围回显（后端 /api/search/start 返回）
   let strengthenSearch = false; // 勾选=加强搜索（scope=all，覆盖更多源）
+  function retryWithAll() {
+    strengthenSearch = true;
+    doSearch();
+  }
   let requestedScope = 'curated'; // 本次请求携带的 scope（用户意图）
   let searchScope = 'curated'; // 后端实际使用的 scope
   let searchCoverage = 'curated'; // curated / expanded
@@ -879,7 +883,9 @@
 
 {#if mode === 'search' && searchDone && total === 0}
   {#if requestedScope === 'curated' && searchCoverage === 'curated'}
-    <p class="muted empty-hint">精选源没有结果，可勾选「加强搜索（更慢，覆盖更多源）」再试。</p>
+    <p class="muted empty-hint">
+      精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用加强搜索重试</button>，或勾选上方「加强搜索（更慢，覆盖更多源）」再试。
+    </p>
   {:else if requestedScope === 'curated'}
     <p class="muted empty-hint">精选集尚未生成（或为空），已回退搜索全部源，仍无结果；可换个关键词再试。</p>
   {:else}
@@ -988,6 +994,13 @@
   }
   .empty-hint {
     margin: 10px 0 0;
+    font-size: 13px;
+  }
+  .empty-retry {
+    width: auto;
+    min-height: auto;
+    padding: 2px 8px;
+    margin: 0 4px;
     font-size: 13px;
   }
   .scope-report {
