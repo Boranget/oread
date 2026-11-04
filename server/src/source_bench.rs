@@ -45,7 +45,8 @@ pub struct BuiltinCorpus {
     pub source_type: i64,
 }
 
-/// 首批 16 条：覆盖玄幻/都市/历史/科幻/出版/漫画，选长期存在的常见书名。
+/// 24 条：覆盖玄幻/都市/历史/科幻/出版/漫画，选长期存在的常见书名。
+/// 漫画（source_type=2）单独占 12 条：漫画可用源数量少，语料太少会导致 comic 精选长期为 0。
 pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     // 玄幻（小说）
     BuiltinCorpus { title: "斗破苍穹", expected_author: Some("天蚕土豆"), category: "玄幻", source_type: TYPE_NOVEL },
@@ -64,12 +65,30 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     // 出版（小说）
     BuiltinCorpus { title: "活着", expected_author: Some("余华"), category: "出版", source_type: TYPE_NOVEL },
     BuiltinCorpus { title: "平凡的世界", expected_author: Some("路遥"), category: "出版", source_type: TYPE_NOVEL },
-    // 漫画（type=2）
+    // 漫画（type=2）：12 条长期存在的常见书名
     BuiltinCorpus { title: "海贼王", expected_author: Some("尾田荣一郎"), category: "漫画", source_type: TYPE_COMIC },
     BuiltinCorpus { title: "火影忍者", expected_author: Some("岸本齐史"), category: "漫画", source_type: TYPE_COMIC },
     BuiltinCorpus { title: "名侦探柯南", expected_author: Some("青山刚昌"), category: "漫画", source_type: TYPE_COMIC },
     BuiltinCorpus { title: "一人之下", expected_author: Some("米二"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "鬼灭之刃", expected_author: Some("吾峠呼世晴"), category: "漫画", source_type: TYPE_COMIC },
+    // 漫画版《斗罗大陆》：用不带后缀的书名，否则与站点标题的包含率不足 0.6 会永远匹配不上
+    BuiltinCorpus { title: "斗罗大陆", expected_author: Some("穆逢春"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "秦时明月", expected_author: None, category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "狐妖小红娘", expected_author: Some("小新"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "镇魂街", expected_author: Some("许辰"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "灌篮高手", expected_author: Some("井上雄彦"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "进击的巨人", expected_author: Some("谏山创"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus { title: "咒术回战", expected_author: Some("芥见下下"), category: "漫画", source_type: TYPE_COMIC },
 ];
+
+/// 精选数量区间：漫画单独用更宽的区间（默认 min=3），小说仍用 min=8。
+pub fn curated_bounds(cfg: &Config, source_type: i64) -> (usize, usize) {
+    if source_type == TYPE_COMIC {
+        (cfg.source_bench_comic_min, cfg.source_bench_comic_max)
+    } else {
+        (cfg.source_bench_min, cfg.source_bench_max)
+    }
+}
 
 fn next_seq() -> i64 {
     static SEQ: AtomicI64 = AtomicI64::new(0);
@@ -1045,7 +1064,8 @@ fn select_curated(rows: &[SourceBenchRow], cfg: &Config, eligible: &HashSet<Stri
                 .then_with(|| a.source_url.cmp(&b.source_url))
         });
         let scores: Vec<i32> = pool.iter().map(|r| r.bench_score).collect();
-        let count = pick_curated_count(&scores, cfg.source_bench_min, cfg.source_bench_max, cfg.source_bench_gap);
+        let (min, max) = curated_bounds(cfg, source_type);
+        let count = pick_curated_count(&scores, min, max, cfg.source_bench_gap);
         let cut_gap = if count > 0 && count < pool.len() {
             Some(scores[count - 1] - scores[count])
         } else {
@@ -1366,7 +1386,8 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
             .collect();
         pool_rows.sort_by(|a, b| b.bench_score.cmp(&a.bench_score).then_with(|| a.source_url.cmp(&b.source_url)));
         let scores: Vec<i32> = pool_rows.iter().map(|r| r.bench_score).collect();
-        let count = pick_curated_count(&scores, cfg.source_bench_min, cfg.source_bench_max, cfg.source_bench_gap);
+        let (min, max) = curated_bounds(cfg, source_type);
+        let count = pick_curated_count(&scores, min, max, cfg.source_bench_gap);
         let cut_gap = if count > 0 && count < pool_rows.len() {
             Some(scores[count - 1] - scores[count])
         } else {
@@ -1469,11 +1490,17 @@ mod tests {
 
     #[test]
     fn builtin_corpus_has_expected_shape() {
-        assert_eq!(BUILTIN_CORPUS.len(), 16);
+        assert_eq!(BUILTIN_CORPUS.len(), 24);
         let novel = BUILTIN_CORPUS.iter().filter(|b| b.source_type == TYPE_NOVEL).count();
         let comic = BUILTIN_CORPUS.iter().filter(|b| b.source_type == TYPE_COMIC).count();
         assert_eq!(novel, 12);
-        assert_eq!(comic, 4);
+        assert_eq!(comic, 12, "漫画语料扩到 12 条（10–12 区间上限）");
+        for title in ["海贼王", "火影忍者", "名侦探柯南", "一人之下", "鬼灭之刃", "斗罗大陆", "秦时明月", "狐妖小红娘"] {
+            assert!(
+                BUILTIN_CORPUS.iter().any(|b| b.title == title && b.source_type == TYPE_COMIC),
+                "漫画内置语料缺少 {title}"
+            );
+        }
         let mut seen = HashSet::new();
         for b in BUILTIN_CORPUS {
             assert!(seen.insert((normalize_title(b.title), b.source_type)), "内置语料重复: {}", b.title);
@@ -1552,6 +1579,17 @@ mod tests {
         assert_eq!(pick_curated_count(&flat, 8, 14, 8), 14, "无断层取上限");
         let small = vec![90, 89, 88];
         assert_eq!(pick_curated_count(&small, 8, 14, 8), 3, "不足下限就全取（但仍要求样本>=2）");
+    }
+
+    #[test]
+    fn comic_curated_uses_its_own_min() {
+        let cfg = Config::from_env();
+        assert_eq!(curated_bounds(&cfg, TYPE_COMIC), (3, 14), "漫画下限单独放宽到 3");
+        assert_eq!(curated_bounds(&cfg, TYPE_NOVEL), (8, 14), "小说仍用 min=8");
+        // 5 个漫画源：若共用 min=8 会全取 5 个（不足下限全取），但漫画上限/断层语义独立；
+        // 这里验证“断层优先”仍在：90/88/86 | 60/58 → 在 86→60 处截断为 3。
+        let scores = vec![90, 88, 86, 60, 58];
+        assert_eq!(pick_curated_count(&scores, 3, 14, 8), 3, "漫画：断层在 3 名后截断");
     }
 
     fn run(url: &str, cat: &str, key: &str, found: bool, suspicious: bool) -> BenchRun {

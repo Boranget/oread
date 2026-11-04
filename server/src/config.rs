@@ -153,6 +153,9 @@ pub struct Config {
     /// 精选数量下限 / 上限（默认 8 / 14）
     pub source_bench_min: usize,
     pub source_bench_max: usize,
+    /// 漫画精选单独下限 / 上限（默认 3 / 14）：漫画源数量少，与小说共用 min=8 会长期选不出
+    pub source_bench_comic_min: usize,
+    pub source_bench_comic_max: usize,
     /// 规则试跑预览是否允许访问回环/私网/链路本地地址（默认拒绝，防 SSRF）。
     /// 本地调试书源时可用 `PREVIEW_ALLOW_PRIVATE=true` 放行。
     pub preview_allow_private: bool,
@@ -225,6 +228,8 @@ impl Config {
             source_bench_gap: env_u64("SOURCE_BENCH_GAP", 8).clamp(1, 100) as i32,
             source_bench_min: env_u64("SOURCE_BENCH_MIN", 8).clamp(1, 50) as usize,
             source_bench_max: env_u64("SOURCE_BENCH_MAX", 14).clamp(1, 50) as usize,
+            source_bench_comic_min: env_u64("SOURCE_BENCH_COMIC_MIN", 3).clamp(1, 50) as usize,
+            source_bench_comic_max: env_u64("SOURCE_BENCH_COMIC_MAX", 14).clamp(1, 50) as usize,
             preview_allow_private: env_bool("PREVIEW_ALLOW_PRIVATE", false),
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())
