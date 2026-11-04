@@ -2193,6 +2193,10 @@ async fn cache_all(
                     }
                     c.chapter_index = idx;
                     let size = c.content.as_deref().map(|s| s.len()).unwrap_or(0) as i64;
+                    // 与单章读取一致：空正文/零图不写缓存，避免整批预取把空白固化下来。
+                    if content_is_empty(&c) {
+                        return CacheOutcome::Cached { index: idx, bytes: 0 };
+                    }
                     if !reserve_budget(&remaining, size) {
                         exhausted.store(true, Ordering::SeqCst);
                         return CacheOutcome::Budget { index: idx };
@@ -2614,13 +2618,28 @@ pub(crate) async fn load_cached_content(
     .bind(format!("-{ttl_secs} seconds"))
     .fetch_optional(pool)
     .await?;
-    if row.is_some() {
+    if let Some(row) = row {
+        // 空正文（文本为空 / 图片章节零图）视为缓存未命中：旧版本的空白缓存不再命中，
+        // 每次读取都会重新抓取，避免整个 TTL 周期内一直白屏。
+        if content_is_empty(&row) {
+            return Ok(None);
+        }
         let _ = sqlx::query("UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?")
             .bind(url)
             .execute(pool)
             .await;
+        return Ok(Some(row));
     }
-    Ok(row)
+    Ok(None)
+}
+
+/// 判定缓存正文是否为空：文本章节 content 去空白后为空；图片章节 images 列表为空。
+fn content_is_empty(c: &BookContent) -> bool {
+    if c.content_type.trim() == "image" {
+        decode_cached_images(c.images_json.as_deref()).0.is_empty()
+    } else {
+        c.content.as_deref().unwrap_or("").trim().is_empty()
+    }
 }
 
 /// 单条正文 upsert（不做淘汰），供 `/api/book/content` 与整本缓存共用。
@@ -2677,6 +2696,12 @@ pub(crate) async fn save_content_cached(
     c: &BookContent,
     limit_bytes: i64,
 ) -> anyhow::Result<()> {
+    // 空正文不落库：源站临时占位/规则失效时抓到的空结果只影响本次请求，
+    // 后续重试与换源不会被这份空缓存挡住。
+    if content_is_empty(c) {
+        tracing::debug!(url = c.url.as_str(), "skip caching empty chapter content");
+        return Ok(());
+    }
     upsert_content(pool, c).await?;
 
     // 淘汰：每轮删除最久未读的一批，最多 8 轮，避免极端情况下长时间占用连接
@@ -2751,6 +2776,50 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    // 空正文/零图章节不落缓存；修复前残留的空缓存按未命中处理。
+    #[tokio::test]
+    async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
+        let pool = mem_pool().await;
+        let empty = mk_content("u1", "b1", 1, "   ");
+        save_content_cached(&pool, &empty, 1 << 20).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "空文本不应写入缓存");
+
+        // 模拟修复前已经落库的空缓存：读取时应当作未命中并重新抓取。
+        sqlx::query(
+            "INSERT INTO book_content (url, book_url, title, content, chapter_index, content_type, \
+             updated_at, accessed_at) VALUES ('u1','b1','t','   ',1,'text',datetime('now'),datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(load_cached_content(&pool, "u1", 7 * 24 * 3600).await.unwrap().is_none());
+
+        // 图片章节零图同样不落缓存。
+        let img_empty = BookContent {
+            url: "u3".into(),
+            book_url: "b1".into(),
+            content_type: "image".into(),
+            content: Some(String::new()),
+            images_json: Some("[]".into()),
+            ..Default::default()
+        };
+        save_content_cached(&pool, &img_empty, 1 << 20).await.unwrap();
+        let n3: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n3, 0);
+
+        // 正常正文仍然命中。
+        let ok = mk_content("u2", "b1", 2, "正文内容");
+        save_content_cached(&pool, &ok, 1 << 20).await.unwrap();
+        assert!(load_cached_content(&pool, "u2", 7 * 24 * 3600).await.unwrap().is_some());
     }
 
     // 搜索调度：两批共用一个总预算，不再给 preferred 单独切分时段

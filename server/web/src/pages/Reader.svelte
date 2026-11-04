@@ -3,6 +3,7 @@
   import { api, describeFailure } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
   import { convertZh, zhLabels } from '../lib/zhconvert.js';
+  import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
   import { applyTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
@@ -547,6 +548,15 @@
   $: effLine = lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
   $: displayParas = paras.map((p) => (p.type === 'text' ? { ...p, text: convertZh(p.text, zhMode) } : p));
+  // 空正文不再渲染成“只有标题的空白页”：给出明确原因与可操作入口（重试/换源/下一章/目录）。
+  $: chapterEmpty = !!current && !contentError && !contentLoading && displayParas.length === 0 && isEmptyChapter(current);
+  $: emptyIsVolume = chapterEmpty && isVolumeTitle(displayTitle);
+  $: emptyTitle = emptyIsVolume ? '这是分卷标题' : '本章内容为空';
+  $: emptyHint = emptyIsVolume
+    ? '该目录项只用于分卷分组，没有正文。请跳到下一章，或从目录选择正文。'
+    : current?.placeholder_suspected
+      ? '源站返回的是付费/占位内容，没有解析到正文。可以重试本章或换一个书源。'
+      : '可能是书源规则失效、源站返回占位页，或上一次抓取失败。可以重试本章、换源，或先阅读其他章节。';
   $: dimOpacity = ((100 - brightness) / 100) * 0.82;
   $: contentStyle = isPaged && viewW > 0 && viewH > 0
     ? `width:${viewW}px;height:${viewH}px;max-width:none;margin:0;padding:0;column-width:${viewW}px;column-gap:0;column-fill:auto;font-size:${effFont}px;line-height:${effLine};font-family:${FONT_STACKS[fontFamily]}`
@@ -606,7 +616,14 @@
     }
     const myReq = ++reqId;
     currentPos = pos;
-    current = null;
+    // 先渲染标题与加载态，正文接口返回后再填充：慢源（1–5s）下不再是整页空白。
+    current = {
+      title: chapters[pos].title,
+      url: chapters[pos].url,
+      content: '',
+      content_type: 'text',
+      images: [],
+    };
     contentLoading = true;
     contentError = '';
     showToc = false;
@@ -638,6 +655,10 @@
       contentError = describeFailure(e, '加载正文');
       contentLoading = false;
     }
+  }
+
+  function retryChapter() {
+    if (currentPos >= 0) openChapter(currentPos, { ratio: currentRatio() });
   }
 
   // 把 0..1 的阅读比例还原到当前模式（滚动用 scrollTop，分页用 scrollLeft）
@@ -1380,6 +1401,9 @@
     } else if (e.key === ' ' || e.key === 'Spacebar') {
       e.preventDefault();
       toggleAuto();
+    } else if (e.key === 't' || e.key === 'T') {
+      // 键盘用户无需先点中间唤出控制栏再点“目录”。
+      toggleToc();
     } else if (e.key === 'Escape') {
       if (showExport) showExport = false;
       else if (showSwitch) showSwitch = false;
@@ -1540,29 +1564,46 @@
           </div>
         {:else if current}
           <h1 class="rd-chapter-title">{displayTitle}</h1>
-          {#each displayParas as p, i}
-            {#if p.type === 'image'}
-              <div class="rd-img" data-para={i}>
-                {#if imgState[p.src]?.status === 'ok'}
-                  <img
-                    src={imgState[p.src].objectUrl}
-                    alt={p.alt || '插图'}
-                    on:error={() => onImgError(p.src)}
-                  />
-                {:else if imgState[p.src]?.status === 'error'}
-                  <div class="rd-img-ph">
-                    <div>插图加载失败</div>
-                    <div class="rd-img-err">{imgState[p.src].error}</div>
-                    <button class="rd-btn" on:click={() => retryImage(p.src)}>重试</button>
-                  </div>
-                {:else}
-                  <div class="rd-img-ph">插图加载中…</div>
+          {#if contentLoading}
+            <div class="rd-state">加载正文…</div>
+          {:else if chapterEmpty}
+            <div class="rd-state rd-empty" role="status">
+              <p class="rd-empty-title">{emptyTitle}</p>
+              <p class="rd-muted">{emptyHint}</p>
+              <div class="err-actions">
+                <button class="rd-btn solid" on:click={retryChapter}>重试本章</button>
+                <button class="rd-btn" on:click={toggleSwitch}>换源</button>
+                {#if nextPos >= 0}
+                  <button class="rd-btn" on:click={() => openChapter(nextPos, { ratio: 0 })}>下一章</button>
                 {/if}
+                <button class="rd-btn" on:click={toggleToc}>目录</button>
               </div>
-            {:else}
-              <p class="rd-p" data-para={i}>{p.text}</p>
-            {/if}
-          {/each}
+            </div>
+          {:else}
+            {#each displayParas as p, i}
+              {#if p.type === 'image'}
+                <div class="rd-img" data-para={i}>
+                  {#if imgState[p.src]?.status === 'ok'}
+                    <img
+                      src={imgState[p.src].objectUrl}
+                      alt={p.alt || '插图'}
+                      on:error={() => onImgError(p.src)}
+                    />
+                  {:else if imgState[p.src]?.status === 'error'}
+                    <div class="rd-img-ph">
+                      <div>插图加载失败</div>
+                      <div class="rd-img-err">{imgState[p.src].error}</div>
+                      <button class="rd-btn" on:click={() => retryImage(p.src)}>重试</button>
+                    </div>
+                  {:else}
+                    <div class="rd-img-ph">插图加载中…</div>
+                  {/if}
+                </div>
+              {:else}
+                <p class="rd-p" data-para={i}>{p.text}</p>
+              {/if}
+            {/each}
+          {/if}
           <div class="rd-navrow">
             <button class="rd-btn" disabled={prevPos < 0} on:click={() => openChapter(prevPos, { ratio: 0.999 })}>上一章</button>
             <button class="rd-btn" on:click={toggleToc}>目录</button>
@@ -2221,6 +2262,13 @@
     font-size: 13px;
   }
   .rd-state.slim { padding: 20px; }
+  .rd-empty { padding: 28px 8px; text-align: center; }
+  .rd-empty-title { font-size: 15px; font-weight: 600; margin: 0; }
+  /* 长章节滚动：仅滚动模式启用渲染跳过，避免影响分页列宽测量 */
+  .rd-scroll:not(.mode-paged) .rd-p {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 1.9em;
+  }
   .rd-error { color: #c0392b; font-size: 13px; margin: 0; }
   .theme-dark .rd-error { color: #e88; }
   .rd-muted { color: var(--rd-muted); }
