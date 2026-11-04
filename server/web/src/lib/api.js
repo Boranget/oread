@@ -420,7 +420,8 @@ export const api = {
         cover_url: seed.coverUrl,
       })}`
     ),
-  toc: (source, bookUrl, seed = {}) =>
+  // 目录标题同样支持替换规则开关（缺省沿用账号设置）
+  toc: (source, bookUrl, seed = {}, useReplace = null) =>
     request(
       'GET',
       `/book/toc?${query({
@@ -430,6 +431,7 @@ export const api = {
         author: seed.author,
         intro: seed.intro,
         cover_url: seed.coverUrl,
+        use_replace: useReplace === null || useReplace === undefined ? undefined : useReplace ? '1' : '0',
       })}`
     ),
   // 正文：正常总带 book_url（书名圈定的替换规则才生效）；后端按 缓存 → 参数 → book_chapters 三级回填，

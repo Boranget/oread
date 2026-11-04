@@ -74,6 +74,24 @@ impl SearchQ {
             .to_string()
     }
 }
+
+/// 解析 `use_replace` 参数：返回 `Some(true/false)` 表示显式覆盖，
+/// `None` 表示沿用账号设置。目录与正文共用同一套取值规则。
+fn parse_use_replace(raw: Option<&str>) -> Option<bool> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("off") => Some(false),
+        Some("1") | Some("true") | Some("on") => Some(true),
+        _ => None,
+    }
+}
+
+/// 合并请求参数与账号设置，得到本次请求最终是否应用替换规则。
+async fn resolve_use_replace(raw: Option<&str>, db: &SqlitePool) -> bool {
+    match parse_use_replace(raw) {
+        Some(v) => v,
+        None => replace::replace_rule_enabled(db).await,
+    }
+}
 #[derive(Deserialize)]
 pub struct JobResultQ {
     job_id: String,
@@ -103,6 +121,10 @@ pub struct BookQ {
     intro: Option<String>,
     #[serde(default)]
     cover_url: Option<String>,
+    /// 目录标题是否应用替换规则：`1`/`0` 显式覆盖用户设置；缺省沿用账号的
+    /// `use_replace_rule`（与 `/api/book/content` 同名参数）
+    #[serde(default)]
+    use_replace: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ContentQ {
@@ -745,35 +767,56 @@ async fn book_info(
 }
 
 /// 目录：优先命中 `book_chapters` 的 TTL 缓存；过期或缺失时抓取并整本替换缓存。
+/// `use_replace` 与 `/api/book/content` 同名：显式开关覆盖账号设置，缺省沿用
+/// `use_replace_rule`；净化只作用于返回标题，缓存保留原文。
 async fn toc(
     State(s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Query(q): Query<BookQ>,
 ) -> AppResult<Json<Vec<BookChapter>>> {
-    if let Some(mut chaps) = load_cached_chapters(&db.0, &q.book_url, s.cfg.toc_ttl_secs).await? {
-        // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
-        // 不必等缓存过期重抓。
-        let _ = sync_total_chapter_num(&db.0, &q.book_url, chaps.len() as i64).await;
-        enrich_volumes(&mut chaps);
-        return Ok(Json(chaps));
+    let use_replace = resolve_use_replace(q.use_replace.as_deref(), &db.0).await;
+    let mut chapters =
+        if let Some(mut chaps) = load_cached_chapters(&db.0, &q.book_url, s.cfg.toc_ttl_secs).await?
+        {
+            // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
+            // 不必等缓存过期重抓。
+            let _ = sync_total_chapter_num(&db.0, &q.book_url, chaps.len() as i64).await;
+            chaps
+        } else {
+            let source = load_source(&s.shared, &q.source).await?;
+            let mut book = Book {
+                book_url: q.book_url.clone(),
+                ..Default::default()
+            };
+            if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
+                book.toc_url = m.toc_url;
+            }
+            let chapters = web_book::chapter_list(&source, &book).await?;
+            save_chapters(&db.0, &q.book_url, &chapters).await?;
+            // 目录落库时同步总章节数，供进度百分比与书架完成度使用
+            sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
+            // 记录目录总数变化（首次建基线不出角标）
+            crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64)
+                .await;
+            // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
+            let _ = backfill_word_counts(&db.0, &q.book_url).await;
+            chapters
+        };
+    if use_replace && !chapters.is_empty() {
+        let book_name = book_name_of(&db.0, &q.book_url).await.unwrap_or_default();
+        let mut cleaned: Vec<String> = chapters
+            .iter()
+            .map(|c| c.title.clone().unwrap_or_default())
+            .collect();
+        replace::purify_titles(&db.0, &book_name, &q.source, &mut cleaned).await;
+        for (c, t) in chapters.iter_mut().zip(cleaned) {
+            // 错误/空标题保持原样，避免把 None 变成空串
+            if c.title.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                c.title = Some(t);
+            }
+        }
     }
-    let source = load_source(&s.shared, &q.source).await?;
-    let mut book = Book {
-        book_url: q.book_url.clone(),
-        ..Default::default()
-    };
-    if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
-        book.toc_url = m.toc_url;
-    }
-    let mut chapters = web_book::chapter_list(&source, &book).await?;
-    save_chapters(&db.0, &q.book_url, &chapters).await?;
-    // 目录落库时同步总章节数，供进度百分比与书架完成度使用
-    sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
-    // 记录目录总数变化（首次建基线不出角标）
-    crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64).await;
-    // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-    let _ = backfill_word_counts(&db.0, &q.book_url).await;
     enrich_volumes(&mut chapters);
     Ok(Json(chapters))
 }
@@ -1169,16 +1212,7 @@ async fn content(
         return Err(AppError::MissingBookUrl);
     }
     // 替换规则开关：请求参数可显式覆盖，缺省沿用账号设置
-    let use_replace = match q
-        .use_replace
-        .as_deref()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("0") | Some("false") | Some("off") => false,
-        Some("1") | Some("true") | Some("on") => true,
-        _ => replace::replace_rule_enabled(&db.0).await,
-    };
+    let use_replace = resolve_use_replace(q.use_replace.as_deref(), &db.0).await;
     if is_image {
         // 图片章节不做正文净化/图片样式注入，避免把 <img> 列表当富文本改写
         let (images, truncated) = decode_cached_images(c.images_json.as_deref());
@@ -2035,6 +2069,20 @@ mod tests {
         assert_eq!(offset2, 13, "小写回退也应返回真实字符偏移");
         assert_eq!(count2, 2, "大小写不敏感统计应命中 2 次");
         assert!(find_snippet("无关内容", "关键词").is_none());
+    }
+
+    // 目录/正文共用：use_replace 参数只接受显式布尔，未知值回落到账号设置（None）
+    #[test]
+    fn parse_use_replace_accepts_explicit_switch_only() {
+        assert_eq!(parse_use_replace(Some("1")), Some(true));
+        assert_eq!(parse_use_replace(Some(" TRUE ")), Some(true));
+        assert_eq!(parse_use_replace(Some("on")), Some(true));
+        assert_eq!(parse_use_replace(Some("0")), Some(false));
+        assert_eq!(parse_use_replace(Some("false")), Some(false));
+        assert_eq!(parse_use_replace(Some("off")), Some(false));
+        assert_eq!(parse_use_replace(None), None);
+        assert_eq!(parse_use_replace(Some("")), None);
+        assert_eq!(parse_use_replace(Some("yes")), None);
     }
 
     // 整本缓存写入路径：同一 URL 二次写入只保留一行，size_bytes 随正文更新
