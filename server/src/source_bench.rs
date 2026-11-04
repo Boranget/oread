@@ -210,27 +210,80 @@ fn norm_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// 标题匹配：归一化后完全相等，或包含率 ≥ 0.8。
-pub fn title_matches(got: &str, expected: &str) -> bool {
+fn norm_pair(got: &str, expected: &str) -> Option<(String, String)> {
     let a = strip_decorations(normalize_title(got));
     let b = strip_decorations(normalize_title(expected));
     if a.is_empty() || b.is_empty() {
-        return false;
+        None
+    } else {
+        Some((a, b))
     }
+}
+
+/// 衍生作/外传的常见标记：长标题比短标题多出来的部分含这些词时，不算“近似同名”。
+/// 目的：`斗破苍穹外传` / `斗破苍穹之少年归来` 这类同人衍生不能靠标题包含混进命中。
+const DERIVATIVE_HINTS: &[&str] = &[
+    "外传", "番外", "前传", "后传", "续集", "续作", "同人", "改编", "打卡", "之", "从",
+];
+
+fn has_derivative_extra(longer: &str, base: &str) -> bool {
+    let extra = longer.replacen(base, "", 1);
+    DERIVATIVE_HINTS.iter().any(|h| extra.contains(h))
+}
+
+/// (a) 归一化标题近似相等：长度比 ≥ 0.6 且包含关系成立，且多出来的部分不含衍生作标记。
+pub fn title_near_equal(got: &str, expected: &str) -> bool {
+    let Some((a, b)) = norm_pair(got, expected) else {
+        return false;
+    };
     if a == b {
         return true;
     }
-    if a.contains(&b) || b.contains(&a) {
-        let short = norm_len(&a).min(norm_len(&b));
-        let long = norm_len(&a).max(norm_len(&b));
-        return short as f64 / long as f64 >= 0.8;
+    if !(a.contains(&b) || b.contains(&a)) {
+        return false;
     }
-    false
+    let short = norm_len(&a).min(norm_len(&b));
+    let long = norm_len(&a).max(norm_len(&b));
+    if (short as f64 / long as f64) < 0.6 {
+        return false;
+    }
+    let (longer, base) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    !has_derivative_extra(longer, base)
 }
 
-/// 作者归一化：在标题归一化的基础上再去掉常见署名后缀。
+/// 标题包含（不含长度/衍生限制），只用于诊断字段，不单独构成命中。
+pub fn title_contains(got: &str, expected: &str) -> bool {
+    let Some((a, b)) = norm_pair(got, expected) else {
+        return false;
+    };
+    a.contains(&b) || b.contains(&a)
+}
+
+/// 诊断用：标题是否“相关”（近似同名或包含）。
+pub fn title_matches(got: &str, expected: &str) -> bool {
+    title_near_equal(got, expected) || title_contains(got, expected)
+}
+
+/// 命中判定：(a) 近似同名（作者不参与）或 (b) 标题包含 + 作者归一化后完全一致。
+pub fn is_hit(
+    got_title: &str,
+    expected_title: &str,
+    got_author: Option<&str>,
+    expected_author: Option<&str>,
+) -> bool {
+    if title_near_equal(got_title, expected_title) {
+        return true;
+    }
+    title_contains(got_title, expected_title) && author_matches(got_author, expected_author)
+}
+
+/// 作者归一化：在标题归一化的基础上去掉“作者：”前缀与常见署名后缀。
 pub fn normalize_author(raw: &str) -> String {
     let mut s = normalize_title(raw);
+    // 站点常见写法“作者：天蚕土豆”，归一化后是“作者天蚕土豆”
+    while s.chars().count() > 2 && s.starts_with("作者") {
+        s = s.chars().skip(2).collect();
+    }
     for suffix in ["著", "编", "译", "繪", "绘", "作者"] {
         while s.ends_with(suffix) && norm_len(&s) > norm_len(suffix) {
             let keep = s.len() - suffix.len();
@@ -797,20 +850,28 @@ async fn run_one_sample(src: &BookSource, item: &CorpusEntry, deadline: Instant)
     match result {
         Ok(Ok(books)) => {
             let first = books.first();
-            let title_match = first
-                .and_then(|b| b.name.as_deref())
+            let got_title = first.and_then(|b| b.name.as_deref());
+            let got_author = first.and_then(|b| b.author.as_deref());
+            let title_match = got_title
                 .map(|name| title_matches(name, &item.title))
                 .unwrap_or(false);
-            let author_match = author_matches(
-                first.and_then(|b| b.author.as_deref()),
-                item.expected_author.as_deref(),
-            );
+            let author_match = author_matches(got_author, item.expected_author.as_deref());
+            let found = got_title
+                .map(|name| {
+                    is_hit(
+                        name,
+                        &item.title,
+                        got_author,
+                        item.expected_author.as_deref(),
+                    )
+                })
+                .unwrap_or(false);
             RawSample {
                 corpus_key: item.id.clone(),
                 title: item.title.clone(),
                 category: item.category.clone(),
                 builtin_sample: item.builtin,
-                found: title_match && author_match,
+                found,
                 title_match,
                 author_match,
                 latency_ms,
@@ -1520,8 +1581,14 @@ mod tests {
         assert!(title_matches("斗破苍穹", "斗破苍穹"));
         assert!(title_matches("斗破苍穹 最新章节", "斗破苍穹"));
         assert!(title_matches("《斗破苍穹》", "斗破苍穹"));
-        // 包含率 < 0.8 不算匹配
-        assert!(!title_matches("斗破苍穹之少年归来", "斗破苍穹"));
+        // 包含率 < 0.6 不算近似同名
+        assert!(!title_near_equal("斗破苍穹之少年归来", "斗破苍穹"));
+        assert!(!title_near_equal("遮天外传", "遮天"));
+        // 包含率 >= 0.6 但多出来的部分是“外传/之/从…”等衍生标记，也不算同名
+        assert!(!title_near_equal("斗破苍穹外传", "斗破苍穹"));
+        assert!(!title_near_equal("从斗破苍穹开始打卡", "斗破苍穹"));
+        // 但诊断字段仍能看到“标题包含”
+        assert!(title_contains("斗破苍穹外传", "斗破苍穹"));
         assert!(!title_matches("别的书", "斗破苍穹"));
     }
 
@@ -1529,10 +1596,59 @@ mod tests {
     fn author_match_rules() {
         assert!(author_matches(Some("天蚕土豆"), Some("天蚕土豆")));
         assert!(author_matches(Some("天蚕土豆 著"), Some("天蚕土豆")));
+        assert!(author_matches(Some("作者：天蚕土豆"), Some("天蚕土豆")), "去掉“作者：”前缀");
         assert!(author_matches(Some("刘慈欣/王晋康"), Some("刘慈欣")));
         assert!(!author_matches(Some("别人"), Some("天蚕土豆")));
         assert!(!author_matches(None, Some("天蚕土豆")));
         assert!(author_matches(None, None), "无期望作者时不校验");
+    }
+
+    /// 旧规则（本仓库上一版）：标题完全相等或包含率 ≥ 0.8，且作者匹配。
+    fn old_hit(
+        got_title: &str,
+        expected_title: &str,
+        got_author: Option<&str>,
+        expected_author: Option<&str>,
+    ) -> bool {
+        let a = strip_decorations(normalize_title(got_title));
+        let b = strip_decorations(normalize_title(expected_title));
+        if a.is_empty() || b.is_empty() {
+            return false;
+        }
+        let title_ok = a == b
+            || ((a.contains(&b) || b.contains(&a))
+                && norm_len(&a).min(norm_len(&b)) as f64
+                    / norm_len(&a).max(norm_len(&b)) as f64
+                    >= 0.8);
+        title_ok && author_matches(got_author, expected_author)
+    }
+
+    #[test]
+    fn hit_rule_five_samples_before_after() {
+        // 2 组真命中 + 3 组衍生作误判
+        let cases: [(&str, &str, Option<&str>, Option<&str>, bool); 5] = [
+            ("斗破苍穹", "斗破苍穹", Some("天蚕土豆"), Some("天蚕土豆"), true),
+            ("《三体》 最新章节", "三体", Some("刘慈欣"), Some("刘慈欣"), true),
+            ("从斗破苍穹开始打卡", "斗破苍穹", Some("晨昏彼岸"), Some("天蚕土豆"), false),
+            ("斗破苍穹之少年归来", "斗破苍穹", Some("某同人"), Some("天蚕土豆"), false),
+            ("斗破苍穹外传", "斗破苍穹", Some("某同人"), Some("天蚕土豆"), false),
+        ];
+        for (got_t, exp_t, got_a, exp_a, want) in cases {
+            let before = old_hit(got_t, exp_t, got_a, exp_a);
+            let after = is_hit(got_t, exp_t, got_a, exp_a);
+            eprintln!("{got_t} vs {exp_t} | before={before} after={after}");
+            assert_eq!(after, want, "新规则判定错误: {got_t}");
+        }
+    }
+
+    #[test]
+    fn exact_title_hits_without_author() {
+        // 同名书作者缺失（站点未填）也应算命中：近似同名不依赖作者
+        assert!(is_hit("斗破苍穹", "斗破苍穹", None, Some("天蚕土豆")));
+        assert!(is_hit("《斗破苍穹》 最新章节", "斗破苍穹", None, Some("天蚕土豆")));
+        // 但只是“标题包含”时仍必须作者一致
+        assert!(!is_hit("斗破苍穹外传", "斗破苍穹", None, Some("天蚕土豆")));
+        assert!(is_hit("斗破苍穹番外篇", "斗破苍穹", None, None), "无期望作者时包含即命中");
     }
 
     #[test]
