@@ -1,4 +1,4 @@
-//! Legado 规则引擎（AnalyzeRule 等价实现）
+﻿//! Legado 规则引擎（AnalyzeRule 等价实现）
 //!
 //! 支持：CSS 选择器(scraper) / JsonPath / XPath(sxd-xpath, XML 源) / 正则 / 变量 `${name}` 展开 /
 //! 整串 JS 段(`<js>`、`@js:`)切分 / 列表解析(get_string_list)。
@@ -410,6 +410,33 @@ function __md5(s){
 /// 简→繁常用字表（供 `java.t2s`）。只覆盖常见字；未收录字原样返回。
 const JS_T2S: &str = r#"var __T2S = {"爱":"愛","罢":"罷","摆":"擺","败":"敗","办":"辦","帮":"幫","宝":"寶","报":"報","备":"備","贝":"貝","笔":"筆","毕":"畢","边":"邊","变":"變","标":"標","表":"錶","别":"彆","宾":"賓","补":"補","参":"參","惨":"慘","灿":"燦","仓":"倉","产":"產","长":"長","尝":"嘗","车":"車","彻":"徹","尘":"塵","陈":"陳","衬":"襯","称":"稱","惩":"懲","迟":"遲","冲":"衝","丑":"醜","础":"礎","处":"處","触":"觸","传":"傳","疮":"瘡","闯":"闖","创":"創","纯":"純","词":"詞","从":"從","丛":"叢","窜":"竄","达":"達","带":"帶","贷":"貸","担":"擔","单":"單","胆":"膽","当":"當","党":"黨","荡":"蕩","档":"檔","导":"導","敌":"敵","邓":"鄧","递":"遞","点":"點","电":"電","垫":"墊","钓":"釣","调":"調","叠":"疊","东":"東","动":"動","冻":"凍","斗":"鬥","独":"獨","读":"讀","断":"斷","对":"對","队":"隊","吨":"噸","夺":"奪","堕":"墮","儿":"兒","尔":"爾","发":"發","罚":"罰","阀":"閥","飞":"飛","费":"費","废":"廢","纷":"紛","坟":"墳","奋":"奮","粪":"糞","风":"風","丰":"豐","冯":"馮","凤":"鳳","肤":"膚","妇":"婦","复":"復","该":"該","干":"乾","赶":"趕","冈":"岡","刚":"剛","岗":"崗","纲":"綱","钢":"鋼","个":"個","给":"給","巩":"鞏","沟":"溝","构":"構","购":"購","谷":"穀","顾":"顧","刮":"颳","关":"關","观":"觀","馆":"館","惯":"慣","广":"廣","归":"歸","龟":"龜","规":"規","国":"國","过":"過","汉":"漢","号":"號","轰":"轟","后":"後","胡":"鬍","壶":"壺","沪":"滬","护":"護","划":"劃","怀":"懷","坏":"壞","欢":"歡","环":"環","还":"還","回":"迴","汇":"匯","会":"會","秽":"穢","荤":"葷","浑":"渾","伙":"夥","获":"獲","击":"擊","鸡":"雞","积":"積","极":"極","际":"際","继":"繼","家":"傢","价":"價","艰":"艱","歼":"殲","舰":"艦","姜":"薑","浆":"漿","桨":"槳","奖":"獎","讲":"講","酱":"醬","胶":"膠","浇":"澆","骄":"驕","娇":"嬌","搅":"攪","缴":"繳","觉":"覺","较":"較","阶":"階","节":"節","洁":"潔","结":"結","借":"藉","仅":"僅","惊":"驚","竞":"競","旧":"舊","剧":"劇","据":"據","惧":"懼","卷":"捲","决":"決","绝":"絕","军":"軍","开":"開","克":"剋","壳":"殼","夸":"誇","矿":"礦","亏":"虧","困":"睏","腊":"臘","蜡":"蠟","来":"來","赖":"賴","兰":"蘭","拦":"攔","栏":"欄","烂":"爛","垒":"壘","类":"類","里":"裡","礼":"禮","丽":"麗","厉":"厲","励":"勵","离":"離","历":"歷","帘":"簾","联":"聯","怜":"憐","炼":"煉","练":"練","粮":"糧","两":"兩","辆":"輛","疗":"療","辽":"遼","了":"瞭","猎":"獵","临":"臨","邻":"鄰","岭":"嶺","庐":"廬","芦":"蘆","炉":"爐","陆":"陸","虏":"虜","录":"錄","虑":"慮","乱":"亂","罗":"羅","萝":"蘿","络":"絡","妈":"媽","马":"馬","骂":"罵","买":"買","麦":"麥","卖":"賣","迈":"邁","脉":"脈","猫":"貓","么":"麼","门":"門","闷":"悶","梦":"夢","弥":"彌","觅":"覓","绵":"綿","面":"麵","庙":"廟","灭":"滅","亩":"畝","恼":"惱","脑":"腦","拟":"擬","酿":"釀","鸟":"鳥","聂":"聶","宁":"寧","农":"農","齐":"齊","岂":"豈","启":"啟","气":"氣","弃":"棄","牵":"牽","签":"簽","迁":"遷","窍":"竅","窃":"竊","亲":"親","轻":"輕","庆":"慶","琼":"瓊","穷":"窮","秋":"鞦","区":"區","驱":"驅","趋":"趨","权":"權","劝":"勸","确":"確","让":"讓","扰":"擾","热":"熱","认":"認","荣":"榮","绒":"絨","洒":"灑","伞":"傘","丧":"喪","扫":"掃","涩":"澀","杀":"殺","晒":"曬","纱":"紗","设":"設","绅":"紳","审":"審","声":"聲","胜":"勝","圣":"聖","师":"師","湿":"濕","时":"時","实":"實","适":"適","势":"勢","兽":"獸","书":"書","术":"術","树":"樹","帅":"帥","双":"雙","谁":"誰","顺":"順","说":"說","丝":"絲","松":"鬆","苏":"蘇","诉":"訴","虽":"雖","随":"隨","台":"臺","态":"態","摊":"攤","滩":"灘","坛":"壇","叹":"嘆","汤":"湯","烫":"燙","涛":"濤","体":"體","条":"條","铁":"鐵","听":"聽","厅":"廳","头":"頭","图":"圖","涂":"塗","团":"團","洼":"窪","袜":"襪","弯":"彎","万":"萬","网":"網","韦":"韋","违":"違","围":"圍","为":"為","卫":"衛","温":"溫","闻":"聞","问":"問","稳":"穩","务":"務","雾":"霧","牺":"犧","习":"習","系":"係","戏":"戲","细":"細","虾":"蝦","吓":"嚇","鲜":"鮮","纤":"纖","咸":"鹹","显":"顯","险":"險","现":"現","献":"獻","乡":"鄉","详":"詳","响":"響","向":"嚮","协":"協","挟":"挾","泻":"瀉","谢":"謝","兴":"興","须":"須","许":"許","悬":"懸","选":"選","学":"學","寻":"尋","压":"壓","亚":"亞","严":"嚴","盐":"鹽","阳":"陽","养":"養","样":"樣","痒":"癢","谣":"謠","药":"藥","爷":"爺","业":"業","叶":"葉","页":"頁","义":"義","议":"議","亿":"億","忆":"憶","艺":"藝","隐":"隱","应":"應","营":"營","拥":"擁","优":"優","忧":"憂","邮":"郵","余":"餘","鱼":"魚","与":"與","屿":"嶼","语":"語","吁":"籲","郁":"鬱","誉":"譽","渊":"淵","园":"園","员":"員","圆":"圓","缘":"緣","远":"遠","愿":"願","跃":"躍","云":"雲","杂":"雜","灾":"災","赞":"讚","赃":"贓","脏":"臟","凿":"鑿","枣":"棗","灶":"竈","责":"責","择":"擇","则":"則","泽":"澤","贼":"賊","赠":"贈","扎":"紮","张":"張","帐":"帳","战":"戰","这":"這","针":"針","征":"徵","争":"爭","挣":"掙","症":"癥","证":"證","只":"隻","帜":"幟","质":"質","种":"種","众":"眾","昼":"晝","烛":"燭","筑":"築","庄":"莊","装":"裝","妆":"妝","壮":"壯","状":"狀","准":"準","浊":"濁","总":"總","钻":"鑽","纵":"縱","邹":"鄒","诅":"詛","组":"組","话":"話","记":"記","写":"寫","诗":"詩","请":"請","难":"難","乐":"樂","进":"進","岁":"歲","间":"間","见":"見","龙":"龍","颜":"顏","恋":"戀","泪":"淚","华":"華","画":"畫"};"#;
 
+/// `cache` 全局（Legado: 规则语义 `bindings["cache"] = CacheManager`）。
+/// 上游 CacheManager 的方法名是 `get / put / delete`（另有 getFromMemory / putMemory /
+/// deleteMemory，CacheManager.kt:60-160），**没有** set/remove/clear。
+/// 本实现是每作用域一份的字符串 map：`get` 未命中返回 null（同上游返回 String?），
+/// put 的对象/数组按 JSON 串存储（上游存 Any）。
+const JS_CACHE: &str = r#"
+var __cache = {};
+var cache = {
+  get: function(k){
+    k = String(k);
+    return Object.prototype.hasOwnProperty.call(__cache, k) ? __cache[k] : null;
+  },
+  getFromMemory: function(k){ return cache.get(k); },
+  put: function(k, v){
+    k = String(k);
+    if (typeof v === "string") { __cache[k] = v; return; }
+    try { __cache[k] = JSON.stringify(v); } catch (e) { __cache[k] = String(v); }
+  },
+  putMemory: function(k, v){ cache.put(k, v); },
+  delete: function(k){ delete __cache[String(k)]; },
+  deleteMemory: function(k){ cache.delete(k); }
+};
+"#;
+
+/// JS 执行结果里回传 cache 变更的分隔符（结果串 + 分隔符 + cache JSON）。
+const JS_CACHE_SENTINEL: &str = "\u{1}F1CACHE\u{1}";
+
 const JAVA_BOOK_SHIM: &str = r#"
 var __vars = {};
 // DOM 桥 Phase 1 的预抽取结果（由 Rust 在 eval 前按字面量选择器算好并赋值）
@@ -646,6 +673,10 @@ enum Mode {
 
 pub struct AnalyzeRule {
     pub variables: RefCell<HashMap<String, String>>,
+    /// Legado JS 环境里的 `cache`（上游 规则语义 `bindings["cache"] = CacheManager`）。
+    /// 最小等价版：同作用域可读写的字符串 map。上游 CacheManager 是 App 级单例 + SQLite，
+    /// 本服务**每作用域一份**（随 AnalyzeRule 存活），不共享、不持久化。
+    pub cache: RefCell<HashMap<String, String>>,
     pub js_lib: String,
     pub is_json: bool,
 }
@@ -654,6 +685,7 @@ impl Default for AnalyzeRule {
     fn default() -> Self {
         Self {
             variables: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
             js_lib: String::new(),
             is_json: false,
         }
@@ -1167,7 +1199,8 @@ impl AnalyzeRule {
     /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
     fn js_vars(&self) -> String {
         const RESERVED: &[&str] = &[
-            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "java",
+            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "java", "cache",
+            "__cache", "__out",
         ];
         let mut out = String::new();
         for (k, v) in self.variables.borrow().iter() {
@@ -1211,16 +1244,20 @@ impl AnalyzeRule {
         let dom_js = serde_json::to_string(&dom).unwrap_or_else(|_| "{}".into());
         let doms_js = serde_json::to_string(&doms).unwrap_or_else(|_| "{}".into());
         let vars_js = self.js_vars();
+        let cache_init = serde_json::to_string(&self.cache.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{lib}\n{shim}\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nif (Array.isArray(__r)) {{ try {{ return JSON.stringify(__r); }} catch(__e) {{}} }}\nreturn String(__r); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{cachejs}\n{lib}\n{shim}\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __r = eval({code});\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {sent} + JSON.stringify(__cache); }})()",
             r = js_string_literal(input),
             b = js_string_literal(base_url),
             vars = vars_js,
+            cachejs = JS_CACHE,
             lib = self.js_lib,
             shim = shim,
+            cacheinit = cache_init,
             dom = dom_js,
             doms = doms_js,
             code = js_string_literal(code),
+            sent = js_string_literal(JS_CACHE_SENTINEL),
         );
         let (tx, rx) = channel::<(Result<String, String>, u64, u64)>();
         js_sender()
@@ -1229,6 +1266,25 @@ impl AnalyzeRule {
         let (result, net_ms, js_elapsed) = rx
             .recv()
             .map_err(|_| RuleError::Other("js worker dropped".into()))?;
+        // 结果串尾部带回 cache 变更：合并回本作用域的 cache（非法/超大则忽略，不影响主结果）
+        let result = match result {
+            Ok(s) => match s.rfind(JS_CACHE_SENTINEL) {
+                Some(idx) => {
+                    let body = s[..idx].to_string();
+                    let tail = &s[idx + JS_CACHE_SENTINEL.len()..];
+                    if tail.len() <= 1_048_576 {
+                        if let Ok(map) =
+                            serde_json::from_str::<HashMap<String, String>>(tail)
+                        {
+                            self.cache.replace(map);
+                        }
+                    }
+                    Ok(body)
+                }
+                None => Ok(s),
+            },
+            Err(e) => Err(e),
+        };
         let (result, net_ms) = (result.map_err(RuleError::Other), net_ms);
         // 排队等单一 JS 线程的时间不计入预算：并发测试/并发请求下同一规则仍应通过。
         JS_LAST_MS.store(js_elapsed, Ordering::Relaxed);
@@ -3763,6 +3819,42 @@ nodes.filter(function (node) {
         ar.get_string(json2, "@put:{k1:$.a,k2:$.b}", false, "").unwrap();
         assert_eq!(ar.get_string("", "@get:{k1}", false, "").unwrap(), "1");
         assert_eq!(ar.get_string("", "@get:{k2}", false, "").unwrap(), "2");
+    }
+
+    #[test]
+    fn cache_get_put_in_same_scope() {
+        let ar = AnalyzeRule::new();
+        ar.eval_js("", "cache.put('kkmh', 'payload')", "").unwrap();
+        // 同一作用域的下一次 eval 仍能读到（快看 init → chapter_list 的用法）
+        let got = ar
+            .eval_js("", "result = String(cache.get('kkmh'))", "")
+            .unwrap();
+        assert_eq!(got, "payload");
+        // 未命中返回 null（上游 CacheManager.get 返回 String?）
+        let miss = ar.eval_js("", "result = String(cache.get('nope'))", "").unwrap();
+        assert_eq!(miss, "null");
+        // 非字符串按 JSON 串存
+        ar.eval_js("", "cache.put('obj', {a:1})", "").unwrap();
+        let obj = ar.eval_js("", "result = cache.get('obj')", "").unwrap();
+        assert_eq!(obj, "{\"a\":1}");
+        // delete 后可写
+        ar.eval_js("", "cache.delete('kkmh')", "").unwrap();
+        let gone = ar.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        assert_eq!(gone, "null");
+    }
+
+    #[test]
+    fn cache_does_not_leak_across_sources() {
+        let a = AnalyzeRule::new();
+        let b = AnalyzeRule::new();
+        a.eval_js("", "cache.put('kk', 'A')", "").unwrap();
+        // 另一个源（另一个 AnalyzeRule）读不到
+        let b_got = b.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        assert_eq!(b_got, "null");
+        let a_got = a.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        assert_eq!(a_got, "A");
+        // 变量表也不跨作用域
+        assert_eq!(b.get_string("", "@get:{kk}", false, "").unwrap(), "");
     }
 
     #[test]
