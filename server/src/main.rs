@@ -9,6 +9,7 @@ mod models;
 mod routes;
 mod rule_engine;
 mod req;
+mod search_rank;
 mod serde_util;
 mod source_health;
 mod source_ledger;
