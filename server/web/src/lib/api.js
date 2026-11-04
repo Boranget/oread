@@ -539,6 +539,14 @@ export const api = {
   replaceRules: () => request('GET', '/replace-rules'),
   saveReplaceRule: (r) => request('POST', '/replace-rules', r),
   deleteReplaceRule: (id) => request('DELETE', `/replace-rules/delete?id=${id}`),
+  // Legado 规则包导入（裸数组 / {name,rules} / 单条对象），返回 {ok,inserted,skipped}
+  importReplaceRules: (body) => request('POST', '/replace-rules/import', body),
+  // 导出 Legado 原生 camelCase：缺省全部（数组），id 指定时单条（对象）
+  exportReplaceRules: (id) =>
+    request('GET', `/replace-rules/export${id ? `?id=${id}` : ''}`),
+  // 试跑预览：返回 {final, steps[{index,hits,applied,skipped_reason,output}]}
+  previewReplaceRules: (body) =>
+    request('POST', '/replace-rules/preview', body, { timeout: 30000 }),
   settings: () => request('GET', '/settings'),
   saveSettings: (s) => request('POST', '/settings', s),
 

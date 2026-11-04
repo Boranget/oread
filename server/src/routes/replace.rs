@@ -850,26 +850,49 @@ pub async fn purify(
     if !replace_rule_enabled(db).await {
         return (title, content);
     }
-    let mut rules: Vec<ReplaceRule> =
-        match sqlx::query_as("SELECT * FROM replace_rules WHERE is_enabled=1 ORDER BY \"order\", id")
-            .fetch_all(db)
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return (title, content),
-        };
-    if builtin_clean_enabled(db).await {
-        // 内置规则先跑，用户规则仍可在其结果上继续修改
-        let mut all = builtin_rules();
-        all.append(&mut rules);
-        rules = all;
-    }
+    let rules = active_rules(db).await;
     if rules.is_empty() {
         return (title, content);
     }
     let t = title.map(|t| apply_rules(&rules, book, origin, &t, true));
     let c = content.map(|c| apply_rules(&rules, book, origin, &c, false));
     (t, c)
+}
+
+/// 当前生效的全部替换规则（内置净化开关打开时排在最前，用户规则随后）。
+/// 目录与正文共用同一份加载逻辑，避免两处行为分叉；调用方自行决定是否启用。
+pub async fn active_rules(db: &SqlitePool) -> Vec<ReplaceRule> {
+    let mut rules: Vec<ReplaceRule> =
+        match sqlx::query_as("SELECT * FROM replace_rules WHERE is_enabled=1 ORDER BY \"order\", id")
+            .fetch_all(db)
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+    if builtin_clean_enabled(db).await {
+        let mut all = builtin_rules();
+        all.append(&mut rules);
+        rules = all;
+    }
+    rules
+}
+
+/// 目录标题净化：规则只加载一次，按 `scope_title` 逐章应用。
+/// 只影响返回给用户的标题，`book_chapters` 缓存保持原文，开关可随时切换。
+pub async fn purify_titles(
+    db: &SqlitePool,
+    book: &str,
+    origin: &str,
+    titles: &mut [String],
+) {
+    let rules = active_rules(db).await;
+    if rules.is_empty() {
+        return;
+    }
+    for t in titles.iter_mut() {
+        *t = apply_rules(&rules, book, origin, t, true);
+    }
 }
 
 #[cfg(test)]
