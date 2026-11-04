@@ -706,6 +706,8 @@ async fn search_start(
     } else {
         None
     };
+    // 精选防腐化：距上次体检超过 72h 时，后台重跑一次（不阻塞本次搜索）。
+    crate::source_bench::maybe_schedule_stale_bench(s.shared.clone(), &s.cfg);
     let curated_total = curated.as_ref().map(|s| s.len()).unwrap_or(0);
     let requested = parse_source_ids(q.source_ids.as_deref());
     // 退化链：精选集合 → preferred → 全量。显式选源始终按“覆盖全部可搜索源”的语义。
