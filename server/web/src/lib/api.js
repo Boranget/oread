@@ -360,6 +360,13 @@ export const api = {
   // ---- auth ----
   login: (username, password) => request('POST', '/auth/login', { username, password }),
   register: (username, password) => request('POST', '/auth/register', { username, password }),
+  // 自助改密：成功即递增 token_version，当前 token 立即失效，需要重新登录
+  changePassword: (old_password, new_password) =>
+    request('POST', '/auth/password', { old_password, new_password }),
+  // ---- 用户管理（仅管理员）----
+  adminUsers: () => request('GET', '/admin/users'),
+  adminSetUserStatus: (userId, disabled) =>
+    request('POST', '/admin/users/status', { user_id: userId, disabled: !!disabled }),
 
   // ---- sources (admin) ----
   sources: () => request('GET', '/sources'),
