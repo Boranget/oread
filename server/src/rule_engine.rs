@@ -109,6 +109,12 @@ fn new_js_context(conf: JsConf) -> boa_engine::Context {
         0,
         boa_engine::NativeFunction::from_fn_ptr(native_ajax),
     );
+    // java.setContent 之后的 DOM 选择器求值桥（惰性解析，见 native_select）。
+    let _ = ctx.register_global_callable(
+        boa_engine::JsString::from("__nativeSelect"),
+        0,
+        boa_engine::NativeFunction::from_fn_ptr(native_select),
+    );
     ctx
 }
 
@@ -207,6 +213,63 @@ fn ajax_error(msg: &str) -> boa_engine::JsError {
     boa_engine::JsError::from_native(
         boa_engine::JsNativeError::error().with_message(msg.to_string()),
     )
+}
+
+/// `java.setContent` 之后 DOM 三件套的按需求值（`__nativeSelect(content, rule, wantList)`）。
+///
+/// 上游的 `java.setContent` 把内容设到同一个 `AnalyzeRule` 上，后续 `getElements` 在该
+/// 文档上按当前模式（HTML/CSS 或 JSON/JSONPath）求值；本服务把这一步下沉为原生函数，
+/// 惰性解析，不再依赖 eval 前的字面量选择器预抽取。
+///
+/// 只允许“纯选择器/JSONPath”规则：含 `@js:`、`<js>`、`{{…}}`、`@put/@get` 的规则会在
+/// 同一 JS 线程上再次排队，必然死锁，直接返回具名未支持错误。
+fn native_select(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let text_arg = |i: usize| -> String {
+        args.get(i)
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default()
+    };
+    let content = text_arg(0);
+    let rule = text_arg(1);
+    let want_list = args
+        .get(2)
+        .map(|v| v.to_boolean())
+        .unwrap_or(true);
+    if rule.trim().is_empty() {
+        return Err(ajax_error("java.setContent 后缺少选择器参数"));
+    }
+    if rule.contains("@js:")
+        || rule.contains("<js>")
+        || rule.contains("{{")
+        || rule.contains("@put:")
+        || rule.contains("@get:")
+    {
+        return Err(ajax_error(
+            "UNSUPPORTED_JS_API:java.setContent 后的选择器不能再含 JS/变量段",
+        ));
+    }
+    let ar = AnalyzeRule::new();
+    let json = if want_list {
+        match ar.get_string_list(&content, &rule) {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()),
+            Err(e) => {
+                return Err(ajax_error(&format!("java.setContent 选择器求值失败：{e}")));
+            }
+        }
+    } else {
+        match ar.get_string(&content, &rule, false, "") {
+            Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "\"\"".into()),
+            Err(e) => {
+                return Err(ajax_error(&format!("java.setContent 选择器求值失败：{e}")));
+            }
+        }
+    };
+    Ok(boa_engine::JsValue::from(boa_engine::JsString::from(json)))
 }
 
 /// 垫片抛出的“未支持 API”统一前缀；worker 把它翻译成用户能读懂的提示。
@@ -477,6 +540,9 @@ var __vars = {};
 // DOM 桥 Phase 1 的预抽取结果（由 Rust 在 eval 前按字面量选择器算好并赋值）
 var __DOM = {};
 var __DOMS = {};
+// java.setContent 设置的“当前文档”。null 表示未设置，仍走原始页面的预抽取表；
+// 设置后 java.getElements/getString/getStringList 才按需解析这个文档（惰性求值）。
+var __content = null;
 var book = {
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
@@ -588,29 +654,46 @@ var java = {
   },
   post: function(url, body, headers){ return java.ajax(url, "POST", body, headers); },
   connect: function(){ throw new Error("UNSUPPORTED_JS_API:java.connect（本服务无 socket 桥接）"); },
-  // DOM 桥 Phase 1：只认 Rust 预抽取好的“字面量选择器”结果（__DOM / __DOMS），
-  // 动态拼串或页面超限不走这里，直接给出具名未支持提示。
+  // DOM 桥：`java.setContent(html)` 之后按需在“当前文档”上求值（Rust 原生解析，
+  // 不再依赖预抽取的只读表）；未 setContent 时仍用 Phase 1 的字面量选择器快路。
+  setContent: function(html){ __content = (html == null) ? "" : String(html); },
   getElements: function(rule, index){
-    if (rule == null || !__DOM.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      var arr = JSON.parse(__nativeSelect(__content, key, true));
+      if (typeof index === "number") {
+        return (index >= 0 && index < arr.length) ? arr[index] : "";
+      }
+      return arr;
+    }
+    if (rule == null || !__DOM.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getElements（仅支持字面量选择器参数）");
     }
-    var arr = __DOM[String(rule)].slice(0);
+    var arr = __DOM[key].slice(0);
     if (typeof index === "number") {
       return (index >= 0 && index < arr.length) ? arr[index] : "";
     }
     return arr;
   },
   getStringList: function(rule){
-    if (rule == null || !__DOM.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      return JSON.parse(__nativeSelect(__content, key, true));
+    }
+    if (rule == null || !__DOM.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getStringList（仅支持字面量选择器参数）");
     }
-    return __DOM[String(rule)].slice(0);
+    return __DOM[key].slice(0);
   },
   getString: function(rule){
-    if (rule == null || !__DOMS.hasOwnProperty(String(rule))) {
+    var key = rule == null ? "" : String(rule);
+    if (__content !== null) {
+      return JSON.parse(__nativeSelect(__content, key, false));
+    }
+    if (rule == null || !__DOMS.hasOwnProperty(key)) {
       throw new Error("UNSUPPORTED_JS_API:java.getString（仅支持字面量选择器参数）");
     }
-    return __DOMS[String(rule)];
+    return __DOMS[key];
   },
   getCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.getCookie（本服务无 Cookie 桥接）"); },
   setCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.setCookie（本服务无 Cookie 桥接）"); },
@@ -722,6 +805,12 @@ pub struct AnalyzeRule {
     /// 最小等价版：同作用域可读写的字符串 map。上游 CacheManager 是 App 级单例 + SQLite，
     /// 本服务**每作用域一份**（随 AnalyzeRule 存活），不共享、不持久化。
     pub cache: RefCell<HashMap<String, String>>,
+    /// 跨请求的 book 层变量（Legado `book.putVariable`，上游 规则语义）。
+    /// `@put:{key:rule}` 除了写当前 `variables`，也写这里；路由层在请求结束后按
+    /// `book_key` 落库，下一次同书请求（info → toc → content）预载回来。
+    pub book_vars: RefCell<HashMap<String, String>>,
+    /// 当前作用域所属的 book_key（由路由层/编排层设置，None 表示没有 book 维度）。
+    pub book_key: RefCell<Option<String>>,
     pub js_lib: String,
     pub is_json: bool,
 }
@@ -731,6 +820,8 @@ impl Default for AnalyzeRule {
         Self {
             variables: RefCell::new(HashMap::new()),
             cache: RefCell::new(HashMap::new()),
+            book_vars: RefCell::new(HashMap::new()),
+            book_key: RefCell::new(None),
             js_lib: String::new(),
             is_json: false,
         }
@@ -750,6 +841,34 @@ impl AnalyzeRule {
         self.variables.borrow_mut().extend(m);
     }
 
+    /// 进入一本书的作用域：清空请求内变量，载入该书持久化的变量与 cache 快照。
+    /// 之后 `@put` 同时写入 `variables`（本请求可见）与 `book_vars`（请求结束落库）。
+    pub fn begin_book_scope(
+        &self,
+        key: String,
+        vars: HashMap<String, String>,
+        cache: HashMap<String, String>,
+    ) {
+        let mut v = self.variables.borrow_mut();
+        v.clear();
+        v.extend(vars.iter().map(|(k, val)| (k.clone(), val.clone())));
+        self.book_vars.replace(vars);
+        self.cache.replace(cache);
+        self.book_key.replace(Some(key));
+    }
+
+    pub fn book_scope_key(&self) -> Option<String> {
+        self.book_key.borrow().clone()
+    }
+
+    pub fn book_vars_snapshot(&self) -> HashMap<String, String> {
+        self.book_vars.borrow().clone()
+    }
+
+    pub fn cache_snapshot(&self) -> HashMap<String, String> {
+        self.cache.borrow().clone()
+    }
+
     /// 变量/JSONPath 模板展开：支持 `${var}`、`{{var}}`，以及 `{{$.field}}` / `${$.field}` / `{$.field}`
     /// （JSONPath 形式按**当前规则输入** `content` 求值，用于书源里
     /// `.../read?bid={{$.id}}`、`https://api.x/topics/{$.id}` 这类“列表项字段拼进 URL/POST body”的写法）。
@@ -761,9 +880,28 @@ impl AnalyzeRule {
             None
         };
         re.replace_all(rule, |caps: &regex::Captures| {
+            // `${…}`：只在确实是引擎变量/JSONPath 时替换；未知名字原样保留——
+            // 它通常是 JS 模板字符串（快看 `x=>`<img src="${x},${headers}">``），
+            // 替换成空串会把 JS 的插值一起吃掉。
+            if let Some(m) = caps.get(1) {
+                let key = m.as_str().trim();
+                if key.starts_with("$.") || key.starts_with("$[") {
+                    if let Some(v) = json.as_ref() {
+                        if let Ok(mut vals) = json_query(v, key) {
+                            if let Some(x) = vals.pop() {
+                                return value_to_string(x);
+                            }
+                        }
+                    }
+                    return String::new();
+                }
+                if let Some(v) = self.variables.borrow().get(key).cloned() {
+                    return v;
+                }
+                return caps.get(0).unwrap().as_str().to_string();
+            }
             let key = caps
-                .get(1)
-                .or_else(|| caps.get(2))
+                .get(2)
                 .or_else(|| caps.get(3))
                 .map(|m| m.as_str())
                 .unwrap_or("");
@@ -793,7 +931,7 @@ impl AnalyzeRule {
         .to_string()
     }
 
-    fn detect_mode(rule: &str, is_json: bool) -> Mode {
+    fn detect_mode(rule: &str, is_json: bool, content: &str) -> Mode {
         // Legado 的 `@CSS:`/`@XPath:`/`@Json:` 前缀全部大小写不敏感。
         if starts_with_ci(rule, "@xpath:") {
             Mode::XPath
@@ -801,7 +939,11 @@ impl AnalyzeRule {
             Mode::Json
         } else if starts_with_ci(rule, "@css:") || rule.starts_with("@@") {
             Mode::Css
-        } else if rule.starts_with("$.") || rule.starts_with("$[") || is_json {
+        } else if rule.starts_with("$.") || rule.starts_with("$[") {
+            Mode::Json
+        } else if is_json && !content.trim_start().starts_with('<') {
+            // 源级 JSON 提示只对 JSON 内容生效：HTML 页面上的 `img@data-src`
+            // 不能被强行当成 JSONPath（快看图片规则就栽在这里）。
             Mode::Json
         } else if rule.starts_with('/') {
             // `/.../`（含替换形式 `/pat/repl/`）判定为正则；普通 XPath 不以 / 结尾
@@ -900,7 +1042,12 @@ impl AnalyzeRule {
                 }
                 let value = value_rule.trim().to_string();
                 if let Ok(v) = self.get_string_inner(content, &value, is_url, base_url) {
-                    self.variables.borrow_mut().insert(key.to_string(), v);
+                    self.variables
+                        .borrow_mut()
+                        .insert(key.to_string(), v.clone());
+                    // book 层持久化：即使本轮没有 book_key（如搜索阶段），也留在
+                    // book_vars 里等待编排层落库，不跨请求丢失。
+                    self.book_vars.borrow_mut().insert(key.to_string(), v);
                 }
             }
         }
@@ -1043,7 +1190,7 @@ impl AnalyzeRule {
                 Mode::Js => self.eval_js(&input, t, base_url)?,
                 _ => {
                     let m = if mode == Mode::Default {
-                        Self::detect_mode(t, self.is_json)
+                        Self::detect_mode(t, self.is_json, &input)
                     } else {
                         mode
                     };
@@ -1244,8 +1391,8 @@ impl AnalyzeRule {
     /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
     fn js_vars(&self) -> String {
         const RESERVED: &[&str] = &[
-            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "java", "cache",
-            "__cache", "__out",
+            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "__content",
+            "__nativeSelect", "__nativeAjax", "java", "cache", "__cache", "__out",
         ];
         let mut out = String::new();
         for (k, v) in self.variables.borrow().iter() {
@@ -1425,7 +1572,7 @@ impl AnalyzeRule {
             }
             return Ok(vec![res]);
         }
-        let mode = Self::detect_mode(&rule, self.is_json);
+        let mode = Self::detect_mode(&rule, self.is_json, content);
         match mode {
             Mode::Json => self.json_list(content, Self::strip_prefix(&rule, "@json:")),
             _ => self.css_list(content, Self::strip_prefix(&rule, "@css:")),
@@ -1517,6 +1664,38 @@ impl AnalyzeRule {
         }
         // JS 段：数组按 JSON 拆项，普通字符串按 `\n` 拆（Legado getStringList 对 String 的处理）
         if starts_with_ci(r, "@js:") || contains_ci(r, "@js:") || r.contains("<js>") {
+            let js_parts = Self::split_js(r);
+            if js_parts.len() >= 2 {
+                let last = js_parts.len() - 1;
+                let mut input = content.to_string();
+                for (i, (mode, text)) in js_parts.iter().enumerate() {
+                    let t = text.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if i == last {
+                        return match self.eval_js(&input, t, base_url) {
+                            Ok(s) if !s.is_empty() => {
+                                if s.starts_with('[') {
+                                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&s) {
+                                        return arr;
+                                    }
+                                }
+                                s.split('\n').map(|x| x.to_string()).collect()
+                            }
+                            _ => vec![],
+                        };
+                    }
+                    if *mode == Mode::Js {
+                        input = self.eval_js(&input, t, base_url).unwrap_or_default();
+                    } else {
+                        // 列表语义：JSONPath 指向数组时先摊平成多项，再以 `\n` 交给 JS。
+                        // 爱看 `$.data.current_chapter.chapter_img_list@js:result.split("\n")…`
+                        // 依赖的就是「每条图片 URL 一行」的输入（上游 getStringList 的 List 语义）。
+                        input = self.eval_list(&input, t, base_url).join("\n");
+                    }
+                }
+            }
             return match self.get_string_inner(content, r, false, base_url) {
                 Ok(s) if !s.is_empty() => {
                     if s.starts_with('[') {
@@ -1529,7 +1708,7 @@ impl AnalyzeRule {
                 _ => vec![],
             };
         }
-        match Self::detect_mode(r, self.is_json) {
+        match Self::detect_mode(r, self.is_json, content) {
             Mode::Json => self
                 .json_list(content, Self::strip_prefix(r, "@json:"))
                 .unwrap_or_default(),
@@ -3737,6 +3916,29 @@ nodes.filter(function (node) {
         assert!(items[0].contains("甲"));
     }
 
+    /// 快看的图片规则首段：CSS `img@data-src` 必须按列表返回每个属性值。
+    #[test]
+    fn get_list_css_attr_data_src() {
+        let html = r#"<div class="ComicPics"><img data-src="https://cdn/x1.webp?a=1&amp;t=2" src="s1"><img data-src="https://cdn/x2.webp" src="s2"></div>"#;
+        let ar = AnalyzeRule::new();
+        let vals = ar.get_string_list_all(html, "img@data-src", "");
+        assert_eq!(
+            vals,
+            vec![
+                "https://cdn/x1.webp?a=1&t=2".to_string(),
+                "https://cdn/x2.webp".to_string()
+            ]
+        );
+        // 接着 JS 段：拼成 `<img src="url,{headers}">` 形态
+        let rule = "img@data-src\n<js>\nlet headers = JSON.stringify({\"headers\":{\"Referer\":baseUrl}});\nresult.split('\\n').map(x=>`<img src=\"${x},${headers}\">`).join('\\n');\n</js>";
+        let out = ar.get_string_list_all(html, rule, "https://m.kuaikanmanhua.com/");
+        assert_eq!(out.len(), 2, "实际: {out:?}");
+        assert!(
+            out[0].starts_with("<img src=\"https://cdn/x1.webp?a=1&t=2,"),
+            "实际: {out:?}"
+        );
+    }
+
     #[test]
     fn dom_bridge_dynamic_argument_reports_unsupported() {
         // 动态拼串不预处理，必须在运行时给出具名提示，而不是静默空结果
@@ -3928,6 +4130,102 @@ nodes.filter(function (node) {
         // 另一个源（另一个 AnalyzeRule）读不到
         assert_eq!(b.get_string("", "@get:{bid}", false, "").unwrap(), "");
         assert_eq!(a.get_string("", "@get:{bid}", false, "").unwrap(), "111");
+    }
+
+    /// 跨请求：搜索阶段 `@put` 的 bid 在 info/toc 的新 AnalyzeRule 上读回（爱看链路）。
+    #[test]
+    fn book_vars_survive_new_request_scope() {
+        let json = r#"{"comic_name":"海贼王","comic_id":106492}"#;
+        // 请求 1（搜索）：写入 book 层变量
+        let req1 = AnalyzeRule::new();
+        req1.begin_book_scope("bk-1".into(), HashMap::new(), HashMap::new());
+        let name = req1
+            .get_string(json, "$.comic_name@put:{bid:$.comic_id}", false, "")
+            .unwrap();
+        assert_eq!(name, "海贼王");
+        assert_eq!(req1.book_vars_snapshot().get("bid").map(|s| s.as_str()), Some("106492"));
+
+        // 请求 2（目录）：新实例预载同一 book_key 的快照后 @get 生效
+        let req2 = AnalyzeRule::new();
+        req2.begin_book_scope("bk-1".into(), req1.book_vars_snapshot(), HashMap::new());
+        let url = req2
+            .get_string(
+                "",
+                "https://m.kanman.com/api/getchapterlist?comic_id=@get:{bid}",
+                true,
+                "",
+            )
+            .unwrap();
+        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+
+        // 另一本书（不同 book_key）不会读到
+        let other = AnalyzeRule::new();
+        other.begin_book_scope("bk-2".into(), HashMap::new(), HashMap::new());
+        assert_eq!(other.get_string("", "@get:{bid}", false, "").unwrap(), "");
+    }
+
+    /// 跨请求 cache：info 阶段 `cache.put` 的 JSON，目录阶段预载后可 `cache.get`。
+    #[test]
+    fn cache_survives_new_request_scope() {
+        let req1 = AnalyzeRule::new();
+        req1.begin_book_scope("bk-1".into(), HashMap::new(), HashMap::new());
+        req1.eval_js("", "cache.put('kkmh', '{\"data\":[1,2]}')", "").unwrap();
+        let snap = req1.cache_snapshot();
+        assert_eq!(snap.get("kkmh").map(|s| s.as_str()), Some("{\"data\":[1,2]}"));
+
+        let req2 = AnalyzeRule::new();
+        req2.begin_book_scope("bk-1".into(), HashMap::new(), snap);
+        let got = req2.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        assert_eq!(got, "{\"data\":[1,2]}");
+        // 目录阶段 delete 后快照里也没了（供路由层按 diff 删库）
+        req2.eval_js("", "cache.delete('kkmh')", "").unwrap();
+        assert!(req2.cache_snapshot().is_empty());
+    }
+
+    /// 快看形态：`java.setContent(json)` → `java.getElements('$.data[*].comicList[*]')`。
+    #[test]
+    fn set_content_then_get_elements_jsonpath_like_source() {
+        let nuxt = r#"{"data":[{"comicList":[{"id":1,"title":"第1话"},{"id":2,"title":"第2话"}]},{"comicList":[{"id":3,"title":"第3话"}]}]}"#;
+        let code = format!(
+            "java.setContent({}); result = java.getElements('$.data[*].comicList[*]');",
+            serde_json::to_string(nuxt).unwrap()
+        );
+        let ar = AnalyzeRule::new();
+        let out = ar.eval_js("", &code, "").unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let arr = v.as_array().expect("应返回章节节点数组");
+        assert_eq!(arr.len(), 3, "两页 comicList 共 3 章: {out}");
+        let first: Value = serde_json::from_str(arr[0].as_str().unwrap()).unwrap();
+        assert_eq!(first["title"], "第1话");
+    }
+
+    /// setContent 也只作用于本次 eval（每次 eval 都是新的 IIFE）。
+    #[test]
+    fn set_content_scoped_to_call() {
+        let ar = AnalyzeRule::new();
+        ar.eval_js("", "java.setContent('{\"a\":[1,2]}'); result = 1", "")
+            .unwrap();
+        let err = ar
+            .eval_js("", "result = java.getElements('$.a[*]')", "")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("仅支持字面量选择器"),
+            "下一次调用不应复用上次的文档（应回落到预抽取表并报未支持）：{err}"
+        );
+    }
+
+    /// setContent 也支持 HTML 文档（CSS 选择器），下游 getString 同文档求值。
+    #[test]
+    fn set_content_html_css_selectors() {
+        let ar = AnalyzeRule::new();
+        let out = ar
+            .eval_js(
+                "",
+                "java.setContent('<div class=\"x\"><p>甲</p></div>'); result = java.getString('div.x p');",
+                "",
+            )
+            .unwrap();
+        assert_eq!(out, "甲");
     }
 
     #[test]
