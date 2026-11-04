@@ -748,6 +748,17 @@ pub async fn chapter_content(
     chapter_content_book(source, chapter, None).await
 }
 
+/// 正文规则以 `@textNodes` 结尾时，生成等价的 `@html` 回退规则。
+/// `@html` 保留 <p>/<br> 等分段，前端能按段渲染；仅用于「抽取结果为空」的兜底。
+fn content_text_fallback(rule: &str) -> Option<String> {
+    let trimmed = rule.trim_end();
+    let head = trimmed.strip_suffix("@textNodes")?;
+    if head.is_empty() {
+        return None;
+    }
+    Some(format!("{head}@html"))
+}
+
 /// 带 book 作用域的正文（正文规则里的 `@get` 变量按同书预载）。
 pub async fn chapter_content_book(
     source: &BookSource,
@@ -763,7 +774,23 @@ pub async fn chapter_content_book(
     let mut parts: Vec<String> = Vec::new();
     for (page_url, html) in &pages {
         let ar = make_ar_book(source, store, &book_url);
-        let part = ar.get_string(html, rule.content.as_deref().unwrap_or(""), false, page_url)?;
+        let content_rule = rule.content.as_deref().unwrap_or("");
+        let mut part = ar.get_string(html, content_rule, false, page_url)?;
+        // `@textNodes` 只取直接子文本节点；部分站点把正文包在 <p> 里，直接文本节点只有空白。
+        // 结果为空时用同一选择器的 `@html` 回退一次，避免整章空白（不改变普通规则的语义）。
+        if part.trim().is_empty() {
+            if let Some(fallback) = content_text_fallback(content_rule) {
+                let retried = ar.get_string(html, &fallback, false, page_url)?;
+                if !retried.trim().is_empty() {
+                    tracing::debug!(
+                        rule = content_rule,
+                        fallback = fallback.as_str(),
+                        "content @textNodes empty, fell back to @html"
+                    );
+                    part = retried;
+                }
+            }
+        }
         record_ar(&ar, store);
         parts.push(part);
     }
@@ -1583,6 +1610,33 @@ fn _unused(_: HashMap<String, String>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_text_nodes_fallback_recovers_p_wrapped_text() {
+        // 真实形态（biquge7《百年孤独》）：`.text` 里只有 <p>，直接文本节点全是空白，
+        // `@textNodes` 得到空串；回退到同一选择器的 `@html` 才能拿到正文。
+        let src = BookSource::default();
+        let ar = make_ar(&src);
+        let html = r#"<div class="text">
+            <p>第一段正文。</p>
+            <p>第二段正文。</p>
+        </div>"#;
+        let rule = "class.text@textNodes";
+        assert!(ar.get_string(html, rule, false, "https://x/").unwrap().trim().is_empty());
+        let fallback = content_text_fallback(rule).expect("should produce fallback");
+        assert_eq!(fallback, "class.text@html");
+        let out = ar.get_string(html, &fallback, false, "https://x/").unwrap();
+        assert!(out.contains("第一段正文"), "out={out}");
+        assert!(out.contains("第二段正文"), "out={out}");
+        assert!(out.contains("<p>"), "should keep paragraph tags for reader: {out}");
+    }
+
+    #[test]
+    fn content_text_nodes_fallback_is_not_generated_for_other_rules() {
+        assert!(content_text_fallback("class.text@text").is_none());
+        assert!(content_text_fallback("class.text@textNodes@trim").is_none());
+        assert!(content_text_fallback("@textNodes").is_none());
+    }
 
     #[test]
     fn comic_img_html_falls_back_to_outer_html() {
