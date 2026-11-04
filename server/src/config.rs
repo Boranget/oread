@@ -104,6 +104,25 @@ pub struct Config {
     pub image_cache_mb: u64,
     /// 单张图片大小上限（字节，超限返回 413 或流式截断）
     pub image_max_body_bytes: usize,
+    /// 长条漫画页服务端切片总开关（默认关）。关闭时 `/k` 与 `/api/book/image?slice=1`
+    /// 都退回整图一页；开启后只对显示高度超过 1.3 屏的图切片。
+    pub comic_slice: bool,
+    /// 切片版心宽（CSS px，默认 928）
+    pub comic_slice_dw: u32,
+    /// 切片可用高（CSS px，默认 1196 = 1268 舞台 − 72 底栏留白）
+    pub comic_slice_vh: u32,
+    /// 片间 overlap（CSS px，默认 64，上限为可用高的 1/4）
+    pub comic_slice_ov: u32,
+    /// 近白行亮度均值下限（默认 200）
+    pub comic_slice_mu: u8,
+    /// 近白行带内标准差上限（默认 30）
+    pub comic_slice_sd: u8,
+    /// 切点搜索半径（CSS px，默认 96）
+    pub comic_slice_r: u32,
+    /// `/k` 默认视口宽（CSS px，缺 `vw` 参数时兜底，默认 1072）
+    pub kindle_vw: u32,
+    /// `/k` 默认视口高（CSS px，缺 `vh` 参数时兜底，默认 1268）
+    pub kindle_vh: u32,
     /// 书源 JS 规则总开关
     pub js_enabled: bool,
     /// 单段 JS 规则的时间预算（毫秒，用于超时提示/统计）
@@ -173,6 +192,10 @@ impl Config {
             env_u64_opt("SEARCH_TOTAL_BUDGET_SECS"),
         );
         let http_concurrency_raw = env_u64_opt("HTTP_CONCURRENCY");
+        // 切片参数有跨字段约束：overlap 不得超过可用高的 1/4（与 SliceParams 的夹取一致）。
+        let comic_slice_vh = env_u64("COMIC_SLICE_VH", 1196).clamp(320, 2000) as u32;
+        let comic_slice_ov = env_u64("COMIC_SLICE_OV", 64)
+            .clamp(0, (comic_slice_vh / 4) as u64) as u32;
         Self {
             host: env_prefixed("HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port: env_prefixed("PORT")
@@ -193,6 +216,16 @@ impl Config {
             http_max_body_bytes: env_u64("HTTP_MAX_BODY_MB", 5).clamp(1, 32) as usize * 1024 * 1024,
             image_cache_mb: env_u64("IMAGE_CACHE_MB", 64).clamp(4, 256),
             image_max_body_bytes: env_u64("IMAGE_MAX_BODY_MB", 8).clamp(1, 32) as usize * 1024 * 1024,
+            comic_slice: env_bool("COMIC_SLICE", false),
+            comic_slice_dw: env_u64("COMIC_SLICE_DW", 928).clamp(320, 2000) as u32,
+            comic_slice_vh,
+            comic_slice_ov,
+            comic_slice_mu: env_u64("COMIC_SLICE_MU", 200).clamp(0, 255) as u8,
+            comic_slice_sd: env_u64("COMIC_SLICE_SD", 30).clamp(0, 255) as u8,
+            comic_slice_r: env_u64("COMIC_SLICE_R", 96).clamp(8, 480) as u32,
+            // `/k` 视口兜底：请求带 `vw`/`vh` 时以请求为准，缺参才用这两个环境默认值。
+            kindle_vw: env_u64("KINDLE_VW", 1072).clamp(480, 2400) as u32,
+            kindle_vh: env_u64("KINDLE_VH", 1268).clamp(480, 2400) as u32,
             js_enabled: env_bool("JS_ENABLED", true),
             js_timeout_ms: env_u64("JS_TIMEOUT_MS", 200).clamp(20, 5000),
             toc_ttl_secs: env_u64("TOC_TTL_SECS", 6 * 3600).clamp(60, 7 * 86400) as i64,

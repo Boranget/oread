@@ -282,12 +282,13 @@ async fn chapter_images(
     let placeholder_suspected = !images.is_empty() && (chapter.is_pay || chapter.is_vip);
     // 每张图附 `slices`：>1 表示该图超长条页、需要按屏切片翻页；0 表示整图一屏。
     // 只按源页面给的 width/height 预判（未知尺寸按 1 屏处理，交给 `/k` 打开时再算）。
-    let slice_params = image::SliceParams::default();
+    // 切片开关关闭时恒为 0，前端按整图一页展示。
+    let slice_params = image::SliceParams::from_config(&s.cfg, None, None, None);
     let images_out: Vec<serde_json::Value> = images
         .iter()
         .map(|im| {
             let n = match (im.width, im.height) {
-                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                (Some(w), Some(h)) if w > 0 && h > 0 && s.cfg.comic_slice => {
                     image::slice_count_window(w, h, &slice_params)
                 }
                 _ => 1,
