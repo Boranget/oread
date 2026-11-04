@@ -327,6 +327,19 @@ pub struct SearchBook {
     pub origin_order: i64,
     #[serde(default)]
     pub chapter_word_count_text: Option<String>,
+    /// 去重后命中的全部书源（展示源名；同书多源 → 多元素）。
+    /// 前端/`/k` 用它展示「N 个源」，也是多源共识加分的依据。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<String>,
+    /// 相关性档位：`strong`（书名命中）/ `author`（只命中作者）/
+    /// `partial`（只命中查询片段，可能相关）。空查询时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<String>,
+    /// 稳定排序桶（仅 job 分页使用）：翻页游标 `(rank_bucket, rank_seq)`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_bucket: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]

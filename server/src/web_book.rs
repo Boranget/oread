@@ -1125,6 +1125,47 @@ pub struct ExploreCategory {
     pub url: String,
 }
 
+/// 单次搜索会话的稳定排序状态（仅 `/api/search/result` 使用）：
+/// - `order`：去重键 → 首次入池时确定的 `(bucket, seq)`，之后不再变化；
+/// - `next_seq`：单调递增的入池序号；
+/// - `snapshot`：一旦用户开始翻页（cursor / page>1），冻结整份有序结果，
+///   后续页都从同一份快照读取，保证同一会话翻页不重不漏。
+#[derive(Default)]
+pub(crate) struct RankFreeze {
+    pub order: HashMap<String, (u8, u64)>,
+    pub next_seq: u64,
+    pub snapshot: Option<Vec<SearchBook>>,
+}
+
+/// 去重键：归一化书名 + 归一化作者；书名为空时退化为 book_url。
+pub(crate) fn dedupe_key(b: &SearchBook) -> String {
+    let name = b.name.as_deref().unwrap_or("").trim().to_lowercase();
+    let author = b.author.as_deref().unwrap_or("").trim().to_lowercase();
+    if name.is_empty() {
+        b.book_url.clone()
+    } else {
+        format!("{name}|{author}")
+    }
+}
+
+/// 一条去重后的候选（内部结构，排序前构造）。
+struct RankedBook {
+    book: SearchBook,
+    relevance: u8,
+    weight: i64,
+    custom_order: i64,
+    /// 命中该书的源：`(url, 展示名)`，按 url 去重。
+    origins: Vec<(String, String)>,
+    bucket: u8,
+    seq: u64,
+}
+
+impl RankedBook {
+    fn score(&self) -> u8 {
+        crate::search_rank::combined_score(self.relevance, self.weight, self.origins.len())
+    }
+}
+
 /// 聚合去重 + 排序。
 ///
 /// - `query` 非空（搜索结果）：先丢弃与查询词完全无关的条目，再按相关性降序排序——
@@ -1132,11 +1173,18 @@ pub struct ExploreCategory {
 ///   固定为 `SCORE_PARTIAL`，严格排在所有书名命中之后。同分再按源权重降序、
 ///   `customOrder` 升序、`book_url` 升序。源权重只作为同档内的小幅加分（≤3），
 ///   不会让低相关的高权重源压过完整命中。
+///   多源同书合并后按真实来源数计算共识加分，并在结果里带出 `origins`。
+///   强命中（exact/prefix/contains/approx）≥ `STRONG_MIN_RESULTS` 时，
+///   只命中片段的 partial 被折叠掉，避免首屏只剩“可能相关”。
 /// - `query` 为空（发现/探索页）：保持旧的"纯源权重"排序，不做相关性过滤。
-pub(crate) fn dedupe_and_sort(
+///
+/// `freeze` 为 `Some` 时用于 job 分页：条目首次入池即固定 `(bucket, seq)`，
+/// 后到结果不会挤动已翻过的页。
+pub(crate) fn dedupe_and_sort_with(
     books: Vec<SearchBook>,
     sources: &[BookSource],
     query: &str,
+    freeze: Option<&mut RankFreeze>,
 ) -> Vec<SearchBook> {
     let order: HashMap<&str, (i64, i64)> = sources
         .iter()
@@ -1149,63 +1197,151 @@ pub(crate) fn dedupe_and_sort(
             .copied()
             .unwrap_or((0, 0))
     };
-    let mut books = books;
     let q = crate::search_rank::normalize_title(query);
-    if !q.is_empty() {
-        books.retain(|b| {
+
+    // 先去重：同书多源合并成一条，累计真实来源（共识加分依据）。
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut ranked: Vec<RankedBook> = Vec::new();
+    for b in books {
+        let rel = if q.is_empty() {
+            0
+        } else {
             crate::search_rank::search_relevance(
                 &q,
                 b.name.as_deref().unwrap_or(""),
                 b.author.as_deref().unwrap_or(""),
-            ) > 0
-        });
-        books.sort_by(|a, b| {
-            let (wa, oa) = weight_order(a);
-            let (wb, ob) = weight_order(b);
-            let sa = crate::search_rank::combined_score(
-                crate::search_rank::search_relevance(
-                    &q,
-                    a.name.as_deref().unwrap_or(""),
-                    a.author.as_deref().unwrap_or(""),
-                ),
-                wa,
-                1,
-            );
-            let sb = crate::search_rank::combined_score(
-                crate::search_rank::search_relevance(
-                    &q,
-                    b.name.as_deref().unwrap_or(""),
-                    b.author.as_deref().unwrap_or(""),
-                ),
-                wb,
-                1,
-            );
-            sb.cmp(&sa)
-                .then_with(|| wb.cmp(&wa))
-                .then_with(|| oa.cmp(&ob))
-                .then_with(|| a.book_url.cmp(&b.book_url))
+            )
+        };
+        if !q.is_empty() && rel == 0 {
+            continue;
+        }
+        let (w, o) = weight_order(&b);
+        let origin_url = b.origin.clone().unwrap_or_default();
+        let origin_name = b
+            .origin_name
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| origin_url.clone());
+        let key = dedupe_key(&b);
+        match index.get(&key) {
+            Some(&i) => {
+                let e = &mut ranked[i];
+                if !origin_url.is_empty()
+                    && !e.origins.iter().any(|(u, _)| u == &origin_url)
+                {
+                    e.origins.push((origin_url, origin_name));
+                }
+                // 同书多源：保留更相关（同相关时权重更高）的那一行做展示。
+                if rel > e.relevance || (rel == e.relevance && w > e.weight) {
+                    let origins = std::mem::take(&mut e.origins);
+                    *e = RankedBook {
+                        book: b,
+                        relevance: rel,
+                        weight: w,
+                        custom_order: o,
+                        origins,
+                        bucket: 0,
+                        seq: 0,
+                    };
+                }
+            }
+            None => {
+                index.insert(key, ranked.len());
+                let origins = if origin_url.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(origin_url, origin_name)]
+                };
+                ranked.push(RankedBook {
+                    book: b,
+                    relevance: rel,
+                    weight: w,
+                    custom_order: o,
+                    origins,
+                    bucket: 0,
+                    seq: 0,
+                });
+            }
+        }
+    }
+
+    let mut frozen = false;
+    if let Some(f) = freeze {
+        frozen = true;
+        for e in ranked.iter_mut() {
+            let key = dedupe_key(&e.book);
+            let (bucket, seq) = match f.order.get(&key).copied() {
+                Some(v) => v,
+                None => {
+                    let seq = f.next_seq;
+                    f.next_seq += 1;
+                    let b = crate::search_rank::bucket(e.score());
+                    f.order.insert(key, (b, seq));
+                    (b, seq)
+                }
+            };
+            e.bucket = bucket;
+            e.seq = seq;
+            e.book.rank_bucket = Some(bucket);
+            e.book.rank_seq = Some(seq);
+        }
+    }
+
+    // 排序：job 分页用固定 (bucket, seq)，其余用分数 + 权重 + 顺序 + url。
+    if frozen {
+        ranked.sort_by(|a, b| b.bucket.cmp(&a.bucket).then(a.seq.cmp(&b.seq)));
+    } else if !q.is_empty() {
+        ranked.sort_by(|a, b| {
+            b.score()
+                .cmp(&a.score())
+                .then_with(|| b.weight.cmp(&a.weight))
+                .then_with(|| a.custom_order.cmp(&b.custom_order))
+                .then_with(|| a.book.book_url.cmp(&b.book.book_url))
         });
     } else {
-        books.sort_by(|a, b| {
-            let (wa, oa) = weight_order(a);
-            let (wb, ob) = weight_order(b);
-            wb.cmp(&wa)
-                .then_with(|| oa.cmp(&ob))
-                .then_with(|| a.book_url.cmp(&b.book_url))
+        ranked.sort_by(|a, b| {
+            b.weight
+                .cmp(&a.weight)
+                .then_with(|| a.custom_order.cmp(&b.custom_order))
+                .then_with(|| a.book.book_url.cmp(&b.book.book_url))
         });
     }
-    let mut seen = HashSet::new();
-    books.retain(|b| {
-        let name = b.name.as_deref().unwrap_or("").trim().to_lowercase();
-        let author = b.author.as_deref().unwrap_or("").trim().to_lowercase();
-        let key = if name.is_empty() {
-            b.book_url.clone()
-        } else {
-            format!("{name}|{author}")
-        };
-        seen.insert(key)
-    });
-    books
+
+    // 相关性档位 + origins 回填。
+    for e in ranked.iter_mut() {
+        if !q.is_empty() {
+            e.book.relevance =
+                Some(crate::search_rank::relevance_class(e.relevance).to_string());
+        }
+        e.book.origins = e
+            .origins
+            .iter()
+            .map(|(_, name)| name.clone())
+            .filter(|n| !n.is_empty())
+            .collect();
+    }
+
+    // 有条件折叠：强命中足够多时，partial 不再进入首屏（整体丢弃）。
+    // 空查询（发现页）不过滤、不折叠。
+    if !q.is_empty() {
+        let strong = ranked
+            .iter()
+            .filter(|e| e.relevance >= crate::search_rank::SCORE_APPROX_MIN)
+            .count();
+        if crate::search_rank::should_fold_partials(strong) {
+            ranked.retain(|e| e.relevance != crate::search_rank::SCORE_PARTIAL);
+        }
+    }
+
+    ranked.into_iter().map(|e| e.book).collect()
+}
+
+pub(crate) fn dedupe_and_sort(
+    books: Vec<SearchBook>,
+    sources: &[BookSource],
+    query: &str,
+) -> Vec<SearchBook> {
+    dedupe_and_sort_with(books, sources, query, None)
 }
 
 /// 多源搜索：并发请求所有启用书源；单源失败只记录错误，不影响整体。
@@ -1920,5 +2056,68 @@ mod tests {
         let out = dedupe_and_sort(books, &sources, "");
         assert_eq!(out.len(), 2, "空查询不得丢弃任何条目");
         assert_eq!(out[0].name.as_deref(), Some("斗罗大陆"), "高权重源仍排前");
+    }
+
+    /// 多源共识：同一本书命中 3 个源应排在同相关、同权重的单源书之前。
+    #[test]
+    fn multi_source_consensus_outranks_single_source() {
+        let sources = vec![src("a", 0, 0), src("b", 0, 0), src("c", 0, 0)];
+        let books = vec![
+            sb("百年孤独", "马尔克斯", "a", "u1"),
+            sb("百年孤独", "马尔克斯", "b", "u2"),
+            sb("百年孤独", "马尔克斯", "c", "u3"),
+            sb("百年孤独外传", "某人", "a", "u4"),
+        ];
+        let out = dedupe_and_sort(books, &sources, "百年孤独");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name.as_deref(), Some("百年孤独"), "3 源同书应排前");
+        assert_eq!(out[0].origins.len(), 3, "origins 应累计 3 个源");
+        assert_eq!(out[1].origins.len(), 1);
+    }
+
+    /// 共识加分不得跨档：partial 即使 3 源 + 满权重也压不过单源 approx。
+    #[test]
+    fn consensus_never_crosses_relevance_tier() {
+        let sources = vec![src("a", 9, 0), src("b", 9, 0), src("c", 9, 0), src("d", 0, 0)];
+        let books = vec![
+            sb("百年争战", "", "a", "u1"),
+            sb("百年争战", "", "b", "u2"),
+            sb("百年争战", "", "c", "u3"),
+            sb("百年孤獨", "", "d", "u4"), // 近似档（异体字编辑距离命中）
+        ];
+        let out = dedupe_and_sort(books, &sources, "百年孤独");
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].relevance.as_deref(),
+            Some("strong"),
+            "approx 必须压过 3 源 partial"
+        );
+    }
+
+    /// strong ≥ 5 时 partial 折叠掉；strong < 5 时 partial 保留且排在 strong 之后。
+    #[test]
+    fn partials_fold_only_when_enough_strong_hits() {
+        let sources = vec![src("s", 0, 0)];
+        let mut few: Vec<SearchBook> = vec![
+            sb("百年孤独", "", "s", "u1"),
+            sb("新百年孤独", "", "s", "u2"),
+        ];
+        few.extend(["百年争战", "百年世家", "百年修仙", "百年风华"].map(|n| sb(n, "", "s", n)));
+        let out = dedupe_and_sort(few, &sources, "百年孤独");
+        assert_eq!(out.len(), 6, "strong=2 < 5，partial 仍补位");
+        assert_eq!(out[0].relevance.as_deref(), Some("strong"));
+        assert_eq!(out[1].relevance.as_deref(), Some("strong"));
+        assert!(out[2..]
+            .iter()
+            .all(|b| b.relevance.as_deref() == Some("partial")));
+
+        let mut many: Vec<SearchBook> = (0..5)
+            .map(|i| sb(&format!("百年孤独第{i}部"), "", "s", &format!("u{i}")))
+            .collect();
+        many.push(sb("百年争战", "", "s", "p1"));
+        many.push(sb("百年世家", "", "s", "p2"));
+        let out = dedupe_and_sort(many, &sources, "百年孤独");
+        assert_eq!(out.len(), 5, "strong=5 ≥ 5，partial 应被折叠");
+        assert!(out.iter().all(|b| b.relevance.as_deref() == Some("strong")));
     }
 }
