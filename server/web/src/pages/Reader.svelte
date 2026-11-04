@@ -45,6 +45,13 @@
   let contentLoading = false;
   let contentError = '';
 
+  // ---- 正文内嵌图片 ----
+  // 与漫画链路共用 /api/book/image 代理：先 fetch 成 Blob，再由 objectURL 渲染，
+  // 这样 <img src> 也能带上 Bearer，不新增任何图片请求方式。
+  let imgState = {};
+  const imgCache = new Map();
+  const IMG_TAG_RE = /<img\b[^>]*>/gi;
+
   // 付费/VIP 章节来自 /api/book/toc 的 is_vip / is_pay；同时为真只按 V 展示
   let payNoticeClosed = -1;
   $: payChapter = currentPos >= 0 ? chapters[currentPos] || null : null;
@@ -212,6 +219,10 @@
     clearInterval(statsTimer);
     flushStats(true);
     cancelAnimationFrame(autoRaf);
+    for (const rec of imgCache.values()) {
+      if (rec && rec.objectUrl) URL.revokeObjectURL(rec.objectUrl);
+    }
+    imgCache.clear();
   });
 
   function onPageHide() {
@@ -236,9 +247,42 @@
     return String(s || '').replace(/<[^>]*>/g, '').replace(/\s/g, '').length;
   }
 
-  function htmlToParas(html) {
+  // 读取 <img> 属性；兼容带引号/不带引号两种写法
+  function imgAttr(tag, name) {
+    const re = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
+    const m = re.exec(tag);
+    return m ? (m[1] ?? m[2] ?? m[3] ?? '') : '';
+  }
+
+  // 懒加载属性优先（src 常是 1px 占位图），顺序与后端 pick_img_src 保持一致
+  function pickImgSrc(tag) {
+    for (const k of ['data-src', 'data-original', 'data-lazy-src', 'data-original-src', 'data-echo', 'data-url']) {
+      const v = imgAttr(tag, k).trim();
+      if (v) return v;
+    }
+    const src = imgAttr(tag, 'src').trim();
+    if (src) return src;
+    for (const k of ['srcset', 'data-srcset']) {
+      const first = imgAttr(tag, k).split(',')[0].trim().split(/\s+/)[0];
+      if (first) return first;
+    }
+    return '';
+  }
+
+  // 相对地址按章节页归并为绝对地址（图片代理只接 http/https）
+  function absImg(raw, base) {
+    const s = String(raw || '').trim();
+    if (!s || /^data:/i.test(s) || /^javascript:/i.test(s)) return '';
+    try {
+      return new URL(s, base || location.href).href;
+    } catch {
+      return '';
+    }
+  }
+
+  function textToParas(html) {
     const text = String(html || '')
-      .replace(/<\s*(br|\/p|\/div|\/h[1-6]|\/li|\/tr)\s*\/?\s*>/gi, '\n')
+      .replace(/<\s*(br|\/p|\/div|\/h[1-6]|\/li|\/tr|\/blockquote)\s*\/?\s*>/gi, '\n')
       .replace(/<[^>]*>/g, '')
       .replace(/&nbsp;/g, ' ')
       .replace(/&lt;/g, '<')
@@ -251,6 +295,78 @@
       .split('\n')
       .map((s) => s.trim())
       .filter(Boolean);
+  }
+
+  // 正文解析：保留 <img>，按页面顺序切成文本段 / 图片段，图片随后走代理加载
+  function htmlToParas(html, base) {
+    const src = String(html || '');
+    const out = [];
+    let last = 0;
+    IMG_TAG_RE.lastIndex = 0;
+    let m;
+    while ((m = IMG_TAG_RE.exec(src))) {
+      for (const t of textToParas(src.slice(last, m.index))) out.push({ type: 'text', text: t });
+      const url = absImg(pickImgSrc(m[0]), base);
+      if (url) out.push({ type: 'image', src: url, alt: imgAttr(m[0], 'alt') });
+      last = m.index + m[0].length;
+    }
+    for (const t of textToParas(src.slice(last))) out.push({ type: 'text', text: t });
+    return out;
+  }
+
+  function setImg(src, rec) {
+    imgCache.set(src, rec);
+    imgState = { ...imgState, [src]: rec };
+  }
+
+  // 最多保留 40 张，超出按插入顺序淘汰并释放 objectURL，避免长时间阅读内存上涨
+  function dropOldImages() {
+    while (imgCache.size > 40) {
+      const [key, val] = imgCache.entries().next().value;
+      imgCache.delete(key);
+      if (val && val.objectUrl) URL.revokeObjectURL(val.objectUrl);
+      const next = { ...imgState };
+      delete next[key];
+      imgState = next;
+    }
+  }
+
+  async function loadInlineImage(src, force = false) {
+    if (!src) return;
+    const prev = imgCache.get(src);
+    if (!force && prev && prev.status !== 'error') return;
+    if (prev && prev.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+    setImg(src, { status: 'loading' });
+    const chapterUrl = (current && current.url) || '';
+    try {
+      const rec = await api.comicImage(
+        book.sourceId || '',
+        src,
+        chapterUrl,
+        book.bookUrl || ''
+      );
+      setImg(src, { status: 'ok', objectUrl: rec.objectUrl, bytes: rec.bytes });
+      dropOldImages();
+    } catch (e) {
+      setImg(src, { status: 'error', error: (e && e.message) || '图片加载失败，请重试' });
+    }
+  }
+
+  // 触发本章图片加载：已在缓存（含加载中/成功）的跳过，失败的等用户点“重试”
+  function queueImages(segs) {
+    for (const p of segs) {
+      if (p.type !== 'image') continue;
+      const rec = imgCache.get(p.src);
+      if (!rec) loadInlineImage(p.src);
+    }
+  }
+
+  function retryImage(src) {
+    loadInlineImage(src, true);
+  }
+
+  function onImgError(src) {
+    setImg(src, { status: 'error', error: '图片解码失败，请重试' });
   }
 
   function flushStats(keepalive = false) {
@@ -328,6 +444,17 @@
       return;
     }
     toast = useReplaceRules ? '已开启替换规则' : '已关闭替换规则';
+    // 目录标题与正文用同一个开关：切换后立刻拉一次目录，抽屉里的章名同步变化
+    if (book.bookUrl) {
+      try {
+        const toc = await api.toc(book.sourceId, book.bookUrl, seed, useReplaceRules);
+        if (Array.isArray(toc) && toc.length) {
+          chapters = toc.slice().sort((x, y) => x.index - y.index);
+        }
+      } catch {
+        /* 目录刷新失败不阻塞正文切换 */
+      }
+    }
     if (currentPos >= 0) {
       const ratio = currentRatio();
       await openChapter(currentPos, { ratio });
@@ -407,10 +534,15 @@
 
   $: prevPos = sibling(currentPos, -1);
   $: nextPos = sibling(currentPos, 1);
-  // 后端 content 可能是 HTML 片段（含 <p>/<br>/<img>），这里只取可读文本并按段落切开
+  // 后端 content 可能是 HTML 片段（含 <p>/<br>/<img>）：保留图片，文本按段落切开
   $: paras = current && current.content
-    ? htmlToParas(current.content)
+    ? htmlToParas(
+        current.content,
+        current.url || (chapters[currentPos] && chapters[currentPos].url) || ''
+      )
     : [];
+  $: imageParas = paras.filter((p) => p.type === 'image');
+  $: if (current && imageParas.length) queueImages(imageParas);
   // 墨水屏固定整页翻页，字号下限 20px、行距下限 1.8
   $: eink = $deviceKind === 'eink';
   $: isPaged = eink || readMode !== 'scroll';
@@ -418,7 +550,7 @@
   $: effFont = eink ? Math.max(font, 20) : font;
   $: effLine = eink ? Math.max(lineHeight, 1.8) : lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
-  $: displayParas = paras.map((p) => convertZh(p, zhMode));
+  $: displayParas = paras.map((p) => (p.type === 'text' ? { ...p, text: convertZh(p.text, zhMode) } : p));
   $: dimOpacity = eink ? 0 : ((100 - brightness) / 100) * 0.82;
   $: contentStyle = isPaged && viewW > 0 && viewH > 0
     ? `width:${viewW}px;height:${viewH}px;max-width:none;margin:0;padding:0;column-width:${viewW}px;column-gap:0;column-fill:auto;font-size:${effFont}px;line-height:${effLine};font-family:${FONT_STACKS[fontFamily]}`
@@ -919,7 +1051,7 @@
     await openChapter(idx, { ratio: 0 });
     // 复用段落定位：找到第一个含关键词的段落再滚过去
     if (!q) return;
-    const p = paras.findIndex((x) => x.toLowerCase().includes(q));
+    const p = paras.findIndex((x) => x.type === 'text' && x.text.toLowerCase().includes(q));
     if (p < 0) return;
     await new Promise((r) => setTimeout(r, 320));
     await jumpToParagraph(p);
@@ -1440,7 +1572,29 @@
           </div>
         {:else if current}
           <h1 class="rd-chapter-title">{displayTitle}</h1>
-          {#each displayParas as p, i}<p class="rd-p" data-para={i}>{p}</p>{/each}
+          {#each displayParas as p, i}
+            {#if p.type === 'image'}
+              <div class="rd-img" data-para={i}>
+                {#if imgState[p.src]?.status === 'ok'}
+                  <img
+                    src={imgState[p.src].objectUrl}
+                    alt={p.alt || '插图'}
+                    on:error={() => onImgError(p.src)}
+                  />
+                {:else if imgState[p.src]?.status === 'error'}
+                  <div class="rd-img-ph">
+                    <div>插图加载失败</div>
+                    <div class="rd-img-err">{imgState[p.src].error}</div>
+                    <button class="rd-btn" on:click={() => retryImage(p.src)}>重试</button>
+                  </div>
+                {:else}
+                  <div class="rd-img-ph">插图加载中…</div>
+                {/if}
+              </div>
+            {:else}
+              <p class="rd-p" data-para={i}>{p.text}</p>
+            {/if}
+          {/each}
           <div class="rd-navrow">
             <button class="rd-btn" disabled={prevPos < 0} on:click={() => openChapter(prevPos, { ratio: 0.999 })}>上一章</button>
             <button class="rd-btn" on:click={toggleToc}>目录</button>
@@ -2042,6 +2196,50 @@
     margin: 0 0 0.85em;
     text-indent: 2em;
     word-break: break-word;
+  }
+  /* 内嵌图片：桌面居中 + max-width；手机满宽；墨水屏块级 + 百分比宽（颜色交给服务端灰度转码） */
+  .rd-img {
+    display: block;
+    margin: 0.8em 0;
+    text-align: center;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .rd-img img {
+    display: block;
+    margin: 0 auto;
+    max-width: 100%;
+    height: auto;
+    border-radius: 4px;
+  }
+  .rd-content.paged .rd-img {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+  .rd-img-ph {
+    display: block;
+    padding: 18px 12px;
+    border: 1px dashed var(--rd-border);
+    color: var(--rd-muted);
+    font-size: 13px;
+    text-align: center;
+  }
+  .rd-img-err {
+    margin-top: 4px;
+    font-size: 12px;
+    word-break: break-all;
+  }
+  .rd-img-ph .rd-btn {
+    margin-top: 10px;
+  }
+  :global(html[data-device='mobile']) .rd-img img {
+    width: 100%;
+  }
+  :global(html[data-device='eink']) .rd-img img {
+    display: block;
+    width: 92%;
+    max-width: 100%;
+    height: auto;
   }
   .rd-navrow {
     display: flex;
