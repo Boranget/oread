@@ -1360,7 +1360,47 @@ pub async fn search_all_with_errors_budgeted(
     page: i32,
     budget: std::time::Duration,
 ) -> SearchOutcome {
-    let deadline = tokio::time::Instant::now() + budget;
+    // 旧调用方语义：budget 同时是整批与单源预算，走 curated 并发池。
+    search_all_budgeted_scoped(
+        sources,
+        key,
+        page,
+        budget,
+        budget,
+        crate::req::SearchScope::Curated,
+    )
+    .await
+}
+
+/// 按 scope 使用与 `/api/search/start` 相同的单源/整批预算与并发池：
+/// `curated` 5s/6s、`all` 6s/10s。legacy `/api/search` 走这里，
+/// 保证同一关键词在同一源集合下拿到的结果集合与两段式一致。
+pub async fn search_all_with_errors_scoped(
+    sources: &[BookSource],
+    key: &str,
+    page: i32,
+    scope: crate::req::SearchScope,
+) -> SearchOutcome {
+    search_all_budgeted_scoped(
+        sources,
+        key,
+        page,
+        crate::req::search_budget_for(scope),
+        crate::req::search_total_budget(scope),
+        scope,
+    )
+    .await
+}
+
+async fn search_all_budgeted_scoped(
+    sources: &[BookSource],
+    key: &str,
+    page: i32,
+    per_source: std::time::Duration,
+    total: std::time::Duration,
+    scope: crate::req::SearchScope,
+) -> SearchOutcome {
+    let deadline = tokio::time::Instant::now() + total;
     let mut tasks = Vec::new();
     for s in sources {
         if !s.enabled
@@ -1374,21 +1414,16 @@ pub async fn search_all_with_errors_budgeted(
         let comic = crate::req::is_comic_source_type(src.book_source_type);
         let fut = async move {
             // 先排队拿源级并发槽（不计入单源预算），再开始计时。
-            let _slot = crate::req::acquire_search_slot(
-                comic,
-                deadline,
-                crate::req::SearchScope::Curated,
-            )
-            .await?;
+            let _slot = crate::req::acquire_search_slot(comic, deadline, scope).await?;
             let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remain.is_zero() {
                 anyhow::bail!("全局搜索预算耗尽（排队未及执行）");
             }
-            match tokio::time::timeout(remain.min(budget), search(&src, key, page)).await {
+            match tokio::time::timeout(remain.min(per_source), search(&src, key, page)).await {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!(
                     "搜索超时（单源 {}s 预算）",
-                    budget.as_secs()
+                    per_source.as_secs()
                 )),
             }
         };

@@ -415,7 +415,8 @@ export const api = {
   // 两段式搜索：job 轮询，books 先到先渲染
   // result 轮询已完成源；后端只读 key（不是 q），翻页复用同一 job_id
   // sourceIds 可传 book_source_url 或 /api/sources 排序后的 1-based 序号（逗号分隔）
-  searchStart: (key, sourceIds = [], scope = 'curated') =>
+  // scope 必须显式传：all（默认）/ curated；调用方不能依赖后端默认值。
+  searchStart: (key, sourceIds = [], scope = 'all') =>
     request(
       'GET',
       `/search/start?${query({

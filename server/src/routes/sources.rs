@@ -130,11 +130,17 @@ pub async fn list(
     let health = crate::source_health::load_map(&s.shared)
         .await
         .unwrap_or_default();
+    let quarantined = source_ledger::quarantined_set(&s.shared)
+        .await
+        .unwrap_or_default();
     Ok(Json(
         sources
             .into_iter()
             .map(|x| {
                 let h = health.get(&x.book_source_url);
+                // 与聚合搜索同一口径：前端计数/全选必须用它，不能只看 enabled。
+                let searchable =
+                    crate::routes::books::is_searchable_source(&x, &quarantined, &health);
                 BookSourceListItem {
                     tier: h
                         .map(|h| h.tier.clone())
@@ -151,6 +157,7 @@ pub async fn list(
                     book_source_type: x.book_source_type,
                     type_name: crate::entities::source_type_name(x.book_source_type).to_string(),
                     unsupported_type: x.unsupported_type,
+                    searchable,
                 }
             })
             .collect(),

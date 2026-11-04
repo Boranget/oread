@@ -845,6 +845,19 @@ pub struct SearchQ {
     key: Option<String>,
     fs: Option<i64>,
     sp: Option<i64>,
+    /// 搜索范围：`/k` 缺省 curated（服务端渲染必须等整批，KPW3 首屏要快）；
+    /// 显式 `?scope=all` 才走全量（由页面上的「用全部源搜索」链接升级）。
+    scope: Option<String>,
+    /// 是否包含冷却中的源：缺省 0；验收/对拍时可显式 1。
+    include_cooled: Option<String>,
+}
+
+/// `/k` 的 scope 解析：只有显式 `all`/`expanded` 走全量，其余（含缺省、未知值）一律 curated。
+fn k_scope(raw: Option<&str>) -> crate::req::SearchScope {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("all" | "expanded" | "enhanced") => crate::req::SearchScope::All,
+        _ => crate::req::SearchScope::Curated,
+    }
 }
 #[derive(Deserialize)]
 pub struct FsQ {
@@ -1764,20 +1777,83 @@ async fn search(
     let mut list = String::new();
     let mut pager = String::new();
     if !key.is_empty() {
-        let sources = match load_sources(&s.shared).await {
+        let mut sources = match load_sources(&s.shared).await {
             Ok(v) => v,
             Err(e) => return err_to_page(e),
         };
-        let books = web_book::search_all(&sources, &key, 1).await;
-        if books.is_empty() {
-            list.push_str(
-                "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
-            );
+        crate::routes::sources::sort_sources(&mut sources);
+        // 与 legacy `/api/search` 共用 `aggregated`：同一源集合、同一预算/并发池、
+        // 同一 dedupe_and_sort + relevance 档位排序，并共享 60s 结果缓存；
+        // 同一实例上 /k 首屏与 `/api/search` 前 8 条顺序一致。
+        let include_cooled = matches!(
+            q.include_cooled.as_deref().map(str::trim),
+            Some("1" | "true" | "yes" | "on")
+        );
+        let requested_scope = k_scope(q.scope.as_deref());
+        let plan = crate::routes::books::resolve_search_sources(
+            &s.shared,
+            sources,
+            &[],
+            requested_scope,
+            include_cooled,
+            // `/k` 精选集合缺失时不退全量：只跑 preferred 层，保住 KPW3 首屏耗时。
+            crate::routes::books::CuratedMissingFallback::Preferred,
+        )
+        .await;
+        let (books, _errors) =
+            crate::routes::books::aggregated(&plan.active, &key, include_cooled, plan.scope)
+                .await;
+        let strong_total = books
+            .iter()
+            .filter(|b| b.relevance.as_deref() == Some("strong"))
+            .count();
+        // 三层退化链的页面说明（复用现有次级文字样式，不加新视觉 token）：
+        // curated_fallback = 精选不可用已退常用源；all_fallback = 常用源也为空、已退全部可搜索源。
+        let fallback_note = if plan.source_total == 0 {
+            None
         } else {
-            let t_pages = ((books.len() + K_SEARCH_PAGE - 1) / K_SEARCH_PAGE).max(1);
+            match plan.source_mode {
+                "curated_fallback" => Some(format!(
+                    "精选源当前不可用，已改用常用源（{n} 个源）。",
+                    n = plan.source_total
+                )),
+                "all_fallback" => Some(format!(
+                    "精选/常用源暂不可用，已改用全部 {n} 个源。",
+                    n = plan.source_total
+                )),
+                _ => None,
+            }
+        };
+        if let Some(note) = &fallback_note {
+            list.push_str(&format!(
+                "<p style=\"font-size:20px;line-height:32px;color:#555;padding:8px 36px 0\">{note}</p>"
+            ));
+        }
+        // 结果不足（0 条或 strong < 5）时给「用全部源搜索」的主动升级入口，不是默认路径。
+        let upgrade_link = plan.scope == crate::req::SearchScope::Curated
+            && (books.is_empty() || strong_total < crate::search_rank::STRONG_MIN_RESULTS);
+        // 回退说明 / 升级按钮要占纵向空间：多一行时少放一条结果，避免被贴底栏盖住。
+        let per_page = if fallback_note.is_some() || upgrade_link {
+            K_SEARCH_PAGE - 1
+        } else {
+            K_SEARCH_PAGE
+        };
+        if books.is_empty() {
+            if plan.source_total == 0 {
+                list.push_str(
+                    "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">\
+                     当前没有可搜索的源，请先在书源设置中导入并启用。</p>",
+                );
+            } else {
+                list.push_str(
+                    "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
+                );
+            }
+        } else {
+            let t_pages = ((books.len() + per_page - 1) / per_page).max(1);
             let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
-            let start = (sp - 1) * K_SEARCH_PAGE;
-            let end = (start + K_SEARCH_PAGE).min(books.len());
+            let start = (sp - 1) * per_page;
+            let end = (start + per_page).min(books.len());
             list.push_str("<table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">");
             for b in &books[start..end] {
                 let src = b.origin.clone().unwrap_or_default();
@@ -1817,7 +1893,13 @@ async fn search(
             }
             list.push_str("</table>");
             if t_pages > 1 {
-                let base = format!("/k/search?key={}&fs={}", qenc(&key), fs);
+                // 翻页必须带上实际生效的 scope，否则第二页会退回缺省的 curated。
+                let base = format!(
+                    "/k/search?key={}&fs={}&scope={}",
+                    qenc(&key),
+                    fs,
+                    plan.scope.as_str()
+                );
                 let prev = if sp > 1 {
                     Some((format!("{base}&sp={}", sp - 1), "上一页"))
                 } else {
@@ -1830,6 +1912,15 @@ async fn search(
                 };
                 pager = pager_bar(prev, next);
             }
+        }
+        if upgrade_link {
+            let href = with_fs(&format!("/k/search?key={}&scope=all", qenc(&key)), fs);
+            list.push_str(&format!(
+                "<div style=\"padding:12px 36px\">\
+                 <a href=\"{href}\" style=\"display:inline-block;height:56px;line-height:56px;\
+                 padding:0 24px;border:1px solid #000;font-size:24px;color:#000\">用全部源搜索</a></div>",
+                href = esc(&href)
+            ));
         }
     }
     let stage = format!(
@@ -1901,6 +1992,17 @@ async fn selftest(_u: AuthUser) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/k` 默认 curated（首屏必须快）；只有显式 all/expanded 才走全量。
+    #[test]
+    fn k_scope_defaults_to_curated() {
+        assert_eq!(k_scope(None), crate::req::SearchScope::Curated);
+        assert_eq!(k_scope(Some("")), crate::req::SearchScope::Curated);
+        assert_eq!(k_scope(Some("unknown")), crate::req::SearchScope::Curated);
+        assert_eq!(k_scope(Some("curated")), crate::req::SearchScope::Curated);
+        assert_eq!(k_scope(Some(" all ")), crate::req::SearchScope::All);
+        assert_eq!(k_scope(Some("ENHANCED")), crate::req::SearchScope::All);
+    }
 
     #[test]
     fn paginate_lines_respects_budget_and_char_boundaries() {

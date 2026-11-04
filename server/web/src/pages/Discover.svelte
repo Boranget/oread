@@ -38,14 +38,21 @@
   let pendingSources = 0;
   let deadlineMs = 0;
   // 搜索范围回显（后端 /api/search/start 返回）
-  let strengthenSearch = false; // 勾选=加强搜索（scope=all，覆盖更多源）
+  // scope 由 sourceScope 决定：all（默认，全部可搜索源）/ curated（精选源）/ custom（指定源）。
+  // 每次搜索都显式把 scope 与 source_ids 发给后端，避免“文案说全部、实际只跑精选”。
   function retryWithAll() {
-    strengthenSearch = true;
+    sourceScope = 'all';
     doSearch();
   }
-  let requestedScope = 'curated'; // 本次请求携带的 scope（用户意图）
-  let searchScope = 'curated'; // 后端实际使用的 scope
-  let searchCoverage = 'curated'; // curated / expanded
+  // 空态引导：切到「书源管理」（App.svelte 监听 oread:tab 事件）
+  function goSources() {
+    window.dispatchEvent(new CustomEvent('oread:tab', { detail: 'sources' }));
+  }
+  let requestedScope = 'all'; // 本次请求携带的 scope（用户意图）
+  let searchScope = 'all'; // 后端实际使用的 scope
+  let searchCoverage = 'expanded'; // curated / expanded
+  let sourceMode = ''; // user / curated / curated_fallback / all_fallback / all（后端回显）
+  let scopeFiltered = 0; // 精选收缩排除掉的可搜索源数量
   let curatedTotal = 0;
   let failedCount = 0;
   let failedSources = []; // [{ name, reason }]
@@ -53,6 +60,7 @@
 
   // 发现模式
   let sources = [];
+  let sourcesReady = false; // /api/sources 是否已成功返回（区分“还没加载”与“确实 0 个源”）
   let selectedSource = '';
   let categories = [];
   let selectedCat = null;
@@ -60,7 +68,7 @@
   let loading = false;
   let loadingMore = false;
 
-  // 搜索范围：all=全部启用源；custom=指定书源（source_ids 传 URL）
+  // 搜索范围：all=全部可搜索源（默认）；curated=精选源；custom=指定书源（source_ids 传 URL）
   let sourceScope = 'all';
   let pickedSourceIds = [];
   let scopeOpen = false;
@@ -85,7 +93,9 @@
   let retryNote = '';
   let retryExtra = []; // 重试新增的结果，翻页时重新附加，避免翻页丢失
 
-  $: enabledSources = sources.filter((s) => s.enabled);
+  // 可搜索源：与后端 searchable_sources 同一口径（enabled + 类型/规则/searchUrl + 未隔离）
+  // 计数、全选、可选状态都用它，不能只看 enabled。
+  $: searchableSources = sources.filter((s) => s.searchable);
   $: groupOptions = [...new Set(sources.map((s) => s.book_source_group).filter(Boolean))];
   $: pickSources = groupFilter === 'all' ? sources : sources.filter((s) => (s.book_source_group || '') === groupFilter);
 
@@ -99,6 +109,7 @@
     history = readHistory();
     try {
       sources = await api.sources();
+      sourcesReady = true;
       if (sources.length) {
         selectedSource = sources[0].book_source_url;
         await loadCategories();
@@ -304,13 +315,13 @@
   }
 
   function selectAllEnabled() {
-    pickedSourceIds = enabledSources.map((s) => s.book_source_url);
+    pickedSourceIds = searchableSources.map((s) => s.book_source_url);
   }
 
-  // 按分组选择：只并入该分组下的启用书源，保留已选的其他源
+  // 按分组选择：只并入该分组下的可搜索源，保留已选的其他源
   function pickGroup() {
     if (groupFilter === 'all') return;
-    const add = enabledSources
+    const add = searchableSources
       .filter((s) => (s.book_source_group || '') === groupFilter)
       .map((s) => s.book_source_url);
     pickedSourceIds = [...new Set(pickedSourceIds.concat(add))];
@@ -334,7 +345,7 @@
     const q = String(typeof preset === 'string' ? preset : key).trim();
     if (!q || starting) return;
     if (sourceScope === 'custom' && !pickedSourceIds.length) {
-      error = '请至少选择一个书源，或把搜索范围切回「全部启用源」';
+      error = '请至少选择一个书源，或把搜索范围切回「全部可搜索源」';
       return;
     }
     const requestedIds = sourceScope === 'custom' ? pickedSourceIds.slice() : [];
@@ -360,10 +371,11 @@
     finishedSources = 0;
     pendingSources = 0;
     deadlineMs = 0;
-    searchScope = strengthenSearch ? 'all' : 'curated';
-    requestedScope = searchScope;
-    searchCoverage = searchScope;
-    curatedTotal = 0;
+    requestedScope = sourceScope === 'curated' ? 'curated' : 'all';
+    searchScope = requestedScope;
+    searchCoverage = requestedScope === 'curated' ? 'curated' : 'expanded';
+    sourceMode = '';
+    scopeFiltered = 0;
     failedSources = [];
     failedCount = 0;
     pollFailures = 0;
@@ -384,7 +396,9 @@
       if (!jobId) throw new Error('后端未返回 job_id');
       sourceTotal = Number(r.source_total) || 0;
       searchScope = String(r.scope || searchScope);
-      searchCoverage = String(r.coverage || searchScope);
+      searchCoverage = String(r.coverage || searchCoverage);
+      sourceMode = String(r.source_mode || '');
+      scopeFiltered = Number(r.scope_filtered) || 0;
       curatedTotal = Number(r.curated_total) || 0;
       requestSourceCount = Array.isArray(r.source_ids_requested) ? r.source_ids_requested.length : requestedIds.length;
       ignoredSourceIds = Array.isArray(r.ignored_source_ids) ? r.ignored_source_ids.map(String) : [];
@@ -415,7 +429,8 @@
       pickedSourceIds = lastSearchScopeIds.slice();
       scopeOpen = true;
     } else {
-      sourceScope = 'all';
+      // 保持用户上次的范围（精选仍是精选，全部仍是全部）
+      sourceScope = requestedScope === 'curated' ? 'curated' : 'all';
     }
     key = lastSearchKey;
     doSearch();
@@ -438,7 +453,8 @@
     let collected = [];
     let lastErrors = [];
     try {
-      const r = await api.searchStart(q, ids);
+      // 显式 source_ids 会跳过 curated 收缩；scope 仍显式传 all，避免依赖后端默认值。
+      const r = await api.searchStart(q, ids, 'all');
       if (seq !== retrySeq) return;
       const jid = String(r.job_id || '');
       if (!jid) throw new Error('后端未返回 job_id');
@@ -680,11 +696,6 @@
     <button on:click={doSearch} disabled={starting || (sourceScope === 'custom' && !pickedSourceIds.length)}>搜索</button>
   </div>
 
-  <label class="strengthen-toggle">
-    <input type="checkbox" bind:checked={strengthenSearch} />
-    <span>加强搜索（更慢，覆盖更多源）</span>
-  </label>
-
   {#if history.length}
     <div class="hist" aria-label="搜索历史">
       <div class="hist-head">
@@ -705,7 +716,8 @@
   <div class="search-scope">
     <div class="row">
       <select bind:value={sourceScope} on:change={() => (error = '')} style="flex:1;min-width:0" aria-label="搜索范围">
-        <option value="all">全部可搜索源</option>
+        <option value="all">全部可搜索源（{searchableSources.length} 个）</option>
+        <option value="curated">精选源{curatedTotal ? `（${curatedTotal} 个）` : ''}</option>
         <option value="custom">指定分类 / 书源（已选 {pickedSourceIds.length} 个）</option>
       </select>
       {#if sourceScope === 'custom'}
@@ -729,33 +741,35 @@
       {/if}
       <div class="src-list" role="group" aria-label="选择参与搜索的书源">
         {#each pickSources as s (s.book_source_url)}
-          <label class="src-item" class:off={!s.enabled}>
+          <label class="src-item" class:off={!s.searchable}>
             <input
               type="checkbox"
-              disabled={!s.enabled}
+              disabled={!s.searchable}
               checked={pickedSourceIds.includes(s.book_source_url)}
               on:change={() => togglePick(s.book_source_url)}
             />
             <span class="src-name">{sname(s)}</span>
             {#if s.book_source_group}<span class="src-type">{s.book_source_group}</span>{/if}
             {#if typeOf(s)}<span class="src-type">{typeOf(s)}</span>{/if}
-            {#if !s.enabled}<span class="src-off">已禁用</span>{/if}
+            {#if !s.enabled}<span class="src-off">已禁用</span>{:else if !s.searchable}<span class="src-off">不可搜索</span>{/if}
           </label>
         {/each}
         {#if !sources.length}<p class="muted" style="margin:6px 0">还没有书源，请先到「书源管理」添加。</p>{:else if !pickSources.length}<p class="muted" style="margin:6px 0">该分类下没有书源。</p>{/if}
       </div>
       <div class="row" style="margin-top:6px">
-        <button class="ghost" on:click={selectAllEnabled} disabled={!enabledSources.length}>全选启用源</button>
+        <button class="ghost" on:click={selectAllEnabled} disabled={!searchableSources.length}>全选可搜索源</button>
         <button class="ghost" on:click={clearPicked} disabled={!pickedSourceIds.length}>清空</button>
       </div>
     {/if}
 
     <p class="muted scope-hint">
       本次范围：{sourceScope === 'all'
-        ? strengthenSearch
-          ? `全部启用源（${enabledSources.length} 个）`
-          : `精选源${curatedTotal ? `（${curatedTotal} 个）` : ''}`
-        : `已选 ${pickedSourceIds.length} 个源`}
+        ? `全部可搜索源（${searchableSources.length} 个）`
+        : sourceScope === 'curated'
+          ? curatedTotal
+            ? `精选源（${curatedTotal} 个；集合为空或不可用时自动回退）`
+            : '精选源（集合尚未生成，搜索会自动回退）'
+          : `已选 ${pickedSourceIds.length} 个源`}
       {#if sourceScope === 'custom' && !pickedSourceIds.length}&nbsp;· 至少选 1 个才能搜索{/if}
     </p>
   </div>
@@ -793,7 +807,7 @@
   <div class="warn-box" role="alert">
     <div class="warn-title">已忽略 {ignoredSourceIds.length} 个书源：本次实际搜索 {sourceTotal} 个源</div>
     <div class="warn-item">
-      本次请求 {requestSourceCount} 个源，后端只接受已启用且配置了搜索规则的书源。
+      本次请求 {requestSourceCount} 个源，后端只接受可搜索源（已启用、类型支持、搜索规则与地址完整、未隔离）。
       被忽略：{ignoredSourceIds.map(sourceLabel).join('、')}
     </div>
     {#if !sourceTotal}
@@ -804,7 +818,18 @@
 
 {#if mode === 'search' && sourceTotal && !error}
   <p class="scope-report">
-    本次范围：<b>{sourceTotal}</b> 个源{resultScopeMode === 'custom' ? `（指定 ${resultRequested} 个）` : '（全部可搜索源）'}
+    本次范围：<b>{sourceTotal}</b> 个源
+    {#if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
+      （用户指定 {resultRequested} 个，实际可执行 {sourceTotal} 个）
+    {:else if sourceMode === 'curated'}
+      精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
+    {:else if sourceMode === 'curated_fallback'}
+      （精选集不可用，已回退；实际 {sourceTotal} 个源）
+    {:else if sourceMode === 'all_fallback'}
+      （精选/常用源不可用，已改用全部 {sourceTotal} 个源）
+    {:else}
+      （全部可搜索源）
+    {/if}
     <button class="link-btn" on:click={retryScope} disabled={starting || searching || !lastSearchKey}>只搜这些源重试</button>
   </p>
 {/if}
@@ -872,22 +897,32 @@
       {:else if sourceTotal}
         &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
       {/if}
-      {#if requestedScope === 'curated'}
-        &nbsp;· {searchCoverage === 'curated' ? '精选源' : '精选为空，已回退全部源'}
+      {#if sourceMode === 'curated' || (!sourceMode && requestedScope === 'curated')}
+        &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
+      {:else if sourceMode === 'curated_fallback'}
+        &nbsp;· 精选集不可用，已回退
+      {:else if sourceMode === 'all_fallback'}
+        &nbsp;· 精选/常用源不可用，已改用全部源
+      {:else if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
+        &nbsp;· 指定源
       {:else}
-        &nbsp;· 加强搜索（全部源）
+        &nbsp;· 全部可搜索源
       {/if}
     </span>
   </div>
 {/if}
 
 {#if mode === 'search' && searchDone && total === 0}
-  {#if requestedScope === 'curated' && searchCoverage === 'curated'}
+  {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
     <p class="muted empty-hint">
-      精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用加强搜索重试</button>，或勾选上方「加强搜索（更慢，覆盖更多源）」再试。
+      当前还没有可用的书源，请先到<button class="ghost empty-retry" on:click={goSources}>书源管理</button>导入并启用书源。
+    </p>
+  {:else if requestedScope === 'curated' && searchCoverage === 'curated'}
+    <p class="muted empty-hint">
+      精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用全部可搜索源重试</button>，或把上方范围切到「全部可搜索源」再试。
     </p>
   {:else if requestedScope === 'curated'}
-    <p class="muted empty-hint">精选集尚未生成（或为空），已回退搜索全部源，仍无结果；可换个关键词再试。</p>
+    <p class="muted empty-hint">精选集尚未生成（或不可用），已回退到优选/全部可搜索源，仍无结果；可换个关键词再试。</p>
   {:else}
     <p class="muted empty-hint">没有找到结果，可换个关键词再试。</p>
   {/if}
@@ -961,7 +996,11 @@
     {#if failedSources.length || failedCount}
       <div class="empty">没有拿到结果，且有 {failedCount || failedSources.length} 个书源失败，原因见上方。<br />换关键词、稍后重试，或到「书源管理」检查这些书源。</div>
     {:else if !jobExpired && !error}
-      <div class="empty">书源正常返回，但没有匹配的书。<br />换个关键词，或到「书源管理」确认书源是否启用。</div>
+      {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
+        <div class="empty">当前还没有可用的书源，请先到「书源管理」导入并启用书源。<br /><button class="ghost" on:click={goSources}>去书源管理</button></div>
+      {:else}
+        <div class="empty">书源正常返回，但没有匹配的书。<br />换个关键词，或到「书源管理」确认书源是否启用。</div>
+      {/if}
     {/if}
   {/if}
 {:else if !loading && !searched}
@@ -978,20 +1017,7 @@
     margin: 6px 0 0;
     font-size: 12px;
   }
-  /* 加强搜索：块级 + 行内元素，墨水屏友好 */
-  .strengthen-toggle {
-    display: block;
-    margin-top: 6px;
-    font-size: 12px;
-    color: var(--muted, #666);
-    cursor: pointer;
-  }
-  .strengthen-toggle input {
-    width: auto;
-    min-height: auto;
-    margin-right: 6px;
-    vertical-align: middle;
-  }
+  /* 搜索范围下拉的说明文案 */
   .empty-hint {
     margin: 10px 0 0;
     font-size: 13px;

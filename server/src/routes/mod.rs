@@ -57,6 +57,8 @@ pub fn build_router(shared: SqlitePool, cfg: Config) -> Router {
         .route("/api/auth/password", post(auth::change_password))
         .route("/api/admin/users", get(auth::admin_list_users))
         .route("/api/admin/users/status", post(auth::admin_set_user_status))
+        .route("/api/k/metrics", get(crate::k_metrics::metrics))
+        .route("/api/k/metrics/export", get(crate::k_metrics::export))
         .merge(sources::routes())
         .merge(books::routes())
         .merge(export::routes())
@@ -70,6 +72,11 @@ pub fn build_router(shared: SqlitePool, cfg: Config) -> Router {
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::auth_middleware,
+    ))
+    // `/k` 性能埋点放在鉴权外层：登录页、4xx/5xx、空态都能记录
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::k_metrics::record,
     ))
     .with_state(state)
 }
