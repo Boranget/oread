@@ -71,10 +71,79 @@ fn flag(ar: &AnalyzeRule, item: &str, rule: &Option<String>, base: &str) -> bool
         .unwrap_or(false)
 }
 
+/// Legado 多行规则：一行结果作为下一行输入（如快看
+/// `$.id||$.topic_id\n@js:"/mobile/"+result+"/list/"`）。
+/// 规则引擎把整串交给 `||` 回退链时，第二行的 `@js:` 会被并进第二个候选项，
+/// `$.id` 一命中就丢掉 JS 段，于是 bookUrl 只剩 `3095`（旧版更糟：把整段 JSON 拼进 URL）。
+/// 这里先按「顶层换行」切行再逐行管道求值，不改引擎本身的单行语义。
+fn split_rule_lines(rule: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut in_js_tag = false;
+    let mut chars = rule.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let rest = &rule[i..];
+        if !in_js_tag && starts_with_ci_local(rest, "@js:") {
+            // `@js:` 一直延伸到规则末尾（内部换行属于 JS 代码，不能再切行）
+            buf.push_str(rest);
+            break;
+        }
+        if !in_js_tag && rest.starts_with("<js>") {
+            in_js_tag = true;
+            buf.push_str("<js>");
+            for _ in 0..3 {
+                chars.next();
+            }
+            continue;
+        }
+        if in_js_tag && rest.starts_with("</js>") {
+            in_js_tag = false;
+            buf.push_str("</js>");
+            for _ in 0..4 {
+                chars.next();
+            }
+            continue;
+        }
+        if c == '\n' && !in_js_tag {
+            out.push(std::mem::take(&mut buf));
+            continue;
+        }
+        buf.push(c);
+    }
+    out.push(buf);
+    out.retain(|l| !l.trim().is_empty());
+    out
+}
+
+fn starts_with_ci_local(s: &str, p: &str) -> bool {
+    s.get(..p.len())
+        .map(|h| h.eq_ignore_ascii_case(p))
+        .unwrap_or(false)
+}
+
+/// 单值规则求值（含多行管道）：逐行作用，上一行结果作为下一行输入。
+fn eval_rule(
+    ar: &AnalyzeRule,
+    content: &str,
+    rule: &str,
+    is_url: bool,
+    base: &str,
+) -> Result<String, crate::rule_engine::RuleError> {
+    let lines = split_rule_lines(rule);
+    let mut input = content.to_string();
+    let mut last = String::new();
+    for line in lines.iter() {
+        // URL 语义整条只取首值；文本字段保留多值（`\n` 拼接），供 `@js:result.split("\n")` 使用
+        last = ar.get_string(&input, line, is_url, base)?;
+        input = last.clone();
+    }
+    Ok(last)
+}
+
 /// 对可选子规则求值，空结果返回 None
 fn opt(ar: &AnalyzeRule, item: &str, rule: &Option<String>, base: &str) -> Option<String> {
     rule.as_ref()
-        .map(|r| ar.get_string(item, r, false, base).unwrap_or_default())
+        .map(|r| eval_rule(ar, item, r, false, base).unwrap_or_default())
         .filter(|s| !s.is_empty())
 }
 
@@ -92,6 +161,52 @@ fn assign_opt(
 }
 
 // ---------------- 搜索 ----------------
+/// JS `encodeURIComponent` 的等价实现：保留 unreserved 字符（字母数字与 `-_.!~*'()`），
+/// 其余按 UTF-8 逐字节百分号编码。源里 `{{encodeURIComponent(key)}}` 走这里，
+/// 避免中文/空格关键词在 URL 里原样出现或被 reqwest 双重编码。
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
+/// 展开 searchUrl / POST body 的模板：
+/// - `{{key}}`/`${key}`：原样代入关键词；
+/// - `{{encodeURIComponent(key)}}`：百分号编码后代入；
+/// - `{{page}}`/`${page}`：代入页码；
+/// - `{{page*N}}`/`${page*N}`：代入 `page * N`（老源用它算 offset / 每页条数）。
+fn expand_search_template(tpl: &str, key: &str, page: i32) -> String {
+    static PAGE_MULT: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PAGE_MULT.get_or_init(|| {
+        regex::Regex::new(r"\$\{page\*(\d+)\}|\{\{page\*(\d+)\}\}").expect("page*N 模板正则")
+    });
+    let out = re
+        .replace_all(tpl, |c: &regex::Captures| {
+            let n: i32 = c
+                .get(1)
+                .or_else(|| c.get(2))
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(1);
+            (page * n).to_string()
+        })
+        .to_string();
+    out.replace("${encodeURIComponent(key)}", &encode_component(key))
+        .replace("{{encodeURIComponent(key)}}", &encode_component(key))
+        .replace("{{key}}", key)
+        .replace("${key}", key)
+        .replace("{{page}}", &page.to_string())
+        .replace("${page}", &page.to_string())
+}
+
 /// 解析 Legado 搜索 URL：支持 `url,{"method":"POST",...}` 形式；纯 URL 则按 GET 处理。
 /// 返回 (最终 url, method, 请求头, 可选 body)。
 fn build_search_request(
@@ -105,11 +220,7 @@ fn build_search_request(
     } else {
         (url_tpl.as_str(), None)
     };
-    let base = base
-        .replace("{{key}}", key)
-        .replace("${key}", key)
-        .replace("{{page}}", &page.to_string())
-        .replace("${page}", &page.to_string());
+    let base = expand_search_template(base, key, page);
     // 相对 searchUrl（如 `search.php?kw={{key}}`、`/book/so/...`）必须按书源根地址归并，
     // 否则 reqwest 收到相对 URL 直接失败，整源搜索恒为 0 条（错层小说网、三八小说实测）。
     let base = abs(&source.book_source_url, &base);
@@ -123,10 +234,7 @@ fn build_search_request(
                 method = m.to_uppercase();
             }
             if let Some(b) = v.get("body").and_then(|x| x.as_str()) {
-                body = Some(
-                    b.replace("{{key}}", key)
-                        .replace("{{page}}", &page.to_string()),
-                );
+                body = Some(expand_search_template(b, key, page));
             }
             if let Some(h) = v.get("headers").and_then(|x| x.as_object()) {
                 for (k, val) in h {
@@ -167,7 +275,13 @@ pub async fn search(source: &BookSource, key: &str, page: i32) -> anyhow::Result
     let items = ar.get_string_list(&html, rule.book_list.as_deref().unwrap_or(""))?;
     let mut books = Vec::new();
     for item in items {
-        let book_url = ar.get_string(&item, rule.book_url.as_deref().unwrap_or(""), true, &url)?;
+        let book_url = eval_rule(
+            &ar,
+            &item,
+            rule.book_url.as_deref().unwrap_or(""),
+            true,
+            &url,
+        )?;
         if book_url.is_empty() {
             continue;
         }
@@ -202,7 +316,13 @@ pub async fn explore(source: &BookSource, url: &str) -> anyhow::Result<Vec<Searc
     let items = ar.get_string_list(&html, rule.book_list.as_deref().unwrap_or(""))?;
     let mut books = Vec::new();
     for item in items {
-        let book_url = ar.get_string(&item, rule.book_url.as_deref().unwrap_or(""), true, url)?;
+        let book_url = eval_rule(
+            &ar,
+            &item,
+            rule.book_url.as_deref().unwrap_or(""),
+            true,
+            url,
+        )?;
         if book_url.is_empty() {
             continue;
         }
@@ -1310,5 +1430,152 @@ mod tests {
     fn search_type_token_distinguishes_comic() {
         assert_eq!(type_token(0), "text");
         assert_eq!(type_token(2), "image");
+    }
+
+    // searchUrl / POST body 模板展开：{{key}}、${key}、{{page}}、{{page*20}}、{{encodeURIComponent(key)}}
+    #[test]
+    fn search_url_template_expands_key_page_and_encoder() {
+        let mut s = BookSource::default();
+        s.book_source_url = "https://api.example.com".into();
+        s.search_url = Some(
+            "https://api.example.com/search?q={{encodeURIComponent(key)}}&offset={{page*20}}&page={{page}}"
+                .into(),
+        );
+        let (url, _, _, _) = build_search_request(&s, "斗罗大陆", 3);
+        assert_eq!(
+            url,
+            "https://api.example.com/search?q=%E6%96%97%E7%BD%97%E5%A4%A7%E9%99%86&offset=60&page=3"
+        );
+
+        // `${key}` / `${page}` / `${page*N}` 同义写法
+        s.search_url = Some("https://api.example.com/s?k=${key}&skip=${page*20}".into());
+        let (url2, _, _, _) = build_search_request(&s, "abc", 2);
+        assert_eq!(url2, "https://api.example.com/s?k=abc&skip=40");
+
+        // POST body 同样展开（老源的 JSON body 里常写 {{key}}）
+        s.search_url = Some(
+            r#"https://api.example.com/post,{"method":"POST","body":"{\"kw\":\"{{key}}\",\"start\":{{page*20}}}"}"#
+                .into(),
+        );
+        let (_, method, _, body) = build_search_request(&s, "斗罗大陆", 2);
+        assert_eq!(method, "POST");
+        assert_eq!(
+            body.as_deref(),
+            Some(r#"{"kw":"斗罗大陆","start":40}"#)
+        );
+        // encodeURIComponent 只按 unreserved 保留，其余按 UTF-8 编码
+        assert_eq!(encode_component("a b&c/d"), "a%20b%26c%2Fd");
+    }
+
+    /// “搜索接口返回 JSON + 规则用 `$.path` 取字段”的最小矩阵：
+    /// 快看（hits 数组 + `$.id||$.topic_id` 再拼 @js 前缀）、爱看（`$.data` 数组 + `{{$.comic_id}}` 模板）、
+    /// 奇漫屋子（`$.data.list` + 相对 `$.url`）。取出的 book_url 必须是可用的详情页地址，
+    /// 不能把整段 JSON 拼进 URL。
+    #[test]
+    fn json_search_rule_matrix_yields_usable_book_url() {
+        // 用真实搜索响应结构做夹具（字段取自 2026-11 线上响应）
+        let kk_body = r#"{"code":200,"total":2,"hits":[
+            {"id":3095,"topic_id":3095,"title":"斗罗大陆外传唐门英雄传","vertical_image_url":"https://hs1-f2.v3mh.com/image/190115/6uDRSET7T.webp-w320.w"},
+            {"id":23833,"topic_id":23833,"title":"某天成为王的女儿","vertical_image_url":"https://hs1-f2.v3mh.com/image/240816/yeIXGLktt.webp-w320.w"}
+        ]}"#;
+        let kk = BookSource {
+            book_source_url: "https://m.kuaikanmanhua.com/".into(),
+            search_url: Some(
+                "/search/mini/topic/title_and_author?page={{page}}&size=24&q={{key}}".into(),
+            ),
+            book_source_type: 2,
+            rule_search: Some(SearchRule {
+                book_list: Some("$.data.topics||$.data.cards||$.hits.topicMessageList||$.hits".into()),
+                book_url: Some("$.id||$.topic_id\n@js:\"/mobile/\"+result+\"/list/\"".into()),
+                name: Some("$.title.text||$.title".into()),
+                cover_url: Some("$.vertical_image_url".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let ak_body = r#"{"data":[{"comic_id":107477,"comic_name":"某天成为王的女儿"},
+            {"comic_id":100037,"comic_name":"重生之都市修仙"}]}"#;
+        let ak = BookSource {
+            book_source_url: "https://m.kanman.com".into(),
+            search_url: Some(
+                "https://m.kanman.com/api/serachcomic/?product_id=1&productname=kmh&platformname=wap&serachKey={{encodeURIComponent(key)}}&topNumber=10".into(),
+            ),
+            book_source_type: 2,
+            rule_search: Some(SearchRule {
+                book_list: Some("$.data.data||$.data".into()),
+                book_url: Some("https://m.kanman.com/{{$.comic_id}}/".into()),
+                name: Some("$.comic_name".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let qm_body = r#"{"data":{"list":[{"id":3095,"url":"/comic/3095"},{"id":23833,"url":"/comic/23833"}]}}"#;
+        let qm = BookSource {
+            book_source_url: "https://m.qimanwu.app".into(),
+            search_url: Some(
+                "https://m.qimanwu.app/api/search?q={{encodeURIComponent(key)}}&page={{page*20}}".into(),
+            ),
+            book_source_type: 2,
+            rule_search: Some(SearchRule {
+                book_list: Some("$.data.list".into()),
+                book_url: Some("$.url".into()),
+                name: Some("$.id".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let kk_urls = map_search_book_urls(&kk, kk_body, "斗罗大陆", 1);
+        assert_eq!(
+            kk_urls,
+            vec![
+                "https://m.kuaikanmanhua.com/mobile/3095/list/".to_string(),
+                "https://m.kuaikanmanhua.com/mobile/23833/list/".to_string()
+            ],
+            "快看 book_url 不应把整段 JSON 拼进 URL"
+        );
+        let ak_urls = map_search_book_urls(&ak, ak_body, "斗罗大陆", 1);
+        assert_eq!(
+            ak_urls,
+            vec![
+                "https://m.kanman.com/107477/".to_string(),
+                "https://m.kanman.com/100037/".to_string()
+            ]
+        );
+        let qm_urls = map_search_book_urls(&qm, qm_body, "斗罗大陆", 1);
+        assert_eq!(
+            qm_urls,
+            vec![
+                "https://m.qimanwu.app/comic/3095".to_string(),
+                "https://m.qimanwu.app/comic/23833".to_string()
+            ]
+        );
+        // 模板展开：encodeURIComponent 与 page*N 都要在真实 searchUrl 上生效
+        let (qm_search, _, _, _) = build_search_request(&qm, "斗罗大陆", 2);
+        assert_eq!(
+            qm_search,
+            "https://m.qimanwu.app/api/search?q=%E6%96%97%E7%BD%97%E5%A4%A7%E9%99%86&page=40"
+        );
+    }
+
+    /// 复刻 `search()` 的取值链：book_list → 逐项 book_url（is_url）→ 按搜索 URL 归并。
+    fn map_search_book_urls(src: &BookSource, body: &str, key: &str, page: i32) -> Vec<String> {
+        let rule = src.rule_search.as_ref().expect("rule_search");
+        let ar = make_ar(src);
+        let (base, _, _, _) = build_search_request(src, key, page);
+        let items = ar
+            .get_string_list(body, rule.book_list.as_deref().unwrap_or(""))
+            .expect("book_list");
+        items
+            .iter()
+            .map(|item| {
+                // 与 search() 一致：多行 book_url 逐行管道求值
+                let u = eval_rule(&ar, item, rule.book_url.as_deref().unwrap_or(""), true, &base)
+                    .expect("book_url");
+                abs(&base, &u)
+            })
+            .collect()
     }
 }
