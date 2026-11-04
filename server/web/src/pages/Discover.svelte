@@ -908,7 +908,7 @@
       精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用全部可搜索源重试</button>，或把上方范围切到「全部可搜索源」再试。
     </p>
   {:else if requestedScope === 'curated'}
-    <p class="muted empty-hint">精选集尚未生成（或为空），已回退到优选/全部可搜索源，仍无结果；可换个关键词再试。</p>
+    <p class="muted empty-hint">精选集尚未生成（或不可用），已回退到优选/全部可搜索源，仍无结果；可换个关键词再试。</p>
   {:else}
     <p class="muted empty-hint">没有找到结果，可换个关键词再试。</p>
   {/if}

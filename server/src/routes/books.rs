@@ -742,7 +742,7 @@ pub(crate) struct SearchSourcePlan {
 ///
 /// 语义：
 /// - 显式 `source_ids`：跳过 curated 收缩（否则非优选源会被静默丢弃），`source_mode=user`；
-/// - `scope=curated`：只保留体检精选集合；集合缺失/交集为空时退化为 preferred（再为空退全量）；
+/// - `scope=curated`：只保留体检精选集合；集合缺失时退化为全量，交集为空时退化为 preferred（再为空退全量）；
 /// - `scope=all`：全部可搜索源；
 /// - 最后统一做冷却分区（`include_cooled` 为真则全部参与）。
 pub(crate) async fn resolve_search_sources(
@@ -813,10 +813,10 @@ pub(crate) async fn resolve_search_sources(
                 }
             }
             None => (
-                preferred_sources(searchable_all.clone(), &health),
+                searchable_all.clone(),
                 "curated_fallback",
                 "expanded",
-                crate::req::SearchScope::Curated,
+                crate::req::SearchScope::All,
             ),
         }
     } else {

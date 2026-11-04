@@ -68,8 +68,8 @@ const DEFAULT_CONF: HttpConf = HttpConf {
 ///
 /// - `All`（默认）：全量可搜索源。流水线调度后首条结果通常 0.5s 左右，
 ///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 10s。
-/// - `Curated`（用户显式选择「精选」）：只跑体检精选源；curated 集合尚未落地时
-///   退化为“只取 preferred”，总预算 6s。显式 `source_ids` 会跳过该收缩。
+/// - `Curated`（用户显式选择「精选」）：只跑体检精选源；curated 集合不存在时退化为全量，
+///   总预算随 `All`；交集为空时退化为 preferred。显式 `source_ids` 会跳过该收缩。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchScope {
     Curated,
