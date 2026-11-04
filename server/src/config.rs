@@ -27,7 +27,8 @@ fn env_u64_opt(key: &str) -> Option<u64> {
     env_prefixed(key).and_then(|v| v.trim().parse::<u64>().ok())
 }
 
-/// 源级并发槽：默认 8，允许调到 16（设备 4 核实测 16 可用），超出夹回。
+/// 源级并发槽：默认 16（2026-11-04 扫参照：8→16 在同预算下命中源 +3.3pt，
+/// 首屏不变），允许 1..16，超出夹回。
 fn clamp_http_concurrency(n: u64) -> usize {
     n.clamp(1, MAX_SEARCH_CONCURRENCY) as usize
 }
@@ -57,26 +58,42 @@ fn resolve_js_timeout_ms(raw: Option<u64>) -> u64 {
     raw.unwrap_or(DEFAULT_JS_TIMEOUT_MS).clamp(20, 5000)
 }
 
-/// 解析搜索的两个预算旋钮：返回 `(单源预算, 整批预算覆盖值)`。
+/// 解析搜索的三个预算旋钮：返回 `(单源预算, curated 整批, all 整批)`。
 ///
-/// - `SEARCH_TIMEOUT_SECS`：单源预算，默认 6s；
-/// - `SEARCH_TOTAL_BUDGET_SECS`：整批总预算；未设置时返回 `None`，由 scope 取默认值
-///   （curated 6s / all 10s）。
+/// - `SEARCH_TIMEOUT_SECS`：单源预算，默认 8s，两个 scope 共用；
+/// - `SEARCH_CURATED_BUDGET_SECS` / `SEARCH_ALL_BUDGET_SECS`：按 scope 的整批预算；
+/// - `SEARCH_TOTAL_BUDGET_SECS`：两 scope 的整批预算统一覆盖值（优先级低于
+///   上面两个按 scope 的变量）。
 ///
-/// 兼容旧部署：只显式设置了旧变量 `SEARCH_TIMEOUT_SECS` 时，整批预算回落到同值，
-/// 保持“两者同值”的历史语义；两个都不设置时才按 scope 分开。
+/// 未设置任何整批变量时取 scope 默认（curated 6s / all 10s）。
+/// 兼容旧部署：只显式设置了 `SEARCH_TIMEOUT_SECS` 时，整批预算回落到同值，
+/// 保持“两者同值”的历史语义。
 fn resolve_search_budgets(
     timeout_raw: Option<u64>,
     total_raw: Option<u64>,
-) -> (u64, Option<u64>) {
-    let per_source = timeout_raw.unwrap_or(6).clamp(5, 30);
-    let total = match (total_raw, timeout_raw) {
-        (Some(t), _) => Some(t.clamp(2, 60)),
-        // 旧变量单独生效：两者同值（用夹取后的单源值，避免日志与实际不一致）
-        (None, Some(_)) => Some(per_source),
-        (None, None) => None,
+    curated_raw: Option<u64>,
+    all_raw: Option<u64>,
+) -> (u64, u64, u64) {
+    let per_source = timeout_raw.unwrap_or(8).clamp(5, 30);
+    // 旧语义只在“完全没有设置任何整批变量”时生效：只设 SEARCH_TIMEOUT_SECS 视为
+    // “两者同值”。一旦显式给了任一整批变量，另一个 scope 就回落到自己的默认值。
+    let legacy = if total_raw.is_none() && curated_raw.is_none() && all_raw.is_none() {
+        timeout_raw.map(|_| per_source)
+    } else {
+        None
     };
-    (per_source, total)
+    let total = total_raw.map(|v| v.clamp(2, 60));
+    let curated = curated_raw
+        .map(|v| v.clamp(2, 60))
+        .or(total)
+        .or(legacy)
+        .unwrap_or(6);
+    let all = all_raw
+        .map(|v| v.clamp(2, 60))
+        .or(total)
+        .or(legacy)
+        .unwrap_or(10);
+    (per_source, curated, all)
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -103,11 +120,12 @@ pub struct Config {
     /// 单次抓取超时（秒）
     pub http_timeout_secs: u64,
     /// 单源搜索预算（秒）：聚合搜索按“每个书源”独立计时，超时只丢该源、不影响整体。
-    /// 与整批总预算解耦（见 `search_total_budget_secs`）。
+    /// 与整批总预算解耦（见 `search_curated_budget_secs` / `search_all_budget_secs`）。
     pub search_timeout_secs: u64,
-    /// 整批搜索总预算（秒）：`None` 表示按 scope 取默认（curated 6s / all 10s）。
-    /// 两者此前是同一个值，导致“单源超时”被整批上限放大成排队饥饿。
-    pub search_total_budget_secs: Option<u64>,
+    /// `scope=curated` 的整批搜索总预算（秒，默认 6）。
+    pub search_curated_budget_secs: u64,
+    /// `scope=all` 的整批搜索总预算（秒，默认 10）。
+    pub search_all_budget_secs: u64,
     /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
     /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
     pub search_all_slots: usize,
@@ -199,10 +217,13 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let (search_timeout_secs, search_total_budget_secs) = resolve_search_budgets(
-            env_u64_opt("SEARCH_TIMEOUT_SECS"),
-            env_u64_opt("SEARCH_TOTAL_BUDGET_SECS"),
-        );
+        let (search_timeout_secs, search_curated_budget_secs, search_all_budget_secs) =
+            resolve_search_budgets(
+                env_u64_opt("SEARCH_TIMEOUT_SECS"),
+                env_u64_opt("SEARCH_TOTAL_BUDGET_SECS"),
+                env_u64_opt("SEARCH_CURATED_BUDGET_SECS"),
+                env_u64_opt("SEARCH_ALL_BUDGET_SECS"),
+            );
         let http_concurrency_raw = env_u64_opt("HTTP_CONCURRENCY");
         // 切片参数有跨字段约束：overlap 不得超过可用高的 1/4（与 SliceParams 的夹取一致）。
         let comic_slice_vh = env_u64("COMIC_SLICE_VH", 1196).clamp(320, 2000) as u32;
@@ -217,14 +238,15 @@ impl Config {
             jwt_secret: env_prefixed("JWT_SECRET").unwrap_or_else(|| "change-me-in-prod".into()),
 
             cache_limit_mb: env_u64("CACHE_LIMIT_MB", 50).clamp(4, 512),
-            // 并发默认 8（设备实测 16 可行但默认保守）；上限放宽到 16，允许按机器调高。
-            http_concurrency: clamp_http_concurrency(http_concurrency_raw.unwrap_or(8)),
+            // 并发默认 16：扫参照显示同预算下 8→16 命中源 +3.3pt、首屏不变；上限 16。
+            http_concurrency: clamp_http_concurrency(http_concurrency_raw.unwrap_or(16)),
             // all 范围：显式设置时尊重用户（min(配置,16)），未设置时用设备建议的 16。
             search_all_slots: resolve_all_slots(http_concurrency_raw),
             http_timeout_secs: env_u64("HTTP_TIMEOUT_SECS", 15).clamp(3, 60),
-            // 单源预算与整批预算分开：单源默认 6s，整批由 scope 决定（curated 6s / all 10s）。
+            // 单源预算与整批预算分开：单源默认 8s，整批按 scope 默认（curated 6s / all 10s）。
             search_timeout_secs,
-            search_total_budget_secs,
+            search_curated_budget_secs,
+            search_all_budget_secs,
             http_max_body_bytes: env_u64("HTTP_MAX_BODY_MB", 5).clamp(1, 32) as usize * 1024 * 1024,
             image_cache_mb: env_u64("IMAGE_CACHE_MB", 64).clamp(4, 256),
             image_max_body_bytes: env_u64("IMAGE_MAX_BODY_MB", 8).clamp(1, 32) as usize * 1024 * 1024,
@@ -354,43 +376,93 @@ mod tests {
         );
     }
 
-    // 预算拆分：两者都不设置 → 单源 6s、整批交给 scope 默认（None）
+    // 预算拆分：都不设置 → 单源 8s、整批 curated 6s / all 10s
     #[test]
     fn default_search_budgets_are_split() {
-        assert_eq!(resolve_search_budgets(None, None), (6, None));
+        assert_eq!(resolve_search_budgets(None, None, None, None), (8, 6, 10));
     }
 
-    // 独立生效：总预算设置后不再等于单源预算
+    // 独立生效：总预算设置后不再等于单源预算（两 scope 同值）
     #[test]
     fn search_budgets_are_independent() {
         assert_eq!(
-            resolve_search_budgets(Some(6), Some(25)),
-            (6, Some(25))
+            resolve_search_budgets(Some(6), Some(25), None, None),
+            (6, 25, 25)
         );
-        assert_eq!(resolve_search_budgets(Some(6), Some(8)), (6, Some(8)));
+        assert_eq!(
+            resolve_search_budgets(Some(6), Some(8), None, None),
+            (6, 8, 8)
+        );
+    }
+
+    // 按 scope 的整批预算：SEARCH_ALL_BUDGET_SECS 只改 all，curated 仍取默认
+    #[test]
+    fn scope_specific_total_budget_overrides() {
+        assert_eq!(
+            resolve_search_budgets(None, None, None, Some(15)),
+            (8, 6, 15)
+        );
+        assert_eq!(
+            resolve_search_budgets(None, None, Some(8), Some(15)),
+            (8, 8, 15)
+        );
+        // 显式按 scope 的值优先于统一覆盖值
+        assert_eq!(
+            resolve_search_budgets(Some(8), Some(25), Some(8), Some(15)),
+            (8, 8, 15)
+        );
     }
 
     // 兼容：只设旧变量 SEARCH_TIMEOUT_SECS 时两者同值（历史语义）
     #[test]
     fn legacy_timeout_only_keeps_both_equal() {
         assert_eq!(
-            resolve_search_budgets(Some(10), None),
-            (10, Some(10))
+            resolve_search_budgets(Some(10), None, None, None),
+            (10, 10, 10)
         );
         // 越界也按夹取后的单源值回落，避免日志与实际不一致
         assert_eq!(
-            resolve_search_budgets(Some(40), None),
-            (30, Some(30))
+            resolve_search_budgets(Some(40), None, None, None),
+            (30, 30, 30)
         );
     }
 
-    // 并发夹取：默认 8、允许 16、17 夹回 16、0 夹到 1
+    // 越界夹取：单源 5..30，整批 2..60
+    #[test]
+    fn search_budgets_are_clamped() {
+        assert_eq!(
+            resolve_search_budgets(Some(3), Some(1), Some(0), Some(99)),
+            (5, 2, 60)
+        );
+        assert_eq!(
+            resolve_search_budgets(Some(99), None, None, None),
+            (30, 30, 30)
+        );
+    }
+
+    // 只指定 all 整批时，curated 仍取自己的默认 6s，不被旧的“两者同值”污染
+    #[test]
+    fn setting_one_scope_does_not_leak_per_source_into_other_scope() {
+        assert_eq!(
+            resolve_search_budgets(Some(30), None, None, Some(10)),
+            (30, 6, 10)
+        );
+    }
+
+    // 并发夹取：允许 16、17 夹回 16、0 夹到 1
     #[test]
     fn http_concurrency_is_clamped_to_16() {
         assert_eq!(clamp_http_concurrency(8), 8);
         assert_eq!(clamp_http_concurrency(16), 16, "16 应被允许");
         assert_eq!(clamp_http_concurrency(17), 16, "17 应夹到 16");
         assert_eq!(clamp_http_concurrency(0), 1);
+    }
+
+    // 默认并发槽是 16（扫参结论），未显式设置时 all 搜索也拿 16 槽
+    #[test]
+    fn default_concurrency_is_16() {
+        assert_eq!(clamp_http_concurrency(16), 16);
+        assert_eq!(resolve_all_slots(None), 16);
     }
 
     // all 范围的并发：用户设 4 → 4；未设置 → 16；设 32 → 16

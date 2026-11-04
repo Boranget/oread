@@ -114,6 +114,18 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
             "timeout_secs": state.cfg.http_timeout_secs,
             "max_body_mb": state.cfg.http_max_body_bytes / (1024 * 1024),
         },
+        // 搜索调度的真实生效值（与启动日志 `search budgets resolved` 同源）：
+        // 单源预算两 scope 共用；整批预算按 scope 分档；源级并发槽按 scope 分池。
+        "search": {
+            "per_source_secs": state.cfg.search_timeout_secs,
+            "per_source_ms": state.cfg.search_timeout_secs * 1000,
+            "total_curated_secs": state.cfg.search_curated_budget_secs,
+            "total_all_secs": state.cfg.search_all_budget_secs,
+            "source_slots": state.cfg.http_concurrency,
+            "all_source_slots": state.cfg.search_all_slots,
+            "comic_slots": (state.cfg.http_concurrency / 4).max(1),
+            "comic_slots_all": (state.cfg.search_all_slots / 4).max(1),
+        },
         // 图片代理进程内 LRU（与正文缓存分开，但同属缓存预算）
         "image_cache": {
             "bytes": img_bytes,

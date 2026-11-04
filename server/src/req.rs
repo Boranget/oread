@@ -50,17 +50,19 @@ struct HttpConf {
     all_concurrency: usize,
     timeout_secs: u64,
     search_timeout_secs: u64,
-    /// 整批搜索总预算的显式覆盖值；`None` 时按 scope 取默认。
-    search_total_budget_secs: Option<u64>,
+    /// 整批搜索总预算：curated / all 两档。
+    search_curated_budget_secs: u64,
+    search_all_budget_secs: u64,
     max_body_bytes: usize,
 }
 
 const DEFAULT_CONF: HttpConf = HttpConf {
-    concurrency: 8,
+    concurrency: 16,
     all_concurrency: 16,
     timeout_secs: 15,
-    search_timeout_secs: 6,
-    search_total_budget_secs: None,
+    search_timeout_secs: 8,
+    search_curated_budget_secs: 6,
+    search_all_budget_secs: 10,
     max_body_bytes: 5 * 1024 * 1024,
 };
 
@@ -92,7 +94,7 @@ impl SearchScope {
         }
     }
 
-    /// 整批总预算默认值（秒）。
+    /// 整批总预算默认值（秒）。实际生效值见 `search_total_budget()`。
     pub fn default_total_budget_secs(self) -> u64 {
         match self {
             Self::Curated => 6,
@@ -120,16 +122,13 @@ pub fn init(cfg: &Config) {
         all_concurrency: cfg.search_all_slots,
         timeout_secs: cfg.http_timeout_secs,
         search_timeout_secs: cfg.search_timeout_secs,
-        search_total_budget_secs: cfg.search_total_budget_secs,
+        search_curated_budget_secs: cfg.search_curated_budget_secs,
+        search_all_budget_secs: cfg.search_all_budget_secs,
         max_body_bytes: cfg.http_max_body_bytes,
     });
     let per_source = cfg.search_timeout_secs;
-    let curated = cfg
-        .search_total_budget_secs
-        .unwrap_or(SearchScope::Curated.default_total_budget_secs());
-    let all = cfg
-        .search_total_budget_secs
-        .unwrap_or(SearchScope::All.default_total_budget_secs());
+    let curated = cfg.search_curated_budget_secs;
+    let all = cfg.search_all_budget_secs;
     // 启动日志：两个生效值必须一眼可见，避免又回到“两者同值”的隐式 bug。
     tracing::info!(
         target: "search_budget",
@@ -151,22 +150,21 @@ pub fn search_budget() -> Duration {
     Duration::from_secs(conf().search_timeout_secs)
 }
 
-/// 按 scope 的单源预算：curated 只跑精选源，给 5s；all 覆盖更广，给 6s。
+/// 按 scope 的单源预算：两者共用 `SEARCH_TIMEOUT_SECS`（默认 8s）。
 ///
-/// 与 `search_budget()` 区分：后者是通用默认值（legacy 聚合等使用）。
-pub fn search_budget_for(scope: SearchScope) -> Duration {
-    match scope {
-        SearchScope::Curated => Duration::from_secs(5),
-        SearchScope::All => Duration::from_secs(6),
-    }
+/// `scope` 参数保留用于调用点语义区分；实际值不再按 scope 硬编码 5/6，
+/// 否则环境变量只影响启动日志、不影响真实请求预算。
+pub fn search_budget_for(_scope: SearchScope) -> Duration {
+    Duration::from_secs(conf().search_timeout_secs)
 }
 
 /// 一次聚合搜索的整批时长上限（含排队）。与单源预算独立：
-/// 显式覆盖优先，否则按 scope 取默认（curated 6s / all 10s）。
+/// 按 scope 取已解析值（curated 默认 6s / all 默认 10s）。
 pub fn search_total_budget(scope: SearchScope) -> Duration {
-    let secs = conf()
-        .search_total_budget_secs
-        .unwrap_or(scope.default_total_budget_secs());
+    let secs = match scope {
+        SearchScope::Curated => conf().search_curated_budget_secs,
+        SearchScope::All => conf().search_all_budget_secs,
+    };
     Duration::from_secs(secs)
 }
 
@@ -188,7 +186,7 @@ pub fn all_search_slots() -> usize {
     conf().all_concurrency
 }
 
-/// 漫画槽数量：并发的 1/4（至少 1 个）。默认 8 → 2 个；all 16 槽 → 4 个。
+/// 漫画槽数量：并发的 1/4（至少 1 个）。默认 16 → 4 个。
 fn comic_slot_count(slots: usize) -> usize {
     (slots / 4).max(1)
 }
@@ -1546,12 +1544,17 @@ mod tests {
         assert_eq!(SearchScope::parse(Some("ENHANCED")), SearchScope::All);
     }
 
-    // 两个预算独立：单源 curated 5s / all 6s；整批 curated 6s / all 10s
+    // 两个预算独立：单源两个 scope 共用 8s；整批 curated 6s / all 10s
     #[test]
     fn total_budget_defaults_follow_scope_not_per_source() {
-        assert_eq!(search_budget(), Duration::from_secs(6), "通用单源默认 6s");
-        assert_eq!(search_budget_for(SearchScope::Curated), Duration::from_secs(5));
-        assert_eq!(search_budget_for(SearchScope::All), Duration::from_secs(6));
+        assert_eq!(search_budget(), Duration::from_secs(8), "通用单源默认 8s");
+        assert_eq!(search_budget_for(SearchScope::Curated), Duration::from_secs(8));
+        assert_eq!(search_budget_for(SearchScope::All), Duration::from_secs(8));
+        assert_eq!(
+            search_budget_for(SearchScope::Curated),
+            search_budget_for(SearchScope::All),
+            "单源预算不再按 scope 硬编码 5/6"
+        );
         assert_eq!(
             search_total_budget(SearchScope::Curated),
             Duration::from_secs(6)
