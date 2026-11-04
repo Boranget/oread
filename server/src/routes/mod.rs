@@ -1,20 +1,23 @@
-pub mod sources;
+pub mod bookmarks;
 pub mod books;
 pub mod bookshelf;
-pub mod export;
-pub mod bookmarks;
-pub mod replace;
-pub mod stats;
-pub mod health;
-pub mod kindle;
-pub mod image;
 pub mod comic;
+pub mod export;
+pub mod health;
+pub mod image;
 pub mod import_url;
+pub mod kindle;
+pub mod replace;
+pub mod sources;
+pub mod stats;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use sqlx::SqlitePool;
 
 use crate::auth;

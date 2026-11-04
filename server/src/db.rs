@@ -76,8 +76,13 @@ pub async fn init_shared(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
     apply_pragma(&pool).await?;
-    crate::db_guard::migrate_bucket(cfg, &pool, &shared_migrator(), crate::db_guard::Scope::Shared)
-        .await?;
+    crate::db_guard::migrate_bucket(
+        cfg,
+        &pool,
+        &shared_migrator(),
+        crate::db_guard::Scope::Shared,
+    )
+    .await?;
     if cfg.db_vacuum_convert {
         ensure_incremental(&pool).await?;
     }
@@ -163,7 +168,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(after < before, "incremental_vacuum 后空闲页应减少: {before} -> {after}");
+        assert!(
+            after < before,
+            "incremental_vacuum 后空闲页应减少: {before} -> {after}"
+        );
         pool.close().await;
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), ext));

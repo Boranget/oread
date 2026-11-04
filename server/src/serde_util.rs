@@ -14,7 +14,9 @@ where
             .as_i64()
             .ok_or_else(|| serde::de::Error::custom("not an i64")),
         Value::String(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
-        _ => Err(serde::de::Error::custom("expected number or numeric string")),
+        _ => Err(serde::de::Error::custom(
+            "expected number or numeric string",
+        )),
     }
 }
 
@@ -33,7 +35,6 @@ where
         _ => Err(serde::de::Error::custom("expected bool")),
     }
 }
-
 
 /// 递归把 JSON 中所有对象键从 camelCase 转为 snake_case。
 pub fn camel_to_snake_value(v: Value) -> Value {

@@ -73,9 +73,7 @@ pub fn validate_import_url(source: &BookSource, raw: &str) -> AppResult<Url> {
         }
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(AppError::BadRequest(
-            "链接不能包含用户名或密码信息".into(),
-        ));
+        return Err(AppError::BadRequest("链接不能包含用户名或密码信息".into()));
     }
     let host = url
         .host_str()
@@ -145,9 +143,7 @@ pub fn check_page(status: u16, content_type: Option<&str>, body: &str) -> AppRes
         }
     }
     if body.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "详情页返回空内容，无法导入".into(),
-        ));
+        return Err(AppError::BadRequest("详情页返回空内容，无法导入".into()));
     }
     if looks_like_login_page(body) {
         return Err(AppError::BadRequest(
@@ -235,7 +231,9 @@ fn meta_from_html(html: &str) -> MetaFallback {
 
 fn meta_content(doc: &Html, selectors: &[&str]) -> Option<String> {
     for sel in selectors {
-        let Ok(s) = Selector::parse(sel) else { continue };
+        let Ok(s) = Selector::parse(sel) else {
+            continue;
+        };
         if let Some(v) = doc
             .select(&s)
             .next()
@@ -307,6 +305,7 @@ fn join_url(base: &str, maybe: &str) -> String {
 }
 
 async fn find_existing(pool: &SqlitePool, book_url: &str) -> AppResult<Option<ExistingBook>> {
+    #[allow(clippy::type_complexity)] // 行类型与 SELECT 列一一对应，保持就地元组便于核对。
     let row: Option<(
         Option<String>,
         Option<String>,
@@ -370,10 +369,7 @@ async fn import_url(
     let source = match load_source(&s.shared, &q.source_id).await {
         Ok(src) => src,
         Err(AppError::NotFound(_)) => {
-            return Err(AppError::BadRequest(format!(
-                "书源不存在：{}",
-                q.source_id
-            )))
+            return Err(AppError::BadRequest(format!("书源不存在：{}", q.source_id)))
         }
         Err(e) => return Err(e),
     };
@@ -409,7 +405,8 @@ async fn import_url(
 
     let key = web_book::book_key(&source, &book_url);
     let store = crate::routes::books::book_store_for(&db.0, &key).await;
-    let (book, created) = import_book_from_html(&db.0, &source, &book_url, &page.body, Some(&store)).await?;
+    let (book, created) =
+        import_book_from_html(&db.0, &source, &book_url, &page.body, Some(&store)).await?;
     Ok(Json(ImportUrlResp {
         book_url: book.book_url,
         source_id: source.book_source_url.clone(),
@@ -654,8 +651,7 @@ mod tests {
         assert!(format!("{err:?}").contains("仅支持 http/https"), "{err:?}");
         let err = validate_import_url(&source, "http://127.0.0.1/book/1").unwrap_err();
         assert!(format!("{err:?}").contains("内网"), "{err:?}");
-        let err =
-            validate_import_url(&source, "https://user:pass@m.ac.qq.com/book/1").unwrap_err();
+        let err = validate_import_url(&source, "https://user:pass@m.ac.qq.com/book/1").unwrap_err();
         assert!(format!("{err:?}").contains("用户名"), "{err:?}");
     }
 

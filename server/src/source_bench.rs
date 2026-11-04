@@ -39,7 +39,7 @@ pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 
     let est = (source_count.saturating_mul(samples_per_source) as u64)
         .saturating_mul(PER_SAMPLE_BUDGET_SECS)
         / BENCH_CONCURRENCY as u64;
-    est.max(BATCH_BUDGET_SECS).min(MAX_BATCH_BUDGET_SECS)
+    est.clamp(BATCH_BUDGET_SECS, MAX_BATCH_BUDGET_SECS)
 }
 
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
@@ -74,36 +74,156 @@ pub struct BuiltinCorpus {
 /// 漫画（source_type=2）单独占 12 条：按语料类型配额，避免漫画样本不足导致该类精选长期为空。
 pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     // 玄幻（小说）
-    BuiltinCorpus { title: "斗破苍穹", expected_author: Some("天蚕土豆"), category: "玄幻", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "凡人修仙传", expected_author: Some("忘语"), category: "玄幻", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "遮天", expected_author: Some("辰东"), category: "玄幻", source_type: TYPE_NOVEL },
+    BuiltinCorpus {
+        title: "斗破苍穹",
+        expected_author: Some("天蚕土豆"),
+        category: "玄幻",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "凡人修仙传",
+        expected_author: Some("忘语"),
+        category: "玄幻",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "遮天",
+        expected_author: Some("辰东"),
+        category: "玄幻",
+        source_type: TYPE_NOVEL,
+    },
     // 都市（小说）
-    BuiltinCorpus { title: "全职高手", expected_author: Some("蝴蝶蓝"), category: "都市", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "校花的贴身高手", expected_author: Some("鱼人二代"), category: "都市", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "黄金瞳", expected_author: Some("打眼"), category: "都市", source_type: TYPE_NOVEL },
+    BuiltinCorpus {
+        title: "全职高手",
+        expected_author: Some("蝴蝶蓝"),
+        category: "都市",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "校花的贴身高手",
+        expected_author: Some("鱼人二代"),
+        category: "都市",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "黄金瞳",
+        expected_author: Some("打眼"),
+        category: "都市",
+        source_type: TYPE_NOVEL,
+    },
     // 历史（小说）
-    BuiltinCorpus { title: "庆余年", expected_author: Some("猫腻"), category: "历史", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "明朝那些事儿", expected_author: Some("当年明月"), category: "历史", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "赘婿", expected_author: Some("愤怒的香蕉"), category: "历史", source_type: TYPE_NOVEL },
+    BuiltinCorpus {
+        title: "庆余年",
+        expected_author: Some("猫腻"),
+        category: "历史",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "明朝那些事儿",
+        expected_author: Some("当年明月"),
+        category: "历史",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "赘婿",
+        expected_author: Some("愤怒的香蕉"),
+        category: "历史",
+        source_type: TYPE_NOVEL,
+    },
     // 科幻（小说）
-    BuiltinCorpus { title: "三体", expected_author: Some("刘慈欣"), category: "科幻", source_type: TYPE_NOVEL },
+    BuiltinCorpus {
+        title: "三体",
+        expected_author: Some("刘慈欣"),
+        category: "科幻",
+        source_type: TYPE_NOVEL,
+    },
     // 出版（小说）
-    BuiltinCorpus { title: "活着", expected_author: Some("余华"), category: "出版", source_type: TYPE_NOVEL },
-    BuiltinCorpus { title: "平凡的世界", expected_author: Some("路遥"), category: "出版", source_type: TYPE_NOVEL },
+    BuiltinCorpus {
+        title: "活着",
+        expected_author: Some("余华"),
+        category: "出版",
+        source_type: TYPE_NOVEL,
+    },
+    BuiltinCorpus {
+        title: "平凡的世界",
+        expected_author: Some("路遥"),
+        category: "出版",
+        source_type: TYPE_NOVEL,
+    },
     // 漫画（type=2）：12 条长期存在的常见书名
-    BuiltinCorpus { title: "海贼王", expected_author: Some("尾田荣一郎"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "火影忍者", expected_author: Some("岸本齐史"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "名侦探柯南", expected_author: Some("青山刚昌"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "一人之下", expected_author: Some("米二"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "鬼灭之刃", expected_author: Some("吾峠呼世晴"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus {
+        title: "海贼王",
+        expected_author: Some("尾田荣一郎"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "火影忍者",
+        expected_author: Some("岸本齐史"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "名侦探柯南",
+        expected_author: Some("青山刚昌"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "一人之下",
+        expected_author: Some("米二"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "鬼灭之刃",
+        expected_author: Some("吾峠呼世晴"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
     // 漫画版《斗罗大陆》：用不带后缀的书名，否则与站点标题的包含率不足 0.6 会永远匹配不上
-    BuiltinCorpus { title: "斗罗大陆", expected_author: Some("穆逢春"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "秦时明月", expected_author: None, category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "狐妖小红娘", expected_author: Some("小新"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "镇魂街", expected_author: Some("许辰"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "灌篮高手", expected_author: Some("井上雄彦"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "进击的巨人", expected_author: Some("谏山创"), category: "漫画", source_type: TYPE_COMIC },
-    BuiltinCorpus { title: "咒术回战", expected_author: Some("芥见下下"), category: "漫画", source_type: TYPE_COMIC },
+    BuiltinCorpus {
+        title: "斗罗大陆",
+        expected_author: Some("穆逢春"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "秦时明月",
+        expected_author: None,
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "狐妖小红娘",
+        expected_author: Some("小新"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "镇魂街",
+        expected_author: Some("许辰"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "灌篮高手",
+        expected_author: Some("井上雄彦"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "进击的巨人",
+        expected_author: Some("谏山创"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
+    BuiltinCorpus {
+        title: "咒术回战",
+        expected_author: Some("芥见下下"),
+        category: "漫画",
+        source_type: TYPE_COMIC,
+    },
 ];
 
 /// 精选数量区间：漫画单独用更宽的区间（默认 min=3），小说仍用 min=8。
@@ -123,6 +243,8 @@ fn next_seq() -> i64 {
 /// 同一时间只允许一个整批体检在跑（手动触发与 72h 定时共用）。
 static BENCH_INFLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// 查询是否有整批体检在跑；调度侧改用 `try_begin_bench`/`end_bench` 的返回值，本只读查询保留给诊断。
+#[allow(dead_code)]
 pub fn bench_inflight() -> bool {
     BENCH_INFLIGHT.load(Ordering::SeqCst)
 }
@@ -140,7 +262,9 @@ pub fn end_bench() {
 /// 是否到了定时体检时间。没有历史（None/0）不触发，避免冷启动搜索顺带跑整批体检。
 pub fn bench_due(last_bench_at: Option<i64>, now: i64, interval_hours: u64) -> bool {
     match last_bench_at {
-        Some(t) if t > 0 => now.saturating_sub(t) >= (interval_hours as i64).saturating_mul(3_600_000),
+        Some(t) if t > 0 => {
+            now.saturating_sub(t) >= (interval_hours as i64).saturating_mul(3_600_000)
+        }
         _ => false,
     }
 }
@@ -297,7 +421,11 @@ pub fn title_near_equal(got: &str, expected: &str) -> bool {
     if (short as f64 / long as f64) < 0.6 {
         return false;
     }
-    let (longer, base) = if a.len() >= b.len() { (&a, &b) } else { (&b, &a) };
+    let (longer, base) = if a.len() >= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
     !has_derivative_extra(longer, base)
 }
 
@@ -392,7 +520,11 @@ pub struct CorpusEntry {
 }
 
 pub fn builtin_id(item: &BuiltinCorpus) -> String {
-    format!("builtin:{}:{}", item.source_type, normalize_title(item.title))
+    format!(
+        "builtin:{}:{}",
+        item.source_type,
+        normalize_title(item.title)
+    )
 }
 
 pub fn is_builtin_id(id: &str) -> bool {
@@ -449,7 +581,11 @@ pub async fn load_corpus(pool: &SqlitePool) -> AppResult<Vec<CorpusEntry>> {
         id: r.id,
         title: r.title,
         expected_author: r.expected_author,
-        category: if r.category.trim().is_empty() { CATEGORY_FALLBACK.to_string() } else { r.category },
+        category: if r.category.trim().is_empty() {
+            CATEGORY_FALLBACK.to_string()
+        } else {
+            r.category
+        },
         source_type: r.source_type,
         enabled: r.enabled,
         builtin: false,
@@ -474,7 +610,9 @@ fn validate_input(input: &CorpusInput) -> AppResult<String> {
         return Err(AppError::BadRequest("书名不能为空".into()));
     }
     if input.source_type != TYPE_NOVEL && input.source_type != TYPE_COMIC {
-        return Err(AppError::BadRequest("type 只能是 0（小说）或 2（漫画）".into()));
+        return Err(AppError::BadRequest(
+            "type 只能是 0（小说）或 2（漫画）".into(),
+        ));
     }
     let norm = normalize_title(title);
     if norm.is_empty() {
@@ -501,7 +639,9 @@ pub async fn add_user_corpus(pool: &SqlitePool, input: CorpusInput) -> AppResult
     .fetch_optional(pool)
     .await?;
     if exists.is_some() {
-        return Err(AppError::BadRequest("已存在同名语料（同类目下书名归一化后相同）".into()));
+        return Err(AppError::BadRequest(
+            "已存在同名语料（同类目下书名归一化后相同）".into(),
+        ));
     }
     let now = now_ms();
     let id = format!("user-{}-{}", now, next_seq());
@@ -568,7 +708,9 @@ pub async fn update_user_corpus(
     let norm = validate_input(&input)?;
     for b in BUILTIN_CORPUS {
         if b.source_type == input.source_type && normalize_title(b.title) == norm {
-            return Err(AppError::BadRequest("这是内置书名，不能改成内置书名".into()));
+            return Err(AppError::BadRequest(
+                "这是内置书名，不能改成内置书名".into(),
+            ));
         }
     }
     let clash: Option<i64> = sqlx::query_scalar(
@@ -580,7 +722,9 @@ pub async fn update_user_corpus(
     .fetch_optional(pool)
     .await?;
     if clash.is_some() {
-        return Err(AppError::BadRequest("已存在同名语料（同类目下书名归一化后相同）".into()));
+        return Err(AppError::BadRequest(
+            "已存在同名语料（同类目下书名归一化后相同）".into(),
+        ));
     }
     let now = now_ms();
     let category = if input.category.trim().is_empty() {
@@ -705,7 +849,12 @@ pub async fn delete_corpus(pool: &SqlitePool, id: &str) -> AppResult<()> {
 
 /// 按 type 分组、内置优先、category 轮转抽 `limit` 条。
 /// `salt` 用于每次体检轮换起点，保证长期覆盖到所有 category。
-pub fn pick_samples(entries: &[CorpusEntry], source_type: i64, limit: usize, salt: usize) -> Vec<CorpusEntry> {
+pub fn pick_samples(
+    entries: &[CorpusEntry],
+    source_type: i64,
+    limit: usize,
+    salt: usize,
+) -> Vec<CorpusEntry> {
     let usable: Vec<&CorpusEntry> = entries
         .iter()
         .filter(|e| e.enabled && e.source_type == source_type)
@@ -916,7 +1065,9 @@ pub fn start_bench_job(
     limit: Option<usize>,
 ) -> AppResult<String> {
     if !try_begin_bench() {
-        return Err(AppError::BadRequest("已有体检任务在运行，请稍后查询结果".into()));
+        return Err(AppError::BadRequest(
+            "已有体检任务在运行，请稍后查询结果".into(),
+        ));
     }
     let started_at = now_ms();
     let run_id = format!("br-{}-{}", started_at, next_seq());
@@ -1088,7 +1239,7 @@ fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = v.len() / 2;
-    if v.len() % 2 == 0 {
+    if v.len().is_multiple_of(2) {
         (v[mid - 1] + v[mid]) / 2.0
     } else {
         v[mid]
@@ -1171,7 +1322,9 @@ fn compute_source_rows(
     let mut out: Vec<SourceBenchRow> = Vec::new();
     for (url, list) in by_source.iter() {
         let src = sources.get(url);
-        let name = src.map(|s| s.book_source_name.clone()).unwrap_or_else(|| url.clone());
+        let name = src
+            .map(|s| s.book_source_name.clone())
+            .unwrap_or_else(|| url.clone());
         let source_type = src.map(|s| s.book_source_type).unwrap_or(TYPE_NOVEL);
         let total = list.len() as i64;
         let excluded = list.iter().filter(|r| r.suspicious).count() as i64;
@@ -1179,7 +1332,11 @@ fn compute_source_rows(
         let obs = usable.len() as i64;
         // 只有真正拿到响应的样本才算“有效样本”：
         // 体检整批 deadline 到了还没发出的请求不能算样本，更不能按 latency=0 拿满分。
-        let ok: Vec<&BenchRun> = usable.iter().filter(|r| r.error_kind.is_none()).copied().collect();
+        let ok: Vec<&BenchRun> = usable
+            .iter()
+            .filter(|r| r.error_kind.is_none())
+            .copied()
+            .collect();
         let samples = ok.len() as i64;
         let hits = ok.iter().filter(|r| r.found).count() as i64;
         let errors = obs - samples;
@@ -1202,10 +1359,7 @@ fn compute_source_rows(
             if cs == 0 {
                 continue;
             }
-            let ch = ok
-                .iter()
-                .filter(|r| r.category == *cat && r.found)
-                .count() as i64;
+            let ch = ok.iter().filter(|r| r.category == *cat && r.found).count() as i64;
             per_cat.push(CategoryRate {
                 category: cat.clone(),
                 samples: cs,
@@ -1250,7 +1404,11 @@ fn compute_source_rows(
             per_category_hit_rate: per_cat,
         });
     }
-    out.sort_by(|a, b| b.bench_score.cmp(&a.bench_score).then_with(|| a.name.cmp(&b.name)));
+    out.sort_by(|a, b| {
+        b.bench_score
+            .cmp(&a.bench_score)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 
@@ -1280,13 +1438,21 @@ pub fn pick_curated_count(sorted_scores: &[i32], min: usize, max: usize, gap: i3
     cap
 }
 
+/// 精选清单的中间结构；生产路径直接写库，本结构与 `select_curated` 仅单测使用。
+#[allow(dead_code)]
 struct CuratedSelection {
     novel: Vec<CuratedItem>,
     comic: Vec<CuratedItem>,
     flags: HashMap<String, bool>,
 }
 
-fn select_curated(rows: &[SourceBenchRow], cfg: &Config, eligible: &HashSet<String>) -> CuratedSelection {
+/// 按配置挑出精选源；生产路径在入库阶段完成同样筛选，本函数仅单测使用。
+#[allow(dead_code)]
+fn select_curated(
+    rows: &[SourceBenchRow],
+    cfg: &Config,
+    eligible: &HashSet<String>,
+) -> CuratedSelection {
     let mut result = CuratedSelection {
         novel: Vec::new(),
         comic: Vec::new(),
@@ -1351,9 +1517,14 @@ pub async fn run_bench(
     let batch_id = format!("b{}-{}", started_at, batch_seq);
 
     let all = crate::routes::sources::load_sources(pool).await?;
-    let by_url: HashMap<String, BookSource> =
-        all.iter().cloned().map(|s| (s.book_source_url.clone(), s)).collect();
-    let quarantined = crate::source_ledger::quarantined_set(pool).await.unwrap_or_default();
+    let by_url: HashMap<String, BookSource> = all
+        .iter()
+        .cloned()
+        .map(|s| (s.book_source_url.clone(), s))
+        .collect();
+    let quarantined = crate::source_ledger::quarantined_set(pool)
+        .await
+        .unwrap_or_default();
     let corpus = load_corpus(pool).await?;
     let samples_per_source = limit.unwrap_or(cfg.source_bench_samples).clamp(1, 20);
 
@@ -1381,21 +1552,25 @@ pub async fn run_bench(
     }
 
     let corpus_for_type = |t: i64| -> Vec<CorpusEntry> {
-        corpus.iter().filter(|e| e.source_type == t).cloned().collect()
+        corpus
+            .iter()
+            .filter(|e| e.source_type == t)
+            .cloned()
+            .collect()
     };
     let novel_corpus = corpus_for_type(TYPE_NOVEL);
     let comic_corpus = corpus_for_type(TYPE_COMIC);
 
     let health = source_health::load_map(pool).await.unwrap_or_default();
-    let deadline = started + Duration::from_secs(batch_budget_secs(sources.len(), samples_per_source));
-    let prev_streak: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
-        "SELECT source_url, fail_streak FROM source_curated",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
+    let deadline =
+        started + Duration::from_secs(batch_budget_secs(sources.len(), samples_per_source));
+    let prev_streak: HashMap<String, i64> =
+        sqlx::query_as::<_, (String, i64)>("SELECT source_url, fail_streak FROM source_curated")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     // 每个源内部顺序执行 N 条；源之间用 buffer_unordered 限制在 BENCH_CONCURRENCY。
     // 真正的 HTTP 并发仍由 req 的全局信号量（HTTP_CONCURRENCY）兜底。
@@ -1407,8 +1582,17 @@ pub async fn run_bench(
         let comic = comic_corpus.clone();
         let task_progress = progress.clone();
         async move {
-            let pool_corpus = if src.book_source_type == TYPE_COMIC { comic } else { novel };
-            let picked = pick_samples(&pool_corpus, src.book_source_type, samples_per_source, batch_seq as usize + idx);
+            let pool_corpus = if src.book_source_type == TYPE_COMIC {
+                comic
+            } else {
+                novel
+            };
+            let picked = pick_samples(
+                &pool_corpus,
+                src.book_source_type,
+                samples_per_source,
+                batch_seq as usize + idx,
+            );
             let mut out = Vec::with_capacity(picked.len());
             for item in picked {
                 if Instant::now() >= deadline {
@@ -1455,9 +1639,12 @@ pub async fn run_bench(
     {
         let mut per_key: HashMap<String, (i64, i64, String, String)> = HashMap::new();
         for r in runs.iter().filter(|r| r.suspicious) {
-            let e = per_key
-                .entry(r.corpus_key.clone())
-                .or_insert((0, 0, r.category.clone(), r.title.clone()));
+            let e = per_key.entry(r.corpus_key.clone()).or_insert((
+                0,
+                0,
+                r.category.clone(),
+                r.title.clone(),
+            ));
             e.1 += 1;
             if r.found {
                 e.0 += 1;
@@ -1470,13 +1657,22 @@ pub async fn run_bench(
                 corpus_key: key,
                 title,
                 category,
-                hit_rate: if obs > 0 { (hits as f64 / obs as f64 * 1000.0).round() / 1000.0 } else { 0.0 },
+                hit_rate: if obs > 0 {
+                    (hits as f64 / obs as f64 * 1000.0).round() / 1000.0
+                } else {
+                    0.0
+                },
                 category_median: (med * 1000.0).round() / 1000.0,
                 observations: obs,
-                reason: "命中率低于同 category 中位数的 50%，判定为“语料可能失效”，已排除出源评分".into(),
+                reason: "命中率低于同 category 中位数的 50%，判定为“语料可能失效”，已排除出源评分"
+                    .into(),
             });
         }
-        suspicious.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.title.cmp(&b.title)));
+        suspicious.sort_by(|a, b| {
+            a.category
+                .cmp(&b.category)
+                .then_with(|| a.title.cmp(&b.title))
+        });
     }
 
     let mut rows = compute_source_rows(&runs, &by_url, &corpus, cfg, &health, &prev_streak);
@@ -1511,7 +1707,11 @@ pub async fn run_bench(
     for row in rows.iter() {
         let all_failed = row.samples > 0 && row.errors == row.samples;
         let prev = prev_streak.get(&row.source_url).copied().unwrap_or(0);
-        let fail_streak = if all_failed { prev.saturating_add(1) } else { 0 };
+        let fail_streak = if all_failed {
+            prev.saturating_add(1)
+        } else {
+            0
+        };
         sqlx::query(
             "INSERT INTO source_curated \
              (source_url, source_type, bench_score, curated, samples, fail_streak, last_bench_at, meta_json) \
@@ -1583,7 +1783,10 @@ fn category_medians(runs: &[BenchRun], corpus: &[CorpusEntry]) -> HashMap<String
             }
         }
     }
-    cat_rates.into_iter().map(|(k, v)| (k, median(&v))).collect()
+    cat_rates
+        .into_iter()
+        .map(|(k, v)| (k, median(&v)))
+        .collect()
 }
 
 struct StoredScoreRow {
@@ -1598,8 +1801,22 @@ struct StoredScoreRow {
 }
 
 /// 从库内状态重算精选并回写 curated 标记。
-async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<CuratedItem>, Vec<CuratedItem>)> {
-    let rows: Vec<(String, i64, i64, i64, i64, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+async fn recompute_curated(
+    pool: &SqlitePool,
+    cfg: &Config,
+) -> AppResult<(Vec<CuratedItem>, Vec<CuratedItem>)> {
+    #[allow(clippy::type_complexity)]
+    // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
+    let rows: Vec<(
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
         "SELECT c.source_url, c.source_type, c.bench_score, c.samples, c.fail_streak, h.tier, \
                 (SELECT b.name FROM book_sources b WHERE b.id = c.source_url), c.meta_json \
          FROM source_curated c LEFT JOIN source_health h ON h.source_url = c.source_url",
@@ -1608,16 +1825,27 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
     .await?;
     let stored: Vec<StoredScoreRow> = rows
         .into_iter()
-        .map(|(source_url, source_type, bench_score, samples, fail_streak, tier, name, meta_json)| StoredScoreRow {
-            name: name.unwrap_or_else(|| source_url.clone()),
-            source_url,
-            source_type,
-            bench_score: bench_score as i32,
-            samples,
-            hit_rate: meta_hit_rate(meta_json.as_deref()),
-            fail_streak,
-            tier,
-        })
+        .map(
+            |(
+                source_url,
+                source_type,
+                bench_score,
+                samples,
+                fail_streak,
+                tier,
+                name,
+                meta_json,
+            )| StoredScoreRow {
+                name: name.unwrap_or_else(|| source_url.clone()),
+                source_url,
+                source_type,
+                bench_score: bench_score as i32,
+                samples,
+                hit_rate: meta_hit_rate(meta_json.as_deref()),
+                fail_streak,
+                tier,
+            },
+        )
         .collect();
 
     let mut novel_items: Vec<CuratedItem> = Vec::new();
@@ -1638,7 +1866,11 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
             .filter(|r| curated_hit_ok(r.hit_rate))
             .filter(|r| r.tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED))
             .collect();
-        pool_rows.sort_by(|a, b| b.bench_score.cmp(&a.bench_score).then_with(|| a.source_url.cmp(&b.source_url)));
+        pool_rows.sort_by(|a, b| {
+            b.bench_score
+                .cmp(&a.bench_score)
+                .then_with(|| a.source_url.cmp(&b.source_url))
+        });
         let scores: Vec<i32> = pool_rows.iter().map(|r| r.bench_score).collect();
         let (min, max) = curated_bounds(cfg, source_type);
         let count = pick_curated_count(&scores, min, max, cfg.source_bench_gap);
@@ -1655,7 +1887,7 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
                 source_url: r.source_url.clone(),
                 name: r.name.clone(),
                 source_type,
-                bench_score: r.bench_score as i32,
+                bench_score: r.bench_score,
                 samples: r.samples,
                 cut_gap: if idx + 1 == count { cut_gap } else { None },
             });
@@ -1669,11 +1901,13 @@ async fn recompute_curated(pool: &SqlitePool, cfg: &Config) -> AppResult<(Vec<Cu
     if !selected.is_empty() {
         let mut tx = pool.begin().await?;
         for url in selected {
-            sqlx::query("UPDATE source_curated SET curated = 1, last_run_at = ? WHERE source_url = ?")
-                .bind(recomputed_at)
-                .bind(url)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE source_curated SET curated = 1, last_run_at = ? WHERE source_url = ?",
+            )
+            .bind(recomputed_at)
+            .bind(url)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
     }
@@ -1692,29 +1926,26 @@ pub async fn revalidate_curated_source(pool: &SqlitePool, source_url: &str) -> A
     .fetch_optional(pool)
     .await?;
     let now = now_ms();
-    match row {
-        Some((samples, fail_streak, tier, meta_json)) => {
-            let eligible = samples >= MIN_CURATED_SAMPLES
-                && fail_streak < 2
-                && curated_hit_ok(meta_hit_rate(meta_json.as_deref()))
-                && tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED);
-            if eligible {
-                sqlx::query("UPDATE source_curated SET last_run_at = ? WHERE source_url = ?")
-                    .bind(now)
-                    .bind(source_url)
-                    .execute(pool)
-                    .await?;
-            } else {
-                sqlx::query(
-                    "UPDATE source_curated SET curated = 0, last_run_at = ? WHERE source_url = ?",
-                )
+    if let Some((samples, fail_streak, tier, meta_json)) = row {
+        let eligible = samples >= MIN_CURATED_SAMPLES
+            && fail_streak < 2
+            && curated_hit_ok(meta_hit_rate(meta_json.as_deref()))
+            && tier.as_deref() == Some(crate::source_quality::TIER_PREFERRED);
+        if eligible {
+            sqlx::query("UPDATE source_curated SET last_run_at = ? WHERE source_url = ?")
                 .bind(now)
                 .bind(source_url)
                 .execute(pool)
                 .await?;
-            }
+        } else {
+            sqlx::query(
+                "UPDATE source_curated SET curated = 0, last_run_at = ? WHERE source_url = ?",
+            )
+            .bind(now)
+            .bind(source_url)
+            .execute(pool)
+            .await?;
         }
-        None => {}
     }
     Ok(())
 }
@@ -1727,13 +1958,12 @@ pub fn maybe_schedule_stale_bench(pool: SqlitePool, cfg: &Config) {
     }
     let interval = cfg.source_bench_interval_hours;
     tokio::spawn(async move {
-        let last: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT MAX(last_bench_at) FROM source_curated",
-        )
-        .fetch_one(&pool)
-        .await
-        .ok()
-        .flatten();
+        let last: Option<i64> =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(last_bench_at) FROM source_curated")
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
         if !bench_due(last, now_ms(), interval) {
             end_bench();
             return;
@@ -1783,6 +2013,8 @@ pub async fn curated_set(pool: &SqlitePool) -> AppResult<HashSet<String>> {
 
 /// 只读：精选清单（前端展示用）。
 pub async fn curated_lists(pool: &SqlitePool) -> AppResult<(Vec<CuratedItem>, Vec<CuratedItem>)> {
+    #[allow(clippy::type_complexity)]
+    // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
     let rows: Vec<(String, i64, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT c.source_url, c.source_type, c.bench_score, c.samples, \
                 (SELECT b.name FROM book_sources b WHERE b.id = c.source_url), c.meta_json \
@@ -1822,6 +2054,7 @@ pub async fn curated_lists(pool: &SqlitePool) -> AppResult<(Vec<CuratedItem>, Ve
     Ok((novel, comic))
 }
 
+#[allow(clippy::field_reassign_with_default, clippy::type_complexity)] // 测试里逐字段构造对象、就地写行元组，均便于对照真实结构。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1844,19 +2077,40 @@ mod tests {
     #[test]
     fn builtin_corpus_has_expected_shape() {
         assert_eq!(BUILTIN_CORPUS.len(), 24);
-        let novel = BUILTIN_CORPUS.iter().filter(|b| b.source_type == TYPE_NOVEL).count();
-        let comic = BUILTIN_CORPUS.iter().filter(|b| b.source_type == TYPE_COMIC).count();
+        let novel = BUILTIN_CORPUS
+            .iter()
+            .filter(|b| b.source_type == TYPE_NOVEL)
+            .count();
+        let comic = BUILTIN_CORPUS
+            .iter()
+            .filter(|b| b.source_type == TYPE_COMIC)
+            .count();
         assert_eq!(novel, 12);
         assert_eq!(comic, 12, "漫画语料扩到 12 条（10–12 区间上限）");
-        for title in ["海贼王", "火影忍者", "名侦探柯南", "一人之下", "鬼灭之刃", "斗罗大陆", "秦时明月", "狐妖小红娘"] {
+        for title in [
+            "海贼王",
+            "火影忍者",
+            "名侦探柯南",
+            "一人之下",
+            "鬼灭之刃",
+            "斗罗大陆",
+            "秦时明月",
+            "狐妖小红娘",
+        ] {
             assert!(
-                BUILTIN_CORPUS.iter().any(|b| b.title == title && b.source_type == TYPE_COMIC),
+                BUILTIN_CORPUS
+                    .iter()
+                    .any(|b| b.title == title && b.source_type == TYPE_COMIC),
                 "漫画内置语料缺少 {title}"
             );
         }
         let mut seen = HashSet::new();
         for b in BUILTIN_CORPUS {
-            assert!(seen.insert((normalize_title(b.title), b.source_type)), "内置语料重复: {}", b.title);
+            assert!(
+                seen.insert((normalize_title(b.title), b.source_type)),
+                "内置语料重复: {}",
+                b.title
+            );
         }
     }
 
@@ -1888,7 +2142,10 @@ mod tests {
     fn author_match_rules() {
         assert!(author_matches(Some("天蚕土豆"), Some("天蚕土豆")));
         assert!(author_matches(Some("天蚕土豆 著"), Some("天蚕土豆")));
-        assert!(author_matches(Some("作者：天蚕土豆"), Some("天蚕土豆")), "去掉“作者：”前缀");
+        assert!(
+            author_matches(Some("作者：天蚕土豆"), Some("天蚕土豆")),
+            "去掉“作者：”前缀"
+        );
         assert!(author_matches(Some("刘慈欣/王晋康"), Some("刘慈欣")));
         assert!(!author_matches(Some("别人"), Some("天蚕土豆")));
         assert!(!author_matches(None, Some("天蚕土豆")));
@@ -1909,8 +2166,7 @@ mod tests {
         }
         let title_ok = a == b
             || ((a.contains(&b) || b.contains(&a))
-                && norm_len(&a).min(norm_len(&b)) as f64
-                    / norm_len(&a).max(norm_len(&b)) as f64
+                && norm_len(&a).min(norm_len(&b)) as f64 / norm_len(&a).max(norm_len(&b)) as f64
                     >= 0.8);
         title_ok && author_matches(got_author, expected_author)
     }
@@ -1919,11 +2175,41 @@ mod tests {
     fn hit_rule_five_samples_before_after() {
         // 2 组真命中 + 3 组衍生作误判
         let cases: [(&str, &str, Option<&str>, Option<&str>, bool); 5] = [
-            ("斗破苍穹", "斗破苍穹", Some("天蚕土豆"), Some("天蚕土豆"), true),
-            ("《三体》 最新章节", "三体", Some("刘慈欣"), Some("刘慈欣"), true),
-            ("从斗破苍穹开始打卡", "斗破苍穹", Some("晨昏彼岸"), Some("天蚕土豆"), false),
-            ("斗破苍穹之少年归来", "斗破苍穹", Some("某同人"), Some("天蚕土豆"), false),
-            ("斗破苍穹外传", "斗破苍穹", Some("某同人"), Some("天蚕土豆"), false),
+            (
+                "斗破苍穹",
+                "斗破苍穹",
+                Some("天蚕土豆"),
+                Some("天蚕土豆"),
+                true,
+            ),
+            (
+                "《三体》 最新章节",
+                "三体",
+                Some("刘慈欣"),
+                Some("刘慈欣"),
+                true,
+            ),
+            (
+                "从斗破苍穹开始打卡",
+                "斗破苍穹",
+                Some("晨昏彼岸"),
+                Some("天蚕土豆"),
+                false,
+            ),
+            (
+                "斗破苍穹之少年归来",
+                "斗破苍穹",
+                Some("某同人"),
+                Some("天蚕土豆"),
+                false,
+            ),
+            (
+                "斗破苍穹外传",
+                "斗破苍穹",
+                Some("某同人"),
+                Some("天蚕土豆"),
+                false,
+            ),
         ];
         for (got_t, exp_t, got_a, exp_a, want) in cases {
             let before = old_hit(got_t, exp_t, got_a, exp_a);
@@ -1937,10 +2223,18 @@ mod tests {
     fn exact_title_hits_without_author() {
         // 同名书作者缺失（站点未填）也应算命中：近似同名不依赖作者
         assert!(is_hit("斗破苍穹", "斗破苍穹", None, Some("天蚕土豆")));
-        assert!(is_hit("《斗破苍穹》 最新章节", "斗破苍穹", None, Some("天蚕土豆")));
+        assert!(is_hit(
+            "《斗破苍穹》 最新章节",
+            "斗破苍穹",
+            None,
+            Some("天蚕土豆")
+        ));
         // 但只是“标题包含”时仍必须作者一致
         assert!(!is_hit("斗破苍穹外传", "斗破苍穹", None, Some("天蚕土豆")));
-        assert!(is_hit("斗破苍穹番外篇", "斗破苍穹", None, None), "无期望作者时包含即命中");
+        assert!(
+            is_hit("斗破苍穹番外篇", "斗破苍穹", None, None),
+            "无期望作者时包含即命中"
+        );
     }
 
     #[test]
@@ -1975,7 +2269,11 @@ mod tests {
             picked.iter().any(|e| !e.builtin && e.title == "用户新书"),
             "用户新增书名必须能进入下一批抽样"
         );
-        assert_eq!(picked.iter().filter(|e| e.builtin).count(), 4, "内置仍占绝对多数");
+        assert_eq!(
+            picked.iter().filter(|e| e.builtin).count(),
+            4,
+            "内置仍占绝对多数"
+        );
     }
 
     #[test]
@@ -1986,7 +2284,11 @@ mod tests {
         let flat = vec![80; 20];
         assert_eq!(pick_curated_count(&flat, 8, 14, 8), 14, "无断层取上限");
         let small = vec![90, 89, 88];
-        assert_eq!(pick_curated_count(&small, 8, 14, 8), 3, "不足下限就全取（但仍要求样本>=2）");
+        assert_eq!(
+            pick_curated_count(&small, 8, 14, 8),
+            3,
+            "不足下限就全取（但仍要求样本>=2）"
+        );
     }
 
     #[test]
@@ -2003,12 +2305,20 @@ mod tests {
     #[test]
     fn comic_curated_uses_its_own_min() {
         let cfg = Config::from_env();
-        assert_eq!(curated_bounds(&cfg, TYPE_COMIC), (3, 14), "漫画下限单独放宽到 3");
+        assert_eq!(
+            curated_bounds(&cfg, TYPE_COMIC),
+            (3, 14),
+            "漫画下限单独放宽到 3"
+        );
         assert_eq!(curated_bounds(&cfg, TYPE_NOVEL), (8, 14), "小说仍用 min=8");
         // 5 个漫画源：若共用 min=8 会全取 5 个（不足下限全取），但漫画上限/断层语义独立；
         // 这里验证“断层优先”仍在：90/88/86 | 60/58 → 在 86→60 处截断为 3。
         let scores = vec![90, 88, 86, 60, 58];
-        assert_eq!(pick_curated_count(&scores, 3, 14, 8), 3, "漫画：断层在 3 名后截断");
+        assert_eq!(
+            pick_curated_count(&scores, 3, 14, 8),
+            3,
+            "漫画：断层在 3 名后截断"
+        );
     }
 
     fn run(url: &str, cat: &str, key: &str, found: bool, suspicious: bool) -> BenchRun {
@@ -2047,27 +2357,56 @@ mod tests {
             run("https://s2", "玄幻", "冷门", false, false),
         ];
         mark_suspicious(&mut runs, &corpus);
-        assert!(runs.iter().find(|r| r.corpus_key == "冷门").unwrap().suspicious);
-        assert!(!runs.iter().find(|r| r.corpus_key == "正常1").unwrap().suspicious);
+        assert!(
+            runs.iter()
+                .find(|r| r.corpus_key == "冷门")
+                .unwrap()
+                .suspicious
+        );
+        assert!(
+            !runs
+                .iter()
+                .find(|r| r.corpus_key == "正常1")
+                .unwrap()
+                .suspicious
+        );
 
         let cfg = Config::from_env();
         let mut src = BookSource::default();
         src.book_source_url = "https://s1".into();
         src.book_source_name = "s1".into();
         let sources = HashMap::from([("https://s1".to_string(), src)]);
-        let rows = compute_source_rows(&runs, &sources, &corpus, &cfg, &HashMap::new(), &HashMap::new());
+        let rows = compute_source_rows(
+            &runs,
+            &sources,
+            &corpus,
+            &cfg,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let row = &rows[0];
         assert_eq!(row.samples, 2, "可疑语料被排除出计分样本");
         assert_eq!(row.excluded_samples, 1);
         assert_eq!(row.hits, 2);
-        assert!((row.hit_rate - 1.0).abs() < 1e-9, "剔除冷门语料后命中率不受拖累");
+        assert!(
+            (row.hit_rate - 1.0).abs() < 1e-9,
+            "剔除冷门语料后命中率不受拖累"
+        );
     }
 
     #[test]
     fn batch_budget_scales_with_source_count() {
         assert_eq!(batch_budget_secs(1, 5), BATCH_BUDGET_SECS, "单源仍用 60s");
-        assert_eq!(batch_budget_secs(139, 5), 434, "139 源×5 样本：按最坏情况估算");
-        assert_eq!(batch_budget_secs(200, 20), MAX_BATCH_BUDGET_SECS, "封顶 600s");
+        assert_eq!(
+            batch_budget_secs(139, 5),
+            434,
+            "139 源×5 样本：按最坏情况估算"
+        );
+        assert_eq!(
+            batch_budget_secs(200, 20),
+            MAX_BATCH_BUDGET_SECS,
+            "封顶 600s"
+        );
     }
 
     #[test]
@@ -2085,7 +2424,14 @@ mod tests {
             r.error_kind = Some("timeout".into());
             runs.push(r);
         }
-        let rows = compute_source_rows(&runs, &sources, &corpus, &cfg, &HashMap::new(), &HashMap::new());
+        let rows = compute_source_rows(
+            &runs,
+            &sources,
+            &corpus,
+            &cfg,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let row = &rows[0];
         assert_eq!(row.samples, 0, "超时样本不算有效样本");
         assert_eq!(row.errors, 5);
@@ -2096,15 +2442,63 @@ mod tests {
     fn curated_never_includes_non_preferred_or_low_samples() {
         let scores = vec![95, 94, 90];
         let cfg = Config::from_env();
-        let eligible: HashSet<String> = ["https://a".into(), "https://c".into()].into_iter().collect();
+        let eligible: HashSet<String> = ["https://a".into(), "https://c".into()]
+            .into_iter()
+            .collect();
         let rows = vec![
-            SourceBenchRow { source_url: "https://a".into(), name: "a".into(), source_type: TYPE_NOVEL, samples: 5, hits: 5, hit_rate: 1.0, avg_latency_ms: 100, errors: 0, error_kinds: serde_json::json!({}), bench_score: 95, curated: false, excluded_samples: 0, per_category_hit_rate: vec![] },
-            SourceBenchRow { source_url: "https://b".into(), name: "b".into(), source_type: TYPE_NOVEL, samples: 5, hits: 5, hit_rate: 1.0, avg_latency_ms: 100, errors: 0, error_kinds: serde_json::json!({}), bench_score: 94, curated: false, excluded_samples: 0, per_category_hit_rate: vec![] },
-            SourceBenchRow { source_url: "https://c".into(), name: "c".into(), source_type: TYPE_NOVEL, samples: 1, hits: 1, hit_rate: 1.0, avg_latency_ms: 100, errors: 0, error_kinds: serde_json::json!({}), bench_score: 90, curated: false, excluded_samples: 0, per_category_hit_rate: vec![] },
+            SourceBenchRow {
+                source_url: "https://a".into(),
+                name: "a".into(),
+                source_type: TYPE_NOVEL,
+                samples: 5,
+                hits: 5,
+                hit_rate: 1.0,
+                avg_latency_ms: 100,
+                errors: 0,
+                error_kinds: serde_json::json!({}),
+                bench_score: 95,
+                curated: false,
+                excluded_samples: 0,
+                per_category_hit_rate: vec![],
+            },
+            SourceBenchRow {
+                source_url: "https://b".into(),
+                name: "b".into(),
+                source_type: TYPE_NOVEL,
+                samples: 5,
+                hits: 5,
+                hit_rate: 1.0,
+                avg_latency_ms: 100,
+                errors: 0,
+                error_kinds: serde_json::json!({}),
+                bench_score: 94,
+                curated: false,
+                excluded_samples: 0,
+                per_category_hit_rate: vec![],
+            },
+            SourceBenchRow {
+                source_url: "https://c".into(),
+                name: "c".into(),
+                source_type: TYPE_NOVEL,
+                samples: 1,
+                hits: 1,
+                hit_rate: 1.0,
+                avg_latency_ms: 100,
+                errors: 0,
+                error_kinds: serde_json::json!({}),
+                bench_score: 90,
+                curated: false,
+                excluded_samples: 0,
+                per_category_hit_rate: vec![],
+            },
         ];
         let sel = select_curated(&rows, &cfg, &eligible);
         let urls: Vec<&str> = sel.novel.iter().map(|i| i.source_url.as_str()).collect();
-        assert_eq!(urls, vec!["https://a"], "b 非 preferred、c 样本不足都不参与");
+        assert_eq!(
+            urls,
+            vec!["https://a"],
+            "b 非 preferred、c 样本不足都不参与"
+        );
         let _ = scores;
     }
 
@@ -2140,7 +2534,11 @@ mod tests {
         ];
         let sel = select_curated(&rows, &cfg, &eligible);
         let urls: Vec<&str> = sel.comic.iter().map(|i| i.source_url.as_str()).collect();
-        assert_eq!(urls, vec!["https://h1", "https://h2"], "0 命中源不入选，comic min=3 也不拿它凑数");
+        assert_eq!(
+            urls,
+            vec!["https://h1", "https://h2"],
+            "0 命中源不入选，comic min=3 也不拿它凑数"
+        );
         assert!(!sel.flags.get("https://z").copied().unwrap_or(false));
     }
 
@@ -2158,13 +2556,23 @@ mod tests {
         ];
         let sel = select_curated(&rows, &cfg, &eligible);
         let urls: Vec<&str> = sel.novel.iter().map(|i| i.source_url.as_str()).collect();
-        assert_eq!(urls, vec!["https://a", "https://b", "https://c"], "命中率>0 的低分源仍可入选，断层规则不变");
+        assert_eq!(
+            urls,
+            vec!["https://a", "https://b", "https://c"],
+            "命中率>0 的低分源仍可入选，断层规则不变"
+        );
     }
 
     #[test]
     fn meta_hit_rate_reads_last_bench_rate() {
-        assert_eq!(meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0.8}"#)), 0.8);
-        assert_eq!(meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0}"#)), 0.0);
+        assert_eq!(
+            meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0.8}"#)),
+            0.8
+        );
+        assert_eq!(
+            meta_hit_rate(Some(r#"{"batch_id":"b1","hit_rate":0}"#)),
+            0.0
+        );
         assert_eq!(meta_hit_rate(None), 0.0, "无 meta 视为未体检，不具备资格");
         assert_eq!(meta_hit_rate(Some("not json")), 0.0);
         assert!(!curated_hit_ok(0.0));

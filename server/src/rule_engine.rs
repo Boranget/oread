@@ -1,4 +1,4 @@
-﻿//! Legado 规则引擎（AnalyzeRule 等价实现）
+//! Legado 规则引擎（AnalyzeRule 等价实现）
 //!
 //! 支持：CSS 选择器(scraper) / JsonPath / XPath(sxd-xpath, XML 源) / 正则 / 变量 `${name}` 展开 /
 //! 整串 JS 段(`<js>`、`@js:`)切分 / 列表解析(get_string_list)。
@@ -15,7 +15,6 @@ use std::time::Instant;
 use jsonpath_rust::JsonPathQuery;
 use once_cell::sync::OnceCell;
 use regex::Regex;
-use scraper::{Html, Selector};
 use serde_json::Value;
 
 /// JS 规则预算。boa 0.19 无中断/时间片 API，因此用「循环迭代上限 + 递归/栈上限」
@@ -67,7 +66,6 @@ pub fn js_metrics() -> (u64, u64) {
 /// boa_gc 引用计数错乱（`STATUS_HEAP_CORRUPTION`）。因此改为「单一专用 JS 线程」：
 /// 全进程只有一个 `Context`，既规避线程安全问题，也把 boa 常驻内存固定为一个实例。
 /// 该线程仅在首次遇到 JS 规则时启动（见 `js_sender`）。
-
 /// JS 执行任务：脚本文本 + 回传通道。
 struct JsJob {
     script: String,
@@ -163,10 +161,7 @@ fn js_worker(rx: Receiver<JsJob>) {
             // `{e:?}` 对 opaque Error 只会打印 ErrorObject 地址，书源作者看不懂。
             // 用 Display 取出 message；垫片抛出的未支持 API 显式给出特性名。
             .map_err(|e| {
-                poisoned = e
-                    .as_native()
-                    .map(|n| n.is_runtime_limit())
-                    .unwrap_or(false);
+                poisoned = e.as_native().map(|n| n.is_runtime_limit()).unwrap_or(false);
                 js_error_message(&e.to_string())
             })
             .and_then(|v| {
@@ -261,10 +256,7 @@ fn native_select(
     };
     let content = text_arg(0);
     let rule = text_arg(1);
-    let want_list = args
-        .get(2)
-        .map(|v| v.to_boolean())
-        .unwrap_or(true);
+    let want_list = args.get(2).map(|v| v.to_boolean()).unwrap_or(true);
     if rule.trim().is_empty() {
         return Err(ajax_error("java.setContent 后缺少选择器参数"));
     }
@@ -792,9 +784,10 @@ fn js_unescape(s: &str) -> String {
     out
 }
 
-
 #[derive(Debug)]
 pub enum RuleError {
+    // 历史上 CSS 选择器解析失败用此变体；当前统一走 `Other`，变体保留以稳定错误分类。
+    #[allow(dead_code)]
     Selector(String),
     Json(String),
     Regex(String),
@@ -862,6 +855,8 @@ impl AnalyzeRule {
         self.variables.borrow_mut().insert(k.into(), v.into());
     }
 
+    /// 批量注入变量；生产路径逐条调用 `set_var`，本方法仅单测使用。
+    #[allow(dead_code)]
     pub fn set_vars(&self, m: HashMap<String, String>) {
         self.variables.borrow_mut().extend(m);
     }
@@ -1048,7 +1043,9 @@ impl AnalyzeRule {
     /// 本服务没有 Book/Chapter 实体，作用域退化为一次 `AnalyzeRule`（一次请求内新建）的
     /// 变量表，不写任何全局状态，因此不同源/不同请求天然隔离。
     fn apply_put_get(&self, rule: &str, content: &str, is_url: bool, base_url: &str) -> String {
-        if !rule.contains("@put:") && !rule.contains("@get:") && !rule.contains("@PUT:")
+        if !rule.contains("@put:")
+            && !rule.contains("@get:")
+            && !rule.contains("@PUT:")
             && !rule.contains("@GET:")
         {
             return rule.to_string();
@@ -1080,7 +1077,11 @@ impl AnalyzeRule {
         get_re
             .replace_all(&text, |caps: &regex::Captures| {
                 let key = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-                self.variables.borrow().get(key).cloned().unwrap_or_default()
+                self.variables
+                    .borrow()
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default()
             })
             .to_string()
     }
@@ -1139,7 +1140,7 @@ impl AnalyzeRule {
         // `splitPutRule` + `makeUpRule` 语义处理（可出现在规则任意位置，不只整串）。
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
         // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
-        if let Some(parts) = split_outside_js(&rule, "##") {
+        if let Some(parts) = split_outside_js(rule, "##") {
             let sub = self.get_string_inner(content, parts[0].trim(), is_url, base_url)?;
             let pattern = parts.get(1).copied().unwrap_or("");
             if pattern.is_empty() {
@@ -1147,9 +1148,14 @@ impl AnalyzeRule {
             }
             let replacement = parts.get(2).copied().unwrap_or("");
             let replace_first = parts.len() > 3;
-            return Ok(apply_replace_regex(&sub, pattern, replacement, replace_first));
+            return Ok(apply_replace_regex(
+                &sub,
+                pattern,
+                replacement,
+                replace_first,
+            ));
         }
-        if let Some(parts) = split_outside_js(&rule, "||") {
+        if let Some(parts) = split_outside_js(rule, "||") {
             for p in &parts {
                 let mut v = self.eval_list(content, p, base_url);
                 if !v.is_empty() {
@@ -1158,7 +1164,7 @@ impl AnalyzeRule {
             }
             return Ok(String::new());
         }
-        if let Some(parts) = split_outside_js(&rule, "&&") {
+        if let Some(parts) = split_outside_js(rule, "&&") {
             // Legado 的 `&&` 是「列表合并」：多值用 `\n` 连接，而不是空串粘连。
             let mut items: Vec<String> = Vec::new();
             for p in &parts {
@@ -1169,7 +1175,7 @@ impl AnalyzeRule {
             }
             return Ok(items.join("\n"));
         }
-        if let Some(parts) = split_outside_js(&rule, "%%") {
+        if let Some(parts) = split_outside_js(rule, "%%") {
             let lists: Vec<Vec<String>> = parts
                 .iter()
                 .map(|p| self.eval_list(content, p, base_url))
@@ -1206,7 +1212,7 @@ impl AnalyzeRule {
         }
         // 默认：<js> / @js: 段切分管道
         let mut input = content.to_string();
-        for (mode, text) in Self::split_js(&rule) {
+        for (mode, text) in Self::split_js(rule) {
             let t = text.trim();
             if t.is_empty() {
                 continue;
@@ -1241,12 +1247,7 @@ impl AnalyzeRule {
         }
     }
 
-    fn apply_css(
-        &self,
-        html: &str,
-        rule: &str,
-        first_only: bool,
-    ) -> Result<String, RuleError> {
+    fn apply_css(&self, html: &str, rule: &str, first_only: bool) -> Result<String, RuleError> {
         let (selector, tokens) = split_css_rule(rule);
         let doc = parse_css_document(html);
         let mut els = select_initial(&doc, &selector);
@@ -1288,29 +1289,29 @@ impl AnalyzeRule {
                     vals.join("\n")
                 })
             }
-            None => Ok(els
-                .first()
-                .map(|e| e.inner_html())
-                .unwrap_or_default()),
+            None => Ok(els.first().map(|e| e.inner_html()).unwrap_or_default()),
         }
     }
 
     fn apply_json(&self, json: &str, rule: &str) -> Result<String, RuleError> {
-        let v: Value =
-            serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
+        let v: Value = serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
         let vals = json_query(&v, rule)?;
         // Legado 的 getString 对多值结果按 `\n` 拼接（`$..image` 这类递归路径会命中多个节点）。
         // 此前只取最后一个，导致「章节多图」被压成 1 张，源规则里 `@js:result.split("\n")` 也只剩一行。
         if vals.is_empty() {
             return Ok(String::new());
         }
-        Ok(vals.into_iter().map(value_to_string).collect::<Vec<_>>().join("\n"))
+        Ok(vals
+            .into_iter()
+            .map(value_to_string)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     fn apply_regex(&self, input: &str, rule: &str) -> Result<String, RuleError> {
         // 斜杠包裹规则：/pat/ 为提取（捕获组1），/pat/repl/ 为替换
-        if rule.starts_with('/') {
-            let interior = &rule[1..]; // 含结尾斜杠
+        if let Some(interior) = rule.strip_prefix('/') {
+            // interior 含结尾斜杠
             let slash_count = interior.matches('/').count();
             if slash_count >= 2 {
                 // 替换形式：/pat/repl/
@@ -1344,10 +1345,11 @@ impl AnalyzeRule {
     fn apply_xpath(&self, content: &str, rule: &str) -> Result<String, RuleError> {
         use sxd_document::parser::parse as xml_parse;
         use sxd_xpath::evaluate_xpath;
-        let package = xml_parse(content).map_err(|e| RuleError::Other(format!("xpath parse: {e:?}")))?;
+        let package =
+            xml_parse(content).map_err(|e| RuleError::Other(format!("xpath parse: {e:?}")))?;
         let doc = package.as_document();
-        let val =
-            evaluate_xpath(&doc, rule).map_err(|e| RuleError::Other(format!("xpath eval: {e:?}")))?;
+        let val = evaluate_xpath(&doc, rule)
+            .map_err(|e| RuleError::Other(format!("xpath eval: {e:?}")))?;
         Ok(match val {
             sxd_xpath::Value::String(s) => s,
             sxd_xpath::Value::Number(n) => n.to_string(),
@@ -1405,9 +1407,7 @@ impl AnalyzeRule {
             }
             lists.insert(
                 sel,
-                serde_json::Value::Array(
-                    vals.into_iter().map(serde_json::Value::String).collect(),
-                ),
+                serde_json::Value::Array(vals.into_iter().map(serde_json::Value::String).collect()),
             );
         }
         (lists, singles)
@@ -1416,8 +1416,20 @@ impl AnalyzeRule {
     /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
     fn js_vars(&self) -> String {
         const RESERVED: &[&str] = &[
-            "result", "__input", "__base", "baseUrl", "__DOM", "__DOMS", "__r", "__content",
-            "__nativeSelect", "__nativeAjax", "java", "cache", "__cache", "__out",
+            "result",
+            "__input",
+            "__base",
+            "baseUrl",
+            "__DOM",
+            "__DOMS",
+            "__r",
+            "__content",
+            "__nativeSelect",
+            "__nativeAjax",
+            "java",
+            "cache",
+            "__cache",
+            "__out",
         ];
         let mut out = String::new();
         for (k, v) in self.variables.borrow().iter() {
@@ -1446,9 +1458,7 @@ impl AnalyzeRule {
     fn eval_js(&self, input: &str, code: &str, base_url: &str) -> Result<String, RuleError> {
         let conf = js_conf();
         if !conf.enabled {
-            return Err(RuleError::Other(
-                "JS rules disabled by JS_ENABLED=0".into(),
-            ));
+            return Err(RuleError::Other("JS rules disabled by JS_ENABLED=0".into()));
         }
         // 整段包成 IIFE，避免不同书源/不同次执行之间的全局变量污染
         let shim = format!(
@@ -1461,7 +1471,8 @@ impl AnalyzeRule {
         let dom_js = serde_json::to_string(&dom).unwrap_or_else(|_| "{}".into());
         let doms_js = serde_json::to_string(&doms).unwrap_or_else(|_| "{}".into());
         let vars_js = self.js_vars();
-        let cache_init = serde_json::to_string(&self.cache.borrow().clone()).unwrap_or_else(|_| "{}".into());
+        let cache_init =
+            serde_json::to_string(&self.cache.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
             "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\n{vars}\n{cachejs}\n{lib}\n{shim}\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {sent} + JSON.stringify(__cache) + {msent} + String(__ms); }})()",
             r = js_string_literal(input),
@@ -1497,9 +1508,7 @@ impl AnalyzeRule {
                 if let Some(idx) = s.rfind(JS_CACHE_SENTINEL) {
                     let tail = s[idx + JS_CACHE_SENTINEL.len()..].to_string();
                     if tail.len() <= 1_048_576 {
-                        if let Ok(map) =
-                            serde_json::from_str::<HashMap<String, String>>(&tail)
-                        {
+                        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&tail) {
                             self.cache.replace(map);
                         }
                     }
@@ -1606,12 +1615,7 @@ impl AnalyzeRule {
     /// 列表求值（保留末端抽取标记）：用于 `nextTocUrl` / 漫画图片等“可能返回多条”的规则。
     /// 与 Legado `getStringList` 对齐：`||` 取首个非空列表、`&&` 合并列表、`%%` 交错，
     /// `##` 先解析出列表再**逐项**替换，`@js:` 结果按数组或换行拆项。
-    pub fn get_string_list_all(
-        &self,
-        content: &str,
-        rule: &str,
-        base_url: &str,
-    ) -> Vec<String> {
+    pub fn get_string_list_all(&self, content: &str, rule: &str, base_url: &str) -> Vec<String> {
         let rule = self.apply_put_get(rule, content, false, base_url);
         let rule = self.expand_vars(&rule, content);
         let r = rule.trim();
@@ -1787,14 +1791,15 @@ impl AnalyzeRule {
     }
 
     fn json_list(&self, json: &str, rule: &str) -> Result<Vec<String>, RuleError> {
-        let v: Value =
-            serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
+        let v: Value = serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
         let mut out = Vec::new();
         // JSONPath 直接命中数组时（`$['hits']` / `$.data.topics`）按数组元素展开：
         // Legado 的 getElements 会把 List 的每个元素当作列表项，不把整个数组当成一项。
         for val in json_query(&v, rule)? {
             match val {
-                Value::Array(a) => out.extend(a.into_iter().filter(|x| !x.is_null()).map(value_to_string)),
+                Value::Array(a) => {
+                    out.extend(a.into_iter().filter(|x| !x.is_null()).map(value_to_string))
+                }
                 Value::Null => {}
                 other => out.push(value_to_string(other)),
             }
@@ -1830,7 +1835,10 @@ enum JpSeg {
     RecursiveKey(String),
     RecursiveWildcard,
     /// 过滤谓词 `[?(@.field=='x' && @.n>1)]` / `[?(@.a=='x' || @.b=='y')]`
-    Filter { conds: Vec<JpCond>, any: bool },
+    Filter {
+        conds: Vec<JpCond>,
+        any: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1931,9 +1939,7 @@ fn parse_cond_path(raw: &str) -> Result<Vec<String>, String> {
             break;
         }
         if let Some(r) = rest.strip_prefix('.') {
-            let end = r
-                .find(|c: char| c == '.' || c == '[')
-                .unwrap_or(r.len());
+            let end = r.find(['.', '[']).unwrap_or(r.len());
             let key = r[..end].trim();
             if key.is_empty() {
                 return Err(format!("谓词字段名为空：{s}"));
@@ -1964,8 +1970,7 @@ fn parse_cond_path(raw: &str) -> Result<Vec<String>, String> {
 fn parse_pred_value(raw: &str) -> Result<Value, String> {
     let s = raw.trim();
     if s.len() >= 2
-        && ((s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"')))
+        && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
     {
         return Ok(Value::String(unquote_arg(s)));
     }
@@ -2253,11 +2258,7 @@ fn eval_json_path(root: &Value, segs: &[JpSeg]) -> Vec<Value> {
             JpSeg::Index(n) => {
                 for v in &cur {
                     if let Value::Array(a) = v {
-                        let idx = if *n < 0 {
-                            a.len() as i64 + *n
-                        } else {
-                            *n
-                        };
+                        let idx = if *n < 0 { a.len() as i64 + *n } else { *n };
                         if idx >= 0 && (idx as usize) < a.len() {
                             next.push(a[idx as usize].clone());
                         }
@@ -2294,10 +2295,8 @@ fn eval_json_path(root: &Value, segs: &[JpSeg]) -> Vec<Value> {
                             }
                         }
                         // 对象也允许过滤（命中则保留对象本身），与部分 JSONPath 实现一致
-                        Value::Object(_) => {
-                            if jp_filter_match(conds, *any, v) {
-                                next.push(v.clone());
-                            }
+                        Value::Object(_) if jp_filter_match(conds, *any, v) => {
+                            next.push(v.clone());
                         }
                         _ => {}
                     }
@@ -2368,9 +2367,7 @@ fn json_query(v: &Value, rule: &str) -> Result<Vec<Value>, RuleError> {
                 match v.clone().path(rule) {
                     Ok(Value::Array(arr)) => Ok(arr),
                     Ok(other) => Ok(vec![other]),
-                    Err(e) => Err(RuleError::Json(format!(
-                        "JSONPath 语法不受支持：{e}"
-                    ))),
+                    Err(e) => Err(RuleError::Json(format!("JSONPath 语法不受支持：{e}"))),
                 }
             } else {
                 Err(RuleError::Json(format!(
@@ -2531,7 +2528,9 @@ fn jsoup_text(el: scraper::ElementRef<'_>) -> String {
         if exiting {
             // jsoup tail：块级元素结束且下一个兄弟是文本或行内元素时补空格
             if let Some(e) = node.value().as_element() {
-                if is_jsoup_block_tag(e.name()) && !accum.is_empty() && !jsoup_last_char_is_ws(&accum)
+                if is_jsoup_block_tag(e.name())
+                    && !accum.is_empty()
+                    && !jsoup_last_char_is_ws(&accum)
                 {
                     let need_space = match node.next_sibling() {
                         Some(n) => match n.value() {
@@ -2610,9 +2609,11 @@ fn parse_css_document(html: &str) -> scraper::Html {
         .take(9)
         .collect::<String>()
         .to_ascii_lowercase();
-    let table_fragment = ["<tr", "<td", "<th", "<tbody", "<thead", "<tfoot", "<caption"]
-        .iter()
-        .any(|p| head.starts_with(p));
+    let table_fragment = [
+        "<tr", "<td", "<th", "<tbody", "<thead", "<tfoot", "<caption",
+    ]
+    .iter()
+    .any(|p| head.starts_with(p));
     if table_fragment {
         scraper::Html::parse_document(&format!("<table>{}</table>", html.trim_start()))
     } else {
@@ -2862,7 +2863,7 @@ fn elements_html(html: &str, rule: &str) -> Vec<String> {
 }
 
 /// 去掉 @css:/@CSS:/@@ 前缀，并按 '@' 切分为 (选择器, 抽取/遍历标记)。
-fn split_css_rule<'a>(rule: &'a str) -> (String, Vec<&'a str>) {
+fn split_css_rule(rule: &str) -> (String, Vec<&str>) {
     let rule = strip_prefix_ci(rule, "@css:")
         .trim_start_matches("@@")
         .trim();
@@ -3055,8 +3056,7 @@ fn find_close_paren(cs: &[char], open: usize) -> Option<usize> {
 fn unquote_arg(raw: &str) -> String {
     let s = raw.trim();
     if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\'')))
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         s[1..s.len() - 1].to_string()
     } else {
@@ -3112,9 +3112,9 @@ fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
                 } else if starts_at(&cs, i, ":last") && boundary(5) {
                     filters.push(JqFilter::Last);
                     i += 5;
-                } else if (starts_at(&cs, i, ":eq(")
+                } else if starts_at(&cs, i, ":eq(")
                     || starts_at(&cs, i, ":lt(")
-                    || starts_at(&cs, i, ":gt("))
+                    || starts_at(&cs, i, ":gt(")
                 {
                     let open = i + 3;
                     if let Some(close) = find_close_paren(&cs, open) {
@@ -3231,12 +3231,10 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
         // 上游 `findIndexSet` 先把尾部 `.N` 拆成下标，剩余部分才是选择器；
         // 否则 CSS 会把 `a.0` / `.author.0` 判为非法选择器而返回空。
         let (name, i) = split_name_index(core.trim());
-        let bare_tag_index = i.is_some()
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric());
-        let indexed_selector = i.is_some()
-            && !name.is_empty()
-            && scraper::Selector::parse(&name).is_ok();
+        let bare_tag_index =
+            i.is_some() && !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
+        let indexed_selector =
+            i.is_some() && !name.is_empty() && scraper::Selector::parse(&name).is_ok();
         if bare_tag_index || indexed_selector {
             (name, i)
         } else {
@@ -3272,7 +3270,9 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
 
 /// 取元素的直接子元素（仅元素节点）。
 fn child_elements<'a>(el: scraper::ElementRef<'a>) -> Vec<scraper::ElementRef<'a>> {
-    el.children().filter_map(scraper::ElementRef::wrap).collect()
+    el.children()
+        .filter_map(scraper::ElementRef::wrap)
+        .collect()
 }
 
 /// 从当前元素集合向下钻取到指定标签（@tag.name[.index]）。
@@ -3355,15 +3355,31 @@ fn js_regex_allowed(rule: &str, at: usize) -> bool {
     let p = b[j - 1];
     if matches!(
         p,
-        b'(' | b',' | b'=' | b':' | b'[' | b'!' | b'&' | b'|' | b'?' | b'{' | b'}' | b';'
-            | b'+' | b'-' | b'*' | b'%' | b'^' | b'~' | b'<' | b'>'
+        b'(' | b','
+            | b'='
+            | b':'
+            | b'['
+            | b'!'
+            | b'&'
+            | b'|'
+            | b'?'
+            | b'{'
+            | b'}'
+            | b';'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'%'
+            | b'^'
+            | b'~'
+            | b'<'
+            | b'>'
     ) {
         return true;
     }
     // `return /re/` 这类关键字后的 `/` 也是正则，而不是除法
     let mut k = j;
-    while k > 0 && ((b[k - 1] as char).is_ascii_alphanumeric() || matches!(b[k - 1], b'_' | b'$'))
-    {
+    while k > 0 && ((b[k - 1] as char).is_ascii_alphanumeric() || matches!(b[k - 1], b'_' | b'$')) {
         k -= 1;
     }
     matches!(
@@ -3538,7 +3554,11 @@ fn split_put_pairs(inner: &str) -> Vec<(String, String)> {
             }
         }
         if let Some(idx) = split_at {
-            let key = group[..idx].trim().trim_matches('"').trim_matches('\'').trim();
+            let key = group[..idx]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
             let value = group[idx + 1..]
                 .trim()
                 .trim_matches('"')
@@ -3661,7 +3681,12 @@ fn resolve_index(i: i64, len: usize) -> Option<usize> {
 /// - `##pat`：删除所有匹配（replacement 为空）；
 /// - `##pat##repl`：替换所有匹配；
 /// - `##pat##repl###`：只替换第一个匹配（无匹配时原样返回）。
-fn apply_replace_regex(value: &str, pattern: &str, replacement: &str, replace_first: bool) -> String {
+fn apply_replace_regex(
+    value: &str,
+    pattern: &str,
+    replacement: &str,
+    replace_first: bool,
+) -> String {
     let re = match Regex::new(pattern) {
         Ok(r) => r,
         Err(_) => return value.replace(pattern, replacement),
@@ -3739,10 +3764,7 @@ fn decode_entity(ent: &str) -> Option<char> {
                 .strip_prefix("#x")
                 .or_else(|| ent.strip_prefix("#X"))
                 .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .or_else(|| {
-                    ent.strip_prefix('#')
-                        .and_then(|d| d.parse::<u32>().ok())
-                });
+                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse::<u32>().ok()));
             num.and_then(char::from_u32)
         }
     }
@@ -3778,12 +3800,7 @@ mod tests {
             </div>
           </div>"#;
         let cover = ar
-            .get_string(
-                html,
-                ".content@.book.0@.bookcover@tag.img@src",
-                false,
-                "",
-            )
+            .get_string(html, ".content@.book.0@.bookcover@tag.img@src", false, "")
             .unwrap();
         assert_eq!(cover, "/cover.jpg");
         let kind = ar
@@ -3930,7 +3947,12 @@ nodes.filter(function (node) {
         let html = r#"<div class="head"><h1 class="title">测试书</h1></div>
             <div class="item">甲</div><div class="item">乙</div>"#;
         let title = ar
-            .get_string(html, r#"@js: java.getString("class.title@text")"#, false, "")
+            .get_string(
+                html,
+                r#"@js: java.getString("class.title@text")"#,
+                false,
+                "",
+            )
             .unwrap();
         assert_eq!(title, "测试书");
         let items = ar
@@ -3978,7 +4000,10 @@ nodes.filter(function (node) {
             .to_string();
         assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
         assert!(err.contains("java.getElements"), "实际: {err}");
-        assert!(err.contains("字面量"), "应提示只支持字面量参数，实际: {err}");
+        assert!(
+            err.contains("字面量"),
+            "应提示只支持字面量参数，实际: {err}"
+        );
     }
 
     #[test]
@@ -4055,7 +4080,12 @@ nodes.filter(function (node) {
     fn java_to_num_chapter() {
         let ar = AnalyzeRule::new();
         let r = ar
-            .get_string("", "<js>java.toNumChapter(\"第一百一十二\")</js>", false, "")
+            .get_string(
+                "",
+                "<js>java.toNumChapter(\"第一百一十二\")</js>",
+                false,
+                "",
+            )
             .unwrap();
         assert_eq!(r, "112");
     }
@@ -4101,10 +4131,14 @@ nodes.filter(function (node) {
                 "",
             )
             .unwrap();
-        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+        assert_eq!(
+            url,
+            "https://m.kanman.com/api/getchapterlist?comic_id=106492"
+        );
         // 多个 put 键
         let json2 = r#"{"a":1,"b":2}"#;
-        ar.get_string(json2, "@put:{k1:$.a,k2:$.b}", false, "").unwrap();
+        ar.get_string(json2, "@put:{k1:$.a,k2:$.b}", false, "")
+            .unwrap();
         assert_eq!(ar.get_string("", "@get:{k1}", false, "").unwrap(), "1");
         assert_eq!(ar.get_string("", "@get:{k2}", false, "").unwrap(), "2");
     }
@@ -4119,7 +4153,9 @@ nodes.filter(function (node) {
             .unwrap();
         assert_eq!(got, "payload");
         // 未命中返回 null（上游 CacheManager.get 返回 String?）
-        let miss = ar.eval_js("", "result = String(cache.get('nope'))", "").unwrap();
+        let miss = ar
+            .eval_js("", "result = String(cache.get('nope'))", "")
+            .unwrap();
         assert_eq!(miss, "null");
         // 非字符串按 JSON 串存
         ar.eval_js("", "cache.put('obj', {a:1})", "").unwrap();
@@ -4127,7 +4163,9 @@ nodes.filter(function (node) {
         assert_eq!(obj, "{\"a\":1}");
         // delete 后可写
         ar.eval_js("", "cache.delete('kkmh')", "").unwrap();
-        let gone = ar.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        let gone = ar
+            .eval_js("", "result = String(cache.get('kkmh'))", "")
+            .unwrap();
         assert_eq!(gone, "null");
     }
 
@@ -4137,9 +4175,13 @@ nodes.filter(function (node) {
         let b = AnalyzeRule::new();
         a.eval_js("", "cache.put('kk', 'A')", "").unwrap();
         // 另一个源（另一个 AnalyzeRule）读不到
-        let b_got = b.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        let b_got = b
+            .eval_js("", "result = String(cache.get('kk'))", "")
+            .unwrap();
         assert_eq!(b_got, "null");
-        let a_got = a.eval_js("", "result = String(cache.get('kk'))", "").unwrap();
+        let a_got = a
+            .eval_js("", "result = String(cache.get('kk'))", "")
+            .unwrap();
         assert_eq!(a_got, "A");
         // 变量表也不跨作用域
         assert_eq!(b.get_string("", "@get:{kk}", false, "").unwrap(), "");
@@ -4167,7 +4209,10 @@ nodes.filter(function (node) {
             .get_string(json, "$.comic_name@put:{bid:$.comic_id}", false, "")
             .unwrap();
         assert_eq!(name, "海贼王");
-        assert_eq!(req1.book_vars_snapshot().get("bid").map(|s| s.as_str()), Some("106492"));
+        assert_eq!(
+            req1.book_vars_snapshot().get("bid").map(|s| s.as_str()),
+            Some("106492")
+        );
 
         // 请求 2（目录）：新实例预载同一 book_key 的快照后 @get 生效
         let req2 = AnalyzeRule::new();
@@ -4180,7 +4225,10 @@ nodes.filter(function (node) {
                 "",
             )
             .unwrap();
-        assert_eq!(url, "https://m.kanman.com/api/getchapterlist?comic_id=106492");
+        assert_eq!(
+            url,
+            "https://m.kanman.com/api/getchapterlist?comic_id=106492"
+        );
 
         // 另一本书（不同 book_key）不会读到
         let other = AnalyzeRule::new();
@@ -4193,13 +4241,19 @@ nodes.filter(function (node) {
     fn cache_survives_new_request_scope() {
         let req1 = AnalyzeRule::new();
         req1.begin_book_scope("bk-1".into(), HashMap::new(), HashMap::new());
-        req1.eval_js("", "cache.put('kkmh', '{\"data\":[1,2]}')", "").unwrap();
+        req1.eval_js("", "cache.put('kkmh', '{\"data\":[1,2]}')", "")
+            .unwrap();
         let snap = req1.cache_snapshot();
-        assert_eq!(snap.get("kkmh").map(|s| s.as_str()), Some("{\"data\":[1,2]}"));
+        assert_eq!(
+            snap.get("kkmh").map(|s| s.as_str()),
+            Some("{\"data\":[1,2]}")
+        );
 
         let req2 = AnalyzeRule::new();
         req2.begin_book_scope("bk-1".into(), HashMap::new(), snap);
-        let got = req2.eval_js("", "result = String(cache.get('kkmh'))", "").unwrap();
+        let got = req2
+            .eval_js("", "result = String(cache.get('kkmh'))", "")
+            .unwrap();
         assert_eq!(got, "{\"data\":[1,2]}");
         // 目录阶段 delete 后快照里也没了（供路由层按 diff 删库）
         req2.eval_js("", "cache.delete('kkmh')", "").unwrap();
@@ -4257,9 +4311,7 @@ nodes.filter(function (node) {
         let ar = AnalyzeRule::new();
         ar.set_var("y", "world");
         // {{var}} 在 JS 段内展开
-        let r = ar
-            .get_string("", "<js>\"{{y}}\"</js>", false, "")
-            .unwrap();
+        let r = ar.get_string("", "<js>\"{{y}}\"</js>", false, "").unwrap();
         assert_eq!(r, "world");
     }
 
@@ -4282,22 +4334,31 @@ nodes.filter(function (node) {
         let ar = AnalyzeRule::new();
         // 一个 item 内多个 <a> 时，单值抽取（@href/@text）应取首个，而非拼接
         let html = r#"<tr><td><p><a href="/book/1">书名A</a></p></td><td><p><a href="/book/2">最新</a></p></td></tr>"#;
-        let href = ar.get_string(html, "@css:p:nth-of-type(1) a@href", true, "").unwrap();
+        let href = ar
+            .get_string(html, "@css:p:nth-of-type(1) a@href", true, "")
+            .unwrap();
         assert_eq!(href, "/book/1");
     }
 
     #[test]
     fn bare_tag_and_excluded_indices() {
         let ar = AnalyzeRule::new();
-        let html = r#"<dl id="list"><dd>第1</dd><dd>第2</dd><dd>第3</dd><dd>第4</dd><dd>第5</dd></dl>"#;
+        let html =
+            r#"<dl id="list"><dd>第1</dd><dd>第2</dd><dd>第3</dd><dd>第4</dd><dd>第5</dd></dl>"#;
         // 裸标签遍历（@dd）+ 多值按 "\n" 合并（上游 getResultLast 收集全部元素）
-        let t1 = ar.get_string(html, "@CSS:id.list@dd@text", false, "").unwrap();
+        let t1 = ar
+            .get_string(html, "@CSS:id.list@dd@text", false, "")
+            .unwrap();
         assert_eq!(t1, "第1\n第2\n第3\n第4\n第5");
         // Legado 的 `!0:1` 是“排除第 0、1 个”，剩余第 3/4/5 个
-        let t2 = ar.get_string(html, "@CSS:id.list@dd!0:1@text", false, "").unwrap();
+        let t2 = ar
+            .get_string(html, "@CSS:id.list@dd!0:1@text", false, "")
+            .unwrap();
         assert_eq!(t2, "第3\n第4\n第5");
         // `!2` 排除第 3 个
-        let t3 = ar.get_string(html, "@CSS:id.list@dd!2@text", false, "").unwrap();
+        let t3 = ar
+            .get_string(html, "@CSS:id.list@dd!2@text", false, "")
+            .unwrap();
         assert_eq!(t3, "第1\n第2\n第4\n第5");
     }
 
@@ -4309,11 +4370,18 @@ nodes.filter(function (node) {
         let html = r#"<ul class="chapter"><li>书头0</li><li>书头1</li><li>书头2</li><li>书头3</li><li>书头4</li><li><a href="/c6">第6章</a></li><li><a href="/c7">第7章</a></li></ul>"#;
         let items = ar.get_string_list(html, "li!0:1:2:3:4@a").unwrap();
         assert_eq!(items.len(), 2, "前 5 个 li 应被 `!0:1:2:3:4` 排除");
-        assert_eq!(ar.get_string(&items[0], "text", false, "").unwrap(), "第6章");
+        assert_eq!(
+            ar.get_string(&items[0], "text", false, "").unwrap(),
+            "第6章"
+        );
         assert_eq!(ar.get_string(&items[0], "href", true, "").unwrap(), "/c6");
 
-        let html2 = r#"<select><option value="">请选择</option><option value="/c1">1</option></select>"#;
-        assert_eq!(ar.get_string(html2, "option!0@value", true, "").unwrap(), "/c1");
+        let html2 =
+            r#"<select><option value="">请选择</option><option value="/c1">1</option></select>"#;
+        assert_eq!(
+            ar.get_string(html2, "option!0@value", true, "").unwrap(),
+            "/c1"
+        );
     }
 
     // B4：裸 `text` / `href`（无选择器前缀）表示取当前节点
@@ -4350,7 +4418,9 @@ nodes.filter(function (node) {
     fn js_segment_transforms() {
         let ar = AnalyzeRule::new();
         let input = "hello world";
-        let out = ar.get_string(input, "<js>result.toUpperCase()</js>", false, "").unwrap();
+        let out = ar
+            .get_string(input, "<js>result.toUpperCase()</js>", false, "")
+            .unwrap();
         // 纯字符串场景：JS 段把 result 转大写
         assert_eq!(out, "HELLO WORLD");
     }
@@ -4362,7 +4432,10 @@ nodes.filter(function (node) {
         let html = r#"<div class="item"><a href="/b/1">书A</a><span class="au">作者</span></div>"#;
         assert_eq!(ar.get_string(html, "tag.a@href", true, "").unwrap(), "/b/1");
         assert_eq!(ar.get_string(html, "tag.a@text", false, "").unwrap(), "书A");
-        assert_eq!(ar.get_string(html, "class.au@text", false, "").unwrap(), "作者");
+        assert_eq!(
+            ar.get_string(html, "class.au@text", false, "").unwrap(),
+            "作者"
+        );
     }
 
     #[test]
@@ -4408,7 +4481,7 @@ nodes.filter(function (node) {
 
     #[test]
     fn variable_expansion_works() {
-        let mut ar = AnalyzeRule::new();
+        let ar = AnalyzeRule::new();
         ar.set_var("sel", ".name");
         let html = r#"<div class="name">测试书名</div>"#;
         let r = ar.get_string(html, "${sel}", false, "").unwrap();
@@ -4439,7 +4512,8 @@ nodes.filter(function (node) {
         let html = r#"<div class="page2"><a href="/b">2</a></div>"#;
         // `${page}` 先展开为 2，再作为 CSS 选择器 `.page2 a` 执行
         assert_eq!(
-            ar.get_string(html, "@css:.page${page} a@href", true, "").unwrap(),
+            ar.get_string(html, "@css:.page${page} a@href", true, "")
+                .unwrap(),
             "/b"
         );
     }
@@ -4448,7 +4522,8 @@ nodes.filter(function (node) {
     #[test]
     fn list_all_extracts_multiple_hrefs() {
         let ar = AnalyzeRule::new();
-        let html = r#"<div class="pages"><a href="/toc/2.html">2</a><a href="/toc/3.html">3</a></div>"#;
+        let html =
+            r#"<div class="pages"><a href="/toc/2.html">2</a><a href="/toc/3.html">3</a></div>"#;
         let list = ar.get_string_list_all(html, "@css:.pages a@href", "");
         assert_eq!(list, vec!["/toc/2.html", "/toc/3.html"]);
         // 单值规则仍取首个
@@ -4493,8 +4568,13 @@ nodes.filter(function (node) {
         );
         // base64 同族（上游 JsExtensions.kt L676-730 签名）
         assert_eq!(
-            ar.get_string("", "<js>java.base64Decode('5Lit5paH','UTF-8')</js>", false, "")
-                .unwrap(),
+            ar.get_string(
+                "",
+                "<js>java.base64Decode('5Lit5paH','UTF-8')</js>",
+                false,
+                ""
+            )
+            .unwrap(),
             "中文"
         );
         assert_eq!(
@@ -4520,8 +4600,13 @@ nodes.filter(function (node) {
             "YQ"
         );
         assert_eq!(
-            ar.get_string("", "<js>java.base64DecodeToByteArray('5Lit5paH').length</js>", false, "")
-                .unwrap(),
+            ar.get_string(
+                "",
+                "<js>java.base64DecodeToByteArray('5Lit5paH').length</js>",
+                false,
+                ""
+            )
+            .unwrap(),
             "6"
         );
         assert_eq!(
@@ -4530,8 +4615,13 @@ nodes.filter(function (node) {
             "e4b8ade69687"
         );
         assert_eq!(
-            ar.get_string("", "<js>java.hexDecodeToString('e4b8ade69687')</js>", false, "")
-                .unwrap(),
+            ar.get_string(
+                "",
+                "<js>java.hexDecodeToString('e4b8ade69687')</js>",
+                false,
+                ""
+            )
+            .unwrap(),
             "中文"
         );
         // 毫秒时间戳 + Java 风格 pattern
@@ -4571,9 +4661,7 @@ nodes.filter(function (node) {
         let books = ar.get_string_list(json, "$..books[*]").unwrap();
         assert_eq!(books.len(), 2, "递归下降 + [*] 应取到嵌套 books");
         assert!(books[0].contains("b1"));
-        let names = ar
-            .get_string_list(json, "$.booklist[*].book_name")
-            .unwrap();
+        let names = ar.get_string_list(json, "$.booklist[*].book_name").unwrap();
         assert_eq!(names, vec!["书C"]);
         // 单值：递归下降命中多个值时，与 Legado 一致按 `\n` 拼接（源规则常据此 `split("\n")`）
         assert_eq!(
@@ -4581,8 +4669,16 @@ nodes.filter(function (node) {
             "书C\n书A\n书B"
         );
         // 下标（含负下标）
-        assert_eq!(ar.get_string(json, "$.data.books[1].id", false, "").unwrap(), "b2");
-        assert_eq!(ar.get_string(json, "$.data.books[-1].id", false, "").unwrap(), "b2");
+        assert_eq!(
+            ar.get_string(json, "$.data.books[1].id", false, "")
+                .unwrap(),
+            "b2"
+        );
+        assert_eq!(
+            ar.get_string(json, "$.data.books[-1].id", false, "")
+                .unwrap(),
+            "b2"
+        );
     }
 
     // Legado 用的 Jayway json-path 容忍 `$.data.[*]`（点与方括号混用），爱看目录规则就是这种写法
@@ -4590,7 +4686,10 @@ nodes.filter(function (node) {
     fn jsonpath_tolerates_dot_before_bracket() {
         let ar = AnalyzeRule::new();
         let json = r#"{"data":[{"id":1},{"id":2}]}"#;
-        assert_eq!(ar.get_string(json, "$.data.[0].id", false, "").unwrap(), "1");
+        assert_eq!(
+            ar.get_string(json, "$.data.[0].id", false, "").unwrap(),
+            "1"
+        );
         assert_eq!(
             ar.get_string_list(json, "$.data.[*].id").unwrap(),
             vec!["1", "2"]
@@ -4623,7 +4722,8 @@ nodes.filter(function (node) {
             "https://api.x/read?bid=42"
         );
         assert_eq!(
-            ar.get_string(item, "{\"bid\":\"{{$.id}}\"}", false, "").unwrap(),
+            ar.get_string(item, "{\"bid\":\"{{$.id}}\"}", false, "")
+                .unwrap(),
             "{\"bid\":\"42\"}"
         );
     }
@@ -4631,7 +4731,8 @@ nodes.filter(function (node) {
     // 切分 JS 时字符串/正则里的 `</js>`、`||`、引号不能截断代码
     #[test]
     fn js_split_ignores_tags_inside_strings_and_regex() {
-        let parts = AnalyzeRule::split_js(r#"<js>result.replace("</js>", "").replace(/a||b/g, "")</js>"#);
+        let parts =
+            AnalyzeRule::split_js(r#"<js>result.replace("</js>", "").replace(/a||b/g, "")</js>"#);
         assert_eq!(parts.len(), 1, "整段应只有一个 JS 段");
         let code = match &parts[0] {
             (Mode::Js, c) => c.clone(),
@@ -4640,8 +4741,13 @@ nodes.filter(function (node) {
         assert!(code.contains("</js>"), "字符串里的 </js> 不应截断: {code}");
         let ar = AnalyzeRule::new();
         assert_eq!(
-            ar.get_string("x</js>y", r#"<js>result.replace("</js>", "")</js>"#, false, "")
-                .unwrap(),
+            ar.get_string(
+                "x</js>y",
+                r#"<js>result.replace("</js>", "")</js>"#,
+                false,
+                ""
+            )
+            .unwrap(),
             "xy"
         );
     }
@@ -4701,8 +4807,12 @@ nodes.filter(function (node) {
         let err = rt
             .block_on(async {
                 tokio::spawn(async {
-                    AnalyzeRule::new()
-                        .get_string("", "<js>java.ajax('http://127.0.0.1:1/')</js>", false, "")
+                    AnalyzeRule::new().get_string(
+                        "",
+                        "<js>java.ajax('http://127.0.0.1:1/')</js>",
+                        false,
+                        "",
+                    )
                 })
                 .await
                 .unwrap()
@@ -4842,20 +4952,24 @@ nodes.filter(function (node) {
     fn jquery_pseudo_first_last_eq() {
         let ar = AnalyzeRule::new();
         assert_eq!(
-            ar.get_string(NEWS_HTML, "li:first@a@text", false, "").unwrap(),
+            ar.get_string(NEWS_HTML, "li:first@a@text", false, "")
+                .unwrap(),
             "第一章"
         );
         assert_eq!(
-            ar.get_string(NEWS_HTML, "li:last@a@text", false, "").unwrap(),
+            ar.get_string(NEWS_HTML, "li:last@a@text", false, "")
+                .unwrap(),
             "第四章"
         );
         assert_eq!(
-            ar.get_string(NEWS_HTML, "li:eq(1)@a@text", false, "").unwrap(),
+            ar.get_string(NEWS_HTML, "li:eq(1)@a@text", false, "")
+                .unwrap(),
             "第二章"
         );
         // jQuery 负下标：-1 为最后一个
         assert_eq!(
-            ar.get_string(NEWS_HTML, "li:eq(-1)@a@text", false, "").unwrap(),
+            ar.get_string(NEWS_HTML, "li:eq(-1)@a@text", false, "")
+                .unwrap(),
             "第四章"
         );
     }
@@ -4877,7 +4991,8 @@ nodes.filter(function (node) {
         );
         // 遍历段里的伪类（@li:eq）同样生效
         assert_eq!(
-            ar.get_string(NEWS_HTML, "ul@li:eq(3)@a@text", false, "").unwrap(),
+            ar.get_string(NEWS_HTML, "ul@li:eq(3)@a@text", false, "")
+                .unwrap(),
             "第四章"
         );
     }
@@ -4896,7 +5011,8 @@ nodes.filter(function (node) {
         // 存在的任意属性正常取到
         let with_attr = r#"<a class="link" data-id="42" href="/x">详情</a>"#;
         assert_eq!(
-            ar.get_string(with_attr, ".link@data-id", false, "").unwrap(),
+            ar.get_string(with_attr, ".link@data-id", false, "")
+                .unwrap(),
             "42"
         );
     }
@@ -4953,7 +5069,8 @@ nodes.filter(function (node) {
     #[test]
     fn p2_bare_tag_index_in_initial_selector() {
         let ar = AnalyzeRule::new();
-        let html = r#"<div class="list"><a href="/1">一</a><a href="/2">二</a><a href="/3">三</a></div>"#;
+        let html =
+            r#"<div class="list"><a href="/1">一</a><a href="/2">二</a><a href="/3">三</a></div>"#;
         assert_eq!(ar.get_string(html, "a.0@href", true, "").unwrap(), "/1");
         assert_eq!(ar.get_string(html, "a.-1@href", true, "").unwrap(), "/3");
         // 等价写法不得回归
@@ -4979,7 +5096,10 @@ nodes.filter(function (node) {
         assert_eq!(titles, vec!["A", "B", "D"]);
         // 方括号字段语法
         let titles2 = ar
-            .get_string_list(BOOKS_JSON, "$.data.list[?(@['author']=='我吃西红柿')].title")
+            .get_string_list(
+                BOOKS_JSON,
+                "$.data.list[?(@['author']=='我吃西红柿')].title",
+            )
             .unwrap();
         assert_eq!(titles2, vec!["C"]);
         // 数值比较
@@ -5060,8 +5180,16 @@ nodes.filter(function (node) {
     fn p0_7_mode_prefix_is_case_insensitive() {
         let ar = AnalyzeRule::new();
         let html = r#"<div class="list">ABC</div>"#;
-        for rule in ["@CSS:div.list@text", "@Css:div.list@text", "@css:div.list@text"] {
-            assert_eq!(ar.get_string(html, rule, false, "").unwrap(), "ABC", "{rule}");
+        for rule in [
+            "@CSS:div.list@text",
+            "@Css:div.list@text",
+            "@css:div.list@text",
+        ] {
+            assert_eq!(
+                ar.get_string(html, rule, false, "").unwrap(),
+                "ABC",
+                "{rule}"
+            );
         }
         let json = r#"{"title":"T"}"#;
         for rule in ["@Json:$.title", "@JSON:$.title", "@json:$.title"] {
@@ -5079,7 +5207,8 @@ nodes.filter(function (node) {
     #[test]
     fn p0_1_fallback_returns_full_list_not_first_value() {
         let ar = AnalyzeRule::new();
-        let html = r#"<div class="list"><li>A</li><li>B</li><li>C</li></div><div class="box"></div>"#;
+        let html =
+            r#"<div class="list"><li>A</li><li>B</li><li>C</li></div><div class="box"></div>"#;
         let v = ar.get_string_list_all(html, ".list li@text||.box li@text", "");
         assert_eq!(v, vec!["A", "B", "C"]);
     }
@@ -5111,10 +5240,7 @@ nodes.filter(function (node) {
             "A\nB"
         );
         let json = r#"{"a":"A","b":"B"}"#;
-        assert_eq!(
-            ar.get_string(json, "$.a&&$.b", false, "").unwrap(),
-            "A\nB"
-        );
+        assert_eq!(ar.get_string(json, "$.a&&$.b", false, "").unwrap(), "A\nB");
     }
 
     // ---- P0-3：`##` 三种形态 ----
@@ -5161,7 +5287,11 @@ nodes.filter(function (node) {
     fn p0_4_negative_index_forms() {
         let ar = AnalyzeRule::new();
         let html = r#"<div class="list"><li>A</li><li>B</li><li>C</li></div>"#;
-        assert_eq!(ar.get_string(html, "class.list@tag.li.-1@text", false, "").unwrap(), "C");
+        assert_eq!(
+            ar.get_string(html, "class.list@tag.li.-1@text", false, "")
+                .unwrap(),
+            "C"
+        );
         let pics = r#"<div class="pic"><img src="1.jpg"><img src="2.jpg"><img src="3.jpg"></div>"#;
         assert_eq!(
             ar.get_string(pics, "class.pic@tag.img[-1]@src", false, "")
@@ -5196,16 +5326,19 @@ nodes.filter(function (node) {
         let ar = AnalyzeRule::new();
         ar.set_var("page", "2");
         assert_eq!(
-            ar.get_string("", "https://x/list/{{page*20}}", true, "").unwrap(),
+            ar.get_string("", "https://x/list/{{page*20}}", true, "")
+                .unwrap(),
             "https://x/list/40"
         );
         assert_eq!(
-            ar.get_string("", "https://x/list/{{(page-1)*20+10}}", true, "").unwrap(),
+            ar.get_string("", "https://x/list/{{(page-1)*20+10}}", true, "")
+                .unwrap(),
             "https://x/list/30"
         );
         ar.set_var("key", "abc");
         assert_eq!(
-            ar.get_string("", "https://x/{{java.base64Encode(key)}}", true, "").unwrap(),
+            ar.get_string("", "https://x/{{java.base64Encode(key)}}", true, "")
+                .unwrap(),
             "https://x/YWJj"
         );
     }
@@ -5257,7 +5390,8 @@ nodes.filter(function (node) {
         );
         // 与 `##` 替换组合（case 0/99 的实际写法）
         assert_eq!(
-            ar.get_string(html, ".author.0@text##作者：", false, "").unwrap(),
+            ar.get_string(html, ".author.0@text##作者：", false, "")
+                .unwrap(),
             "作者甲"
         );
     }
@@ -5287,11 +5421,11 @@ nodes.filter(function (node) {
     #[test]
     fn f5_text_inserts_space_between_block_elements() {
         let ar = AnalyzeRule::new();
-        let html = r#"<div class="text"><p>二月二，龙抬头。</p><p>暮色里，小镇名叫泥瓶巷。</p></div>"#;
+        let html =
+            r#"<div class="text"><p>二月二，龙抬头。</p><p>暮色里，小镇名叫泥瓶巷。</p></div>"#;
         assert_eq!(
             ar.get_string(html, "class.text@text", false, "").unwrap(),
             "二月二，龙抬头。 暮色里，小镇名叫泥瓶巷。"
         );
     }
 }
-

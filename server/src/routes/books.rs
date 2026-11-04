@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use crate::auth::{AuthUser, UserDb};
 use crate::entities::{Book, BookChapter, BookContent, SearchBook};
 use crate::error::{AppError, AppResult};
-use crate::routes::AppState;
 use crate::routes::replace;
 use crate::routes::sources::{load_source, load_sources};
+use crate::routes::AppState;
 use crate::source_health;
 use crate::source_ledger;
 use crate::web_book;
@@ -193,7 +193,6 @@ fn prune_cache(g: &mut Vec<AggEntry>) {
     }
 }
 
-
 // ---------- 两段式聚合搜索：先返回已完成源，轮询补齐 ----------
 /// job 存活 60s。
 /// 已完成任务保留上限 32；进行中任务另有 64 的硬上限，避免把仍在轮询的 job 误杀成 404。
@@ -310,7 +309,11 @@ fn prune_jobs(list: &mut Vec<Arc<SearchJob>>) {
 
 fn next_job_id() -> String {
     static SEQ: AtomicI64 = AtomicI64::new(0);
-    format!("j{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "j{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 struct JobView {
@@ -330,12 +333,8 @@ struct JobView {
 fn job_view(job: &SearchJob) -> JobView {
     let mut st = job.state.lock().unwrap();
     let books = st.books.clone();
-    let mut full = web_book::dedupe_and_sort_with(
-        books,
-        &job.sources,
-        &job.key,
-        Some(&mut st.rank),
-    );
+    let mut full =
+        web_book::dedupe_and_sort_with(books, &job.sources, &job.key, Some(&mut st.rank));
     let errors = st.errors.clone();
     let finished = st.finished;
     let pending = st.pending;
@@ -380,6 +379,7 @@ fn frozen_job_view(job: &SearchJob) -> JobView {
     view
 }
 
+#[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消），拆分仅把参数列表搬到另一层。
 async fn run_search_job(
     job: Arc<SearchJob>,
     sources: Vec<crate::entities::BookSource>,
@@ -407,26 +407,10 @@ async fn run_search_job(
 
     let (mut pref_outcomes, obs_outcomes) = tokio::join!(
         run_search_batch(
-            &job,
-            preferred,
-            &key,
-            deadline,
-            budget,
-            &health,
-            scope,
-            &book_pool,
-            &store,
+            &job, preferred, &key, deadline, budget, &health, scope, &book_pool, &store,
         ),
         run_search_batch(
-            &job,
-            observing,
-            &key,
-            deadline,
-            budget,
-            &health,
-            scope,
-            &book_pool,
-            &store,
+            &job, observing, &key, deadline, budget, &health, scope, &book_pool, &store,
         )
     );
     pref_outcomes.extend(obs_outcomes);
@@ -438,6 +422,7 @@ async fn run_search_job(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // 与 `run_search_job` 同一批调度参数，保持签名对称便于对照。
 async fn run_search_batch(
     job: &Arc<SearchJob>,
     sources: Vec<crate::entities::BookSource>,
@@ -667,7 +652,10 @@ fn select_sources(
             });
         match found {
             Some(s) => {
-                if !selected.iter().any(|x| x.book_source_url == s.book_source_url) {
+                if !selected
+                    .iter()
+                    .any(|x| x.book_source_url == s.book_source_url)
+                {
                     selected.push(s.clone());
                 }
             }
@@ -1126,7 +1114,9 @@ async fn search_result(
             let page_books: Vec<SearchBook> =
                 full.iter().skip(skip).take(page_size).cloned().collect();
             let has_more = skip + page_books.len() < total;
-            let next = has_more.then(|| page_books.last().and_then(cursor_of)).flatten();
+            let next = has_more
+                .then(|| page_books.last().and_then(cursor_of))
+                .flatten();
             (page_books, has_more, next)
         }
     };
@@ -1388,36 +1378,35 @@ async fn toc(
     Query(q): Query<BookQ>,
 ) -> AppResult<Json<Vec<BookChapter>>> {
     let use_replace = resolve_use_replace(q.use_replace.as_deref(), &db.0).await;
-    let mut chapters =
-        if let Some(mut chaps) = load_cached_chapters(&db.0, &q.book_url, s.cfg.toc_ttl_secs).await?
-        {
-            // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
-            // 不必等缓存过期重抓。
-            let _ = sync_total_chapter_num(&db.0, &q.book_url, chaps.len() as i64).await;
-            chaps
-        } else {
-            let source = load_source(&s.shared, &q.source).await?;
-            let mut book = Book {
-                book_url: q.book_url.clone(),
-                ..Default::default()
-            };
-            if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
-                book.toc_url = m.toc_url;
-            }
-            let key = web_book::book_key(&source, &book.book_url);
-            let store = book_store_for(&db.0, &key).await;
-            let chapters = web_book::chapter_list_book(&source, &book, Some(&store)).await?;
-            persist_book_changes(&db.0, store.take_changes()).await;
-            save_chapters(&db.0, &q.book_url, &chapters).await?;
-            // 目录落库时同步总章节数，供进度百分比与书架完成度使用
-            sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
-            // 记录目录总数变化（首次建基线不出角标）
-            crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64)
-                .await;
-            // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-            let _ = backfill_word_counts(&db.0, &q.book_url).await;
-            chapters
+    let mut chapters = if let Some(chaps) =
+        load_cached_chapters(&db.0, &q.book_url, s.cfg.toc_ttl_secs).await?
+    {
+        // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
+        // 不必等缓存过期重抓。
+        let _ = sync_total_chapter_num(&db.0, &q.book_url, chaps.len() as i64).await;
+        chaps
+    } else {
+        let source = load_source(&s.shared, &q.source).await?;
+        let mut book = Book {
+            book_url: q.book_url.clone(),
+            ..Default::default()
         };
+        if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
+            book.toc_url = m.toc_url;
+        }
+        let key = web_book::book_key(&source, &book.book_url);
+        let store = book_store_for(&db.0, &key).await;
+        let chapters = web_book::chapter_list_book(&source, &book, Some(&store)).await?;
+        persist_book_changes(&db.0, store.take_changes()).await;
+        save_chapters(&db.0, &q.book_url, &chapters).await?;
+        // 目录落库时同步总章节数，供进度百分比与书架完成度使用
+        sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
+        // 记录目录总数变化（首次建基线不出角标）
+        crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64).await;
+        // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
+        let _ = backfill_word_counts(&db.0, &q.book_url).await;
+        chapters
+    };
     if use_replace && !chapters.is_empty() {
         let book_name = book_name_of(&db.0, &q.book_url).await.unwrap_or_default();
         let mut cleaned: Vec<String> = chapters
@@ -1427,7 +1416,11 @@ async fn toc(
         replace::purify_titles(&db.0, &book_name, &q.source, &mut cleaned).await;
         for (c, t) in chapters.iter_mut().zip(cleaned) {
             // 错误/空标题保持原样，避免把 None 变成空串
-            if c.title.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            if c.title
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
                 c.title = Some(t);
             }
         }
@@ -1694,10 +1687,7 @@ async fn toc_batch(
             let _ = backfill_word_counts(&pool, &book_url).await;
             let after_total = chapters.len() as i64;
             let new_urls: HashSet<&str> = chapters.iter().map(|c| c.url.as_str()).collect();
-            let added = new_urls
-                .iter()
-                .filter(|u| !old_urls.contains(**u))
-                .count() as i64;
+            let added = new_urls.iter().filter(|u| !old_urls.contains(**u)).count() as i64;
             let removed = old_urls
                 .iter()
                 .filter(|u| !new_urls.contains(u.as_str()))
@@ -1771,8 +1761,7 @@ async fn content(
             };
             let c = if source.book_source_type == 2 {
                 // 漫画源：只抽图片列表，content 置空以保持字段类型不变
-                let imgs =
-                    web_book::chapter_images_book(&source, &chapter, store.as_ref()).await?;
+                let imgs = web_book::chapter_images_book(&source, &chapter, store.as_ref()).await?;
                 BookContent {
                     book_url: chapter.book_url.clone().unwrap_or_default(),
                     url: chapter.url.clone(),
@@ -1869,9 +1858,7 @@ async fn content(
             "prefetch_hint": {"count": prefetch, "priority": "high"},
         })));
     }
-    let book_name = book_name_of(&db.0, &c.book_url)
-        .await
-        .unwrap_or_default();
+    let book_name = book_name_of(&db.0, &c.book_url).await.unwrap_or_default();
     if use_replace {
         let (title, body) = replace::purify(
             &db.0,
@@ -2100,15 +2087,22 @@ fn reserve_budget(remaining: &AtomicI64, size: i64) -> bool {
     }
 }
 
+// `index`/`bytes` 供构造侧记录进度与诊断，部分分支只读取状态码而不读字段；保留完整载荷便于排查。
+#[allow(dead_code)]
 enum CacheOutcome {
-    Cached { index: i64, bytes: i64 },
+    Cached {
+        index: i64,
+        bytes: i64,
+    },
     Failed {
         index: i64,
         url: String,
         title: Option<String>,
         error: String,
     },
-    Budget { index: i64 },
+    Budget {
+        index: i64,
+    },
 }
 
 async fn cache_all(
@@ -2143,11 +2137,9 @@ async fn cache_all(
                     .bind(&book_url)
                     .fetch_optional(&db.0)
                     .await?;
-            origin
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| {
-                    AppError::BadRequest("缺少 source，且 book_meta 未记录书源".into())
-                })?
+            origin.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+                AppError::BadRequest("缺少 source，且 book_meta 未记录书源".into())
+            })?
         }
     };
     let source = load_source(&s.shared, &source_id).await?;
@@ -2175,11 +2167,10 @@ async fn cache_all(
         Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
         None => s.cfg.cache_limit_bytes(),
     };
-    let used_before: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes),0) FROM book_content",
-    )
-    .fetch_one(&db.0)
-    .await?;
+    let used_before: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+            .fetch_one(&db.0)
+            .await?;
     let attempted = pending.len();
     let remaining = Arc::new(AtomicI64::new((limit_bytes - used_before).max(0)));
     let exhausted = Arc::new(AtomicBool::new(false));
@@ -2216,7 +2207,10 @@ async fn cache_all(
                     let size = c.content.as_deref().map(|s| s.len()).unwrap_or(0) as i64;
                     // 与单章读取一致：空正文/零图不写缓存，避免整批预取把空白固化下来。
                     if content_is_empty(&c) {
-                        return CacheOutcome::Cached { index: idx, bytes: 0 };
+                        return CacheOutcome::Cached {
+                            index: idx,
+                            bytes: 0,
+                        };
                     }
                     if !reserve_budget(&remaining, size) {
                         exhausted.store(true, Ordering::SeqCst);
@@ -2315,11 +2309,10 @@ pub(crate) async fn clear_content_cache(
             (deleted, freed)
         }
         None => {
-            let freed: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(size_bytes),0) FROM book_content",
-            )
-            .fetch_one(pool)
-            .await?;
+            let freed: i64 =
+                sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+                    .fetch_one(pool)
+                    .await?;
             let deleted = sqlx::query("DELETE FROM book_content")
                 .execute(pool)
                 .await?
@@ -2371,7 +2364,9 @@ async fn switch_source(
         name_ok && author_ok
     });
     let out: Vec<SearchBook> = match q.exclude_source.as_deref() {
-        Some(ex) => candidates.filter(|b| b.origin.as_deref() != Some(ex)).collect(),
+        Some(ex) => candidates
+            .filter(|b| b.origin.as_deref() != Some(ex))
+            .collect(),
         None => candidates.collect(),
     };
     Ok(Json(out))
@@ -2433,7 +2428,10 @@ pub(crate) async fn save_book_meta(pool: &SqlitePool, b: &Book) -> anyhow::Resul
     Ok(())
 }
 
-pub(crate) async fn load_book_meta(pool: &SqlitePool, book_url: &str) -> anyhow::Result<Option<Book>> {
+pub(crate) async fn load_book_meta(
+    pool: &SqlitePool,
+    book_url: &str,
+) -> anyhow::Result<Option<Book>> {
     let b: Option<Book> = sqlx::query_as::<_, Book>("SELECT * FROM book_meta WHERE book_url = ?")
         .bind(book_url)
         .fetch_optional(pool)
@@ -2486,7 +2484,9 @@ pub(crate) async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_boo
                 let mut kept = serde_json::Map::new();
                 for k in keys {
                     kept.insert(k.clone(), serde_json::Value::String(vars[k].clone()));
-                    if serde_json::to_string(&kept).map(|s| s.len()).unwrap_or(usize::MAX)
+                    if serde_json::to_string(&kept)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX)
                         > BOOK_VARS_MAX_BYTES
                     {
                         kept.remove(k);
@@ -2533,13 +2533,12 @@ pub(crate) async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_boo
             }
         }
         for ck in ch.cache_deletes {
-            if let Err(e) = sqlx::query(
-                "DELETE FROM book_cache WHERE book_key = ?1 AND cache_key = ?2",
-            )
-            .bind(&ch.key)
-            .bind(&ck)
-            .execute(pool)
-            .await
+            if let Err(e) =
+                sqlx::query("DELETE FROM book_cache WHERE book_key = ?1 AND cache_key = ?2")
+                    .bind(&ch.key)
+                    .bind(&ck)
+                    .execute(pool)
+                    .await
             {
                 tracing::warn!(error = %e, "delete book cache failed");
             }
@@ -2752,13 +2751,7 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     .execute(pool)
     .await?;
     // 正文字数回填到目录行（未知时保持 0）；SQLite TEXT 的 length() 按字符计数。
-    let chars = c
-        .content
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .count() as i64;
+    let chars = c.content.as_deref().unwrap_or("").trim().chars().count() as i64;
     let _ = sqlx::query("UPDATE book_chapters SET word_count = ?2 WHERE url = ?1")
         .bind(&c.url)
         .bind(chars)
@@ -2783,11 +2776,9 @@ pub(crate) async fn save_content_cached(
 
     // 淘汰：每轮删除最久未读的一批，最多 8 轮，避免极端情况下长时间占用连接
     for _ in 0..8 {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(size_bytes),0) FROM book_content",
-        )
-        .fetch_one(pool)
-        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+            .fetch_one(pool)
+            .await?;
         if total <= limit_bytes {
             break;
         }
@@ -2810,14 +2801,14 @@ pub(crate) async fn save_content_cached(
 
 /// 取书籍名称（用于替换规则的 scope 匹配）
 async fn book_name_of(pool: &SqlitePool, book_url: &str) -> anyhow::Result<String> {
-    let name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM book_meta WHERE book_url = ?")
-            .bind(book_url)
-            .fetch_optional(pool)
-            .await?;
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM book_meta WHERE book_url = ?")
+        .bind(book_url)
+        .fetch_optional(pool)
+        .await?;
     Ok(name.unwrap_or_default())
 }
 
+#[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，与生产默认值的差异一目了然。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2876,7 +2867,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(load_cached_content(&pool, "u1", 7 * 24 * 3600).await.unwrap().is_none());
+        assert!(load_cached_content(&pool, "u1", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .is_none());
 
         // 图片章节零图同样不落缓存。
         let img_empty = BookContent {
@@ -2887,7 +2881,9 @@ mod tests {
             images_json: Some("[]".into()),
             ..Default::default()
         };
-        save_content_cached(&pool, &img_empty, 1 << 20).await.unwrap();
+        save_content_cached(&pool, &img_empty, 1 << 20)
+            .await
+            .unwrap();
         let n3: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u3'")
             .fetch_one(&pool)
             .await
@@ -2906,12 +2902,18 @@ mod tests {
         // 带可见文字的 HTML 片段仍然落库并命中。
         let html = mk_content("u5", "b1", 5, "<p>有正文的段落</p>");
         save_content_cached(&pool, &html, 1 << 20).await.unwrap();
-        assert!(load_cached_content(&pool, "u5", 7 * 24 * 3600).await.unwrap().is_some());
+        assert!(load_cached_content(&pool, "u5", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .is_some());
 
         // 正常正文仍然命中。
         let ok = mk_content("u2", "b1", 2, "正文内容");
         save_content_cached(&pool, &ok, 1 << 20).await.unwrap();
-        assert!(load_cached_content(&pool, "u2", 7 * 24 * 3600).await.unwrap().is_some());
+        assert!(load_cached_content(&pool, "u2", 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     // 解析管线指纹不符 → 旧缓存按未命中处理，重建后按当前指纹回写并正常命中。
@@ -2933,7 +2935,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            load_cached_content(&pool, "u1", 7 * 24 * 3600).await.unwrap().is_none(),
+            load_cached_content(&pool, "u1", 7 * 24 * 3600)
+                .await
+                .unwrap()
+                .is_none(),
             "指纹不符必须视为未命中"
         );
 
@@ -2944,7 +2949,10 @@ mod tests {
             .unwrap()
             .expect("重建后应命中");
         assert_eq!(rebuilt.content.as_deref(), Some(body));
-        assert_eq!(rebuilt.cache_version.as_deref(), Some(content_cache_version()));
+        assert_eq!(
+            rebuilt.cache_version.as_deref(),
+            Some(content_cache_version())
+        );
     }
 
     // 旧记录没有 cache_version（迁移前写入）→ 未命中，首次读取重建后回写指纹。
@@ -2960,7 +2968,10 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            load_cached_content(&pool, "legacy", 7 * 24 * 3600).await.unwrap().is_none(),
+            load_cached_content(&pool, "legacy", 7 * 24 * 3600)
+                .await
+                .unwrap()
+                .is_none(),
             "无指纹的旧记录必须视为未命中"
         );
 
@@ -2994,8 +3005,14 @@ mod tests {
     #[test]
     fn pipeline_uses_single_total_budget_for_both_batches() {
         // 两批同时进调度：调度时间窗就是整批总预算（不再按 pct 提前截断）。
-        assert_eq!(crate::req::search_total_budget(crate::req::SearchScope::Curated), Duration::from_secs(6));
-        assert_eq!(crate::req::search_total_budget(crate::req::SearchScope::All), Duration::from_secs(10));
+        assert_eq!(
+            crate::req::search_total_budget(crate::req::SearchScope::Curated),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            crate::req::search_total_budget(crate::req::SearchScope::All),
+            Duration::from_secs(10)
+        );
     }
 
     fn mk_book(name: String, url: String) -> SearchBook {
@@ -3048,11 +3065,11 @@ mod tests {
         {
             let mut st = job.state.lock().unwrap();
             for i in 10..18 {
-                st.books.push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
+                st.books
+                    .push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
             }
         }
-        loop {
-            let Some(cur) = cursor.clone() else { break };
+        while let Some(cur) = cursor.clone() {
             let after = parse_cursor(&cur).expect("游标可解析");
             let view = job_view(&job);
             let page: Vec<SearchBook> = view
@@ -3070,10 +3087,18 @@ mod tests {
         }
 
         let final_view = job_view(&job);
-        let all: HashSet<String> = final_view.books.iter().map(|b| b.book_url.clone()).collect();
+        let all: HashSet<String> = final_view
+            .books
+            .iter()
+            .map(|b| b.book_url.clone())
+            .collect();
         assert_eq!(seen.len(), all.len(), "逐条不重复");
         for u in &all {
-            assert_eq!(seen.iter().filter(|x| *x == u).count(), 1, "{u} 应恰好出现一次");
+            assert_eq!(
+                seen.iter().filter(|x| *x == u).count(),
+                1,
+                "{u} 应恰好出现一次"
+            );
         }
         assert_eq!(seen.len(), 18, "首屏 + 后续页应覆盖全部 18 条");
     }
@@ -3090,7 +3115,8 @@ mod tests {
         {
             let mut st = job.state.lock().unwrap();
             for i in 6..10 {
-                st.books.push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
+                st.books
+                    .push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
             }
         }
         let again = frozen_job_view(&job);
@@ -3159,7 +3185,12 @@ mod tests {
     // 片段：命中位置按字符计、前后 40 字上下文、命中次数正确（含 ASCII 大小写回退）
     #[test]
     fn snippet_has_context_offset_and_count() {
-        let body = format!("{}关键词{}关键词{}", "前".repeat(100), "中".repeat(50), "后".repeat(100));
+        let body = format!(
+            "{}关键词{}关键词{}",
+            "前".repeat(100),
+            "中".repeat(50),
+            "后".repeat(100)
+        );
         let (snippet, offset, count) = find_snippet(&body, "关键词").unwrap();
         assert_eq!(count, 2);
         assert_eq!(offset, 100, "首个命中应位于第 100 个字符");
@@ -3196,12 +3227,11 @@ mod tests {
         upsert_content(&pool, &c).await.unwrap();
         let c2 = mk_content("https://x/1", "https://x/book", 1, "更长的正文内容");
         upsert_content(&pool, &c2).await.unwrap();
-        let (rows, size): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM book_content",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (rows, size): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM book_content")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows, 1);
         assert_eq!(size, "更长的正文内容".len() as i64);
         let title: String =
@@ -3243,13 +3273,12 @@ mod tests {
             ..Default::default()
         };
         save_book_meta(&pool, &detail).await.unwrap();
-        let total: i64 = sqlx::query_scalar(
-            "SELECT total_chapter_num FROM book_meta WHERE book_url = ?1",
-        )
-        .bind(url)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let total: i64 =
+            sqlx::query_scalar("SELECT total_chapter_num FROM book_meta WHERE book_url = ?1")
+                .bind(url)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(total, 500, "详情保存不应把总章节数写回 0");
 
         sync_total_chapter_num(&pool, url, 0).await.unwrap();
@@ -3336,11 +3365,17 @@ mod tests {
         assert_eq!(loaded[2].volume_title.as_deref(), Some("第一卷 风起"));
 
         // 正文落库回填字数；第 2 章在下一个分卷下
-        upsert_content(&pool, &mk_content("https://x/c1", book, 1, "第一章正文内容"))
-            .await
-            .unwrap();
+        upsert_content(
+            &pool,
+            &mk_content("https://x/c1", book, 1, "第一章正文内容"),
+        )
+        .await
+        .unwrap();
         let reloaded = load_cached_chapters(&pool, book, 0).await.unwrap().unwrap();
-        assert_eq!(reloaded[1].word_count, "第一章正文内容".chars().count() as i64);
+        assert_eq!(
+            reloaded[1].word_count,
+            "第一章正文内容".chars().count() as i64
+        );
     }
 
     // 清理：按书只删该书；不传 book_id 清空全部；bytes_freed 为被删行的 size_bytes 之和
@@ -3445,8 +3480,7 @@ mod tests {
         let set: std::collections::HashSet<String> =
             ["http://curated".to_string()].into_iter().collect();
 
-        let curated =
-            filter_sources_by_scope(candidates.clone(), Some(&set), SearchScope::Curated);
+        let curated = filter_sources_by_scope(candidates.clone(), Some(&set), SearchScope::Curated);
         assert_eq!(curated.len(), 1, "curated 只跑精选源");
         assert_eq!(curated[0].book_source_url, "http://curated");
 
@@ -3680,11 +3714,7 @@ mod tests {
 
         let mut restored = login;
         restored.login_url = None;
-        let pool = searchable_sources(
-            vec![restored, open],
-            &HashSet::new(),
-            &HashMap::new(),
-        );
+        let pool = searchable_sources(vec![restored, open], &HashSet::new(), &HashMap::new());
         assert_eq!(pool.len(), 2, "去掉 loginUrl 后应自动回到搜索池");
     }
 
@@ -3717,8 +3747,14 @@ mod tests {
             st.pending = 1;
         }
         let view = job_view(&job);
-        assert!(view.attempted <= view.scheduled, "attempted 不能大于 scheduled");
-        assert!(view.scheduled <= job.source_total, "scheduled 不能大于 total");
+        assert!(
+            view.attempted <= view.scheduled,
+            "attempted 不能大于 scheduled"
+        );
+        assert!(
+            view.scheduled <= job.source_total,
+            "scheduled 不能大于 total"
+        );
         assert_eq!(
             job.source_total - view.scheduled,
             1,
@@ -3746,8 +3782,14 @@ mod tests {
             &store,
         )
         .await;
-        assert!(outcomes.iter().all(|o| o.status != source_health::STATUS_OK));
-        assert_eq!(job.state.lock().unwrap().attempted, 0, "未拿到槽不算 attempted");
+        assert!(outcomes
+            .iter()
+            .all(|o| o.status != source_health::STATUS_OK));
+        assert_eq!(
+            job.state.lock().unwrap().attempted,
+            0,
+            "未拿到槽不算 attempted"
+        );
         let view = job_view(&job);
         assert_eq!(view.scheduled, 1);
         assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
@@ -3793,14 +3835,14 @@ mod tests {
         });
 
         // 没有健康行（等价于 observing）：legacy 路径仍要搜它
-        let out = web_book::search_all_with_errors_budgeted(
-            &[s],
-            "书",
-            1,
-            Duration::from_millis(800),
-        )
-        .await;
-        assert!(out.errors.is_empty(), "非 preferred 源不应被过滤: {:?}", out.errors);
+        let out =
+            web_book::search_all_with_errors_budgeted(&[s], "书", 1, Duration::from_millis(800))
+                .await;
+        assert!(
+            out.errors.is_empty(),
+            "非 preferred 源不应被过滤: {:?}",
+            out.errors
+        );
         assert_eq!(out.books.len(), 1);
         assert_eq!(out.books[0].name.as_deref(), Some("测试书"));
     }
@@ -3842,7 +3884,10 @@ mod tests {
         prune_jobs(&mut list);
 
         assert!(list.len() <= SEARCH_JOB_MAX, "应回到已完成任务上限");
-        assert_eq!(list.iter().filter(|j| j.id.starts_with("done")).count(), SEARCH_JOB_MAX - 1);
+        assert_eq!(
+            list.iter().filter(|j| j.id.starts_with("done")).count(),
+            SEARCH_JOB_MAX - 1
+        );
         assert!(
             list.iter().any(|j| j.id == active.id),
             "进行中的 job 不能被完成后淘汰误杀"
@@ -3876,7 +3921,10 @@ mod tests {
             .collect();
         prune_jobs(&mut list);
         assert_eq!(list.len(), SEARCH_JOB_MAX_ACTIVE);
-        assert!(!list.iter().any(|j| j.id == "run0"), "最旧的活跃任务被硬上限淘汰");
+        assert!(
+            !list.iter().any(|j| j.id == "run0"),
+            "最旧的活跃任务被硬上限淘汰"
+        );
     }
 
     fn src(name: &str, url: &str, weight: i64, enabled: bool) -> crate::entities::BookSource {
@@ -3940,11 +3988,11 @@ mod tests {
         let enabled: Vec<_> = all
             .into_iter()
             .filter(|x| {
-            x.enabled
-                && crate::entities::is_supported_source_type(x.book_source_type)
-                && x.rule_search.is_some()
-                && x.search_url.is_some()
-        })
+                x.enabled
+                    && crate::entities::is_supported_source_type(x.book_source_type)
+                    && x.rule_search.is_some()
+                    && x.search_url.is_some()
+            })
             .collect();
         assert_eq!(enabled[0].book_source_url, "http://a");
 

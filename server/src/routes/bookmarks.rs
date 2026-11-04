@@ -62,9 +62,7 @@ pub(crate) fn validate_new(q: &NewBookmark) -> AppResult<()> {
         return Err(AppError::BadRequest("book_id 不能为空".into()));
     }
     if q.chapter_index < 0 {
-        return Err(AppError::BadRequest(
-            "chapter_index 必须大于等于 0".into(),
-        ));
+        return Err(AppError::BadRequest("chapter_index 必须大于等于 0".into()));
     }
     if !q.position.is_finite() || !(0.0..=1.0).contains(&q.position) {
         return Err(AppError::BadRequest(
@@ -77,10 +75,7 @@ pub(crate) fn validate_new(q: &NewBookmark) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) async fn insert_bookmark(
-    pool: &SqlitePool,
-    q: &NewBookmark,
-) -> sqlx::Result<Bookmark> {
+pub(crate) async fn insert_bookmark(pool: &SqlitePool, q: &NewBookmark) -> sqlx::Result<Bookmark> {
     sqlx::query_as(
         "INSERT INTO bookmarks (book_id, chapter_index, position, chapter_title, note) \
          VALUES (?1,?2,?3,?4,?5) \

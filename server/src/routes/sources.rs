@@ -39,8 +39,14 @@ pub fn routes() -> Router<AppState> {
                 .post(bench_corpus_add)
                 .delete(bench_corpus_delete),
         )
-        .route("/api/sources/bench/corpus/update", post(bench_corpus_update))
-        .route("/api/sources/bench/corpus/toggle", post(bench_corpus_toggle))
+        .route(
+            "/api/sources/bench/corpus/update",
+            post(bench_corpus_update),
+        )
+        .route(
+            "/api/sources/bench/corpus/toggle",
+            post(bench_corpus_toggle),
+        )
         .route("/api/sources/bench/run", post(bench_run))
         .route("/api/sources/bench/run/:id", get(bench_run_status))
         .route("/api/sources/bench/curated", get(bench_curated))
@@ -74,6 +80,8 @@ fn parse_source_row(rules: Option<String>, content: Option<String>) -> Option<Bo
 /// 不会重写 JSON；而 JSON 里 `enabled` 缺失时反序列化默认 `true`（见 entities 的 `default_true`）。
 /// 若信任 JSON，列上已停用的源会继续进入聚合搜索（`source_total` 偏大、结果 `origin` 出现停用源）。
 pub async fn load_sources(pool: &SqlitePool) -> AppResult<Vec<BookSource>> {
+    #[allow(clippy::type_complexity)]
+    // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
     let rows: Vec<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
         "SELECT rules, content, book_source_type, unsupported_type, enabled FROM book_sources",
     )
@@ -94,6 +102,7 @@ pub async fn load_sources(pool: &SqlitePool) -> AppResult<Vec<BookSource>> {
 
 /// 按书源 ID（book_source_url）取完整书源。
 pub async fn load_source(pool: &SqlitePool, id: &str) -> AppResult<BookSource> {
+    #[allow(clippy::type_complexity)] // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
     let row: Option<(Option<String>, Option<String>, i64, bool, bool)> = sqlx::query_as(
         "SELECT rules, content, book_source_type, unsupported_type, enabled FROM book_sources WHERE id = ?",
     )
@@ -210,8 +219,19 @@ fn prepare_import(src: &mut BookSource) -> bool {
 /// 漫画特征词：用于导入时给出 `type=2` 建议（不做自动改库）。
 /// 中文“漫”单独出现会误伤（如“浪漫”），因此必须同时满足内容规则含 `<img` / `@js`。
 const COMIC_NAME_HINTS: [&str; 13] = [
-    "漫画", "漫", "mkz", "manhua", "comic", "manga", "baozimh", "kanman", "kuaikan",
-    "ac.qq", "1kkk", "哔哩哔哩漫画", "腾讯动漫",
+    "漫画",
+    "漫",
+    "mkz",
+    "manhua",
+    "comic",
+    "manga",
+    "baozimh",
+    "kanman",
+    "kuaikan",
+    "ac.qq",
+    "1kkk",
+    "哔哩哔哩漫画",
+    "腾讯动漫",
 ];
 
 fn comic_name_hit(src: &BookSource) -> Option<String> {
@@ -227,11 +247,15 @@ fn comic_content_hit(src: &BookSource) -> bool {
     let Some(rc) = src.rule_content.as_ref() else {
         return false;
     };
-    let joined = [rc.content.as_deref(), rc.image_style.as_deref(), rc.image_decode.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let joined = [
+        rc.content.as_deref(),
+        rc.image_style.as_deref(),
+        rc.image_decode.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
     joined.contains("<img") || joined.contains("@js")
 }
 
@@ -551,7 +575,10 @@ pub async fn import(
             }
             let url = &src.book_source_url;
             let existing = existing_map.get(url);
-            let quarantined = states.get(url).map(|st| st.is_quarantined()).unwrap_or(false);
+            let quarantined = states
+                .get(url)
+                .map(|st| st.is_quarantined())
+                .unwrap_or(false);
             let changed = existing
                 .map(|e| source_ledger::rule_hash(e) != source_ledger::rule_hash(src))
                 .unwrap_or(true);
@@ -604,8 +631,7 @@ pub async fn import(
     let mut health_after = health_after;
     if !transient_probe_urls.is_empty() {
         let urls: Vec<String> = transient_probe_urls.iter().cloned().collect();
-        if let Err(e) =
-            source_health::keep_observing_after_transient_probe(&s.shared, &urls).await
+        if let Err(e) = source_health::keep_observing_after_transient_probe(&s.shared, &urls).await
         {
             tracing::warn!(error = %e, "keep observing after transient import probe failed");
         }
@@ -629,8 +655,7 @@ pub async fn import(
     let mut kept_enabled = 0usize;
     let mut disable_suggested = 0usize;
     let mut type_suggestions = 0usize;
-    let (mut tier_preferred, mut tier_observing, mut tier_quarantined) =
-        (0usize, 0usize, 0usize);
+    let (mut tier_preferred, mut tier_observing, mut tier_quarantined) = (0usize, 0usize, 0usize);
 
     for src in &list {
         let url = src.book_source_url.clone();
@@ -728,9 +753,7 @@ pub async fn import(
                 } else {
                     source_ledger::DECISION_ACTIVE.to_string()
                 };
-                category = if was_quarantined
-                    && decision == source_ledger::DECISION_ACTIVE
-                {
+                category = if was_quarantined && decision == source_ledger::DECISION_ACTIVE {
                     "resurrected"
                 } else {
                     "updated"
@@ -773,9 +796,7 @@ pub async fn import(
                 } else {
                     source_ledger::DECISION_ACTIVE.to_string()
                 };
-                category = if was_quarantined
-                    && decision == source_ledger::DECISION_ACTIVE
-                {
+                category = if was_quarantined && decision == source_ledger::DECISION_ACTIVE {
                     "resurrected"
                 } else {
                     "updated"
@@ -816,10 +837,7 @@ pub async fn import(
         {
             decision = source_ledger::DECISION_QUARANTINED.to_string();
             if reason.is_none() {
-                reason = Some(format!(
-                    "quality_quarantine: score={}",
-                    final_eval.score
-                ));
+                reason = Some(format!("quality_quarantine: score={}", final_eval.score));
             }
         }
         if decision == source_ledger::DECISION_QUARANTINED {
@@ -1181,7 +1199,10 @@ pub async fn get_one(
                 .unwrap_or_else(|| crate::source_quality::TIER_OBSERVING.to_string())),
         );
         obj.insert("score".into(), json!(row.map(|h| h.score).unwrap_or(50)));
-        obj.insert("last_eval_at".into(), json!(row.and_then(|h| h.last_eval_at)));
+        obj.insert(
+            "last_eval_at".into(),
+            json!(row.and_then(|h| h.last_eval_at)),
+        );
         obj.insert(
             "evidence".into(),
             json!(row
@@ -1204,7 +1225,7 @@ pub struct ValidateReq {
 
 /// 书源校验：规则必填项 + 可选 URL 可达性。返回 errors/warnings，不阻塞保存。
 pub async fn validate(
-    State(s): State<AppState>,
+    State(_s): State<AppState>,
     _u: AuthUser,
     body: Option<Json<Value>>,
 ) -> AppResult<Json<Value>> {
@@ -1234,7 +1255,11 @@ pub async fn validate(
         warnings.push("既无 searchUrl 也无 exploreUrl，书源不可用于搜索/发现".into());
     }
     if !search_url.is_empty() {
-        match src.rule_search.as_ref().and_then(|r| r.book_list.as_deref()) {
+        match src
+            .rule_search
+            .as_ref()
+            .and_then(|r| r.book_list.as_deref())
+        {
             Some(b) if !b.trim().is_empty() => {}
             _ => errors.push("配置了 searchUrl 但缺少 ruleSearch.bookList".into()),
         }
@@ -1357,9 +1382,7 @@ pub async fn check_updates(
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
     let raw = match body {
-        Value::Object(mut o) => o
-            .remove("sources")
-            .unwrap_or(Value::Array(Vec::new())),
+        Value::Object(mut o) => o.remove("sources").unwrap_or(Value::Array(Vec::new())),
         other => other,
     };
     let items = match raw {
@@ -1443,7 +1466,7 @@ pub async fn health_check(
                 .get(&x.book_source_url)
                 .map(|h| h.due(now, recheck_ms))
                 .unwrap_or(true)
-                // 同时满足“无记录 → 该测”
+            // 同时满足“无记录 → 该测”
         });
         // retain 的 unwrap_or 已覆盖“无记录”，这里保持简单明确
     }
@@ -1525,9 +1548,8 @@ pub async fn health_summary(
 
     let now = source_health::now_ms();
     let detail_on = truthy(q.detail.as_deref());
-    let (mut total, mut ok, mut partial, mut fail, mut cooling, mut never) = (
-        0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
-    );
+    let (mut total, mut ok, mut partial, mut fail, mut cooling, mut never) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut active, mut quarantined) = (0usize, 0usize);
     let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut details: Vec<Value> = Vec::new();
@@ -1551,8 +1573,7 @@ pub async fn health_summary(
             cooling += 1;
         }
         let decision: Option<String> = r.try_get("decision").ok().flatten();
-        let decision =
-            decision.unwrap_or_else(|| source_ledger::DECISION_ACTIVE.to_string());
+        let decision = decision.unwrap_or_else(|| source_ledger::DECISION_ACTIVE.to_string());
         if decision == source_ledger::DECISION_QUARANTINED {
             quarantined += 1;
         } else {
@@ -1664,11 +1685,11 @@ pub async fn prune(
             "action 仅支持 quarantine（默认）或 disable；隔离保留原始定义，不提供物理删除".into(),
         ));
     }
-    let confirm = truthy(q.confirm.as_deref())
-        || body.as_ref().and_then(|b| b.confirm).unwrap_or(false);
+    let confirm =
+        truthy(q.confirm.as_deref()) || body.as_ref().and_then(|b| b.confirm).unwrap_or(false);
 
     let now = source_health::now_ms();
-    let since = now.saturating_sub((days as i64).saturating_mul(86_400_000));
+    let since = now.saturating_sub(days.saturating_mul(86_400_000));
     let rows = sqlx::query(
         "SELECT s.id AS id, s.name AS name, s.enabled AS enabled, \
          h.last_status AS last_status, h.last_checked_at AS last_checked_at, \
@@ -1722,7 +1743,10 @@ pub async fn prune(
     let mut affected = 0usize;
     let mut failed = 0usize;
     for c in &candidates {
-        let id = c.get("book_source_url").and_then(|v| v.as_str()).unwrap_or("");
+        let id = c
+            .get("book_source_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if id.is_empty() {
             continue;
         }
@@ -1831,15 +1855,18 @@ impl BenchCorpusInput {
 }
 
 /// `GET /api/sources/bench/corpus`：内置 ∪ 用户语料（内置带 builtin 标志）。
-pub async fn bench_corpus(
-    State(s): State<AppState>,
-    _u: AuthUser,
-) -> AppResult<Json<Value>> {
+pub async fn bench_corpus(State(s): State<AppState>, _u: AuthUser) -> AppResult<Json<Value>> {
     let corpus = crate::source_bench::load_corpus(&s.shared).await?;
     let builtin = corpus.iter().filter(|c| c.builtin).count();
     let user = corpus.len() - builtin;
-    let novel = corpus.iter().filter(|c| c.source_type == crate::source_bench::TYPE_NOVEL).count();
-    let comic = corpus.iter().filter(|c| c.source_type == crate::source_bench::TYPE_COMIC).count();
+    let novel = corpus
+        .iter()
+        .filter(|c| c.source_type == crate::source_bench::TYPE_NOVEL)
+        .count();
+    let comic = corpus
+        .iter()
+        .filter(|c| c.source_type == crate::source_bench::TYPE_COMIC)
+        .count();
     Ok(Json(json!({
         "items": corpus,
         "total": corpus.len(),
@@ -1947,14 +1974,18 @@ pub async fn bench_run(
         Some(Value::Array(arr)) => {
             let mut list = Vec::with_capacity(arr.len());
             for item in arr {
-                let sid = item
-                    .as_str()
-                    .ok_or_else(|| AppError::BadRequest("source_ids 必须是字符串数组或 \"all\"".into()))?;
+                let sid = item.as_str().ok_or_else(|| {
+                    AppError::BadRequest("source_ids 必须是字符串数组或 \"all\"".into())
+                })?;
                 list.push(sid.to_string());
             }
             Some(list)
         }
-        _ => return Err(AppError::BadRequest("source_ids 必须是字符串数组或 \"all\"".into())),
+        _ => {
+            return Err(AppError::BadRequest(
+                "source_ids 必须是字符串数组或 \"all\"".into(),
+            ))
+        }
     };
     let run_id =
         crate::source_bench::start_bench_job(s.shared.clone(), s.cfg.clone(), ids, req.limit)?;
@@ -1973,10 +2004,7 @@ pub async fn bench_run_status(
 }
 
 /// `GET /api/sources/bench/curated`：当前精选清单（小说 / 漫画两套）。
-pub async fn bench_curated(
-    State(s): State<AppState>,
-    _u: AuthUser,
-) -> AppResult<Json<Value>> {
+pub async fn bench_curated(State(s): State<AppState>, _u: AuthUser) -> AppResult<Json<Value>> {
     let (novel, comic) = crate::source_bench::curated_lists(&s.shared).await?;
     let total = novel.len() + comic.len();
     Ok(Json(json!({
@@ -1988,6 +2016,7 @@ pub async fn bench_curated(
     })))
 }
 
+#[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，便于对照默认值。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2143,7 +2172,10 @@ mod tests {
         .unwrap();
 
         // 两条规则除 URL 外完全相同（JSON 里都写 enabled=true），只有 enabled 列不同 → 模拟漂移。
-        for (id, enabled) in [("https://on.example.com", 1), ("https://off.example.com", 0)] {
+        for (id, enabled) in [
+            ("https://on.example.com", 1),
+            ("https://off.example.com", 0),
+        ] {
             let rules = serde_json::json!({
                 "book_source_url": id,
                 "book_source_name": id,
@@ -2172,10 +2204,12 @@ mod tests {
             .find(|s| s.book_source_url == "https://off.example.com")
             .unwrap();
         assert!(!off.enabled, "列 enabled=0 必须覆盖 JSON 的 enabled=true");
-        assert!(!load_source(&pool, "https://off.example.com")
-            .await
-            .unwrap()
-            .enabled);
+        assert!(
+            !load_source(&pool, "https://off.example.com")
+                .await
+                .unwrap()
+                .enabled
+        );
 
         // 与 search_start 相同的准入条件：source_total 只数可搜索源。
         let eligible: Vec<BookSource> = loaded
@@ -2195,7 +2229,9 @@ mod tests {
         )
         .await;
         assert!(
-            out.errors.iter().all(|e| e.source != "https://off.example.com"),
+            out.errors
+                .iter()
+                .all(|e| e.source != "https://off.example.com"),
             "停用源出现在搜索结果 origin 中"
         );
     }
@@ -2274,7 +2310,9 @@ mod tests {
                 .await
                 .unwrap();
         assert!(
-            reason.unwrap_or_default().starts_with("skipped_login_required"),
+            reason
+                .unwrap_or_default()
+                .starts_with("skipped_login_required"),
             "台账原因缺失或口径不一致"
         );
 

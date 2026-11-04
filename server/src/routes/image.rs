@@ -38,7 +38,8 @@ use crate::routes::sources::load_source;
 use crate::routes::AppState;
 use crate::{image_cache, req};
 
-/// 单张图片回源上限（字节）
+/// 单张图片回源上限（字节）；流式读取按块累计，实际判定用 `CACHE_ITEM_MAX`，本常量仅单测引用。
+#[allow(dead_code)]
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// 单张图片允许写入 LRU 的上限，超过只转发不缓存
 const CACHE_ITEM_MAX: usize = 2 * 1024 * 1024;
@@ -215,12 +216,22 @@ fn is_image_content_type(ct: &str) -> bool {
 }
 
 fn is_webp_content_type(ct: &str) -> bool {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     base == "image/webp"
 }
 
 fn is_jpeg_content_type(ct: &str) -> bool {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     matches!(base.as_str(), "image/jpeg" | "image/jpg" | "image/pjpeg")
 }
 
@@ -326,7 +337,12 @@ impl SliceParams {
     }
 
     /// 生效值：环境变量给出的默认值（见 `Config`），查询参数可覆盖版心宽/可用高/重叠。
-    pub(crate) fn from_config(cfg: &crate::config::Config, dw: Option<u32>, vh: Option<u32>, ov: Option<u32>) -> Self {
+    pub(crate) fn from_config(
+        cfg: &crate::config::Config,
+        dw: Option<u32>,
+        vh: Option<u32>,
+        ov: Option<u32>,
+    ) -> Self {
         Self::resolve(
             cfg.comic_slice_dw,
             cfg.comic_slice_vh,
@@ -340,6 +356,7 @@ impl SliceParams {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // 视口/切片/字号等参数均为纯数值，收拢结构体反而增加构造样板。
     fn resolve(
         dw: u32,
         vh: u32,
@@ -520,6 +537,7 @@ fn cut_guard_ok(raw: &[u8], w: usize, h: usize, y: usize, g: usize, ink_pct: f64
 /// 最近近白行（与旧行为一致），再无近白行则硬切在 `target`。
 /// 切点不超过 `start + win` 且间距 ≥ 0.35×窗高，保证每片显示高 ≤ `vh`；末刀优先让末片高度
 /// ≥ 0.3×窗高（免得出 64–128px 的薄片）。同一图同一参数结果恒定。
+#[allow(clippy::too_many_arguments)] // 切图几何参数（窗/重叠/行数/目标）均为标量，签名直白优于打包。
 pub fn plan_cuts(
     luma: &image::GrayImage,
     win_src: usize,
@@ -576,7 +594,11 @@ pub fn plan_cuts(
             if !cut_guard_ok(raw, w, h, y, g_src, ink_pct) {
                 continue;
             }
-            let tail_ok = if y >= last_from { h - y >= min_tail } else { true };
+            let tail_ok = if y >= last_from {
+                h - y >= min_tail
+            } else {
+                true
+            };
             let better = match best_ok {
                 None => true,
                 Some((bd, _, bm, bt)) => {
@@ -674,7 +696,12 @@ fn slice_variant_key(base: &str, p: &SliceParams, i: usize, n: usize) -> String 
 
 /// 切点计划缓存 key：只依赖原图与切片参数（质量/自适应不影响切点）。
 fn slice_plan_key(url: &str, cfg: &EinkConfig, p: &SliceParams) -> String {
-    format!("{url}#{}-plan-w{}-a{}", p.label(), cfg.width, u8::from(cfg.adaptive))
+    format!(
+        "{url}#{}-plan-w{}-a{}",
+        p.label(),
+        cfg.width,
+        u8::from(cfg.adaptive)
+    )
 }
 
 /// 切点计划：片数 + 源行切点，随原图确定性生成，可跨请求复用。
@@ -753,7 +780,16 @@ fn transcode_slice(
         resize_lanczos_linear(&luma, tw, th)
     };
     let (win, ov, r, g) = src_metrics(resized.width(), p);
-    let cuts = plan_cuts(&resized, win, ov, r, g, p.mu, p.sd as f64, SLICE_INK_PCT as f64);
+    let cuts = plan_cuts(
+        &resized,
+        win,
+        ov,
+        r,
+        g,
+        p.mu,
+        p.sd as f64,
+        SLICE_INK_PCT as f64,
+    );
     let ranges = slice_ranges(&cuts, ov, resized.height() as usize);
     if ranges.len() <= 1 {
         let out = if cfg.usm { usm_luma(&resized) } else { resized };
@@ -794,13 +830,9 @@ fn transcode_slice(
         quality,
         n,
         index,
-        plan: Some(SlicePlan {
-            n,
-            cuts,
-        }),
+        plan: Some(SlicePlan { n, cuts }),
     })
 }
-
 
 fn key_pairs(url: &str, jpeg_source: bool, cfg: &EinkConfig) -> Vec<(String, String)> {
     candidate_qualities(cfg)
@@ -1080,12 +1112,13 @@ fn transcode_to_jpeg(
 
 /// WebP → JPEG（内存内完成，不落盘）。仅测试用便捷封装；生产路径直接调用 `transcode_to_jpeg`。
 #[cfg(test)]
-fn transcode_webp_to_jpeg(
-    raw: &[u8],
-    profile: EncodeProfile,
-) -> Result<(Vec<u8>, Dims), String> {
-    let (data, dims, _) =
-        transcode_to_jpeg(raw, image::ImageFormat::WebP, profile, EinkConfig::default())?;
+fn transcode_webp_to_jpeg(raw: &[u8], profile: EncodeProfile) -> Result<(Vec<u8>, Dims), String> {
+    let (data, dims, _) = transcode_to_jpeg(
+        raw,
+        image::ImageFormat::WebP,
+        profile,
+        EinkConfig::default(),
+    )?;
     Ok((data, dims))
 }
 
@@ -1155,13 +1188,11 @@ fn be_u32(b: &[u8], at: usize) -> Option<u32> {
 }
 
 fn be_u16(b: &[u8], at: usize) -> Option<u16> {
-    b.get(at..at + 2)
-        .map(|s| u16::from_be_bytes([s[0], s[1]]))
+    b.get(at..at + 2).map(|s| u16::from_be_bytes([s[0], s[1]]))
 }
 
 fn le_u16(b: &[u8], at: usize) -> Option<u16> {
-    b.get(at..at + 2)
-        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+    b.get(at..at + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 
 fn le_i32(b: &[u8], at: usize) -> Option<i32> {
@@ -1204,7 +1235,7 @@ pub fn parse_dims(buf: &[u8]) -> Option<Dims> {
         match &buf[12..16] {
             b"VP8 " => {
                 // payload 偏移 20；3 字节帧标签后是起始码 9D 01 2A，再后面 2+2 字节为宽高
-                if &buf[23..26] == [0x9D, 0x01, 0x2A] {
+                if buf[23..26] == [0x9D, 0x01, 0x2A] {
                     let width = le_u16(buf, 26)? as u32 & 0x3FFF;
                     let height = le_u16(buf, 28)? as u32 & 0x3FFF;
                     if width > 0 && height > 0 {
@@ -1263,7 +1294,10 @@ pub fn parse_dims(buf: &[u8]) -> Option<Dims> {
                 let h = be_u16(buf, pos + 5)? as u32;
                 let w = be_u16(buf, pos + 7)? as u32;
                 if w > 0 && h > 0 {
-                    return Some(Dims { width: w, height: h });
+                    return Some(Dims {
+                        width: w,
+                        height: h,
+                    });
                 }
                 return None;
             }
@@ -1273,7 +1307,10 @@ pub fn parse_dims(buf: &[u8]) -> Option<Dims> {
     None
 }
 
-fn build_etag_headers(builder: axum::http::response::Builder, etag: &str) -> axum::http::response::Builder {
+fn build_etag_headers(
+    builder: axum::http::response::Builder,
+    etag: &str,
+) -> axum::http::response::Builder {
     builder
         .header(header::CACHE_CONTROL, "public, max-age=86400")
         .header(header::ETAG, etag)
@@ -1287,7 +1324,8 @@ fn build_etag_headers(builder: axum::http::response::Builder, etag: &str) -> axu
 fn not_modified(etag: &str) -> Response {
     let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
     b = build_etag_headers(b, etag);
-    b.body(Body::empty()).unwrap_or_else(|_| StatusCode::NOT_MODIFIED.into_response())
+    b.body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::NOT_MODIFIED.into_response())
 }
 
 fn matches_if_none_match(headers: &HeaderMap, etag: &str) -> bool {
@@ -1315,11 +1353,22 @@ fn serve_bytes(data: Vec<u8>, ct: &str, etag: &str, hit: bool, headers: &HeaderM
         .header(HeaderName::from_static("x-image-bytes"), len.to_string());
     if let Some(d) = dims {
         b = b
-            .header(HeaderName::from_static("x-image-width"), d.width.to_string())
-            .header(HeaderName::from_static("x-image-height"), d.height.to_string());
+            .header(
+                HeaderName::from_static("x-image-width"),
+                d.width.to_string(),
+            )
+            .header(
+                HeaderName::from_static("x-image-height"),
+                d.height.to_string(),
+            );
     }
-    b.body(Body::from(data))
-        .unwrap_or_else(|_| error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", "构建响应失败"))
+    b.body(Body::from(data)).unwrap_or_else(|_| {
+        error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "构建响应失败",
+        )
+    })
 }
 
 /// 转码响应：在通用响应上补 `x-image-transcoded`（路径/宽度/质量）、
@@ -1357,7 +1406,12 @@ const MAX_META_BATCH: usize = 30;
 
 /// Content-Type → 解码格式；未知类型返回 `None`（不做切片，走原图直出）。
 fn image_format_of(ct: &str) -> Option<image::ImageFormat> {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     match base.as_str() {
         "image/webp" => Some(image::ImageFormat::WebP),
         "image/jpeg" | "image/jpg" | "image/pjpeg" => Some(image::ImageFormat::Jpeg),
@@ -1412,10 +1466,12 @@ fn serve_slice_response(
         elapsed,
     );
     if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-        res.headers_mut().insert(HeaderName::from_static("x-image-slices"), v);
+        res.headers_mut()
+            .insert(HeaderName::from_static("x-image-slices"), v);
     }
     if let Ok(v) = HeaderValue::from_str(&i.to_string()) {
-        res.headers_mut().insert(HeaderName::from_static("x-image-slice"), v);
+        res.headers_mut()
+            .insert(HeaderName::from_static("x-image-slice"), v);
     }
     if let Ok(v) = HeaderValue::from_str(&height.to_string()) {
         res.headers_mut()
@@ -1452,10 +1508,12 @@ async fn handle_slice(
         if let Some((data, ct, etag)) = cache_lookup(&keys) {
             let mut res = serve_bytes(data, &ct, &etag, true, headers);
             if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
-                res.headers_mut().insert(HeaderName::from_static("x-image-slices"), v);
+                res.headers_mut()
+                    .insert(HeaderName::from_static("x-image-slices"), v);
             }
             if let Ok(v) = HeaderValue::from_str(&i.to_string()) {
-                res.headers_mut().insert(HeaderName::from_static("x-image-slice"), v);
+                res.headers_mut()
+                    .insert(HeaderName::from_static("x-image-slice"), v);
             }
             return res;
         }
@@ -1467,20 +1525,22 @@ async fn handle_slice(
     // 2) 回源
     let hdrs = source_referer(source, q.chapter_url.as_deref(), q.book_url.as_deref());
     let (budget, src_timeout) = image_budget(source);
-    let opened =
-        match tokio::time::timeout(budget, req::open_stream_timed(&q.url, &hdrs, false, src_timeout))
-            .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return map_open_error(e),
-            Err(_) => {
-                return error_body(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream_timeout",
-                    &format!("图片回源超时（{}s）", budget.as_secs()),
-                )
-            }
-        };
+    let opened = match tokio::time::timeout(
+        budget,
+        req::open_stream_timed(&q.url, &hdrs, false, src_timeout),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return map_open_error(e),
+        Err(_) => {
+            return error_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                &format!("图片回源超时（{}s）", budget.as_secs()),
+            )
+        }
+    };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -1510,12 +1570,7 @@ async fn handle_slice(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let ct_base = ct
-        .split(';')
-        .next()
-        .unwrap_or("image/*")
-        .trim()
-        .to_string();
+    let ct_base = ct.split(';').next().unwrap_or("image/*").trim().to_string();
     // PNG/GIF/BMP 等非 JPEG/WebP 源：image 依赖没有启用这些解码器，整图路径是原样直出。
     // 切片路径必须同样原样直出，否则 `slice=1` 会对普通图报 502，违反「普通图字节不变」。
     if !matches!(
@@ -1537,7 +1592,10 @@ async fn handle_slice(
         return error_body(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "slice_unsupported",
-            &format!("切片不支持的图片类型：{}", if ct.is_empty() { "未知" } else { &ct }),
+            &format!(
+                "切片不支持的图片类型：{}",
+                if ct.is_empty() { "未知" } else { &ct }
+            ),
         );
     };
     if let Some(len) = resp.content_length() {
@@ -1596,10 +1654,13 @@ async fn handle_slice(
         }
         etag_of(&key)
     };
-    let label = if out.n <= 1 { "slice:whole-gray" } else { "slice:gray" };
+    let label = if out.n <= 1 {
+        "slice:whole-gray"
+    } else {
+        "slice:gray"
+    };
     serve_slice_response(out, &etag, headers, label, source_bytes, started.elapsed())
 }
-
 
 fn err_item(url: &str, code: &str, message: &str) -> serde_json::Value {
     json!({
@@ -1632,16 +1693,14 @@ pub(crate) async fn fetch_image_meta(
         return err_item(&url, code, &m);
     }
     let budget = timeout.unwrap_or(IMAGE_TIMEOUT);
-    let opened = match tokio::time::timeout(
-        budget,
-        req::open_stream_timed(&url, &hdrs, false, timeout),
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return err_item(&url, "upstream_error", &e.to_string()),
-        Err(_) => return err_item(&url, "upstream_timeout", "图片回源超时"),
-    };
+    let opened =
+        match tokio::time::timeout(budget, req::open_stream_timed(&url, &hdrs, false, timeout))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return err_item(&url, "upstream_error", &e.to_string()),
+            Err(_) => return err_item(&url, "upstream_timeout", "图片回源超时"),
+        };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -1664,7 +1723,11 @@ pub(crate) async fn fetch_image_meta(
     }
     if let Some(len) = resp.content_length() {
         if len as usize > max_bytes {
-            return err_item(&url, "image_too_large", &format!("图片大小 {len} 字节超过上限"));
+            return err_item(
+                &url,
+                "image_too_large",
+                &format!("图片大小 {len} 字节超过上限"),
+            );
         }
     }
     let declared = resp.content_length();
@@ -1765,7 +1828,11 @@ async fn images_meta(
     Json(json!({"count": items.len(), "items": items})).into_response()
 }
 
-pub(crate) fn source_referer(source: &BookSource, chapter_url: Option<&str>, book_url: Option<&str>) -> HashMap<String, String> {
+pub(crate) fn source_referer(
+    source: &BookSource,
+    chapter_url: Option<&str>,
+    book_url: Option<&str>,
+) -> HashMap<String, String> {
     // 与正文请求一致：支持 JSON / 多行 / `@js:` 三种 header 形式
     let mut h = req::source_headers(source, &source.book_source_url);
     let referer = chapter_url
@@ -1791,7 +1858,8 @@ pub(crate) fn source_referer(source: &BookSource, chapter_url: Option<&str>, boo
 
 /// 进程内图片尺寸缓存：`/k` 漫画一屏一页要一次拿到整章尺寸，同章重复打开不应重复回源。
 /// 只存「探测成功」的结果；失败不缓存，下次仍可重试。
-static DIM_CACHE: Lazy<Mutex<HashMap<String, (u32, u32)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static DIM_CACHE: Lazy<Mutex<HashMap<String, (u32, u32)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 /// 尺寸缓存上限（条目数），超出直接清空（漫画章节数量有限，不做 LRU）
 const DIM_CACHE_MAX: usize = 2000;
 
@@ -1854,7 +1922,8 @@ pub(crate) async fn probe_dims(
 
 fn map_open_error(e: anyhow::Error) -> Response {
     let m = e.to_string();
-    if m.contains("私网") || m.contains("回环") || m.contains("仅允许") || m.contains("链路本地") {
+    if m.contains("私网") || m.contains("回环") || m.contains("仅允许") || m.contains("链路本地")
+    {
         return error_body(
             StatusCode::FORBIDDEN,
             "private_address",
@@ -1971,20 +2040,22 @@ async fn proxy(
 
     let hdrs = source_referer(&source, q.chapter_url.as_deref(), q.book_url.as_deref());
     let (budget, src_timeout) = image_budget(&source);
-    let opened =
-        match tokio::time::timeout(budget, req::open_stream_timed(&q.url, &hdrs, false, src_timeout))
-            .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return map_open_error(e),
-            Err(_) => {
-                return error_body(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream_timeout",
-                    &format!("图片回源超时（{}s）", budget.as_secs()),
-                )
-            }
-        };
+    let opened = match tokio::time::timeout(
+        budget,
+        req::open_stream_timed(&q.url, &hdrs, false, src_timeout),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return map_open_error(e),
+        Err(_) => {
+            return error_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                &format!("图片回源超时（{}s）", budget.as_secs()),
+            )
+        }
+    };
     let resp = opened.response;
     let status = resp.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
@@ -2018,7 +2089,10 @@ async fn proxy(
         return error_body(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "not_an_image",
-            &format!("源站返回非图片内容：{}", if ct.is_empty() { "未知" } else { &ct }),
+            &format!(
+                "源站返回非图片内容：{}",
+                if ct.is_empty() { "未知" } else { &ct }
+            ),
         );
     }
     if let Some(len) = resp.content_length() {
@@ -2032,12 +2106,7 @@ async fn proxy(
     }
     let upstream_len = resp.content_length();
 
-    let ct_base = ct
-        .split(';')
-        .next()
-        .unwrap_or("image/*")
-        .trim()
-        .to_string();
+    let ct_base = ct.split(';').next().unwrap_or("image/*").trim().to_string();
 
     // 墨水屏的变体 ETag 与普通 WebP 降级档的 ETag 都可能在客户端手里：
     // 命中任意一个就直接 304，省掉回源与解码。
@@ -2087,7 +2156,10 @@ async fn proxy(
         if out.len() <= CACHE_ITEM_MAX {
             image_cache::put(&key, out.clone(), "image/jpeg".to_string());
         }
-        let label = format!("webp->jpeg-{}", if profile.grayscale { "gray" } else { "color" });
+        let label = format!(
+            "webp->jpeg-{}",
+            if profile.grayscale { "gray" } else { "color" }
+        );
         return serve_transcoded(
             out,
             "image/jpeg",
@@ -2110,13 +2182,12 @@ async fn proxy(
         };
         let source_bytes = raw.len();
         let started = Instant::now();
-        let decoded = tokio::task::spawn_blocking(move || match transcode_jpeg_to_gray(
-            &raw, profile, cfg,
-        ) {
-            Ok(v) => Ok(v),
-            Err(msg) => Err((msg, raw)),
-        })
-        .await;
+        let decoded =
+            tokio::task::spawn_blocking(move || match transcode_jpeg_to_gray(&raw, profile, cfg) {
+                Ok(v) => Ok(v),
+                Err(msg) => Err((msg, raw)),
+            })
+            .await;
         let (out, dims, quality) = match decoded {
             Ok(Ok(v)) => v,
             Ok(Err((msg, raw))) => {
@@ -2192,11 +2263,7 @@ async fn proxy(
             }
         }
     }
-    let known_len = upstream_len.or(if ended {
-        Some(head.len() as u64)
-    } else {
-        None
-    });
+    let known_len = upstream_len.or(if ended { Some(head.len() as u64) } else { None });
     let upstream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> = if head.is_empty() {
         Box::pin(raw)
     } else {
@@ -2241,10 +2308,7 @@ async fn proxy(
                         Some((Ok(chunk), (up, buf, total, keep)))
                     }
                     Some(Err(e)) => Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("读取上游图片失败: {e}"),
-                        )),
+                        Err(std::io::Error::other(format!("读取上游图片失败: {e}"))),
                         (up, buf, total, keep),
                     )),
                 }
@@ -2267,14 +2331,27 @@ async fn proxy(
     }
     if let Some(d) = dims {
         b = b
-            .header(HeaderName::from_static("x-image-width"), d.width.to_string())
-            .header(HeaderName::from_static("x-image-height"), d.height.to_string());
+            .header(
+                HeaderName::from_static("x-image-width"),
+                d.width.to_string(),
+            )
+            .header(
+                HeaderName::from_static("x-image-height"),
+                d.height.to_string(),
+            );
     }
-    b.body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", "构建响应失败"))
+    b.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+        error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "构建响应失败",
+        )
+    })
 }
 
 /// 只允许图片响应；SVG 等文本型图片由 CSP sandbox + nosniff 兜底。
+/// 生产路径直接调用 `is_image_content_type`；本函数是语义别名，仅单测使用。
+#[allow(dead_code)]
 pub fn allowed_content_type(ct: &str) -> bool {
     is_image_content_type(ct)
 }
@@ -2296,7 +2373,11 @@ mod tests {
     #[test]
     fn image_budget_uses_source_timeout_or_image_default() {
         let mut s = BookSource::default();
-        assert_eq!(image_budget(&s).0, IMAGE_TIMEOUT, "未设置时保持图片 5s 预算");
+        assert_eq!(
+            image_budget(&s).0,
+            IMAGE_TIMEOUT,
+            "未设置时保持图片 5s 预算"
+        );
         assert_eq!(image_budget(&s).1, None);
         s.timeout_millisecond = 2000;
         assert_eq!(
@@ -2342,7 +2423,13 @@ mod tests {
     fn webp_dims_parsed_from_vp8l_and_vp8x() {
         // 真实编码器产出的 VP8L
         let webp = make_webp(1500, 2573);
-        assert_eq!(parse_dims(&webp), Some(Dims { width: 1500, height: 2573 }));
+        assert_eq!(
+            parse_dims(&webp),
+            Some(Dims {
+                width: 1500,
+                height: 2573
+            })
+        );
 
         // 合成 VP8L 头
         let mut vp8l = b"RIFF\0\0\0\0WEBPVP8L".to_vec();
@@ -2351,22 +2438,40 @@ mod tests {
         let bits: u32 = (799 - 1) | ((1199 - 1) << 14);
         vp8l.extend_from_slice(&bits.to_le_bytes());
         vp8l.resize(30, 0);
-        assert_eq!(parse_dims(&vp8l), Some(Dims { width: 799, height: 1199 }));
+        assert_eq!(
+            parse_dims(&vp8l),
+            Some(Dims {
+                width: 799,
+                height: 1199
+            })
+        );
 
         // 合成 VP8X 头（宽高以 24 位小端存 width-1 / height-1）
         let mut vp8x = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
         vp8x.resize(24, 0);
         vp8x.extend_from_slice(&(799u32).to_le_bytes()[..3]);
         vp8x.extend_from_slice(&(1199u32).to_le_bytes()[..3]);
-        assert_eq!(parse_dims(&vp8x), Some(Dims { width: 800, height: 1200 }));
+        assert_eq!(
+            parse_dims(&vp8x),
+            Some(Dims {
+                width: 800,
+                height: 1200
+            })
+        );
     }
 
     fn gray_profile(quality: u8) -> EncodeProfile {
-        EncodeProfile { grayscale: true, quality }
+        EncodeProfile {
+            grayscale: true,
+            quality,
+        }
     }
 
     fn color_profile(quality: u8) -> EncodeProfile {
-        EncodeProfile { grayscale: false, quality }
+        EncodeProfile {
+            grayscale: false,
+            quality,
+        }
     }
 
     /// 统计 JPEG SOF 段里的分量数：1 = 灰度，3 = RGB。
@@ -2394,10 +2499,22 @@ mod tests {
     fn webp_transcodes_to_width_capped_jpeg() {
         let webp = make_webp(1500, 2400);
         let (jpeg, dims) = transcode_webp_to_jpeg(&webp, gray_profile(78)).expect("transcode");
-        assert_eq!(dims, Dims { width: 1200, height: 1920 });
+        assert_eq!(
+            dims,
+            Dims {
+                width: 1200,
+                height: 1920
+            }
+        );
         assert!(jpeg.starts_with(&[0xFF, 0xD8]), "输出应为 JPEG");
         // JPEG 头部里的 SOF 宽高也应与转码结果一致
-        assert_eq!(parse_dims(&jpeg), Some(Dims { width: 1200, height: 1920 }));
+        assert_eq!(
+            parse_dims(&jpeg),
+            Some(Dims {
+                width: 1200,
+                height: 1920
+            })
+        );
         // 墨水屏档必须是单分量灰度 JPEG
         assert_eq!(jpeg_components(&jpeg), Some(1));
     }
@@ -2406,7 +2523,13 @@ mod tests {
     fn small_webp_keeps_dimensions_and_corrupt_is_rejected() {
         let webp = make_webp(600, 900);
         let (jpeg, dims) = transcode_webp_to_jpeg(&webp, gray_profile(78)).expect("transcode");
-        assert_eq!(dims, Dims { width: 600, height: 900 });
+        assert_eq!(
+            dims,
+            Dims {
+                width: 600,
+                height: 900
+            }
+        );
         assert!(!jpeg.is_empty());
         assert!(transcode_webp_to_jpeg(b"not a webp", gray_profile(78)).is_err());
     }
@@ -2415,12 +2538,17 @@ mod tests {
     fn eink_grayscale_keeps_reasonable_tones() {
         let webp = make_webp(800, 1200);
         let (jpeg, dims) = transcode_webp_to_jpeg(&webp, gray_profile(78)).expect("transcode");
-        assert_eq!(dims, Dims { width: 800, height: 1200 });
+        assert_eq!(
+            dims,
+            Dims {
+                width: 800,
+                height: 1200
+            }
+        );
         assert_eq!(jpeg_components(&jpeg), Some(1));
 
         // 解码回来统计亮度：既不能是全黑/全白，也不能反相
-        let decoded =
-            image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
         let luma = decoded.to_luma8();
         let (mut min, mut max, mut sum) = (255u8, 0u8, 0u64);
         for p in luma.pixels() {
@@ -2433,13 +2561,16 @@ mod tests {
         let mean = sum / n;
         assert!(min < 60, "最小值 {min} 说明可能全黑");
         assert!(max > 200, "最大值 {max} 说明可能全黑或被压扁");
-        assert!((60..=200).contains(&mean), "平均亮度 {mean} 应居中，反相/全黑都不满足");
+        assert!(
+            (60..=200).contains(&mean),
+            "平均亮度 {mean} 应居中，反相/全黑都不满足"
+        );
     }
 
     #[test]
     fn color_profile_still_three_components() {
-        let (jpeg, _) = transcode_webp_to_jpeg(&make_webp(300, 400), color_profile(82))
-            .expect("transcode");
+        let (jpeg, _) =
+            transcode_webp_to_jpeg(&make_webp(300, 400), color_profile(82)).expect("transcode");
         assert_eq!(jpeg_components(&jpeg), Some(3));
     }
 
@@ -2469,12 +2600,24 @@ mod tests {
         let desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36";
 
         // Kindle/Silk 一律转，即使 Accept 声明支持 webp
-        assert!(wants_webp_transcode(&headers(Some(kindle), Some("image/webp,image/*"))));
-        assert!(wants_webp_transcode(&headers(Some(silk), Some("image/webp"))));
+        assert!(wants_webp_transcode(&headers(
+            Some(kindle),
+            Some("image/webp,image/*")
+        )));
+        assert!(wants_webp_transcode(&headers(
+            Some(silk),
+            Some("image/webp")
+        )));
         // 桌面 UA + Accept 含 webp：原样透传
-        assert!(!wants_webp_transcode(&headers(Some(desktop), Some("image/avif,image/webp,*/*"))));
+        assert!(!wants_webp_transcode(&headers(
+            Some(desktop),
+            Some("image/avif,image/webp,*/*")
+        )));
         // 现代 UA 但 Accept 明确不含 webp：转
-        assert!(wants_webp_transcode(&headers(Some(desktop), Some("image/jpeg,image/png"))));
+        assert!(wants_webp_transcode(&headers(
+            Some(desktop),
+            Some("image/jpeg,image/png")
+        )));
         // 无 Accept 头按现代客户端处理
         assert!(!wants_webp_transcode(&headers(Some(desktop), None)));
     }
@@ -2490,8 +2633,14 @@ mod tests {
         assert_ne!(jpeg_key, orig, "转码档与原图不能共用 key");
         assert_ne!(etag_of(&webp_key), etag_of(&jpeg_key));
 
-        let wide = EinkConfig { width: 1440, ..base };
-        let adaptive = EinkConfig { adaptive: true, ..base };
+        let wide = EinkConfig {
+            width: 1440,
+            ..base
+        };
+        let adaptive = EinkConfig {
+            adaptive: true,
+            ..base
+        };
         assert_ne!(
             variant_key(u, true, &base, 70),
             variant_key(u, true, &wide, 70),
@@ -2544,7 +2693,13 @@ mod tests {
         let (out, dims, quality) =
             transcode_jpeg_to_gray(&jpeg, gray_profile(EINK_JPEG_QUALITY_DEFAULT), cfg)
                 .expect("transcode");
-        assert_eq!(dims, Dims { width: 1200, height: 1920 });
+        assert_eq!(
+            dims,
+            Dims {
+                width: 1200,
+                height: 1920
+            }
+        );
         assert_eq!(quality, EINK_JPEG_QUALITY_DEFAULT);
         assert_eq!(jpeg_components(&out), Some(1), "墨水屏输出必须是单分量灰度");
         assert_eq!(parse_dims(&out), Some(dims));
@@ -2557,9 +2712,15 @@ mod tests {
             width: 1440,
             ..EinkConfig::default()
         };
-        let (out, dims, _) =
-            transcode_jpeg_to_gray(&make_jpeg(2000, 3000), gray_profile(70), cfg).expect("transcode");
-        assert_eq!(dims, Dims { width: 1440, height: 2160 });
+        let (out, dims, _) = transcode_jpeg_to_gray(&make_jpeg(2000, 3000), gray_profile(70), cfg)
+            .expect("transcode");
+        assert_eq!(
+            dims,
+            Dims {
+                width: 1440,
+                height: 2160
+            }
+        );
         assert_eq!(parse_dims(&out), Some(dims));
     }
 
@@ -2586,9 +2747,15 @@ mod tests {
             HeaderName::from_static("x-device-mode"),
             HeaderValue::from_static("eink"),
         );
-        assert!(is_eink_client(&mode, None), "X-Device-Mode: eink 等价于 ?eink=1");
+        assert!(
+            is_eink_client(&mode, None),
+            "X-Device-Mode: eink 等价于 ?eink=1"
+        );
 
-        assert!(is_eink_client(&h(Some(kindle_ua)), None), "Kindle UA 无需额外声明");
+        assert!(
+            is_eink_client(&h(Some(kindle_ua)), None),
+            "Kindle UA 无需额外声明"
+        );
     }
 
     #[test]
@@ -2597,23 +2764,47 @@ mod tests {
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
             b'D', b'R', 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x01, 0xE0,
         ];
-        assert_eq!(parse_dims(&png), Some(Dims { width: 640, height: 480 }));
+        assert_eq!(
+            parse_dims(&png),
+            Some(Dims {
+                width: 640,
+                height: 480
+            })
+        );
 
         let gif = [b'G', b'I', b'F', b'8', b'9', b'a', 0x40, 0x01, 0xF0, 0x00];
-        assert_eq!(parse_dims(&gif), Some(Dims { width: 320, height: 240 }));
+        assert_eq!(
+            parse_dims(&gif),
+            Some(Dims {
+                width: 320,
+                height: 240
+            })
+        );
 
         // SOI + 一个 SOF0 段（长度 0x0011 = 17，精度 8，高 480，宽 640）
         let jpeg = [
             0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03, 0x01, 0x22,
             0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
         ];
-        assert_eq!(parse_dims(&jpeg), Some(Dims { width: 640, height: 480 }));
+        assert_eq!(
+            parse_dims(&jpeg),
+            Some(Dims {
+                width: 640,
+                height: 480
+            })
+        );
 
         let mut bmp = vec![b'B', b'M'];
         bmp.resize(18, 0);
         bmp.extend_from_slice(&640i32.to_le_bytes());
         bmp.extend_from_slice(&480i32.to_le_bytes());
-        assert_eq!(parse_dims(&bmp), Some(Dims { width: 640, height: 480 }));
+        assert_eq!(
+            parse_dims(&bmp),
+            Some(Dims {
+                width: 640,
+                height: 480
+            })
+        );
 
         assert_eq!(parse_dims(b"not an image"), None);
         assert_eq!(parse_dims(&[]), None);
@@ -2634,7 +2825,11 @@ mod tests {
     fn luma_with_white_band(w: u32, h: u32, band: std::ops::Range<usize>) -> image::GrayImage {
         image::GrayImage::from_fn(w, h, |x, y| {
             let _ = x;
-            let v = if band.contains(&(y as usize)) { 255u8 } else { 40u8 };
+            let v = if band.contains(&(y as usize)) {
+                255u8
+            } else {
+                40u8
+            };
             image::Luma([v])
         })
     }
@@ -2647,7 +2842,10 @@ mod tests {
         assert_eq!(cuts.len(), 3, "两片 + 首尾切点");
         assert_eq!(cuts[0], 0);
         // 白带内离 target 最近的近白行（带的下沿）就是切点
-        assert!(cuts[1] >= 1480 && cuts[1] <= 1498, "切点应落在白带内: {cuts:?}");
+        assert!(
+            cuts[1] >= 1480 && cuts[1] <= 1498,
+            "切点应落在白带内: {cuts:?}"
+        );
         assert_eq!(cuts[2], 2266);
         // 上界保证：每片显示高 ≤ vh
         assert!(cuts[1] <= 1547, "切点不得超过窗口上界");
@@ -2658,14 +2856,24 @@ mod tests {
         // 100×400：整图近白，但 156..164 行是「脸/眼」暗带（全宽暗像素）。
         // target=150 正好落在暗带上方的白高光行：μ/σ 能过，但 ±10 带内有暗像素 → 必须拒绝。
         let luma = image::GrayImage::from_fn(100, 400, |_x, y| {
-            let v = if (156..164).contains(&(y as usize)) { 30u8 } else { 255u8 };
+            let v = if (156..164).contains(&(y as usize)) {
+                30u8
+            } else {
+                255u8
+            };
             image::Luma([v])
         });
         let cuts = plan_cuts(&luma, 150, 30, 30, 10, SLICE_MU, SLICE_SD_U8 as f64, 2.0);
-        assert_ne!(cuts[1], 150, "切在暗带旁边的候选必须被墨量守卫拒掉: {cuts:?}");
+        assert_ne!(
+            cuts[1], 150,
+            "切在暗带旁边的候选必须被墨量守卫拒掉: {cuts:?}"
+        );
         // 退到带外最近的一行（146：±10 带内已不含 156 行）
         assert_eq!(cuts[1], 146, "应退到墨量达标的最近行: {cuts:?}");
-        assert!(cuts.windows(2).all(|w| w[1] > w[0]), "切点必须升序: {cuts:?}");
+        assert!(
+            cuts.windows(2).all(|w| w[1] > w[0]),
+            "切点必须升序: {cuts:?}"
+        );
         assert_eq!(cuts.last().copied(), Some(400));
     }
 
@@ -2686,8 +2894,14 @@ mod tests {
     fn slice_key_uses_sl2_and_ink_params() {
         let p = SliceParams::default();
         let label = p.label();
-        assert!(label.starts_with("sl2-dw928-vh1196-ov64-mu200-sd30-r96"), "{label}");
-        assert!(label.ends_with("-ik2-g10"), "墨量守卫参数必须进 key: {label}");
+        assert!(
+            label.starts_with("sl2-dw928-vh1196-ov64-mu200-sd30-r96"),
+            "{label}"
+        );
+        assert!(
+            label.ends_with("-ik2-g10"),
+            "墨量守卫参数必须进 key: {label}"
+        );
         // 守卫带宽/阈值是常量，key 里必须能看出用的是哪一组
         assert_eq!(SLICE_INK_PCT, 2);
         assert_eq!(SLICE_G_CSS, 10);
@@ -2719,7 +2933,10 @@ mod tests {
             assert!(e - s <= win, "单片源高不得超过窗高: {s}..{e}");
         }
         // 确定性：同一图同一参数必须得到同一 cuts
-        assert_eq!(cuts, plan_cuts(&luma, win, ov, r, g, SLICE_MU, SLICE_SD_U8 as f64, 2.0));
+        assert_eq!(
+            cuts,
+            plan_cuts(&luma, win, ov, r, g, SLICE_MU, SLICE_SD_U8 as f64, 2.0)
+        );
     }
 
     #[test]
@@ -2753,7 +2970,10 @@ mod tests {
         let k3 = slice_variant_key(&base, &p, 2, 3);
         assert_ne!(k0, k1);
         assert_ne!(k1, k3, "同一片在不同总片数下不能共用 key");
-        assert!(k0.contains("sl2-dw928-vh1196-ov64-mu200-sd30-r96-ik2-g10-i0of2"), "{k0}");
+        assert!(
+            k0.contains("sl2-dw928-vh1196-ov64-mu200-sd30-r96-ik2-g10-i0of2"),
+            "{k0}"
+        );
         assert_eq!(k0, slice_variant_key(&base, &p, 0, 2), "key 必须可复现");
         let small = SliceParams::new(Some(1072), None, None);
         assert_ne!(
@@ -2801,9 +3021,8 @@ mod tests {
             .expect("encode");
         let cfg = EinkConfig::default();
         let p = SliceParams::default();
-        let first =
-            transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 0)
-                .expect("slice 0");
+        let first = transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 0)
+            .expect("slice 0");
         assert_eq!(first.n, 2);
         assert_eq!(first.index, 0);
         let plan = first.plan.as_ref().expect("plan");
@@ -2823,15 +3042,13 @@ mod tests {
         let ranges = slice_ranges(&plan.cuts, ov, h as usize);
         assert_eq!(ranges.len(), 2);
         assert_eq!(first.dims.height as usize, ranges[0].1 - ranges[0].0);
-        let second =
-            transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 1)
-                .expect("slice 1");
+        let second = transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 1)
+            .expect("slice 1");
         assert_eq!(second.index, 1);
         assert_eq!(second.dims.height as usize, ranges[1].1 - ranges[1].0);
         // 越界 i 被夹到末片
-        let clamped =
-            transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 9)
-                .expect("clamp");
+        let clamped = transcode_slice(&buf, image::ImageFormat::Jpeg, gray_profile(70), cfg, &p, 9)
+            .expect("clamp");
         assert_eq!(clamped.index, 1, "i 越界夹到 n−1");
     }
 }

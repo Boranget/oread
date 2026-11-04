@@ -63,7 +63,7 @@ const SETTINGS_DEFAULTS: &[(&str, &str)] = &[
 ];
 
 pub async fn list(
-    State(s): State<AppState>,
+    State(_s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
 ) -> AppResult<Json<Vec<ReplaceRule>>> {
@@ -75,7 +75,7 @@ pub async fn list(
 
 /// 新增或更新（带 id 时按 id 更新，避免前端编辑产生重复记录）
 pub async fn add(
-    State(s): State<AppState>,
+    State(_s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Json(r): Json<ReplaceRule>,
@@ -127,7 +127,7 @@ pub async fn add(
 }
 
 pub async fn remove(
-    State(s): State<AppState>,
+    State(_s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Query(q): Query<IdQ>,
@@ -163,11 +163,10 @@ pub async fn export_rules(
     Query(q): Query<ExportQ>,
 ) -> AppResult<Json<Value>> {
     if let Some(id) = q.id {
-        let r: Option<ReplaceRule> =
-            sqlx::query_as("SELECT * FROM replace_rules WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&db.0)
-                .await?;
+        let r: Option<ReplaceRule> = sqlx::query_as("SELECT * FROM replace_rules WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&db.0)
+            .await?;
         let r = r.ok_or_else(|| AppError::NotFound("replace rule not found".into()))?;
         return Ok(Json(rule_to_legado_value(&r)));
     }
@@ -246,9 +245,7 @@ pub async fn import_rules(
     let mut skipped = 0usize;
     for (i, item) in items.into_iter().enumerate() {
         let r = normalize_import_rule(item).map_err(|e| match e {
-            AppError::BadRequest(m) => {
-                AppError::BadRequest(format!("第 {} 条规则: {m}", i + 1))
-            }
+            AppError::BadRequest(m) => AppError::BadRequest(format!("第 {} 条规则: {m}", i + 1)),
             other => other,
         })?;
         if r.pattern.trim().is_empty() {
@@ -433,9 +430,7 @@ fn preview_rules_from_req(q: &PreviewReq) -> AppResult<Vec<ReplaceRule>> {
     } else if let Some(rule) = &q.rule {
         rule.clone()
     } else {
-        return Err(AppError::BadRequest(
-            "rules 或 rule 至少提供一个".into(),
-        ));
+        return Err(AppError::BadRequest("rules 或 rule 至少提供一个".into()));
     };
     let items = import_items(raw)?;
     let mut out = Vec::new();
@@ -475,11 +470,7 @@ pub async fn preview_rules(
             (body, true)
         }
         (_, Some(input)) => (input.clone(), false),
-        _ => {
-            return Err(AppError::BadRequest(
-                "input 或 url 至少提供一个".into(),
-            ))
-        }
+        _ => return Err(AppError::BadRequest("input 或 url 至少提供一个".into())),
     };
     if text.len() > PREVIEW_MAX_BYTES {
         return Err(AppError::BadRequest("input 超过 5 MiB 预算".into()));
@@ -515,10 +506,12 @@ async fn migrate_legacy_line_height_once(db: &SqlitePool) -> AppResult<u64> {
     if marked.is_some() {
         return Ok(0);
     }
-    let affected = sqlx::query("UPDATE user_settings SET value='1.75' WHERE key='line_height' AND value='1.8'")
-        .execute(db)
-        .await?
-        .rows_affected();
+    let affected = sqlx::query(
+        "UPDATE user_settings SET value='1.75' WHERE key='line_height' AND value='1.8'",
+    )
+    .execute(db)
+    .await?
+    .rows_affected();
     put_setting(db, DEFAULTS_MIGRATED_KEY, "1").await?;
     Ok(affected)
 }
@@ -586,7 +579,9 @@ fn validate_settings(q: &SettingsQ) -> AppResult<()> {
     }
     if let Some(v) = q.line_height {
         if !v.is_finite() || !(1.2..=2.6).contains(&v) {
-            return Err(AppError::BadRequest("line_height 必须在 1.2–2.6 之间".into()));
+            return Err(AppError::BadRequest(
+                "line_height 必须在 1.2–2.6 之间".into(),
+            ));
         }
     }
     if let Some(v) = q.cache_limit_mb {
@@ -618,8 +613,17 @@ fn validate_settings(q: &SettingsQ) -> AppResult<()> {
     if let Some(v) = &q.font_family {
         if !matches!(
             v.as_str(),
-            "serif" | "sans" | "sans-serif" | "kai" | "kaiti" | "song" | "songti" | "hei"
-                | "heiti" | "mono" | "system"
+            "serif"
+                | "sans"
+                | "sans-serif"
+                | "kai"
+                | "kaiti"
+                | "song"
+                | "songti"
+                | "hei"
+                | "heiti"
+                | "mono"
+                | "system"
         ) {
             return Err(AppError::BadRequest(
                 "font_family 必须是 serif/sans/kai/song/hei/mono/system 等枚举值".into(),
@@ -716,10 +720,14 @@ pub fn apply_image_style(input: &str, style: i64) -> String {
     match style {
         3 => re.replace_all(input, "").to_string(),
         1 => re
-            .replace_all(input, |c: &regex::Captures| merge_img_style(&c[0], "max-width:100%;height:auto;"))
+            .replace_all(input, |c: &regex::Captures| {
+                merge_img_style(&c[0], "max-width:100%;height:auto;")
+            })
             .to_string(),
         2 => re
-            .replace_all(input, |c: &regex::Captures| merge_img_style(&c[0], "display:block;margin:0 auto;"))
+            .replace_all(input, |c: &regex::Captures| {
+                merge_img_style(&c[0], "display:block;margin:0 auto;")
+            })
             .to_string(),
         _ => input.to_string(),
     }
@@ -893,14 +901,15 @@ pub async fn purify(
 /// 当前生效的全部替换规则（内置净化开关打开时排在最前，用户规则随后）。
 /// 目录与正文共用同一份加载逻辑，避免两处行为分叉；调用方自行决定是否启用。
 pub async fn active_rules(db: &SqlitePool) -> Vec<ReplaceRule> {
-    let mut rules: Vec<ReplaceRule> =
-        match sqlx::query_as("SELECT * FROM replace_rules WHERE is_enabled=1 ORDER BY \"order\", id")
-            .fetch_all(db)
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+    let mut rules: Vec<ReplaceRule> = match sqlx::query_as(
+        "SELECT * FROM replace_rules WHERE is_enabled=1 ORDER BY \"order\", id",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
     if builtin_clean_enabled(db).await {
         let mut all = builtin_rules();
         all.append(&mut rules);
@@ -911,12 +920,7 @@ pub async fn active_rules(db: &SqlitePool) -> Vec<ReplaceRule> {
 
 /// 目录标题净化：规则只加载一次，按 `scope_title` 逐章应用。
 /// 只影响返回给用户的标题，`book_chapters` 缓存保持原文，开关可随时切换。
-pub async fn purify_titles(
-    db: &SqlitePool,
-    book: &str,
-    origin: &str,
-    titles: &mut [String],
-) {
+pub async fn purify_titles(db: &SqlitePool, book: &str, origin: &str, titles: &mut [String]) {
     let rules = active_rules(db).await;
     if rules.is_empty() {
         return;
@@ -1030,10 +1034,11 @@ mod tests {
     async fn legacy_line_height_migrates_once_and_only_exact_default() {
         let p18 = settings_pool_with_line_height("1.8").await;
         assert_eq!(migrate_legacy_line_height_once(&p18).await.unwrap(), 1);
-        let got: String = sqlx::query_scalar("SELECT value FROM user_settings WHERE key='line_height'")
-            .fetch_one(&p18)
-            .await
-            .unwrap();
+        let got: String =
+            sqlx::query_scalar("SELECT value FROM user_settings WHERE key='line_height'")
+                .fetch_one(&p18)
+                .await
+                .unwrap();
         assert_eq!(got, "1.75");
         let marked: Option<String> =
             sqlx::query_scalar("SELECT value FROM user_settings WHERE key=?1")
@@ -1197,8 +1202,7 @@ mod tests {
         disabled.is_enabled = false;
         let mut wrong_scope = mk("限定", "x", "y", false);
         wrong_scope.scope = Some("别的书".into());
-        let (out, steps) =
-            preview_apply(&[disabled, wrong_scope], "x", "某书", "site", false);
+        let (out, steps) = preview_apply(&[disabled, wrong_scope], "x", "某书", "site", false);
         assert_eq!(out, "x");
         assert_eq!(steps[0].skipped_reason.as_deref(), Some("disabled"));
         assert_eq!(steps[1].skipped_reason.as_deref(), Some("scope_mismatch"));
@@ -1237,10 +1241,7 @@ mod tests {
                 page_width: Some(bad),
                 ..Default::default()
             };
-            assert!(
-                validate_settings(&q).is_err(),
-                "page_width={bad} 应被拒绝"
-            );
+            assert!(validate_settings(&q).is_err(), "page_width={bad} 应被拒绝");
         }
         for ok in [320_i64, 800, 2000] {
             let q = SettingsQ {
@@ -1259,7 +1260,9 @@ mod tests {
                 "font_family={bad:?} 应被拒绝"
             );
         }
-        for ok in ["serif", "sans", "kaiti", "songti", "heiti", "mono", "system"] {
+        for ok in [
+            "serif", "sans", "kaiti", "songti", "heiti", "mono", "system",
+        ] {
             let q = SettingsQ {
                 font_family: Some(ok.into()),
                 ..Default::default()

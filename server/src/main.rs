@@ -7,9 +7,12 @@ mod error;
 mod image_cache;
 mod k_metrics;
 mod models;
+mod req;
 mod routes;
 mod rule_engine;
-mod req;
+// search_rank 的排序/配额/停止策略目前由单测与基准覆盖，生产路由尚未接入；
+// 模块级放行 dead_code，避免 20+ 条逐项 allow 淹没真实告警。
+#[allow(dead_code)]
 mod search_rank;
 mod serde_util;
 mod source_bench;
@@ -18,7 +21,6 @@ mod source_ledger;
 mod source_quality;
 mod web_book;
 
-use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;

@@ -111,23 +111,19 @@ pub async fn list(
     let group = q.group.clone().filter(|g| !g.trim().is_empty());
     let _ = q.book_id;
     let mut rows = sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
-    .bind(group)
-    .fetch_all(&db.0)
-    .await?;
+        .bind(group)
+        .fetch_all(&db.0)
+        .await?;
     // 更新开关与角标单独回填：列表 SQL 保持稳定，旧库迁移后也能工作
-    let flags: Vec<(String, i64)> =
-        sqlx::query_as("SELECT book_id, enable_update FROM bookshelf")
+    let flags: Vec<(String, i64)> = sqlx::query_as("SELECT book_id, enable_update FROM bookshelf")
+        .fetch_all(&db.0)
+        .await?;
+    let badges: Vec<(String, i64)> =
+        sqlx::query_as("SELECT book_id, MAX(0, total - seen_total) FROM book_updates")
             .fetch_all(&db.0)
             .await?;
-    let badges: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT book_id, MAX(0, total - seen_total) FROM book_updates",
-    )
-    .fetch_all(&db.0)
-    .await?;
-    let flags: std::collections::HashMap<String, bool> = flags
-        .into_iter()
-        .map(|(id, v)| (id, v != 0))
-        .collect();
+    let flags: std::collections::HashMap<String, bool> =
+        flags.into_iter().map(|(id, v)| (id, v != 0)).collect();
     let badges: std::collections::HashMap<String, i64> = badges.into_iter().collect();
     for row in &mut rows {
         row.enable_update = flags.get(&row.book_id).copied().unwrap_or(true);
@@ -175,7 +171,7 @@ pub async fn add(
 }
 
 pub async fn remove(
-    State(s): State<AppState>,
+    State(_s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Query(q): Query<BookIdQ>,
@@ -193,12 +189,11 @@ pub(crate) async fn record_toc_delta(pool: &SqlitePool, book_id: &str, after_tot
     if after_total <= 0 {
         return;
     }
-    let row: Result<Option<(i64, i64)>, _> = sqlx::query_as(
-        "SELECT total, seen_total FROM book_updates WHERE book_id = ?1",
-    )
-    .bind(book_id)
-    .fetch_optional(pool)
-    .await;
+    let row: Result<Option<(i64, i64)>, _> =
+        sqlx::query_as("SELECT total, seen_total FROM book_updates WHERE book_id = ?1")
+            .bind(book_id)
+            .fetch_optional(pool)
+            .await;
     match row {
         Ok(Some((total, seen))) if total > 0 && seen > 0 => {
             let _ = sqlx::query(
@@ -265,7 +260,9 @@ pub async fn mark_seen(
         return Err(AppError::BadRequest("book_id 不能为空".into()));
     }
     let total = mark_shelf_seen(&db.0, id).await?;
-    Ok(Json(json!({"ok": true, "seen_total": total, "new_chapters": 0})))
+    Ok(Json(
+        json!({"ok": true, "seen_total": total, "new_chapters": 0}),
+    ))
 }
 
 /// 设置书籍分组（单本或批量）；`group` 为空表示移出分组。
@@ -350,12 +347,14 @@ pub(crate) async fn apply_shelf_batch(
                 .execute(&mut *tx)
                 .await
                 .map(|r| r.rows_affected()),
-            "set_update" => sqlx::query("UPDATE bookshelf SET enable_update = ?2 WHERE book_id = ?1")
-                .bind(id)
-                .bind(if enabled.unwrap_or(true) { 1i64 } else { 0i64 })
-                .execute(&mut *tx)
-                .await
-                .map(|r| r.rows_affected()),
+            "set_update" => {
+                sqlx::query("UPDATE bookshelf SET enable_update = ?2 WHERE book_id = ?1")
+                    .bind(id)
+                    .bind(if enabled.unwrap_or(true) { 1i64 } else { 0i64 })
+                    .execute(&mut *tx)
+                    .await
+                    .map(|r| r.rows_affected())
+            }
             _ => sqlx::query("UPDATE bookshelf SET \"group\" = ?2 WHERE book_id = ?1")
                 .bind(id)
                 .bind(group)
@@ -375,11 +374,12 @@ pub(crate) async fn apply_shelf_batch(
             }
             Ok(_) => {
                 if action != "remove" && action != "set_update" {
-                    if let Err(e) = sqlx::query("UPDATE book_meta SET \"group\" = ?2 WHERE book_url = ?1")
-                        .bind(id)
-                        .bind(group)
-                        .execute(&mut *tx)
-                        .await
+                    if let Err(e) =
+                        sqlx::query("UPDATE book_meta SET \"group\" = ?2 WHERE book_url = ?1")
+                            .bind(id)
+                            .bind(group)
+                            .execute(&mut *tx)
+                            .await
                     {
                         res.error = Some(format!("更新 book_meta 失败：{e}"));
                         let _ = tx.rollback().await;
@@ -445,10 +445,7 @@ pub async fn batch(
     let group = if action == "remove_group" {
         None
     } else {
-        q.group
-            .as_deref()
-            .map(str::trim)
-            .filter(|g| !g.is_empty())
+        q.group.as_deref().map(str::trim).filter(|g| !g.is_empty())
     };
     let results = apply_shelf_batch(&db.0, action, &ids, group, q.enabled).await;
     let updated = results.iter().filter(|r| r.ok).count();
@@ -474,10 +471,11 @@ pub async fn shelf_stats(
     _u: AuthUser,
     db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
-    let streak: Option<(i64, Option<String>, i64)> =
-        sqlx::query_as("SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1")
-            .fetch_optional(&db.0)
-            .await?;
+    let streak: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT current_days, last_day, longest_days FROM reading_streak WHERE id=1",
+    )
+    .fetch_optional(&db.0)
+    .await?;
     let (current, last_day, longest) = streak.unwrap_or((0, None, 0));
     let today = chrono::Local::now().date_naive();
     let today_str = today.format("%Y-%m-%d").to_string();
@@ -494,6 +492,8 @@ pub async fn shelf_stats(
     .fetch_optional(&db.0)
     .await?
     .unwrap_or(0);
+    #[allow(clippy::type_complexity)]
+    // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
     let books: Vec<(String, Option<String>, i64, i64, Option<String>)> = sqlx::query_as(
         "SELECT book_id, name, total_chapters, read_chapters, last_read_at \
          FROM book_stats ORDER BY last_read_at DESC LIMIT 50",
@@ -531,26 +531,29 @@ pub async fn list_groups(
     _u: AuthUser,
     db: UserDb,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
-    let rows: Vec<(i64, String, Option<String>, i64, i64, bool, bool, i64)> =
-        sqlx::query_as(
-            "SELECT id, name, cover, \"order\", book_sort, enable_refresh, show, \"order\" \
+    #[allow(clippy::type_complexity)]
+    // 行类型与 SELECT 列一一对应；抽成别名反而在列变更时不易察觉。
+    let rows: Vec<(i64, String, Option<String>, i64, i64, bool, bool, i64)> = sqlx::query_as(
+        "SELECT id, name, cover, \"order\", book_sort, enable_refresh, show, \"order\" \
              FROM book_groups ORDER BY \"order\", id",
-        )
-        .fetch_all(&db.0)
-        .await?;
+    )
+    .fetch_all(&db.0)
+    .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|(id, name, cover, order, book_sort, enable_refresh, show, _)| {
-                json!({
-                    "group_id": id,
-                    "group_name": name,
-                    "cover": cover,
-                    "order": order,
-                    "book_sort": book_sort,
-                    "enable_refresh": enable_refresh,
-                    "show": show,
-                })
-            })
+            .map(
+                |(id, name, cover, order, book_sort, enable_refresh, show, _)| {
+                    json!({
+                        "group_id": id,
+                        "group_name": name,
+                        "cover": cover,
+                        "order": order,
+                        "book_sort": book_sort,
+                        "enable_refresh": enable_refresh,
+                        "show": show,
+                    })
+                },
+            )
             .collect(),
     ))
 }
@@ -666,18 +669,21 @@ pub async fn get_progress(
     .fetch_optional(&db.0)
     .await?;
     // 目录数可能只落在 book_stats（进度上报带 total_chapters 时），book_meta 为 0 时回退
-    let mut total: i64 =
-        sqlx::query_scalar("SELECT COALESCE(total_chapter_num,0) FROM book_meta WHERE book_url = ?")
-            .bind(&q.book_id)
-            .fetch_optional(&db.0)
-            .await?
-            .unwrap_or(0);
+    let mut total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(total_chapter_num,0) FROM book_meta WHERE book_url = ?",
+    )
+    .bind(&q.book_id)
+    .fetch_optional(&db.0)
+    .await?
+    .unwrap_or(0);
     if total <= 0 {
-        total = sqlx::query_scalar("SELECT COALESCE(total_chapters,0) FROM book_stats WHERE book_id = ?")
-            .bind(&q.book_id)
-            .fetch_optional(&db.0)
-            .await?
-            .unwrap_or(0);
+        total = sqlx::query_scalar(
+            "SELECT COALESCE(total_chapters,0) FROM book_stats WHERE book_id = ?",
+        )
+        .bind(&q.book_id)
+        .fetch_optional(&db.0)
+        .await?
+        .unwrap_or(0);
     }
     let percent = progress_percent(
         row.as_ref().map(|x| x.0).unwrap_or(0),
@@ -852,23 +858,32 @@ mod tests {
         assert!(res[0].ok && res[1].ok);
         assert!(!res[2].ok, "不存在的书必须单独失败");
         assert_eq!(res[2].error.as_deref(), Some("书籍不在书架"));
-        let g: Option<String> = sqlx::query_scalar("SELECT \"group\" FROM book_meta WHERE book_url='b1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let g: Option<String> =
+            sqlx::query_scalar("SELECT \"group\" FROM book_meta WHERE book_url='b1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(g.as_deref(), Some("科幻"));
 
         // 移出分组：group 置 NULL
         let res = apply_shelf_batch(&pool, "remove_group", &["b1".to_string()], None, None).await;
         assert!(res[0].ok);
-        let g: Option<String> = sqlx::query_scalar("SELECT \"group\" FROM bookshelf WHERE book_id='b1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let g: Option<String> =
+            sqlx::query_scalar("SELECT \"group\" FROM bookshelf WHERE book_id='b1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(g.is_none());
 
         // 批量移除幂等：b2 成功；missing 本来就不在书架，也视为成功（可安全重试）
-        let res = apply_shelf_batch(&pool, "remove", &["b2".to_string(), "missing".to_string()], None, None).await;
+        let res = apply_shelf_batch(
+            &pool,
+            "remove",
+            &["b2".to_string(), "missing".to_string()],
+            None,
+            None,
+        )
+        .await;
         assert!(res[0].ok);
         assert!(res[1].ok, "重复删除必须幂等");
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bookshelf")
@@ -878,19 +893,23 @@ mod tests {
         assert_eq!(left, 1);
 
         // 批量启用/停用更新：逐本写 bookshelf.enable_update
-        let res = apply_shelf_batch(&pool, "set_update", &["b1".to_string()], None, Some(false)).await;
+        let res =
+            apply_shelf_batch(&pool, "set_update", &["b1".to_string()], None, Some(false)).await;
         assert!(res[0].ok);
-        let flag: i64 = sqlx::query_scalar("SELECT enable_update FROM bookshelf WHERE book_id='b1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let flag: i64 =
+            sqlx::query_scalar("SELECT enable_update FROM bookshelf WHERE book_id='b1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(flag, 0);
-        let res = apply_shelf_batch(&pool, "set_update", &["b1".to_string()], None, Some(true)).await;
+        let res =
+            apply_shelf_batch(&pool, "set_update", &["b1".to_string()], None, Some(true)).await;
         assert!(res[0].ok);
-        let flag: i64 = sqlx::query_scalar("SELECT enable_update FROM bookshelf WHERE book_id='b1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let flag: i64 =
+            sqlx::query_scalar("SELECT enable_update FROM bookshelf WHERE book_id='b1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(flag, 1);
     }
 
@@ -912,10 +931,12 @@ mod tests {
         ] {
             sqlx::query(ddl).execute(&pool).await.expect("ddl");
         }
-        sqlx::query("INSERT INTO bookshelf (book_id, title, added_at) VALUES ('b1','书1',datetime('now'))")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO bookshelf (book_id, title, added_at) VALUES ('b1','书1',datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO book_meta (book_url, total_chapter_num) VALUES ('b1',103)")
             .execute(&pool)
             .await
@@ -932,11 +953,12 @@ mod tests {
 
         // 目录涨到 103：角标 3
         super::record_toc_delta(&pool, "b1", 103).await;
-        let badge: i64 =
-            sqlx::query_scalar("SELECT MAX(0, total - seen_total) FROM book_updates WHERE book_id='b1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let badge: i64 = sqlx::query_scalar(
+            "SELECT MAX(0, total - seen_total) FROM book_updates WHERE book_id='b1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(badge, 3);
 
         // 打开章节 → 清零
@@ -946,11 +968,12 @@ mod tests {
             .unwrap();
         let seen = super::mark_shelf_seen(&pool, "b1").await.unwrap();
         assert_eq!(seen, 103);
-        let badge: i64 =
-            sqlx::query_scalar("SELECT MAX(0, total - seen_total) FROM book_updates WHERE book_id='b1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let badge: i64 = sqlx::query_scalar(
+            "SELECT MAX(0, total - seen_total) FROM book_updates WHERE book_id='b1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(badge, 0);
     }
 
@@ -980,10 +1003,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO book_meta (book_url, name, total_chapter_num) VALUES ('b1','书1',30)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO book_meta (book_url, name, total_chapter_num) VALUES ('b1','书1',30)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO reading_progress (book_id, chapter_index, position, updated_at) \
              VALUES ('b1', 10, 0.5, datetime('now'))",

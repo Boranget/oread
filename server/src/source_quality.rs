@@ -78,6 +78,8 @@ pub struct TierConfig {
     pub promote_streak: i64,
     pub demote_streak: i64,
     /// 更新覆盖闸门：新版本得分至少不低于本地旧版这么多，才允许覆盖。
+    /// 该闸门在导入侧计算，评分结构保留字段以便透传。
+    #[allow(dead_code)]
     pub update_score_margin: i32,
     pub weights: Weights,
 }
@@ -119,6 +121,8 @@ pub struct ScoreInput {
 }
 
 impl ScoreInput {
+    /// 构造「无历史」评分输入；生产路径从数据库行组装，本便捷构造仅单测使用。
+    #[allow(dead_code)]
     pub fn new(rule_completeness: f32, network: Network) -> Self {
         Self {
             rule_completeness,
@@ -150,14 +154,27 @@ pub struct Evaluation {
 /// 规则完整度：只算“能不能搜、能不能解析”的静态条件，不做站点/语言特判。
 pub fn rule_completeness(src: &BookSource) -> f32 {
     let mut score = 0.0f32;
-    if src.search_url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if src
+        .search_url
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         score += 0.35;
     }
     let rule = src.rule_search.as_ref();
-    if rule.and_then(|r| r.book_list.as_deref()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if rule
+        .and_then(|r| r.book_list.as_deref())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         score += 0.35;
     }
-    if rule.and_then(|r| r.name.as_deref()).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if rule
+        .and_then(|r| r.name.as_deref())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         score += 0.10;
     }
     if src.rule_toc.is_some() {
@@ -208,7 +225,8 @@ pub fn evaluate(input: &ScoreInput, cfg: &TierConfig) -> Evaluation {
     let rule = input.rule_completeness.clamp(0.0, 1.0);
     let confidence = (input.search_count.max(0) as f32 / 5.0).clamp(0.0, 1.0);
     let hit = 0.5 * (1.0 - confidence) + ratio(input.hit_count, input.search_count) * confidence;
-    let parse = 0.5 * (1.0 - confidence) + ratio(input.parse_ok_count, input.search_count) * confidence;
+    let parse =
+        0.5 * (1.0 - confidence) + ratio(input.parse_ok_count, input.search_count) * confidence;
     let ttfb = ttfb_component(input.avg_ttfb_ms, input.p90_ttfb_ms);
 
     let w = &cfg.weights;
@@ -286,7 +304,10 @@ pub fn evaluate(input: &ScoreInput, cfg: &TierConfig) -> Evaluation {
                 reasons.push(format!("demoted(score={score})"));
                 TIER_OBSERVING
             } else {
-                reasons.push(format!("demote_pending({demote}/{})", cfg.demote_streak.max(1)));
+                reasons.push(format!(
+                    "demote_pending({demote}/{})",
+                    cfg.demote_streak.max(1)
+                ));
                 TIER_PREFERRED
             }
         } else if score < cfg.quarantine_below_score && input.search_count >= 2 {
@@ -317,7 +338,8 @@ pub fn evaluate(input: &ScoreInput, cfg: &TierConfig) -> Evaluation {
     }
 }
 
-/// 导入响应/证据里展示给人看的一句话原因（不参与计算）。
+/// 导入响应/证据里展示给人看的一句话原因（不参与计算）。生产路径直接读 `Evaluation.reasons`。
+#[allow(dead_code)]
 pub fn reason_summary(eval: &Evaluation) -> Vec<String> {
     eval.reasons.clone()
 }

@@ -81,10 +81,7 @@ enum DbState {
     /// 已应用迁移与程序内嵌的一致，无需迁移（也不备份）。
     UpToDate,
     /// 有本程序支持、但库里还没应用的迁移：迁移前必须备份。
-    Pending {
-        applied_max: i64,
-        pending: Vec<i64>,
-    },
+    Pending { applied_max: i64, pending: Vec<i64> },
     /// 库里有本程序不认识（更高）的迁移：库比程序新，必须备份后拒绝启动。
     Newer {
         applied_max: i64,
@@ -187,7 +184,11 @@ fn is_backup_dir_name(name: &str) -> bool {
     if b.len() < 16 || b[8] != b'T' {
         return false;
     }
-    if !b[..8].iter().chain(b[9..15].iter()).all(|c| c.is_ascii_digit()) {
+    if !b[..8]
+        .iter()
+        .chain(b[9..15].iter())
+        .all(|c| c.is_ascii_digit())
+    {
         return false;
     }
     if b[15] != b'Z' {
@@ -195,9 +196,7 @@ fn is_backup_dir_name(name: &str) -> bool {
     }
     match b.len() {
         16 => true,
-        _ => {
-            b[16] == b'-' && b[17..].iter().all(|c| c.is_ascii_digit()) && b.len() > 17
-        }
+        _ => b[16] == b'-' && b[17..].iter().all(|c| c.is_ascii_digit()) && b.len() > 17,
     }
 }
 
@@ -218,7 +217,10 @@ fn create_backup_dir(root: &Path) -> Result<PathBuf, String> {
             Err(e) => return Err(format!("创建备份目录 {} 失败：{e}", path.display())),
         }
     }
-    Err(format!("同一秒内创建备份目录 {} 失败（重名过多）", root.display()))
+    Err(format!(
+        "同一秒内创建备份目录 {} 失败（重名过多）",
+        root.display()
+    ))
 }
 
 /// SQL 字符串字面量：Windows 反斜杠在 SQLite 里是普通字符，但统一成正斜杠更稳。
@@ -244,9 +246,7 @@ async fn snapshot_db(src: &Path, dst: &Path) -> Result<(), String> {
     let _ = conn.close().await;
     result.map_err(|e| format!("一致性快照（VACUUM INTO）失败：{e}"))?;
 
-    let dst_opts = SqliteConnectOptions::new()
-        .filename(dst)
-        .read_only(true);
+    let dst_opts = SqliteConnectOptions::new().filename(dst).read_only(true);
     let mut check = SqliteConnection::connect_with(&dst_opts)
         .await
         .map_err(|e| format!("打开备份文件 {} 失败：{e}", dst.display()))?;
@@ -361,9 +361,7 @@ async fn inspect(pool: &SqlitePool, migrator: &Migrator) -> Result<DbState, sqlx
             .fetch_all(pool)
             .await?;
     if let Some((version, _)) = rows.iter().find(|(_, success)| *success == 0) {
-        return Ok(DbState::Dirty {
-            version: *version,
-        });
+        return Ok(DbState::Dirty { version: *version });
     }
 
     let applied: HashSet<i64> = rows.iter().map(|(v, _)| *v).collect();
@@ -852,7 +850,10 @@ pub async fn migrate_bucket(
         DbState::Fresh | DbState::UpToDate => {
             // 无待应用迁移：不创建备份（避免每次正常启动都堆一份）。
         }
-        DbState::Pending { applied_max, pending } => {
+        DbState::Pending {
+            applied_max,
+            pending,
+        } => {
             tracing::info!(
                 db = %db_path_of(cfg, scope).display(),
                 applied_max,
@@ -978,13 +979,11 @@ mod tests {
     }
 
     async fn stored_checksum(pool: &SqlitePool, version: i64) -> Vec<u8> {
-        sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT checksum FROM _sqlx_migrations WHERE version = ?1",
-        )
-        .bind(version)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT checksum FROM _sqlx_migrations WHERE version = ?1")
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     fn backup_dir_count(cfg: &Config) -> usize {
@@ -1136,9 +1135,20 @@ mod tests {
         let db = dir.join("shared.db");
         let pool = open_pool(&db).await;
 
-        assert_eq!(inspect(&pool, &migrator(&[1, 2])).await.unwrap(), DbState::Fresh);
+        assert_eq!(
+            inspect(&pool, &migrator(&[1, 2])).await.unwrap(),
+            DbState::Fresh
+        );
 
-        create_migrations_table(&pool, &[(1, true, vec![0u8; 48]), (2, true, vec![0u8; 48]), (3, true, vec![0u8; 48])]).await;
+        create_migrations_table(
+            &pool,
+            &[
+                (1, true, vec![0u8; 48]),
+                (2, true, vec![0u8; 48]),
+                (3, true, vec![0u8; 48]),
+            ],
+        )
+        .await;
         assert_eq!(
             inspect(&pool, &migrator(&[1, 2])).await.unwrap(),
             DbState::Newer {
@@ -1188,7 +1198,11 @@ mod tests {
         assert!(err.0.contains("数据库版本高于当前程序"), "{}", err.0);
         assert!(err.0.contains("数据库版本：3"), "{}", err.0);
         assert!(err.0.contains("本程序支持的最高版本：2"), "{}", err.0);
-        assert!(!err.0.contains("VersionMismatch"), "不得暴露裸错误：{}", err.0);
+        assert!(
+            !err.0.contains("VersionMismatch"),
+            "不得暴露裸错误：{}",
+            err.0
+        );
 
         let backups: Vec<_> = std::fs::read_dir(backup_root(&cfg))
             .unwrap()
@@ -1322,11 +1336,7 @@ mod tests {
             err.0
         );
         assert!(err.0.contains("已尝试“换行归一化”"), "{}", err.0);
-        assert_eq!(
-            stored_checksum(&pool, 1).await,
-            tampered,
-            "真差异不得写库"
-        );
+        assert_eq!(stored_checksum(&pool, 1).await, tampered, "真差异不得写库");
         assert_eq!(backup_dir_count(&cfg), 0, "真差异不应产生备份");
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

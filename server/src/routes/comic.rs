@@ -73,7 +73,8 @@ async fn resolve_source_id(
     ))
 }
 
-const CHAPTER_SQL: &str = "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
+const CHAPTER_SQL: &str =
+    "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
      resource_url, tag, start, \"end\", update_time, word_count FROM book_chapters";
 
 /// 解析目标章节：优先 `chapter_url`；否则按 1-based `index` 取目录行。
@@ -112,9 +113,7 @@ async fn resolve_chapter(
     .bind(idx)
     .fetch_optional(pool)
     .await?;
-    let c = row.ok_or_else(|| {
-        AppError::NotFound("目录尚未缓存或序号越界，请先打开目录".into())
-    })?;
+    let c = row.ok_or_else(|| AppError::NotFound("目录尚未缓存或序号越界，请先打开目录".into()))?;
     if c.is_volume {
         return Err(AppError::BadRequest(
             "该序号是分卷标题，请从目录选择章节".into(),
@@ -217,8 +216,7 @@ async fn chapter_images(
     let book_url = clean(q.book_url.as_deref())
         .ok_or_else(|| AppError::BadRequest("缺少 book_url".into()))?
         .to_string();
-    let source_id =
-        resolve_source_id(&db.0, q.source.as_deref(), Some(book_url.as_str())).await?;
+    let source_id = resolve_source_id(&db.0, q.source.as_deref(), Some(book_url.as_str())).await?;
     let source = load_source(&s.shared, &source_id).await?;
     if source.book_source_type != 2 {
         return Err(AppError::BadRequest(format!(
@@ -226,13 +224,7 @@ async fn chapter_images(
             source.book_source_type
         )));
     }
-    let chapter = resolve_chapter(
-        &db.0,
-        &book_url,
-        q.chapter_url.as_deref(),
-        q.index,
-    )
-    .await?;
+    let chapter = resolve_chapter(&db.0, &book_url, q.chapter_url.as_deref(), q.index).await?;
 
     // 1) 命中章节缓存：直接返回图片列表，不再回源
     let cached = load_cached_images(&db.0, &chapter.url, s.cfg.content_ttl_secs).await?;
@@ -328,6 +320,7 @@ fn fetch_error(e: anyhow::Error) -> AppError {
     }
 }
 
+#[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，便于对照默认值。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +333,8 @@ mod tests {
         assert_eq!(imgs[0].url, "https://cdn/a.jpg");
         assert!(truncated);
 
-        let legacy = r#"[{"index":1,"url":"https://cdn/b.jpg"},{"index":2,"url":"https://cdn/c.jpg"}]"#;
+        let legacy =
+            r#"[{"index":1,"url":"https://cdn/b.jpg"},{"index":2,"url":"https://cdn/c.jpg"}]"#;
         let (imgs, truncated) = decode_images(Some(legacy));
         assert_eq!(imgs.len(), 2);
         assert!(!truncated);
