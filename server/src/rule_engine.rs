@@ -1129,6 +1129,11 @@ var book = {
   bookUrl: __bookUrl,
   tocUrl: __bookTocUrl,
   canUpdate: true,
+  name: __bookName,
+  author: __bookAuthor,
+  kind: __bookKind,
+  intro: __bookIntro,
+  coverUrl: __bookCoverUrl,
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
 };
@@ -1633,6 +1638,20 @@ pub struct AnalyzeRule {
     pub book_url: RefCell<String>,
     /// JS 环境里的 `book.tocUrl`。
     pub book_toc_url: RefCell<String>,
+    /// JS 环境里的 `book.name/book.author/book.kind/book.intro/book.coverUrl`。
+    /// 上游 `book` 绑定的是完整 Book 实体，规则（尤其简介模板）会直接读这些元信息；
+    /// 编排层在详情/目录/正文阶段按当前 Book 值注入（搜索阶段为空）。
+    pub book_meta: RefCell<BookMeta>,
+}
+
+/// `book` 绑定里的只读元信息（对应 Legado `Book` 的同名属性）。
+#[derive(Clone, Default)]
+pub struct BookMeta {
+    pub name: String,
+    pub author: String,
+    pub kind: String,
+    pub intro: String,
+    pub cover_url: String,
 }
 
 impl Default for AnalyzeRule {
@@ -1650,6 +1669,7 @@ impl Default for AnalyzeRule {
             refresh_toc: Cell::new(false),
             book_url: RefCell::new(String::new()),
             book_toc_url: RefCell::new(String::new()),
+            book_meta: RefCell::new(BookMeta::default()),
         }
     }
 }
@@ -1661,6 +1681,11 @@ impl AnalyzeRule {
 
     pub fn set_var(&self, k: impl Into<String>, v: impl Into<String>) {
         self.variables.borrow_mut().insert(k.into(), v.into());
+    }
+
+    /// 注入 `book.*` 只读元信息（详情/目录/正文阶段由编排层调用）。
+    pub fn set_book_meta(&self, meta: BookMeta) {
+        *self.book_meta.borrow_mut() = meta;
     }
 
     /// 执行一段独立 JS（`pre_update_js` 等编排层钩子）；`content` 作为 `result`/`__input`。
@@ -2544,7 +2569,7 @@ impl AnalyzeRule {
         let vars_init =
             serde_json::to_string(&self.variables.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\n{vars}\n{cachejs}\n{lib}\n{shim}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\nvar __bookName={bn}; var __bookAuthor={ba}; var __bookKind={bk}; var __bookIntro={bi}; var __bookCoverUrl={bc};\n{vars}\n{cachejs}\n{lib}\n{shim}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
             r = lit,
             b = js_string_literal(base_url),
             page = js_string_literal(&self.current_content.borrow()),
@@ -2552,6 +2577,11 @@ impl AnalyzeRule {
             lu = js_string_literal(&self.source_login_url.borrow()),
             bu = js_string_literal(&self.book_url.borrow()),
             bt = js_string_literal(&self.book_toc_url.borrow()),
+            bn = js_string_literal(&self.book_meta.borrow().name),
+            ba = js_string_literal(&self.book_meta.borrow().author),
+            bk = js_string_literal(&self.book_meta.borrow().kind),
+            bi = js_string_literal(&self.book_meta.borrow().intro),
+            bc = js_string_literal(&self.book_meta.borrow().cover_url),
             vars = vars_js,
             varsinit = vars_init,
             cachejs = JS_CACHE,
@@ -6392,15 +6422,54 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         let ar = AnalyzeRule::new();
         assert_eq!(ar.get_string("", "{{1+1}}", false, "").unwrap(), "2");
         assert_eq!(
-            ar.get_string(r#"{"title":"书名A"}"#, "{{$.title}}", false, "").unwrap(),
+            ar.get_string(r#"{"title":"书名A"}"#, "{{$.title}}", false, "")
+                .unwrap(),
             "书名A"
         );
         // 展开失败时按原有行为返回空串，不 panic
-        assert_eq!(ar.get_string("", "{{没有这个变量}}", false, "").unwrap(), "");
+        assert_eq!(
+            ar.get_string("", "{{没有这个变量}}", false, "").unwrap(),
+            ""
+        );
         // 非“整条模板”的写法不受影响
         assert_eq!(
-            ar.get_string("<a href='/x'>下一页</a>", "{{'a'}}@text", false, "").unwrap(),
+            ar.get_string("<a href='/x'>下一页</a>", "{{'a'}}@text", false, "")
+                .unwrap(),
             "下一页"
+        );
+    }
+
+    #[test]
+    fn js_book_meta_is_visible() {
+        // Legado 的 `book` 绑定是完整 Book 实体；快看/漫画源在详情简介模板里直接读
+        // `book.name/book.author/book.kind`，缺这些字段会把 `undefined` 拼进简介。
+        let ar = AnalyzeRule::new();
+        ar.set_book_meta(BookMeta {
+            name: "书名".into(),
+            author: "作者".into(),
+            kind: "类型".into(),
+            intro: "简介".into(),
+            cover_url: "https://c/x.jpg".into(),
+        });
+        assert_eq!(
+            ar.get_string("", "{{book.name}}", false, "").unwrap(),
+            "书名"
+        );
+        assert_eq!(
+            ar.get_string("", "@js:book.kind + '/' + book.author", false, "")
+                .unwrap(),
+            "类型/作者"
+        );
+        assert_eq!(
+            ar.get_string("", "@js:book.coverUrl", false, "").unwrap(),
+            "https://c/x.jpg"
+        );
+        // 未注入时是空串而非 `undefined`（避免 JS 模板拼出字面量 undefined）
+        assert_eq!(
+            AnalyzeRule::new()
+                .get_string("", "@js:String(book.name)", false, "")
+                .unwrap(),
+            ""
         );
     }
 
