@@ -41,6 +41,8 @@ md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 
 [profile.release]
 opt-level = "z"      # 体积/内存优先

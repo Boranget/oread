@@ -41,6 +41,13 @@ pub struct BookSourceListItem {
     /// （启用 + 类型支持 + 有搜索规则/地址 + 非登录源 + 未隔离且健康档不是 quarantined）。
     #[serde(default)]
     pub searchable: bool,
+    /// 进程内累计的字段级规则异常次数（JS TypeError/选择器失败等）。
+    /// 用于让用户看出「这个源曾有规则异常」，不参与搜索过滤与冷却。
+    #[serde(default)]
+    pub rule_error_count: i64,
+    /// 最近一次规则异常时间（毫秒时间戳）
+    #[serde(default)]
+    pub last_rule_error_at: Option<i64>,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]

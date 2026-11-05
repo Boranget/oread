@@ -399,7 +399,7 @@ async fn import_url(
         &headers,
         &source.book_source_url,
         req::source_timeout(&source),
-        req::source_concurrency(&source),
+        req::source_limit(&source),
     )
     .await?;
     check_page(page.status, page.content_type.as_deref(), &page.body)?;

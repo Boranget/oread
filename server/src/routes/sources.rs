@@ -150,6 +150,7 @@ pub async fn list(
                 // 与聚合搜索同一口径：前端计数/全选必须用它，不能只看 enabled。
                 let searchable =
                     crate::routes::books::is_searchable_source(&x, &quarantined, &health);
+                let anomaly = crate::source_health::rule_anomaly(&x.book_source_url);
                 BookSourceListItem {
                     tier: h
                         .map(|h| h.tier.clone())
@@ -159,6 +160,8 @@ pub async fn list(
                     last_eval_at: h.and_then(|h| h.last_eval_at),
                     login_required: crate::entities::requires_login(&x),
                     searchable,
+                    rule_error_count: anomaly.as_ref().map(|a| a.count).unwrap_or(0),
+                    last_rule_error_at: anomaly.as_ref().map(|a| a.last_at),
                     book_source_url: x.book_source_url,
                     book_source_name: x.book_source_name,
                     enabled: x.enabled,
@@ -1209,6 +1212,11 @@ pub async fn get_one(
                 .and_then(|h| h.evidence_json.as_deref())
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())),
         );
+        // 字段级规则异常只在详情里给出全部上下文（列表接口只给计数/时间）。
+        obj.insert(
+            "rule_errors".into(),
+            json!(crate::source_health::rule_anomaly(&src.book_source_url)),
+        );
     }
     Ok(Json(v))
 }
@@ -1548,6 +1556,7 @@ pub async fn health_summary(
 
     let now = source_health::now_ms();
     let detail_on = truthy(q.detail.as_deref());
+    let rule_anomalies = source_health::rule_anomaly_map();
     let (mut total, mut ok, mut partial, mut fail, mut cooling, mut never) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let (mut active, mut quarantined) = (0usize, 0usize);
@@ -1580,6 +1589,7 @@ pub async fn health_summary(
             active += 1;
         }
         if detail_on {
+            let anomaly = rule_anomalies.get(&id);
             details.push(json!({
                 "book_source_url": id,
                 "name": r.try_get::<String, _>("name").unwrap_or_default(),
@@ -1594,6 +1604,8 @@ pub async fn health_summary(
                 "cooling": cooling_now,
                 "decision": decision,
                 "review_state": r.try_get::<Option<String>, _>("review_state").ok().flatten(),
+                "rule_error_count": anomaly.map(|a| a.count).unwrap_or(0),
+                "last_rule_error_at": anomaly.map(|a| a.last_at),
             }));
         }
     }
@@ -1610,6 +1622,7 @@ pub async fn health_summary(
         "never": never,
         "cooldown_secs": s.cfg.source_cooldown_secs,
         "fail_threshold": source_health::FAIL_THRESHOLD,
+        "rule_anomaly_sources": rule_anomalies.len(),
         "now": now,
         "detail": detail_on,
         "sources": if detail_on { Value::Array(details) } else { Value::Null },
@@ -1638,6 +1651,8 @@ pub async fn health_reset(
     }
     ids.retain(|x| !x.trim().is_empty());
     let cleared = source_health::reset(&s.shared, &ids).await?;
+    // 健康状态重置时一并清掉字段级规则异常台账（手动“重新信任”）。
+    source_health::reset_rule_anomalies(&ids);
     Ok(Json(json!({
         "ok": true,
         "cleared": cleared,
