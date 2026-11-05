@@ -9,7 +9,14 @@
 //!   阅读页正文容器 = 页面高 − 64（底栏），列表页正文区 = 页面高 − 73（顶栏）。
 //! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
 //!   不用 `border-radius`；底栏用 `position:fixed`，不用 transform/transition。
-//! - 唯一脚本是视口补参（`K_VP_FIX_JS`，ES5、最多重载一次），其余翻页/切换字号全部是真实链接或原生 form。
+//! - 文档高不再取 `100%`/`vh`：`K_FIT_JS` 在 `<head>` 里按实测
+//!   `documentElement.clientHeight − SAFE_BOTTOM(24)` 写死（1268 → 1244）。
+//!   这样即使老引擎在「文档高 == 视口高」时也画滚动条、或 URL 里的 `vh` 比真实
+//!   布局视口大，文档也永远比视口矮 24px，不会出现第二屏；底栏
+//!   `position:fixed;bottom:0`（总高 88 = 64 内容 + 24 安全区）压在这 24px 上，
+//!   视觉与原来一致。正文区仍然由 `#k-stage` 的 `top/bottom` 贴视口，不读任何参数。
+//! - 两个内联脚本：文档高兜底（`K_FIT_JS`，不重载）与视口补参（`K_VP_FIX_JS`，ES5、
+//!   最多重载一次），其余翻页/切换字号全部是真实链接或原生 form。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -212,6 +219,22 @@ var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}cat
 if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
 else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
 
+/// 文档高兜底脚本（ES5，零依赖，不重载，注入 `<head>` 保证首帧生效）：
+/// 把 `html` 的实测高度固定为 `documentElement.clientHeight − SAFE_BOTTOM`。
+/// 真机问题是「文档高恰好等于布局视口高」时 Silk 仍绘制滚动条，以及 URL 里的 `vh`
+/// 可能比真实布局视口大；这里以浏览器实测值为准、并主动让文档比视口矮 24px，
+/// 于是无论参数是否准确，文档都不可能产生第二屏。取不到 `clientHeight` 时不改，
+/// 退回 CSS 的 `height:100%`。
+fn fit_js() -> String {
+    format!(
+        "(function(){{function f(){{try{{var d=document.documentElement,H=d.clientHeight||innerHeight;\
+if(H>{min}){{d.style.height=(H-{safe})+'px'}}}}catch(e){{}}}}f();\
+if(window.addEventListener){{window.addEventListener('load',f,false)}}}})()",
+        min = 400,
+        safe = SAFE_BOTTOM
+    )
+}
+
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
     size: usize,
@@ -403,6 +426,7 @@ fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) ->
 <meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
 html{{-webkit-text-size-adjust:none;height:100%;overflow:hidden}}\
 html,body{{margin:0;padding:0;width:100%;background:#fff;color:#000}}\
+html::-webkit-scrollbar,body::-webkit-scrollbar,#k-stage::-webkit-scrollbar{{width:0;height:0;display:none}}\
 body{{height:100%;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
 *{{box-sizing:border-box}}\
 a{{color:#000;text-decoration:none}}\
@@ -410,7 +434,7 @@ h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style></head><body><div class=\"wrap\">{body}</div><script>{js}</script><script>{probe}</script></body></html>",
+</style><script>{fit}</script></head><body><div class=\"wrap\">{body}</div><script>{js}</script><script>{probe}</script></body></html>",
         viewport = viewport,
         title = esc(title),
         size = spec.size,
@@ -419,6 +443,7 @@ table{{border-collapse:collapse}}\
         pad = SIDE_PAD,
         extra = extra_css,
         body = body,
+        fit = fit_js(),
         js = K_VP_FIX_JS,
         probe = K_PROBE_JS
     )
@@ -2572,11 +2597,20 @@ mod tests {
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
         );
-        // 两个脚本：视口补参（ES5、带 kfix 防循环标记）+ 自报探针（只上报不重载）
+        // 三个脚本：文档高兜底（head 内、按实测 clientHeight）+ 视口补参（带 kfix
+        // 防循环标记）+ 自报探针（只上报不重载）
         assert_eq!(
             html.matches("<script").count(),
-            2,
-            "只允许补参脚本与自报探针"
+            3,
+            "只允许文档高兜底、补参脚本与自报探针"
+        );
+        assert!(
+            html.contains("d.style.height=(H-24)+'px'"),
+            "文档高必须按实测 clientHeight 减 24px：{html}"
+        );
+        assert!(
+            html.contains("</style><script>(function(){"),
+            "文档高兜底脚本必须进 head，首帧就生效"
         );
         assert!(html.contains("kfix=1"), "补参脚本必须带防循环标记");
         assert!(
@@ -2711,15 +2745,29 @@ mod tests {
         assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
     }
 
-    /// 一屏一页（不依赖参数视口是否准确）：`html`/`body` 用 `height:100%` 链式撑满真实视口，
-    /// `#k-stage` 绝对定位填满「视口 − 88」，底栏贴 `bottom:0` 且内置 24px 安全区；
-    /// 文档高度恒等于视口高度，不会再出现第二屏/滚动条。
+    /// 一屏一页（不依赖参数视口是否准确）：`#k-stage` 绝对定位填满「视口 − 88」，
+    /// 底栏贴 `bottom:0` 且内置 24px 安全区；文档高由 `fit_js()` 按实测
+    /// `clientHeight − 24` 写死，永远比视口矮，不会出现第二屏/滚动条。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
         let css = read_only_css();
         assert!(
             css.contains("html,body{height:100%;overflow:hidden}"),
             "{css}"
+        );
+        // 老引擎可能在「文档高 == 视口高」时仍画滚动条：根元素与正文区都要显式关掉滚动条绘制
+        let html_css = page_html_css("测试", 2, "", "", vp());
+        assert!(
+            html_css.contains("#k-stage::-webkit-scrollbar{width:0;height:0;display:none}"),
+            "必须显式关闭滚动条绘制：{html_css}"
+        );
+        // 兜底脚本以实测 clientHeight 为准，且不依赖 URL 参数、不重载
+        let fit = fit_js();
+        assert!(fit.contains("d.clientHeight||innerHeight"), "{fit}");
+        assert!(fit.contains("(H-24)+'px'"), "{fit}");
+        assert!(
+            !fit.contains("location") && !fit.contains("replace"),
+            "文档高兜底不得改写 location：{fit}"
         );
         assert!(
             css.contains("#k-stage{position:absolute;top:0;left:36px;right:36px;bottom:88px;padding:36px 36px 0;overflow:hidden}"),
