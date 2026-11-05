@@ -1,7 +1,7 @@
-//! `/k` 服务端性能埋点：默认开启、无参数依赖，按天写 JSONL，有界保留。
+//! `/k` 服务端性能埋点 + 客户端自报视口探针：默认开启、无参数依赖，按天写 JSONL，有界保留。
 //!
-//! - 文件：`DATA_DIR/logs/k-metrics-YYYYMMDD.jsonl`
-//! - 保留最近 7 天；总占用超过 20MB 时从最旧文件开始删
+//! - 文件：`DATA_DIR/logs/k-metrics-YYYYMMDD.jsonl`（请求级）与 `k-probe-YYYYMMDD.jsonl`（视口探针）
+//! - 各自保留最近 7 天；目录内同类文件总占用超过 20MB 时从最旧文件开始删
 //! - 写失败只 warn，绝不影响请求；凭据不落盘（cookie 只记哈希前 8 位）
 
 use std::collections::{BTreeMap, HashMap};
@@ -134,7 +134,7 @@ pub async fn record(State(state): State<AppState>, req: Request, next: Next) -> 
         sid,
         since_prev_ms,
     };
-    spawn_write(PathBuf::from(&state.cfg.data_dir), line);
+    spawn_write(PathBuf::from(&state.cfg.data_dir), "k-metrics", line);
     resp
 }
 
@@ -192,7 +192,7 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn spawn_write(dir: PathBuf, line: KLine) {
+fn spawn_write<T: Serialize + Send + 'static>(dir: PathBuf, prefix: &'static str, line: T) {
     tokio::spawn(async move {
         let Ok(json) = serde_json::to_string(&line) else {
             return;
@@ -203,7 +203,7 @@ fn spawn_write(dir: PathBuf, line: KLine) {
             return;
         }
         let day = Local::now().format("%Y%m%d").to_string();
-        let file = logs.join(format!("k-metrics-{day}.jsonl"));
+        let file = logs.join(format!("{prefix}-{day}.jsonl"));
         match tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -221,12 +221,13 @@ fn spawn_write(dir: PathBuf, line: KLine) {
         let n = WRITES.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(PRUNE_EVERY) {
             let logs = logs.clone();
-            tokio::task::spawn_blocking(move || prune_with(&logs, KEEP_DAYS, MAX_BYTES));
+            let prefix = prefix;
+            tokio::task::spawn_blocking(move || prune_with(&logs, prefix, KEEP_DAYS, MAX_BYTES));
         }
     });
 }
 
-fn metric_files(dir: &Path) -> Vec<PathBuf> {
+fn log_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -236,7 +237,7 @@ fn metric_files(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("k-metrics-") && n.ends_with(".jsonl"))
+                .map(|n| n.starts_with(prefix) && n.ends_with(".jsonl"))
                 .unwrap_or(false)
         })
         .collect();
@@ -249,9 +250,9 @@ fn file_len(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-/// 有界清理：保留最近 `keep_days` 个日文件；总占用超过 `max_bytes` 时删最旧。
-pub(crate) fn prune_with(dir: &Path, keep_days: usize, max_bytes: u64) {
-    let mut files = metric_files(dir);
+/// 有界清理：保留最近 `keep_days` 个同类日文件；总占用超过 `max_bytes` 时删最旧。
+pub(crate) fn prune_with(dir: &Path, prefix: &str, keep_days: usize, max_bytes: u64) {
+    let mut files = log_files(dir, prefix);
     while files.len() > keep_days {
         let old = files.remove(0);
         if let Err(e) = std::fs::remove_file(&old) {
@@ -282,10 +283,10 @@ fn valid_date(d: &str) -> bool {
             .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
-fn metrics_file(data_dir: &Path, date: &str) -> PathBuf {
+fn log_file(data_dir: &Path, prefix: &str, date: &str) -> PathBuf {
     data_dir
         .join("logs")
-        .join(format!("k-metrics-{}.jsonl", date.replace('-', "")))
+        .join(format!("{prefix}-{}.jsonl", date.replace('-', "")))
 }
 
 #[derive(Deserialize)]
@@ -328,9 +329,10 @@ pub async fn metrics(
     if !valid_date(&date) {
         return Err(AppError::BadRequest("date 需为 YYYY-MM-DD".into()));
     }
-    let text = tokio::fs::read_to_string(metrics_file(Path::new(&state.cfg.data_dir), &date))
-        .await
-        .unwrap_or_default();
+    let text =
+        tokio::fs::read_to_string(log_file(Path::new(&state.cfg.data_dir), "k-metrics", &date))
+            .await
+            .unwrap_or_default();
     let lines: Vec<KLine> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<KLine>(l).ok())
@@ -419,9 +421,10 @@ pub async fn export(
     if !valid_date(&date) {
         return Err(AppError::BadRequest("date 需为 YYYY-MM-DD".into()));
     }
-    let body = tokio::fs::read_to_string(metrics_file(Path::new(&state.cfg.data_dir), &date))
-        .await
-        .map_err(|_| AppError::NotFound(format!("该日没有埋点文件：{date}")))?;
+    let body =
+        tokio::fs::read_to_string(log_file(Path::new(&state.cfg.data_dir), "k-metrics", &date))
+            .await
+            .map_err(|_| AppError::NotFound(format!("该日没有埋点文件：{date}")))?;
     Ok((
         StatusCode::OK,
         [
@@ -434,6 +437,201 @@ pub async fn export(
         body,
     )
         .into_response())
+}
+
+/// `GET /api/k/probe`：页内自报视口探针（ES5 XHR，失败静默，不重载页面）。
+///
+/// 字段同时记录「URL 参数视口」与「页面实测视口」，用来判断 Kindle 报的
+/// `innerHeight` 是否等于真正参与排版的布局视口高（`clientHeight`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeLine {
+    pub ts: String,
+    pub path: String,
+    #[serde(default)]
+    pub vw_param: Option<String>,
+    #[serde(default)]
+    pub vh_param: Option<String>,
+    #[serde(default)]
+    pub inner_w: Option<String>,
+    #[serde(default)]
+    pub inner_h: Option<String>,
+    #[serde(default)]
+    pub client_w: Option<String>,
+    #[serde(default)]
+    pub client_h: Option<String>,
+    #[serde(default)]
+    pub scroll_w: Option<String>,
+    #[serde(default)]
+    pub scroll_h: Option<String>,
+    #[serde(default)]
+    pub dpr: Option<String>,
+    #[serde(default)]
+    pub fs: Option<String>,
+    pub ua_class: String,
+    #[serde(default)]
+    pub ua: Option<String>,
+    #[serde(default)]
+    pub sid: Option<String>,
+}
+
+/// 探针单字段上限（防超长 query 落盘）
+const PROBE_LIMIT: usize = 32;
+
+#[derive(Deserialize)]
+pub struct ProbeQ {
+    pub vw_param: Option<String>,
+    pub vh_param: Option<String>,
+    pub inner_w: Option<String>,
+    pub inner_h: Option<String>,
+    pub client_w: Option<String>,
+    pub client_h: Option<String>,
+    pub scroll_w: Option<String>,
+    pub scroll_h: Option<String>,
+    pub dpr: Option<String>,
+    pub fs: Option<String>,
+    pub path: Option<String>,
+}
+
+fn norm(v: Option<String>) -> Option<String> {
+    v.map(|s| truncate(s.trim(), PROBE_LIMIT))
+        .filter(|s| !s.is_empty())
+}
+
+pub async fn probe(
+    State(state): State<AppState>,
+    _u: AuthUser,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ProbeQ>,
+) -> StatusCode {
+    let ua_raw = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let sid = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(session_token)
+        .map(|t| sid_hash(&t));
+    let line = ProbeLine {
+        ts: Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+        path: norm(q.path).unwrap_or_else(|| "/".into()),
+        vw_param: norm(q.vw_param),
+        vh_param: norm(q.vh_param),
+        inner_w: norm(q.inner_w),
+        inner_h: norm(q.inner_h),
+        client_w: norm(q.client_w),
+        client_h: norm(q.client_h),
+        scroll_w: norm(q.scroll_w),
+        scroll_h: norm(q.scroll_h),
+        dpr: norm(q.dpr),
+        fs: norm(q.fs),
+        ua_class: classify_ua(&ua_raw).to_string(),
+        ua: Some(truncate(&ua_raw, 120)),
+        sid,
+    };
+    spawn_write(PathBuf::from(&state.cfg.data_dir), "k-probe", line);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Serialize)]
+struct ProbeStat {
+    count: usize,
+    /// vw/vh 参数组合（`vw_param`x`vh_param`）
+    param: BTreeMap<String, usize>,
+    /// innerWidth×innerHeight
+    inner: BTreeMap<String, usize>,
+    /// documentElement.clientWidth×clientHeight（真正的布局视口）
+    client: BTreeMap<String, usize>,
+    /// documentElement.scrollWidth×scrollHeight
+    scroll: BTreeMap<String, usize>,
+    /// `scroll_h > client_h` 的条数（有纵向滚动）
+    overflow_v: usize,
+    /// `scroll_w > client_w` 的条数（有横向滚动）
+    overflow_h: usize,
+}
+
+fn num(v: &Option<String>) -> Option<i64> {
+    v.as_deref().and_then(|s| s.parse::<i64>().ok())
+}
+
+/// `GET /api/k/probe/summary?date=YYYY-MM-DD`：管理员查看探针聚合 + 最近 20 条。
+pub async fn probe_summary(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(q): Query<MetricsQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_admin(&user)?;
+    let date = q.date.unwrap_or_else(default_date);
+    if !valid_date(&date) {
+        return Err(AppError::BadRequest("date 需为 YYYY-MM-DD".into()));
+    }
+    let text =
+        tokio::fs::read_to_string(log_file(Path::new(&state.cfg.data_dir), "k-probe", &date))
+            .await
+            .unwrap_or_default();
+    let lines: Vec<ProbeLine> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<ProbeLine>(l).ok())
+        .collect();
+
+    let mut stats: BTreeMap<String, ProbeStat> = BTreeMap::new();
+    for line in &lines {
+        let stat = stats.entry(line.path.clone()).or_insert_with(|| ProbeStat {
+            count: 0,
+            param: BTreeMap::new(),
+            inner: BTreeMap::new(),
+            client: BTreeMap::new(),
+            scroll: BTreeMap::new(),
+            overflow_v: 0,
+            overflow_h: 0,
+        });
+        stat.count += 1;
+        let dim = |a: &Option<String>, b: &Option<String>| match (a.as_deref(), b.as_deref()) {
+            (Some(x), Some(y)) => format!("{x}x{y}"),
+            (Some(x), None) => x.to_string(),
+            (None, Some(y)) => format!("?x{y}"),
+            (None, None) => "?".into(),
+        };
+        *stat
+            .param
+            .entry(dim(&line.vw_param, &line.vh_param))
+            .or_default() += 1;
+        *stat
+            .inner
+            .entry(dim(&line.inner_w, &line.inner_h))
+            .or_default() += 1;
+        *stat
+            .client
+            .entry(dim(&line.client_w, &line.client_h))
+            .or_default() += 1;
+        *stat
+            .scroll
+            .entry(dim(&line.scroll_w, &line.scroll_h))
+            .or_default() += 1;
+        let ch = num(&line.client_h);
+        let sh = num(&line.scroll_h);
+        let cw = num(&line.client_w);
+        let sw = num(&line.scroll_w);
+        if let (Some(a), Some(b)) = (sh, ch) {
+            if b > 0 && a > b {
+                stat.overflow_v += 1;
+            }
+        }
+        if let (Some(a), Some(b)) = (sw, cw) {
+            if b > 0 && a > b {
+                stat.overflow_h += 1;
+            }
+        }
+    }
+
+    let recent: Vec<ProbeLine> = lines.iter().rev().take(20).cloned().collect();
+    Ok(Json(serde_json::json!({
+        "date": date,
+        "probes": lines.len(),
+        "paths": stats,
+        "recent": recent,
+    })))
 }
 
 #[cfg(test)]
@@ -518,13 +716,13 @@ mod tests {
             .unwrap();
         }
         // 保留 7 天 → 删最旧 2 个
-        prune_with(&dir, 7, MAX_BYTES);
+        prune_with(&dir, "k-metrics", 7, MAX_BYTES);
         assert!(!dir.join("k-metrics-20260101.jsonl").exists());
         assert!(!dir.join("k-metrics-20260102.jsonl").exists());
         assert!(dir.join("k-metrics-20260109.jsonl").exists());
         // 总量超限 → 继续从最旧删，直到 <= 1000
-        prune_with(&dir, 7, 1000);
-        let files = metric_files(&dir);
+        prune_with(&dir, "k-metrics", 7, 1000);
+        let files = log_files(&dir, "k-metrics");
         let total: u64 = files.iter().map(|p| file_len(p)).sum();
         assert!(total <= 1000, "超限后总量应 <= 1000，实际 {total}");
         assert!(files.len() < 7);
@@ -544,5 +742,88 @@ mod tests {
             AppError::Forbidden.into_response().status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn probe_summary_rejects_non_admin() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 探针聚合只读文件系统，连接池仅用于构造 AppState
+            let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+            let state = AppState {
+                shared: pool,
+                cfg: crate::config::Config::from_env(),
+                user_pools: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::routes::UserPoolCache::default(),
+                )),
+            };
+            let user = AuthUser {
+                id: 2,
+                username: "u2".into(),
+                role: "user".into(),
+            };
+            let res = probe_summary(State(state), user, Query(MetricsQ { date: None })).await;
+            match res {
+                Err(AppError::Forbidden) => {}
+                Err(e) => panic!("非管理员必须是 403，实得 {e:?}"),
+                Ok(_) => panic!("非管理员不得拿到探针聚合"),
+            }
+        });
+    }
+
+    #[test]
+    fn probe_line_keeps_all_fields() {
+        let line = ProbeLine {
+            ts: "2026-11-05T17:09:36+08:00".into(),
+            path: "/k/read".into(),
+            vw_param: Some("1072".into()),
+            vh_param: Some("1268".into()),
+            inner_w: Some("1072".into()),
+            inner_h: Some("1268".into()),
+            client_w: Some("1055".into()),
+            client_h: Some("1200".into()),
+            scroll_w: Some("1072".into()),
+            scroll_h: Some("1244".into()),
+            dpr: Some("1".into()),
+            fs: Some("2".into()),
+            ua_class: "kindle".into(),
+            ua: Some("Mozilla/5.0 Kindle Silk".into()),
+            sid: Some("deadbeef".into()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&line).unwrap();
+        for k in [
+            "ts", "path", "vw_param", "vh_param", "inner_w", "inner_h", "client_w", "client_h",
+            "scroll_w", "scroll_h", "dpr", "fs", "ua_class", "ua", "sid",
+        ] {
+            assert!(v.get(k).is_some(), "探针字段缺失：{k}");
+        }
+        // 反序列化也能还原（聚合读取依赖它）
+        let back: ProbeLine = serde_json::from_value(v).unwrap();
+        assert_eq!(back.client_h.as_deref(), Some("1200"));
+    }
+
+    #[test]
+    fn probe_values_are_truncated() {
+        let long = "1".repeat(200);
+        let p = ProbeQ {
+            vw_param: Some(long.clone()),
+            vh_param: Some(" 1268 ".into()),
+            inner_w: None,
+            inner_h: None,
+            client_w: None,
+            client_h: None,
+            scroll_w: None,
+            scroll_h: None,
+            dpr: None,
+            fs: None,
+            path: Some("/k/read".repeat(30)),
+        };
+        assert_eq!(norm(p.vw_param).unwrap().chars().count(), PROBE_LIMIT);
+        assert_eq!(norm(p.vh_param).as_deref(), Some("1268"));
+        assert_eq!(norm(p.path).unwrap().chars().count(), PROBE_LIMIT);
+        assert_eq!(norm(Some("   ".into())), None);
     }
 }

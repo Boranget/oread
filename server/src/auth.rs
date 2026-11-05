@@ -321,11 +321,13 @@ pub async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|v| v.to_string());
     // Kindle /k 页内的 <img> 由浏览器直接发起，带不上 Authorization 头，只会有 k_session Cookie
-    let cookie_fallback = if bearer.is_none() && path == "/api/book/image" {
-        cookie_token(&req)
-    } else {
-        None
-    };
+    // 自报探针与书图一样由浏览器直接发起，只带 k_session Cookie，带不上 Authorization
+    let cookie_fallback =
+        if bearer.is_none() && (path == "/api/book/image" || path == "/api/k/probe") {
+            cookie_token(&req)
+        } else {
+            None
+        };
     let token = bearer.or(cookie_fallback).ok_or(AppError::Unauthorized)?;
     let claims = verify_token(&token, &state.cfg.jwt_secret)?;
     // 状态实时校验：账号被禁用或令牌版本已递增（改密/禁用）→ 401
