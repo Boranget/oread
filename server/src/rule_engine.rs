@@ -3886,6 +3886,16 @@ fn parse_token(tok: &str) -> Token {
             exclude: false,
         };
     }
+    if let Some(rest) = tok.strip_prefix("text.") {
+        // `@text.xxx`：Legado 的「自身文本包含」遍历步骤，保留 text. 前缀交给 apply_tag 处理。
+        let (name, index) = split_name_index(rest);
+        return Token::Tag {
+            name: format!("text.{name}"),
+            index,
+            indices: vec![],
+            exclude: false,
+        };
+    }
     if is_extract_keyword(tok) {
         return Token::Terminal(tok.to_string());
     }
@@ -4330,7 +4340,15 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
         None => (selector, Vec::new()),
     };
     let (core, jq) = split_jquery_filters(core.trim());
-    let (css, idx) = if let Some(rest) = core.trim().strip_prefix("class.") {
+    let mut text_filter: Option<String> = None;
+    let (css, idx) = if let Some(rest) = core.trim().strip_prefix("text.") {
+        // Legado `text.xxx`：元素**自身**直接文本包含 xxx（jsoup
+        // `getElementsContainingOwnText`）。此前被当成 CSS「标签 text + 类名 xxx」，
+        // 永远匹配不到元素，正文下一页/目录翻页/完整目录入口因此全空（28 源）。
+        let (name, i) = split_name_index(rest);
+        text_filter = Some(name);
+        ("*".to_string(), i)
+    } else if let Some(rest) = core.trim().strip_prefix("class.") {
         let (name, i) = split_name_index(rest);
         (class_name_css(shorthand_segment(&name)), i)
     } else if let Some(rest) = core.trim().strip_prefix("id.") {
@@ -4365,7 +4383,10 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let els: Vec<scraper::ElementRef<'a>> = doc.select(&sel).collect();
+    let els: Vec<scraper::ElementRef<'a>> = match &text_filter {
+        Some(needle) => text_contains_from(&[doc.root_element()], needle),
+        None => doc.select(&sel).collect(),
+    };
     let els = filter_indices(els, &excluded, true);
     let els = match &index_expr {
         Some(expr) => apply_index_expr(els, expr),
@@ -4396,19 +4417,26 @@ fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::
     let (spec, index_expr) = split_bracket_indices(spec.trim());
     let (tag, idx) = split_name_index(spec.trim());
     let (tag, jq) = split_jquery_filters(tag.trim());
-    let css = if tag.trim().is_empty() {
-        "*".to_string()
-    } else {
-        tag
-    };
-    let sel = match scraper::Selector::parse(&css) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let mut matched: Vec<scraper::ElementRef<'a>> = Vec::new();
-    for e in &els {
-        matched.extend(e.select(&sel));
-    }
+    let matched: Vec<scraper::ElementRef<'a>> =
+        if let Some(needle) = tag.trim().strip_prefix("text.") {
+            // `@text.xxx`：在当前元素及其后代中，按自身文本包含关系筛选（上游同一语义）。
+            text_contains_from(&els, needle)
+        } else {
+            let css = if tag.trim().is_empty() {
+                "*".to_string()
+            } else {
+                tag
+            };
+            let sel = match scraper::Selector::parse(&css) {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
+            let mut m: Vec<scraper::ElementRef<'a>> = Vec::new();
+            for e in &els {
+                m.extend(e.select(&sel));
+            }
+            m
+        };
     let matched = apply_jq_filters(matched, &jq);
     let matched = match &index_expr {
         Some(expr) => apply_index_expr(matched, expr),
@@ -4429,6 +4457,37 @@ fn text_nodes(el: &scraper::ElementRef) -> String {
     el.children()
         .filter_map(|n| n.value().as_text().map(|t| t.to_string()))
         .collect()
+}
+
+/// Legado `text.xxx` 的单元素判定：自身直接文本（空白归一、忽略大小写）包含 needle。
+fn own_text_contains(el: &scraper::ElementRef, needle_lower: &str) -> bool {
+    let own = text_nodes(el)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    own.contains(needle_lower)
+}
+
+/// 从给定根元素（含自身）按文档序收集「自身文本包含 needle」的元素，
+/// 对应 jsoup `Element.getElementsContainingOwnText`。
+fn text_contains_from<'a>(
+    roots: &[scraper::ElementRef<'a>],
+    needle: &str,
+) -> Vec<scraper::ElementRef<'a>> {
+    let needle = needle.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<scraper::ElementRef<'a>> = Vec::new();
+    for root in roots {
+        let mut candidates = vec![*root];
+        candidates.extend(root.descendants().filter_map(scraper::ElementRef::wrap));
+        for c in candidates {
+            if own_text_contains(&c, &needle) && seen.insert(c.id()) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// 裸抽取标记（`text` / `href` 等）：Legado 语义是对“当前节点”直接取值。
@@ -6245,6 +6304,76 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ar.get_string(html, "class.au@text", false, "").unwrap(),
             "作者"
         );
+    }
+
+    #[test]
+    fn text_prefix_selector_matches_own_text() {
+        // Legado `text.下一页` = 自身文本包含（jsoup getElementsContainingOwnText）。
+        // 147 源中 28 源用它做正文翻页/目录翻页/完整目录入口，此前被当成 CSS
+        // 「标签 text + 类名 下一页」而永远为空。
+        let ar = AnalyzeRule::new();
+        let html = r#"
+        <div class="pages">
+          <a href="/p/1">上一页</a>
+          <a href="/p/3">下一页</a>
+        </div>
+        <div class="wrap"><a href="/toc">完整目录</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "text.下一页@href", true, "").unwrap(),
+            "/p/3"
+        );
+        assert_eq!(
+            ar.get_string(html, "text.完整目录@href", true, "").unwrap(),
+            "/toc"
+        );
+    }
+
+    #[test]
+    fn text_prefix_uses_own_text_not_descendant_text() {
+        // 上游取的是「自身直接文本」：容器只有子元素文本时不能命中，
+        // 否则 `text.下一页@href` 会先选中容器并取到空 href。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="wrap"><a href="/p/2">下一页</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "text.下一页@href", true, "").unwrap(),
+            "/p/2"
+        );
+        // 容器自身无直接文本 → 不会被选中（选中容器会取到空 href）
+        assert_eq!(
+            ar.get_string(html, "text.下一页@tag.span@href", true, "")
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn text_prefix_is_traversal_step_after_at() {
+        // `class.next_chapter@text.下一页@href`（cn.bzmanga 章末翻页的原始写法）。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="next_chapter"><a href="/next">下一页</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.next_chapter@text.下一页@href", true, "")
+                .unwrap(),
+            "/next"
+        );
+    }
+
+    #[test]
+    fn text_prefix_handles_empty_and_case_insensitive() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<a href="/n">Next Page</a><span>无关</span>"#;
+        // 大小写不敏感（上游对 needle 与文本都做了 lowercase）
+        assert_eq!(
+            ar.get_string(html, "text.next page@href", true, "")
+                .unwrap(),
+            "/n"
+        );
+        // 未命中 → 空串，不 panic
+        assert_eq!(
+            ar.get_string(html, "text.没有这段@href", true, "").unwrap(),
+            ""
+        );
+        assert_eq!(ar.get_string("", "text.下一页@href", true, "").unwrap(), "");
     }
 
     #[test]
