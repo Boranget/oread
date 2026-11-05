@@ -20,7 +20,7 @@ use sqlx::{FromRow, SqlitePool};
 use crate::config::Config;
 use crate::entities::BookSource;
 use crate::error::{AppError, AppResult};
-use crate::source_health::{self, classify, FailureKind};
+use crate::source_health::{self, classify, FailureKind, Outcome};
 use crate::web_book;
 
 pub const TYPE_NOVEL: i64 = 0;
@@ -44,6 +44,18 @@ pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 
 
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
 pub const MIN_CURATED_SAMPLES: i64 = 2;
+
+/// 冷启动直通 preferred 的体检质量分下限。
+///
+/// 规则（每次体检都重新计算，是运行时判定而不是一次性名单）：
+/// `samples >= MIN_CURATED_SAMPLES` 且 `hit_rate > 0` 且 `bench_score >= 50` 且未隔离
+/// → 直接授予 `preferred`（`promote_streak` 抬到 promote 阈值），跳过“连续 3 次好观测”。
+///
+/// 50 ≈ 2/5 命中（60×0.4=24）+ 约 1.3s 平均耗时（30×0.74≈22）+ 全成功（10），
+/// 0 命中或全超时的源过不了；真实搜索的降级路径（demote_streak）仍然生效。
+/// 依据：2026-11 用 147 源实测，导入后 preferred=0、observing=142，一轮体检后精选恒为 0；
+/// 去掉 tier 门槛时小说可取 14、漫画可取 4，卡点只在 tier 与体检脱节。
+pub const BENCH_FAST_TRACK_MIN_SCORE: i32 = 50;
 
 /// 精选资格：体检命中率必须 > 0。0 命中的源即使分数够、下限 min 未满也不入选，
 /// 不拿低分源凑数——让“加强搜索”只跑真的能搜到书的源。
@@ -1733,6 +1745,12 @@ pub async fn run_bench(
     }
     tx.commit().await?;
 
+    // 体检也是真实搜索：把本批结果回写健康观测，并给冷启动一条“体检直通 preferred”的通路。
+    // 失败只告警，不让健康写回拖垮体检结果本身。
+    if let Err(e) = record_bench_health(pool, &rows, &by_url, cfg).await {
+        tracing::warn!(error = %e, "record bench health failed");
+    }
+
     // 重算精选：用当前库内最新分数（含本次批次），资格要求 preferred + 样本足够 + 未连续失败 2 批。
     let (novel_sel, comic_sel) = recompute_curated(pool, cfg).await?;
     let mut flags: HashMap<String, bool> = HashMap::new();
@@ -1761,6 +1779,74 @@ pub async fn run_bench(
         excluded_from_score: runs.iter().filter(|r| r.suspicious).count() as i64,
         suspicious,
     })
+}
+
+/// 冷启动直通的纯规则，供单测与写库共用。
+fn bench_fast_track_ok(row: &SourceBenchRow) -> bool {
+    row.samples >= MIN_CURATED_SAMPLES
+        && row.hit_rate > 0.0
+        && row.bench_score >= BENCH_FAST_TRACK_MIN_SCORE
+}
+
+/// 体检回写健康：每源每批折合成 1 条观测，再按 [`BENCH_FAST_TRACK_MIN_SCORE`] 直通 preferred。
+///
+/// - 有有效响应 → `ok`（parsed=true，hits=本批命中数）；全失败 → `partial`
+///   （按引擎类处理：不因为“体检没响应”把站点连续失败计数拉高、进而误隔离）。
+/// - `usage=true`：体检也是真实搜索，命中/搜索计数进入健康分口径。
+async fn record_bench_health(
+    pool: &SqlitePool,
+    rows: &[SourceBenchRow],
+    by_url: &HashMap<String, BookSource>,
+    cfg: &Config,
+) -> AppResult<()> {
+    let tier_cfg = crate::source_quality::TierConfig::from_config(cfg);
+    let outcomes: Vec<Outcome> = rows
+        .iter()
+        .map(|r| {
+            let ok = r.samples > 0;
+            let rule_complete = by_url
+                .get(&r.source_url)
+                .map(crate::source_quality::rule_completeness)
+                .unwrap_or(0.0);
+            Outcome {
+                source_url: r.source_url.clone(),
+                status: if ok {
+                    source_health::STATUS_OK
+                } else {
+                    source_health::STATUS_PARTIAL
+                },
+                latency_ms: r.avg_latency_ms,
+                error: if ok {
+                    None
+                } else {
+                    Some("bench: no usable response".into())
+                },
+                hits: r.hits,
+                parsed: ok,
+                usage: true,
+                rule_complete,
+            }
+        })
+        .collect();
+    source_health::record_outcomes(pool, &outcomes, cfg.source_cooldown_secs, &tier_cfg).await?;
+
+    let now = now_ms();
+    let promote = cfg.source_tier_promote_streak.max(1);
+    for r in rows.iter().filter(|r| bench_fast_track_ok(r)) {
+        sqlx::query(
+            "UPDATE source_health SET tier = ?1, promote_streak = MAX(promote_streak, ?2), \
+             demote_streak = 0, last_eval_at = ?3 \
+             WHERE source_url = ?4 AND tier <> ?5",
+        )
+        .bind(crate::source_quality::TIER_PREFERRED)
+        .bind(promote)
+        .bind(now)
+        .bind(&r.source_url)
+        .bind(crate::source_quality::TIER_QUARANTINED)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 fn category_medians(runs: &[BenchRun], corpus: &[CorpusEntry]) -> HashMap<String, f64> {
@@ -2235,6 +2321,39 @@ mod tests {
             is_hit("斗破苍穹番外篇", "斗破苍穹", None, None),
             "无期望作者时包含即命中"
         );
+    }
+
+    #[test]
+    fn fast_track_requires_samples_hit_and_score() {
+        let base = SourceBenchRow {
+            source_url: "u".into(),
+            name: "n".into(),
+            source_type: TYPE_NOVEL,
+            samples: 2,
+            hits: 1,
+            hit_rate: 0.4,
+            avg_latency_ms: 1200,
+            errors: 0,
+            error_kinds: serde_json::Value::Null,
+            bench_score: BENCH_FAST_TRACK_MIN_SCORE,
+            curated: false,
+            excluded_samples: 0,
+            per_category_hit_rate: Vec::new(),
+        };
+        assert!(bench_fast_track_ok(&base));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            samples: 1,
+            ..base.clone()
+        }));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            hit_rate: 0.0,
+            hits: 0,
+            ..base.clone()
+        }));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            bench_score: BENCH_FAST_TRACK_MIN_SCORE - 1,
+            ..base
+        }));
     }
 
     #[test]
