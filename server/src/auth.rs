@@ -221,8 +221,17 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterReq>,
 ) -> AppResult<Json<TokenRes>> {
+    let username = req.username.trim().to_string();
+    if !valid_username(&username) {
+        return Err(AppError::BadRequest(
+            "用户名需为 2–32 个字符且不含空白".into(),
+        ));
+    }
+    if !valid_password(&req.password) {
+        return Err(AppError::BadRequest("密码长度需在 6–128 个字符之间".into()));
+    }
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = ?")
-        .bind(&req.username)
+        .bind(&username)
         .fetch_one(&state.shared)
         .await?;
     if exists > 0 {
@@ -230,12 +239,12 @@ pub async fn register(
     }
     let pw = hash(&req.password, DEFAULT_COST).map_err(AppError::Bcrypt)?;
     let id = sqlx::query("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')")
-        .bind(&req.username)
+        .bind(&username)
         .bind(&pw)
         .execute(&state.shared)
         .await?
         .last_insert_rowid();
-    let token = create_token(id, &req.username, "user", 0, &state.cfg.jwt_secret)?;
+    let token = create_token(id, &username, "user", 0, &state.cfg.jwt_secret)?;
     Ok(Json(TokenRes { token }))
 }
 
@@ -350,6 +359,12 @@ pub struct ChangePasswordReq {
 pub(crate) fn valid_password(pw: &str) -> bool {
     let n = pw.chars().count();
     (6..=128).contains(&n)
+}
+
+/// 用户名规则：trim 后 2–32 字符，且不含任何空白（含全角空格）。
+pub(crate) fn valid_username(name: &str) -> bool {
+    let n = name.chars().count();
+    (2..=32).contains(&n) && !name.chars().any(char::is_whitespace)
 }
 
 /// 用户自助改密：校验旧密码；成功后 token_version+1，所有旧 JWT 立即失效。
@@ -479,7 +494,9 @@ pub async fn admin_set_user_status(
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use super::{can_disable_user, valid_password};
+    use super::*;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
 
     // 禁用保护：不能禁自己，也不能禁最后一个启用中的管理员
     #[test]
@@ -500,6 +517,88 @@ mod tests {
         assert!(valid_password("123456"));
         assert!(valid_password(&"a".repeat(128)));
         assert!(!valid_password(&"a".repeat(129)));
+    }
+
+    // 用户名 trim 后 2–32 字符，且不含空白
+    #[test]
+    fn username_policy() {
+        assert!(!valid_username(""), "空用户名应拒绝");
+        assert!(!valid_username("a"), "1 个字符应拒绝");
+        assert!(!valid_username(&"a".repeat(33)), "33 个字符应拒绝");
+        assert!(valid_username(&"a".repeat(32)), "32 个字符应接受");
+        assert!(valid_username("ab"));
+        assert!(!valid_username("a b"), "中间空白应拒绝");
+        assert!(!valid_username("中文 名"), "全角/半角空白应拒绝");
+        // 前端传入前后空格时，register 先 trim 再校验
+        assert!(valid_username("  ab  ".trim()));
+    }
+
+    /// 用内存库 + 最小 users 表构造 AppState，验证 register 的实际行为。
+    async fn register_state() -> AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, \
+             password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', \
+             disabled INTEGER NOT NULL DEFAULT 0, token_version INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        AppState {
+            shared: pool,
+            cfg: crate::config::Config::from_env(),
+            user_pools: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_input() {
+        let state = State(register_state().await);
+        for (username, password) in [
+            ("", "123456"),
+            ("a", "123456"),
+            (&"a".repeat(33) as &str, "123456"),
+            ("a b", "123456"),
+            ("ok", ""),
+            ("ok", "12345"),
+        ] {
+            let res = register(
+                state.clone(),
+                Json(RegisterReq {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                }),
+            )
+            .await;
+            match res {
+                Ok(_) => panic!("{username:?}/{password:?} 应被拒绝"),
+                Err(e) => assert_eq!(e.into_response().status(), 400),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn register_trims_username() {
+        let state = State(register_state().await);
+        let res = register(
+            state.clone(),
+            Json(RegisterReq {
+                username: "  alice  ".into(),
+                password: "123456".into(),
+            }),
+        )
+        .await
+        .expect("合法注册应成功");
+        assert!(!res.0.token.is_empty());
+        let stored: String = sqlx::query_scalar("SELECT username FROM users WHERE id = 1")
+            .fetch_one(&state.shared)
+            .await
+            .unwrap();
+        assert_eq!(stored, "alice", "落库用户名必须已 trim");
     }
 }
 

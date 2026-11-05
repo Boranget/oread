@@ -610,12 +610,14 @@
   {#if isAdmin}
     <button class="ghost" on:click={() => fileInput.click()} disabled={!!busy}>导入 JSON</button>
   {/if}
-  <select bind:value={exportTier} style="width:auto" aria-label="导出范围">
-    <option value="all">全部书源</option>
-    <option value="preferred">只导优选</option>
-  </select>
-  <button class="ghost" on:click={exportAll} disabled={!!busy}>导出</button>
-  <button class="ghost" on:click={openUpdateChecker} disabled={!!busy}>检查更新</button>
+  {#if isAdmin}
+    <select bind:value={exportTier} style="width:auto" aria-label="导出范围">
+      <option value="all">全部书源</option>
+      <option value="preferred">只导优选</option>
+    </select>
+    <button class="ghost" on:click={exportAll} disabled={!!busy}>导出</button>
+    <button class="ghost" on:click={openUpdateChecker} disabled={!!busy}>检查更新</button>
+  {/if}
   <div class="spacer"></div>
   {#if isAdmin}
     <button on:click={openNew}>新建</button>
@@ -819,11 +821,11 @@
           </div>
         </div>
         <div class="row" style="margin-top:10px">
-          <button class="ghost" on:click={() => openDetail(s.book_source_url)}>详情</button>
-          <button class="ghost" on:click={() => validateOne(s)} disabled={validatingUrl === s.book_source_url}>
-            {validatingUrl === s.book_source_url ? '校验中…' : '校验'}
-          </button>
           {#if isAdmin}
+            <button class="ghost" on:click={() => openDetail(s.book_source_url)}>详情</button>
+            <button class="ghost" on:click={() => validateOne(s)} disabled={validatingUrl === s.book_source_url}>
+              {validatingUrl === s.book_source_url ? '校验中…' : '校验'}
+            </button>
             <button class="ghost" on:click={() => toggleOne(s)} disabled={!!busy}>{s.enabled ? '禁用' : '启用'}</button>
             <div class="spacer"></div>
             <button class="danger" on:click={() => remove(s.book_source_url)}>删除</button>
@@ -886,7 +888,7 @@
         </div>
         <div class="row" style="margin-top:10px">
           <button class="ghost" on:click={() => openDetail(detailUrl)}>重试</button>
-          <button class="ghost" on:click={exportOne}>导出该书源</button>
+          {#if isAdmin}<button class="ghost" on:click={exportOne}>导出该书源</button>{/if}
         </div>
       {:else}
         <div class="detail-grid">
@@ -922,7 +924,7 @@
         {#if detail.explore_url}<div class="muted" style="font-size:12px;margin:8px 0;word-break:break-all">发现地址：{detail.explore_url}</div>{/if}
         <pre class="json-view">{JSON.stringify(detail, null, 2)}</pre>
         <div class="row" style="margin-top:12px">
-          <button class="ghost" on:click={exportOne}>导出该书源</button>
+          {#if isAdmin}<button class="ghost" on:click={exportOne}>导出该书源</button>{/if}
           <div class="spacer"></div>
           {#if isAdmin}<button on:click={() => openEdit(detailUrl)}>编辑字段</button>{/if}
         </div>
