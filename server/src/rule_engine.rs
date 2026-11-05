@@ -7,13 +7,15 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use jsonpath_rust::JsonPathQuery;
-use once_cell::sync::OnceCell;
+use md5::{Digest, Md5};
+use once_cell::sync::{Lazy, OnceCell};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use serde_json::Value;
@@ -43,6 +45,119 @@ pub fn init_js(enabled: bool, timeout_ms: u64) {
         recursion_limit: 100,
         stack_size_limit: 512,
     });
+}
+
+/// `cache.getFile/putFile` 的落盘目录（部署侧 `<data_dir>/cache/rule`）。
+/// 未初始化时（单测）退回系统临时目录下的独立子目录。
+static RULE_CACHE_DIR: OnceCell<PathBuf> = OnceCell::new();
+
+pub fn init_rule_cache_dir(dir: impl Into<PathBuf>) {
+    let _ = RULE_CACHE_DIR.set(dir.into());
+}
+
+fn rule_cache_dir() -> PathBuf {
+    RULE_CACHE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::temp_dir().join("boranlib-rule-cache"))
+}
+
+/// `cache.putFile` 单文件上限（Legado 无上限，这里给出明确边界）。
+const CACHE_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Legado `cache.getFile/putFile` 用 `key.hashCode()` 作文件名；这里改用 md5
+/// （跨进程稳定，且天然屏蔽 `../` 等路径穿越——key 只当不透明标识，不当路径用）。
+fn cache_file_path(key: &str) -> PathBuf {
+    let mut hasher = Md5::new();
+    hasher.update(key.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    rule_cache_dir().join(digest)
+}
+
+fn js_cache_file_get(key: &str) -> Result<String, String> {
+    if key.is_empty() {
+        return Err("cache.getFile: key 不能为空".into());
+    }
+    match std::fs::read_to_string(cache_file_path(key)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("cache.getFile 读取失败：{e}")),
+    }
+}
+
+fn js_cache_file_put(key: &str, value: &str, save_time: i64) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("cache.putFile: key 不能为空".into());
+    }
+    if value.len() > CACHE_FILE_MAX_BYTES {
+        return Err("cache.putFile: 内容超过 16MB 上限".into());
+    }
+    let dir = rule_cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cache.putFile 创建缓存目录失败：{e}"))?;
+    let body = if save_time != 0 {
+        // Legado 的过期前缀：13 位当前毫秒 + "-" + saveTime + 空格 + 内容（getFile 原样返回）。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("{now:013}-{save_time} {value}")
+    } else {
+        value.to_string()
+    };
+    std::fs::write(cache_file_path(key), body).map_err(|e| format!("cache.putFile 写入失败：{e}"))
+}
+
+/// 书源级变量（Legado `source.get/put` 落到 `CacheManager` 的 `v_<sourceKey>_<key>`）。
+/// 本服务按进程内、按书源分桶保存：不落盘，重启即清空；Legado 的磁盘缓存语义未复刻。
+const SOURCE_VAR_MAX_VALUE_BYTES: usize = 256 * 1024;
+const SOURCE_VAR_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct SourceVarStore {
+    buckets: HashMap<String, HashMap<String, String>>,
+    bytes: usize,
+}
+
+static SOURCE_VARS: Lazy<Mutex<SourceVarStore>> =
+    Lazy::new(|| Mutex::new(SourceVarStore::default()));
+
+fn js_source_var_get(source_key: &str, key: &str) -> String {
+    let store = SOURCE_VARS.lock().unwrap_or_else(|e| e.into_inner());
+    store
+        .buckets
+        .get(source_key.trim())
+        .and_then(|b| b.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn js_source_var_put(source_key: &str, key: &str, value: &str) -> Result<String, String> {
+    if key.is_empty() {
+        return Err("source.put: key 不能为空".into());
+    }
+    if value.len() > SOURCE_VAR_MAX_VALUE_BYTES {
+        return Err("source.put: 单个值超过 256KB 上限".into());
+    }
+    let sk = source_key.trim();
+    let mut store = SOURCE_VARS.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_bytes = store
+        .buckets
+        .get(sk)
+        .and_then(|b| b.get(key))
+        .map(|old| old.len() + key.len())
+        .unwrap_or(0);
+    let add = value.len() + key.len();
+    let total = store.bytes - prev_bytes + add;
+    if total > SOURCE_VAR_MAX_TOTAL_BYTES {
+        return Err("source.put: 书源变量总量超过 8MB 上限".into());
+    }
+    store
+        .buckets
+        .entry(sk.to_string())
+        .or_default()
+        .insert(key.to_string(), value.to_string());
+    store.bytes = total;
+    Ok(value.to_string())
 }
 
 fn js_conf() -> JsConf {
@@ -263,6 +378,10 @@ fn new_js_context(conf: JsConf) -> boa_engine::Context {
         ("__nativeCookieSet", native_cookie_set as JsNativeFn),
         ("__nativeCookieRemove", native_cookie_remove as JsNativeFn),
         ("__nativeCookieClear", native_cookie_clear as JsNativeFn),
+        ("__nativeSourceVarGet", native_source_var_get as JsNativeFn),
+        ("__nativeSourceVarPut", native_source_var_put as JsNativeFn),
+        ("__nativeCacheFileGet", native_cache_file_get as JsNativeFn),
+        ("__nativeCacheFilePut", native_cache_file_put as JsNativeFn),
     ] {
         let _ = ctx.register_global_callable(
             boa_engine::JsString::from(name),
@@ -380,6 +499,73 @@ fn native_cookie_clear(
     let a = cookie_args(args);
     crate::req::js_cookie_clear(a.first().map(String::as_str).unwrap_or(""));
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from("")))
+}
+
+/// `source.get(key)`：按当前书源读进程内变量；无值返回空串（与 Legado 一致）。
+fn native_source_var_get(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let a = cookie_args(args);
+    let s = js_source_var_get(
+        a.first().map(String::as_str).unwrap_or(""),
+        a.get(1).map(String::as_str).unwrap_or(""),
+    );
+    Ok(boa_engine::JsValue::from(boa_engine::JsString::from(s)))
+}
+
+/// `source.put(key, value)`：按当前书源写进程内变量，返回写入的字符串值（与 Legado 一致）。
+fn native_source_var_put(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let a = cookie_args(args);
+    match js_source_var_put(
+        a.first().map(String::as_str).unwrap_or(""),
+        a.get(1).map(String::as_str).unwrap_or(""),
+        a.get(2).map(String::as_str).unwrap_or(""),
+    ) {
+        Ok(v) => Ok(boa_engine::JsValue::from(boa_engine::JsString::from(v))),
+        Err(msg) => Err(ajax_error(&msg)),
+    }
+}
+
+/// `cache.getFile(key)`：读落盘缓存；缺失返回空串，非法 key/IO 失败显式报错。
+fn native_cache_file_get(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let a = cookie_args(args);
+    let key = a.first().map(String::as_str).unwrap_or("");
+    match js_cache_file_get(key) {
+        Ok(s) => Ok(boa_engine::JsValue::from(boa_engine::JsString::from(s))),
+        Err(msg) => Err(ajax_error(&msg)),
+    }
+}
+
+/// `cache.putFile(key, value[, saveTime])`：写落盘缓存（saveTime 秒，0 表示不设过期前缀）。
+fn native_cache_file_put(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let a = cookie_args(args);
+    let save_time = a
+        .get(2)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|n| n as i64)
+        .unwrap_or(0);
+    match js_cache_file_put(
+        a.first().map(String::as_str).unwrap_or(""),
+        a.get(1).map(String::as_str).unwrap_or(""),
+        save_time,
+    ) {
+        Ok(()) => Ok(boa_engine::JsValue::from(boa_engine::JsString::from(""))),
+        Err(msg) => Err(ajax_error(&msg)),
+    }
 }
 
 /// `java.ajax(url[, method[, body[, headersJson]]])` 的原生实现。
@@ -1294,7 +1480,17 @@ var cache = {
   },
   putMemory: function(k, v){ cache.put(k, v); },
   delete: function(k){ delete __cache[String(k)]; },
-  deleteMemory: function(k){ cache.delete(k); }
+  deleteMemory: function(k){ cache.delete(k); },
+  // Legado `CacheManager.getFile/putFile`：key 只当不透明标识（服务端把它 md5 成文件名），
+  // 不允许用它直接拼路径；落盘目录固定为部署侧 `<data_dir>/cache/rule`。
+  getFile: function(k){ return __nativeCacheFileGet(k == null ? "" : String(k)); },
+  putFile: function(k, v, saveTime){
+    return __nativeCacheFilePut(
+      k == null ? "" : String(k),
+      String(v),
+      saveTime == null ? 0 : Math.trunc(Number(saveTime))
+    );
+  }
 };
 "#;
 
@@ -1331,14 +1527,18 @@ var book = {
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
 };
-// 书源 key（= bookSourceUrl）由 Rust 侧在每次求值前注入；get/put 的书源级变量
-// 本服务暂不持久化，仍显式报“未支持”。
+// 书源 key（= bookSourceUrl）由 Rust 侧在每次求值前注入。`get/put` 对齐 Legado
+// `BaseSource.get/put`：按书源分桶的字符串变量（CacheManager key `v_<sourceKey>_<key>`）。
+// 本服务为进程内存储，不落盘；`put` 返回写入的字符串值，`get` 缺省返回空串。
 var source = {
   key: __sourceKey,
   loginUrl: __sourceLoginUrl,
   getKey: function(){ return __sourceKey; },
-  get: function(){ throw new Error("UNSUPPORTED_JS_API:source.get（本服务暂不持久化书源变量）"); },
-  put: function(){ throw new Error("UNSUPPORTED_JS_API:source.put（本服务暂不持久化书源变量）"); }
+  get: function(k){ return __nativeSourceVarGet(__sourceKey, k == null ? "" : String(k)); },
+  put: function(k, v){
+    var s = String(v);
+    return __nativeSourceVarPut(__sourceKey, k == null ? "" : String(k), s);
+  }
 };
 // Legado `cookie` 全局：落到 Rust 侧按书源分桶的进程内 Cookie 存储（req.rs COOKIE_JAR），
 // 不新建全局 map；get 无值返回空串，set/remove/clear 返回空串（可直接拼进 {{ }} 模板）。
@@ -2084,6 +2284,12 @@ impl AnalyzeRule {
                 if js_spans.iter().any(|(a, b)| start >= *a && start < *b) {
                     return whole.to_string();
                 }
+                // `{{规则##正则[##替换[###]]}}`：Legado 把 `{{}}` 内带规则标志的内容包成
+                // SourceRule，`##` 属于规则本身，必须在求值之后应用。若把 `##…` 直接当路径/
+                // 选择器的一部分，JSONPath 会解析失败，整段展开为空（源包 11 处真实规则）。
+                if let Some(s) = self.template_rule_replace(content, key, json.as_ref()) {
+                    return s;
+                }
             }
             if key.starts_with("$.") || key.starts_with("$[") {
                 if let Some(v) = json.as_ref() {
@@ -2119,6 +2325,45 @@ impl AnalyzeRule {
             String::new()
         })
         .to_string()
+    }
+
+    /// `{{规则##…}}` 里的 `##` 替换：先按规则标志求值前半段，再对结果做正则替换。
+    /// 与 Legado `AnalyzeRule.getString` 一致：`##pat` 删匹配、`##pat##repl` 全替换、
+    /// 出现第 4 段（常见写法 `##pat##repl###`）时只替换第一个匹配。
+    /// 非规则标志内容（纯 JS）返回 `None`，维持原有的 JS 求值路径。
+    fn template_rule_replace(
+        &self,
+        content: &str,
+        key: &str,
+        json: Option<&Value>,
+    ) -> Option<String> {
+        let parts = split_outside_js(key, "##")?;
+        let base = parts[0].trim();
+        let is_rule = base.starts_with("$.")
+            || base.starts_with("$[")
+            || base.starts_with('@')
+            || base.starts_with('<')
+            || base.starts_with("//");
+        if !is_rule {
+            return None;
+        }
+        let pattern = parts.get(1).copied().unwrap_or("");
+        if pattern.is_empty() {
+            return None;
+        }
+        let value = if base.starts_with("$.") || base.starts_with("$[") {
+            json.and_then(|v| json_query(v, base).ok())
+                .and_then(|mut vals| vals.pop())
+                .map(value_to_string)?
+        } else {
+            self.get_string_inner(content, base, false, "").ok()?
+        };
+        Some(apply_replace_regex(
+            &value,
+            pattern,
+            parts.get(2).copied().unwrap_or(""),
+            parts.len() > 3,
+        ))
     }
 
     /// 进入 boa 前展开 JS 源码里的 `{{表达式}}`（Legado 规则级模板语义：模板优先于脚本）。
@@ -2484,7 +2729,14 @@ impl AnalyzeRule {
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
         // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
         if let Some(parts) = split_outside_js(rule, "##") {
-            let sub = self.get_string_inner(content, parts[0].trim(), is_url, base_url)?;
+            // `##` 前半段可能只是模板展开后的字面量（如 `📂 简介：{{$.introduction}}##…`）：
+            // Legado 里整条规则按模板求值，前半段不再当选择器解析，否则会得到空串。
+            let head = parts[0].trim();
+            let sub = if had_template && expanded_is_literal(head) {
+                head.to_string()
+            } else {
+                self.get_string_inner(content, head, is_url, base_url)?
+            };
             let pattern = parts.get(1).copied().unwrap_or("");
             if pattern.is_empty() {
                 return Ok(sub);
@@ -2779,6 +3031,10 @@ impl AnalyzeRule {
             "__content",
             "__nativeSelect",
             "__nativeAjax",
+            "__nativeSourceVarGet",
+            "__nativeSourceVarPut",
+            "__nativeCacheFileGet",
+            "__nativeCacheFilePut",
             "java",
             "cache",
             "__cache",
@@ -8107,6 +8363,147 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         assert!(
             worst < Duration::from_millis(500),
             "慢 JS 占住了 worker，心跳最大间隔 {worst:?}"
+        );
+    }
+
+    // ---- pass6：source.put/get 与 cache.getFile/putFile（懒人听书真实 JS） ----
+
+    #[test]
+    fn p6_source_put_get_roundtrip_across_instances() {
+        // 真实规则：`source.put('bookIds', bookIds)`（数组）→ 后续 `String(source.get('bookIds')).split(",")`。
+        // Legado 的 put 参数是 String，Rhino 会把数组 toString 成逗号串；本服务同口径。
+        let ar1 = AnalyzeRule::new();
+        ar1.get_string("", "<js>source.put('p6ids', [101,102,103])</js>", false, "")
+            .unwrap();
+        let ar2 = AnalyzeRule::new();
+        assert_eq!(
+            ar2.get_string("", "<js>source.get('p6ids')</js>", false, "")
+                .unwrap(),
+            "101,102,103"
+        );
+        // 缺省返回空串（Legado BaseSource.get 的 `?: ""`）
+        assert_eq!(
+            ar2.get_string("", "<js>source.get('p6-missing')</js>", false, "")
+                .unwrap(),
+            ""
+        );
+        // put 返回写入值（Legado 返回 value）
+        assert_eq!(
+            ar1.get_string("", "<js>source.put('p6ret','x')</js>", false, "")
+                .unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn p6_cache_file_put_get_is_sandboxed() {
+        // 落盘目录只来自服务端固定配置；key 被 md5 成文件名，不能当路径用。
+        let dir =
+            std::env::temp_dir().join(format!("boranlib-rule-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        init_rule_cache_dir(dir.clone());
+        let ar = AnalyzeRule::new();
+        assert_eq!(
+            ar.get_string("", "<js>cache.putFile('p6file','hello')</js>", false, "")
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            ar.get_string("", "<js>cache.getFile('p6file')</js>", false, "")
+                .unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            ar.get_string("", "<js>cache.getFile('p6-nope')</js>", false, "")
+                .unwrap(),
+            ""
+        );
+        // 穿越型 key 也不会读到任意部署机文件
+        assert_eq!(
+            ar.get_string("", "<js>cache.getFile('../../etc/passwd')</js>", false, "")
+                .unwrap(),
+            ""
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- pass6：`{{规则##正则[##替换[###]]}}` 与 Legado 对齐 ----
+
+    #[test]
+    fn p6_template_jsonpath_replace_delete() {
+        // 免费追书/♨️免费追书 真实规则 `{{$.lastUpdateChapterDate##\s.*}}`：
+        // 单段 `##` = 正则替换为空（此前 `##…` 被当作 JSONPath 的一部分，整段变空）。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"lastUpdateChapterDate":"2026-11-05 12:00:00"}"#;
+        assert_eq!(
+            ar.get_string(json, r"{{$.lastUpdateChapterDate##\s.*}}", true, "")
+                .unwrap(),
+            "2026-11-05"
+        );
+    }
+
+    #[test]
+    fn p6_template_jsonpath_replace_with_replacement() {
+        // 两段 `##pat##repl` = 全替换；含 `$.tags..name` 深扫描路径。
+        let ar = AnalyzeRule::new();
+        let json =
+            r#"{"lastUpdateChapterDate":"2026-11-05 12:00:00","tags":[{"name":"奇幻 冒险"}]}"#;
+        assert_eq!(
+            ar.get_string(json, r"{{$.lastUpdateChapterDate##\s##🔸}}", true, "")
+                .unwrap(),
+            "2026-11-05🔸12:00:00"
+        );
+        assert_eq!(
+            ar.get_string(json, r"{{$.tags..name##\s##，}}", true, "")
+                .unwrap(),
+            "奇幻，冒险"
+        );
+    }
+
+    #[test]
+    fn p6_template_jsonpath_replace_first_only() {
+        // 快看漫画 真实写法 `…##(\d+)##$1章###`：第 4 段存在 → 只替换第一个匹配。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"data":[{"topicInfo":{"topic_intro":"12 34 56"}}]}"#;
+        assert_eq!(
+            ar.get_string(
+                json,
+                r"{{$.data[0].topicInfo.topic_intro##(\d+)##$1章###}}",
+                true,
+                ""
+            )
+            .unwrap(),
+            "12章 34 56"
+        );
+    }
+
+    #[test]
+    fn p6_template_nested_css_replace() {
+        // 免费追书 真实规则 `{{@@[property="og:novel:update_time"]@content##\s##🔸}}`。
+        let ar = AnalyzeRule::new();
+        let html = r#"<p property="og:novel:update_time" content="2026-11-05 12:00:00"></p>"#;
+        assert_eq!(
+            ar.get_string(
+                html,
+                r#"{{@@[property="og:novel:update_time"]@content##\s##🔸}}"#,
+                false,
+                ""
+            )
+            .unwrap(),
+            "2026-11-05🔸12:00:00"
+        );
+    }
+
+    #[test]
+    fn p6_composed_literal_with_trailing_replace() {
+        // 免费追书 intro：字面量前缀 + 模板 + 整串 `##…##$1<br>`。
+        // 前半段展开后是字面量，不能再当选择器解析（此前整条 intro 变空）。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"introduction":"第一句。第二句！第三句？"}"#;
+        let rule = r#"📂 简介：{{$.introduction}}##(^|[。！？]+[”」）】]?)##$1<br>"#;
+        assert_eq!(
+            ar.get_string(json, rule, true, "").unwrap(),
+            "<br>📂 简介：第一句。<br>第二句！<br>第三句？<br>"
         );
     }
 }
