@@ -2131,8 +2131,18 @@ impl AnalyzeRule {
         if only_get {
             return Ok(rule.trim().to_string());
         }
+        // 整条规则就是一个 `{{…}}` 模板：Legado 直接返回模板求值结果，不能把结果再当
+        // 规则/选择器解析。此前 `{{book.name}}`、`{{java.timeFormat(...)}}` 展开后会被
+        // 当作 CSS 选择器，解析失败返回空串（库内 5 条规则 / 3 源）。
+        let whole_template = {
+            let t = rule.trim();
+            t.starts_with("{{") && t.ends_with("}}") && !t[2..t.len() - 2].contains("}}")
+        };
         let rule = self.expand_vars(&rule, content);
         let rule = rule.trim().to_string();
+        if whole_template && !rule.starts_with("{{") {
+            return Ok(rule);
+        }
         if rule.is_empty() {
             return Ok(String::new());
         }
@@ -6374,6 +6384,24 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ""
         );
         assert_eq!(ar.get_string("", "text.下一页@href", true, "").unwrap(), "");
+    }
+
+    #[test]
+    fn whole_rule_template_returns_value() {
+        // 整条规则恰为 `{{…}}`：上游直接返回模板值；旧实现把展开结果当 CSS，返回空串。
+        let ar = AnalyzeRule::new();
+        assert_eq!(ar.get_string("", "{{1+1}}", false, "").unwrap(), "2");
+        assert_eq!(
+            ar.get_string(r#"{"title":"书名A"}"#, "{{$.title}}", false, "").unwrap(),
+            "书名A"
+        );
+        // 展开失败时按原有行为返回空串，不 panic
+        assert_eq!(ar.get_string("", "{{没有这个变量}}", false, "").unwrap(), "");
+        // 非“整条模板”的写法不受影响
+        assert_eq!(
+            ar.get_string("<a href='/x'>下一页</a>", "{{'a'}}@text", false, "").unwrap(),
+            "下一页"
+        );
     }
 
     #[test]
