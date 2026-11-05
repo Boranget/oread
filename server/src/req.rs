@@ -755,6 +755,55 @@ fn record_response_cookies(scope: &str, headers: &reqwest::header::HeaderMap) {
     }
 }
 
+/// JS `cookie.getCookie(url)`：返回 `name=value; ...`，无值时空串。
+/// 书源桶优先，其次目标 host 桶（与 `cookie_header_for_request` 同一套数据）。
+pub(crate) fn js_cookie_get(source_key: &str, url: &str) -> String {
+    let scope = cookie_scope(url, Some(source_key));
+    cookie_header_for_request(&scope, url).unwrap_or_default()
+}
+
+/// JS `cookie.setCookie(url, value)`：`value` 允许 `a=b; c=d` 多段，写入当前书源桶
+/// （无书源键时写目标 host 桶）。仅进程内，不持久化到库。
+pub(crate) fn js_cookie_set(source_key: &str, url: &str, value: &str) {
+    let scope = cookie_scope(url, Some(source_key));
+    for seg in value.split(';') {
+        let seg = seg.trim();
+        if seg.contains('=') {
+            record_set_cookie(&scope, seg);
+        }
+    }
+}
+
+/// JS `cookie.removeCookie(url|domain)`：清理当前书源桶与目标 host/域名桶。
+/// 本项目桶内不保存 domain 元数据，因此按“桶整体清理”实现（语义上覆盖该 URL/域名的会话）。
+pub(crate) fn js_cookie_remove(source_key: &str, url_or_domain: &str) {
+    let arg = url_or_domain.trim();
+    let mut scopes = vec![cookie_scope(arg, Some(source_key))];
+    let host = if arg.contains("://") {
+        cookie_scope(arg, None)
+    } else {
+        format!("host:{}", arg.trim_start_matches('.'))
+    };
+    if !host.ends_with(':') && !scopes.contains(&host) {
+        scopes.push(host);
+    }
+    let mut store = COOKIE_JAR.lock().unwrap_or_else(|e| e.into_inner());
+    for s in scopes {
+        store.buckets.remove(&s);
+    }
+}
+
+/// JS `cookie.clear()`：只清当前书源桶（不触碰其它源，避免并发串味）。
+pub(crate) fn js_cookie_clear(source_key: &str) {
+    let key = source_key.trim();
+    if key.is_empty() {
+        return;
+    }
+    let scope = format!("source:{key}");
+    let mut store = COOKIE_JAR.lock().unwrap_or_else(|e| e.into_inner());
+    store.buckets.remove(&scope);
+}
+
 #[cfg(test)]
 fn cookie_reset() {
     let mut store = COOKIE_JAR.lock().unwrap_or_else(|e| e.into_inner());
@@ -2028,6 +2077,54 @@ mod tests {
         );
         assert!(header.contains("k11="), "最新条目应保留: {header}");
         assert!(!header.contains("k0="), "最旧条目应被淘汰: {header}");
+    }
+
+    // ---- P4: JS `cookie` 全局底层 ----
+
+    #[test]
+    fn js_cookie_get_missing_returns_empty() {
+        let _guard = lock_cookie_jar();
+        cookie_reset();
+        assert_eq!(js_cookie_get("src-none", "https://none.example/x"), "");
+    }
+
+    #[test]
+    fn js_cookie_set_then_get_and_remove() {
+        let _guard = lock_cookie_jar();
+        cookie_reset();
+        js_cookie_set("src-p4", "https://p4.example", "sid=R; k=R2");
+        assert_eq!(js_cookie_get("src-p4", "https://p4.example"), "sid=R; k=R2");
+        js_cookie_remove("src-p4", "https://p4.example");
+        assert_eq!(js_cookie_get("src-p4", "https://p4.example"), "");
+        // clear 只清当前源
+        js_cookie_set("src-p4", "https://p4.example", "again=1");
+        js_cookie_clear("src-p4");
+        assert_eq!(js_cookie_get("src-p4", "https://p4.example"), "");
+    }
+
+    #[test]
+    fn js_cookie_scopes_are_isolated_concurrently() {
+        let _guard = lock_cookie_jar();
+        cookie_reset();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                js_cookie_set("src-a", "https://a.example", "sid=A");
+                js_cookie_set("src-a", "https://a.example", "only_a=1");
+            });
+            s.spawn(|| {
+                js_cookie_set("src-b", "https://b.example", "sid=B");
+                js_cookie_set("src-b", "https://b.example", "only_b=1");
+            });
+        });
+        // 两个源对同名 cookie 互不影响（各自桶内独立）
+        assert_eq!(
+            js_cookie_get("src-a", "https://a.example"),
+            "sid=A; only_a=1"
+        );
+        assert_eq!(
+            js_cookie_get("src-b", "https://b.example"),
+            "sid=B; only_b=1"
+        );
     }
 
     #[tokio::test]

@@ -309,6 +309,9 @@ fn truthy(s: &str) -> bool {
 
 /// 把相对 URL 归并为绝对 URL
 fn abs(base: &str, maybe: &str) -> String {
+    // Legado 允许 URL 末尾附带 `,{...}` 选项（webView/headers/body 等）；本服务无 WebView，
+    // 但链接本身必须去掉选项才能请求（开心漫画的章节链接即带 `,{"webView": true}`）。
+    let maybe = strip_url_options(maybe);
     if maybe.starts_with("http://") || maybe.starts_with("https://") {
         return maybe.to_string();
     }
@@ -318,6 +321,43 @@ fn abs(base: &str, maybe: &str) -> String {
         }
     }
     maybe.to_string()
+}
+
+/// 去尾巴式 Legado URL 选项：只有后缀能被 JSON 解析成 `{...}` 时才截断，避免误伤普通逗号路径。
+/// 相对链接经 `Url::join` 后选项会被百分号编码（`,%7B…`），这种形态按 `,{` 等价处理。
+fn strip_url_options(url: &str) -> &str {
+    let mut cut = None;
+    if let Some(pos) = url.rfind(",{") {
+        if serde_json::from_str::<serde_json::Value>(&url[pos + 1..]).is_ok() {
+            cut = Some(pos);
+        }
+    }
+    if cut.is_none() {
+        if let Some(pos) = url.rfind(",%7B").or_else(|| url.rfind(",%7b")) {
+            cut = Some(pos);
+        }
+    }
+    match cut {
+        Some(pos) => url[..pos].trim_end(),
+        None => url,
+    }
+}
+
+/// JS 对象项里 `volume/isVolume/is_volume=true` 时视为分卷行（源没配 isVolume 规则时的兜底）。
+fn item_json_volume(item: &str) -> bool {
+    let t = item.trim_start();
+    if !t.starts_with('{') {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        return false;
+    };
+    let Some(m) = v.as_object() else {
+        return false;
+    };
+    ["volume", "isVolume", "is_volume"]
+        .iter()
+        .any(|k| m.get(*k).and_then(|x| x.as_bool()) == Some(true))
 }
 
 /// 对可选的布尔标志子规则求值（isVolume / isVip / isPay 共用）：
@@ -1038,18 +1078,25 @@ pub async fn chapter_list_book(
         )
         .await?;
         let rule_text = rule.chapter_list.as_deref().unwrap_or("");
-        // Legado 目录规则前缀 `-` 表示倒序（如 `-class.list@tag.li`）；直接当选择器会抓空。
+        // Legado 目录规则前缀：`-` 表示倒序（如 `-class.list@tag.li`），`+` 表示保持原序
+        // （`+@js:…` 的「正序」标记，见 WebBookChapterList 对 chapterList 的前缀剥离）；
+        // 直接当选择器/JS 会抓空或语法报错。
         let (list_rule, reverse) = match rule_text.trim().strip_prefix('-') {
             Some(rest) => (rest.trim(), true),
-            None => (rule_text, false),
+            None => match rule_text.trim().strip_prefix('+') {
+                Some(rest) => (rest.trim(), false),
+                None => (rule_text, false),
+            },
         };
         let mut items = eval_list_field(source, "chapter_list", &ar, &html, list_rule);
         if reverse {
             items.reverse();
         }
         for item in &items {
-            let idx = chaps.len() as i64;
-            let is_volume = flag(source, "is_volume", &ar, item, &rule.is_volume, &url);
+            // `@js` 返回 `[{text,href}]` 展开后的对象项：空项/缺字段项跳过并记一条日志
+            let is_volume = flag(source, "is_volume", &ar, item, &rule.is_volume, &url)
+                || item_json_volume(item);
+            let title = opt(source, "chapter_name", &ar, item, &rule.chapter_name, &url);
             let raw_url = eval_field(
                 source,
                 "chapter_url",
@@ -1059,6 +1106,17 @@ pub async fn chapter_list_book(
                 true,
                 &url,
             );
+            if !is_volume
+                && title.as_deref().map(blank_value).unwrap_or(true)
+                && blank_value(&raw_url)
+            {
+                tracing::warn!(
+                    source = source.book_source_url.as_str(),
+                    "目录项缺少标题与链接，已跳过"
+                );
+                continue;
+            }
+            let idx = chaps.len() as i64;
             // 分卷行通常没有真实链接：用稳定合成 URL 作主键，避免覆盖正文章节或产生假 URL
             let url_final = if is_volume {
                 format!("volume:{}#{idx}", book.book_url)
@@ -1072,7 +1130,7 @@ pub async fn chapter_list_book(
             let is_pay = flag(source, "is_pay", &ar, item, &rule.is_pay, &url);
             chaps.push(BookChapter {
                 url: url_final,
-                title: opt(source, "chapter_name", &ar, item, &rule.chapter_name, &url),
+                title,
                 is_volume,
                 is_vip,
                 is_pay,
@@ -2026,6 +2084,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abs_strips_legado_url_options() {
+        // 开心漫画章节链接形如 `https://…/chapter/xxx,{"webView": true}`；带选项请求会 404
+        assert_eq!(
+            abs(
+                "https://www.kaixinman.com/",
+                "/chapter/xxx,{\"webView\": true}"
+            ),
+            "https://www.kaixinman.com/chapter/xxx"
+        );
+        // 相对链接 join 后选项会被编码成 `,%7B…`，同样要剥掉
+        assert_eq!(
+            strip_url_options("https://www.kaixinman.com/chapter/xxx,%7B%22webView%22:%20true%7D"),
+            "https://www.kaixinman.com/chapter/xxx"
+        );
+        // 不是 JSON 选项的逗号尾巴保持原样
+        assert_eq!(
+            abs("https://www.kaixinman.com/", "/a,b.html"),
+            "https://www.kaixinman.com/a,b.html"
+        );
+    }
+
+    #[test]
+    fn chapter_url_append_suffix_is_stripped_as_option() {
+        let src = BookSource::default();
+        let ar = make_ar(&src);
+        let html = r#"<a href="/chapter/x">第1话</a>"#;
+        let raw = ar
+            .get_string(
+                html,
+                "href##$##,{\"webView\": true}",
+                true,
+                "https://www.kaixinman.com/comic/1",
+            )
+            .unwrap();
+        assert_eq!(raw, "/chapter/x,{\"webView\": true}");
+        assert_eq!(
+            abs("https://www.kaixinman.com/comic/1/", &raw),
+            "https://www.kaixinman.com/chapter/x"
+        );
+    }
+
+    #[test]
     fn content_text_nodes_fallback_recovers_p_wrapped_text() {
         // 真实形态（biquge7《百年孤独》）：`.text` 里只有 <p>，直接文本节点全是空白，
         // `@textNodes` 得到空串；回退到同一选择器的 `@html` 才能拿到正文。
@@ -2908,6 +3008,113 @@ mod tests {
             ..Default::default()
         };
         assert_source_timeout(chapter_list(&s, &book).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn toc_plus_js_object_array_expands_with_fields() {
+        // 复现运行期链路：目录页返回 JSON，`+@js`（正序标记）造出 [{header,list:[…]}] 分卷结构，
+        // 章节字段规则是裸名（title/url），必须逐项解析出来（不能只剩分卷头）。
+        // `+` 前缀不剥离会被当成 CSS/JS 规则，整源目录 0 章（武道文学即此因）。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"chapters":[{"t":"第一章","u":"/ch/1"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut s = BookSource::default();
+        s.book_source_url = base.clone();
+        s.rule_toc = Some(TocRule {
+            chapter_list: Some(
+                "+@js:JSON.stringify([{header:'卷一',list:[{title:'一',url:'/ch/1'},{title:'二',url:'/ch/2'}]},{header:'卷二',list:[{title:'三',url:'/ch/3'}]}])".into(),
+            ),
+            chapter_name: Some("title".into()),
+            chapter_url: Some("url".into()),
+            ..Default::default()
+        });
+        let book = Book {
+            book_url: format!("{base}/book"),
+            toc_url: Some(format!("{base}/toc")),
+            ..Default::default()
+        };
+        let chaps = chapter_list(&s, &book).await.unwrap();
+        assert_eq!(chaps.len(), 5, "2 个分卷头 + 3 章: {chaps:?}");
+        assert_eq!(chaps.iter().filter(|c| !c.is_volume).count(), 3);
+        assert_eq!(chaps[1].title.as_deref(), Some("一"));
+        assert!(chaps[1].url.ends_with("/ch/1"), "{}", chaps[1].url);
+    }
+
+    #[tokio::test]
+    async fn toc_chapter_url_strips_encoded_webview_option() {
+        // 开心漫画：`href##$##,{"webView": true}` 把选项拼进链接，抓取前必须剥掉，
+        // 否则相对链接 join 后变成 `,%7B…`，章节请求 404、正文恒为空。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"<ul class="chapter-list clearfix column6 overflow"><li><a href="/chapter/x">第1话</a></li></ul>"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut s = BookSource::default();
+        s.book_source_url = base.clone();
+        s.rule_toc = Some(TocRule {
+            chapter_list: Some(
+                "[class=\"chapter-list clearfix column6 overflow\"]@li@a\n<js>result</js>".into(),
+            ),
+            chapter_name: Some("text".into()),
+            chapter_url: Some("href##$##,{\"webView\": true}".into()),
+            ..Default::default()
+        });
+        let book = Book {
+            book_url: format!("{base}/comic/1"),
+            toc_url: Some(format!("{base}/comic/1")),
+            ..Default::default()
+        };
+        let chaps = chapter_list(&s, &book).await.unwrap();
+        assert_eq!(chaps.len(), 1, "{chaps:?}");
+        assert_eq!(chaps[0].title.as_deref(), Some("第1话"));
+        assert_eq!(
+            chaps[0].url,
+            format!("{base}/chapter/x"),
+            "{}",
+            chaps[0].url
+        );
     }
 
     #[tokio::test]
