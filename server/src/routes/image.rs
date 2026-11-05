@@ -36,7 +36,7 @@ use crate::auth::AuthUser;
 use crate::entities::BookSource;
 use crate::routes::sources::load_source;
 use crate::routes::AppState;
-use crate::{image_cache, req};
+use crate::{image_cache, req, web_book};
 
 /// 单张图片回源上限（字节）；流式读取按块累计，实际判定用 `CACHE_ITEM_MAX`，本常量仅单测引用。
 #[allow(dead_code)]
@@ -1533,7 +1533,7 @@ async fn handle_slice(
             false,
             src_timeout,
             Some(&source.book_source_url),
-            req::source_concurrency(source),
+            req::source_limit(source),
         ),
     )
     .await
@@ -1686,7 +1686,7 @@ pub(crate) async fn fetch_image_meta(
     max_bytes: usize,
     timeout: Option<Duration>,
     source_key: Option<&str>,
-    source_limit: usize,
+    limit: req::SourceLimit,
 ) -> serde_json::Value {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
@@ -1704,7 +1704,7 @@ pub(crate) async fn fetch_image_meta(
     let budget = timeout.unwrap_or(IMAGE_TIMEOUT);
     let opened = match tokio::time::timeout(
         budget,
-        req::open_stream_for_source_timed(&url, &hdrs, false, timeout, source_key, source_limit),
+        req::open_stream_for_source_timed(&url, &hdrs, false, timeout, source_key, limit),
     )
     .await
     {
@@ -1828,7 +1828,7 @@ async fn images_meta(
     let hdrs = source_referer(&source, req.chapter_url.as_deref(), req.book_url.as_deref());
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
     let timeout = req::source_timeout(&source);
-    let source_limit = req::source_concurrency(&source);
+    let source_limit = req::source_limit(&source);
     let items: Vec<serde_json::Value> = futures::stream::iter(req.urls.into_iter().map(|u| {
         fetch_image_meta(
             u,
@@ -1907,7 +1907,7 @@ pub(crate) async fn probe_dims(
     }
     let hdrs = source_referer(source, chapter_url, book_url);
     let timeout = req::source_timeout(source);
-    let source_limit = req::source_concurrency(source);
+    let source_limit = req::source_limit(source);
     let source_key = source.book_source_url.clone();
     let fetched: Vec<(usize, Option<(u32, u32)>)> = futures::stream::iter(missing)
         .map(|(i, u)| {
@@ -1959,6 +1959,70 @@ fn map_open_error(e: anyhow::Error) -> Response {
     error_body(StatusCode::BAD_GATEWAY, "upstream_error", &m)
 }
 
+/// 按魔数嗅探解码后的图片类型（加密源上游常返回 application/octet-stream）。
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Jpeg) => "image/jpeg",
+        Ok(image::ImageFormat::Png) => "image/png",
+        Ok(image::ImageFormat::Gif) => "image/gif",
+        Ok(image::ImageFormat::WebP) => "image/webp",
+        Ok(image::ImageFormat::Bmp) => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `ContentRule.image_decode` 源：整图缓冲 → 规则解密 → 按真实格式直出。
+/// 解密失败时 `web_book::decode_image` 会回退原字节，不会让整章 502。
+async fn proxy_decoded(
+    source: &BookSource,
+    q: &ImageQ,
+    headers: &HeaderMap,
+    max_bytes: usize,
+) -> Response {
+    let hdrs = source_referer(source, q.chapter_url.as_deref(), q.book_url.as_deref());
+    let (budget, src_timeout) = image_budget(source);
+    let opened = match tokio::time::timeout(
+        budget,
+        req::open_stream_for_source_timed(
+            &q.url,
+            &hdrs,
+            false,
+            src_timeout,
+            Some(&source.book_source_url),
+            req::source_limit(source),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return map_open_error(e),
+        Err(_) => {
+            return error_body(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                &format!("图片回源超时（{}s）", budget.as_secs()),
+            )
+        }
+    };
+    let resp = opened.response;
+    let status = resp.status();
+    if !status.is_success() {
+        return error_body(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            &format!("源站返回 {status}"),
+        );
+    }
+    let raw = match collect_image_body(resp, max_bytes).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let decoded = web_book::decode_image(source, &q.url, raw);
+    let etag = etag_of(&format!("{}#decoded", q.url));
+    let ct = sniff_image_mime(&decoded).to_string();
+    serve_bytes(decoded, &ct, &etag, false, headers)
+}
+
 async fn proxy(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -2003,6 +2067,10 @@ async fn proxy(
                 &format!("URL 解析失败: {e}"),
             )
         }
+    }
+    // 加密图源（ContentRule.image_decode）：不走切片/转码，先整图解密再直出。
+    if web_book::has_image_decode(&source) {
+        return proxy_decoded(&source, &q, &headers, max_bytes).await;
     }
     let transcode = wants_webp_transcode(&headers);
     let eink = is_eink_client(&headers, q.eink.as_deref());
@@ -2068,7 +2136,7 @@ async fn proxy(
             false,
             src_timeout,
             Some(&source.book_source_url),
-            req::source_concurrency(&source),
+            req::source_limit(&source),
         ),
     )
     .await
@@ -2411,11 +2479,11 @@ mod tests {
             image_budget(&s),
             (Duration::from_secs(2), Some(Duration::from_secs(2)))
         );
-        s.timeout_millisecond = 100;
+        s.timeout_millisecond = 50;
         assert_eq!(
             image_budget(&s).0,
-            Duration::from_secs(1),
-            "低于下限按 1000ms 夹取"
+            Duration::from_millis(100),
+            "低于极小值保护按 100ms 夹取"
         );
     }
 

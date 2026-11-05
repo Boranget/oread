@@ -32,10 +32,13 @@ use crate::entities::BookSource;
 const MAX_REDIRECTS: usize = 5;
 /// 域名解析的独立预算，避免 DNS 卡住整个预览请求
 const DNS_TIMEOUT_SECS: u64 = 5;
-/// 书源级超时（`timeout_millisecond`）允许区间：过短会把正常慢站判死，
-/// 过长会让单源卡住整批抓取。
-pub const SOURCE_TIMEOUT_MIN_MS: i64 = 1000;
-pub const SOURCE_TIMEOUT_MAX_MS: i64 = 60000;
+/// 书源级超时（`timeout_millisecond`）的边界：不再做 1–60s 的人为夹取。
+/// 只保留极小值保护（防止 1ms 把正常站点全部判死）与全局上限兜底（防止单源卡死整批），
+/// 取值由 `parse_source_timeout_ms` 说明；站点声明的任意中间值原样生效。
+pub const SOURCE_TIMEOUT_MIN_MS: i64 = 100;
+pub const SOURCE_TIMEOUT_MAX_MS: i64 = 120_000;
+/// `concurrentRate` 的间隔上限：防止异常来源写入超大间隔把源永久卡住。
+const SOURCE_RATE_MAX_INTERVAL_MS: u64 = 600_000;
 /// 普通抓取跟随的最大跳数（与浏览器常见的 10 跳一致）。
 /// reqwest 默认就是 limited(10)，这里显式写出来，避免以后改默认值造成 301/302 断链。
 const FOLLOW_REDIRECTS: usize = 10;
@@ -182,7 +185,8 @@ pub fn search_total_budget(scope: SearchScope) -> Duration {
 }
 
 /// 解析书源级超时：空/0/负数 → `None`（调用方回退全局 `HTTP_TIMEOUT_SECS`）；
-/// 否则夹取到 [`SOURCE_TIMEOUT_MIN_MS`, `SOURCE_TIMEOUT_MAX_MS`]。
+/// 否则夹取到 [`SOURCE_TIMEOUT_MIN_MS`(100ms), `SOURCE_TIMEOUT_MAX_MS`(120s)]。
+/// 与 Legado 一致：源声明的 1–60s 之外的值（如 80s）也原样采用。
 pub fn parse_source_timeout_ms(raw: i64) -> Option<Duration> {
     if raw <= 0 {
         return None;
@@ -216,9 +220,57 @@ pub fn parse_source_concurrency(raw: Option<&str>, default: usize) -> usize {
     }
 }
 
-/// 书源的每源在飞上限：`concurrentRate` 的整数部分，未声明时用全局默认。
+/// 书源的每源在飞上限（旧接口，等价于 [`source_limit`] 的并发部分）。
+#[cfg(test)]
 pub fn source_concurrency(source: &BookSource) -> usize {
     parse_source_concurrency(
+        source.concurrent_rate.as_deref(),
+        conf().source_concurrency_default,
+    )
+}
+
+/// 书源请求限制：`concurrentRate` 的完整 Legado 语义「次数/间隔」。
+/// - `concurrency`：同时在飞上限（`N`）
+/// - `per` / `interval`：每 `per` 次请求后等待 `interval`（`N/interval`，单位毫秒）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceLimit {
+    pub concurrency: usize,
+    pub per: usize,
+    pub interval: Duration,
+}
+
+impl SourceLimit {
+    pub fn concurrency_only(n: usize) -> Self {
+        Self {
+            concurrency: n,
+            per: 0,
+            interval: Duration::ZERO,
+        }
+    }
+}
+
+/// 解析完整的 `concurrentRate`：`"3/1000"` → 3 次/1000ms；只写 `"3"` 时退化为纯并发上限。
+/// 非法/0/缺省时 `per=0`（不做速率等待），并发上限按 [`parse_source_concurrency`]。
+pub fn parse_source_limit(raw: Option<&str>, default: usize) -> SourceLimit {
+    let concurrency = parse_source_concurrency(raw, default);
+    let interval_ms = raw
+        .and_then(|v| v.trim().split_once('/'))
+        .and_then(|(_, b)| b.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms.clamp(1, SOURCE_RATE_MAX_INTERVAL_MS));
+    match interval_ms {
+        Some(interval_ms) => SourceLimit {
+            concurrency,
+            per: concurrency,
+            interval: Duration::from_millis(interval_ms),
+        },
+        None => SourceLimit::concurrency_only(concurrency),
+    }
+}
+
+/// 书源的完整请求限制（并发 + 速率）。
+pub fn source_limit(source: &BookSource) -> SourceLimit {
+    parse_source_limit(
         source.concurrent_rate.as_deref(),
         conf().source_concurrency_default,
     )
@@ -270,6 +322,52 @@ pub fn source_limit_metrics() -> (u64, u64) {
         SOURCE_LIMIT_WAITS.load(Ordering::Relaxed),
         SOURCE_LIMIT_WAIT_MS.load(Ordering::Relaxed),
     )
+}
+
+// ---- `concurrentRate` 的「次数/间隔」速率门 ----
+
+#[derive(Clone, Copy, Default)]
+struct RateGate {
+    used: usize,
+    until: Option<std::time::Instant>,
+}
+
+static SOURCE_RATE_GATES: Lazy<Mutex<HashMap<String, RateGate>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 每 `limit.per` 次请求后等待 `limit.interval`（Legado `concurrentRate` 语义）。
+/// 与并发信号量互补：信号量限制在飞数量，本函数限制请求节奏。
+async fn acquire_source_rate(source_key: &str, limit: SourceLimit) -> anyhow::Result<()> {
+    if limit.per == 0 || limit.interval.is_zero() {
+        return Ok(());
+    }
+    loop {
+        let wait = {
+            let mut map = SOURCE_RATE_GATES.lock().unwrap_or_else(|e| e.into_inner());
+            let g = map.entry(source_key.to_string()).or_default();
+            let now = std::time::Instant::now();
+            match g.until {
+                Some(until) if now < until => Some(until - now),
+                _ => {
+                    g.until = None;
+                    g.used += 1;
+                    if g.used >= limit.per {
+                        g.used = 0;
+                        g.until = Some(now + limit.interval);
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(d) = wait {
+            SOURCE_LIMIT_WAITS.fetch_add(1, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            tokio::time::sleep(d).await;
+            SOURCE_LIMIT_WAIT_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            continue;
+        }
+        return Ok(());
+    }
 }
 
 /// 全局默认的每源上限（供未持有 `BookSource` 的调用点使用）。
@@ -911,11 +1009,14 @@ async fn fetch_text(
     allow_private: bool,
     validate_private: bool,
     timeout: Option<Duration>,
-    source_limit: usize,
+    limit: SourceLimit,
 ) -> anyhow::Result<String> {
-    // 先按源限流，再抢全局 16 槽：某个源的排队不会把全局槽占死。
+    // 先按源限流（次数/间隔），再抢全局 16 槽：某个源的排队不会把全局槽占死。
     let _source_permit = match source_key {
-        Some(k) => Some(acquire_source_slot(k, source_limit).await?),
+        Some(k) => {
+            acquire_source_rate(k, limit).await?;
+            Some(acquire_source_slot(k, limit.concurrency).await?)
+        }
         None => None,
     };
     let _permit = acquire_permit().await?;
@@ -970,7 +1071,18 @@ pub async fn fetch(
     headers: &HashMap<String, String>,
     body: Option<&str>,
 ) -> anyhow::Result<String> {
-    fetch_text(url, method, headers, body, None, false, false, None, 0).await
+    fetch_text(
+        url,
+        method,
+        headers,
+        body,
+        None,
+        false,
+        false,
+        None,
+        SourceLimit::concurrency_only(0),
+    )
+    .await
 }
 
 /// 按书源发起请求：Cookie 按 `bookSourceUrl` 分桶，其余与 `fetch` 一致。
@@ -1003,7 +1115,7 @@ pub async fn fetch_for_source_timed(
         false,
         false,
         timeout,
-        source_concurrency_default(),
+        SourceLimit::concurrency_only(source_concurrency_default()),
     )
     .await
 }
@@ -1016,7 +1128,7 @@ pub async fn fetch_for_source_limited(
     body: Option<&str>,
     source_key: &str,
     timeout: Option<Duration>,
-    source_limit: usize,
+    limit: SourceLimit,
 ) -> anyhow::Result<String> {
     fetch_text(
         url,
@@ -1027,7 +1139,7 @@ pub async fn fetch_for_source_limited(
         false,
         false,
         timeout,
-        source_limit,
+        limit,
     )
     .await
 }
@@ -1058,7 +1170,7 @@ pub async fn fetch_page_for_source_timed(
     source_key: &str,
     timeout: Option<Duration>,
 ) -> anyhow::Result<PageResponse> {
-    let source_limit = source_concurrency_default();
+    let source_limit = SourceLimit::concurrency_only(source_concurrency_default());
     fetch_page_for_source_limited(url, headers, source_key, timeout, source_limit).await
 }
 
@@ -1068,9 +1180,10 @@ pub async fn fetch_page_for_source_limited(
     headers: &HashMap<String, String>,
     source_key: &str,
     timeout: Option<Duration>,
-    source_limit: usize,
+    limit: SourceLimit,
 ) -> anyhow::Result<PageResponse> {
-    let _source_permit = acquire_source_slot(source_key, source_limit).await?;
+    acquire_source_rate(source_key, limit).await?;
+    let _source_permit = acquire_source_slot(source_key, limit.concurrency).await?;
     let _permit = acquire_permit().await?;
     let scope = cookie_scope(url, Some(source_key));
     let resp = execute_request(
@@ -1217,7 +1330,7 @@ pub async fn fetch_checked(
         allow_private,
         true,
         None,
-        0,
+        SourceLimit::concurrency_only(0),
     )
     .await
 }
@@ -1251,7 +1364,15 @@ pub async fn open_stream_timed(
     allow_private: bool,
     timeout: Option<Duration>,
 ) -> anyhow::Result<StreamOpen> {
-    open_stream_for_source_timed(url, headers, allow_private, timeout, None, 0).await
+    open_stream_for_source_timed(
+        url,
+        headers,
+        allow_private,
+        timeout,
+        None,
+        SourceLimit::concurrency_only(source_concurrency_default()),
+    )
+    .await
 }
 
 /// 与 [`open_stream_timed`] 相同，但按书源限流（图片代理等多请求场景）。
@@ -1261,10 +1382,13 @@ pub async fn open_stream_for_source_timed(
     allow_private: bool,
     timeout: Option<Duration>,
     source_key: Option<&str>,
-    source_limit: usize,
+    limit: SourceLimit,
 ) -> anyhow::Result<StreamOpen> {
     let source_permit = match source_key {
-        Some(k) => Some(acquire_source_slot(k, source_limit).await?),
+        Some(k) => {
+            acquire_source_rate(k, limit).await?;
+            Some(acquire_source_slot(k, limit.concurrency).await?)
+        }
         None => None,
     };
     let permit = acquire_permit().await?;
@@ -1361,6 +1485,9 @@ pub fn source_headers(source: &BookSource, base_url: &str) -> HashMap<String, St
         Some(raw) if raw.trim().starts_with("@js:") => {
             let mut ar = crate::rule_engine::AnalyzeRule::new();
             ar.js_lib = source.js_lib.clone().unwrap_or_default();
+            ar.source_key.replace(source.book_source_url.clone());
+            ar.source_login_url
+                .replace(source.login_url.clone().unwrap_or_default());
             // 保留 `@js:` 前缀交给规则引擎识别（它负责把 JS 段拆出来执行）
             match ar.get_string("", raw.trim(), false, base_url) {
                 Ok(s) if !s.trim().is_empty() => parse_headers(&Some(s)),
@@ -1595,23 +1722,26 @@ mod tests {
     fn source_timeout_clamps_and_falls_back_to_global() {
         assert_eq!(parse_source_timeout_ms(0), None, "0 表示未设置");
         assert_eq!(parse_source_timeout_ms(-1), None, "负数表示未设置");
+        // Legado 允许任意毫秒值；这里只做极小值保护（100ms），不再把 1–60s 人为夹取
         assert_eq!(
             parse_source_timeout_ms(1),
-            Some(Duration::from_millis(1000))
+            Some(Duration::from_millis(100)),
+            "低于下限夹到 100ms"
         );
         assert_eq!(
-            parse_source_timeout_ms(999),
-            Some(Duration::from_millis(1000)),
-            "低于下限夹到 1000ms"
+            parse_source_timeout_ms(4200),
+            Some(Duration::from_millis(4200)),
+            "常规值原样生效"
         );
         assert_eq!(
-            parse_source_timeout_ms(2000),
-            Some(Duration::from_millis(2000))
+            parse_source_timeout_ms(80_000),
+            Some(Duration::from_millis(80_000)),
+            "超出旧 60s 上限也原样生效"
         );
         assert_eq!(
-            parse_source_timeout_ms(60001),
-            Some(Duration::from_millis(60000)),
-            "高于上限夹到 60000ms"
+            parse_source_timeout_ms(999_999),
+            Some(Duration::from_millis(120_000)),
+            "极端值夹到全局上限 120s"
         );
     }
 
@@ -1659,6 +1789,42 @@ mod tests {
         );
         assert_eq!(parse_source_concurrency(Some("9"), 8), 8, "超过 8 夹回");
         assert_eq!(parse_source_concurrency(Some("100/200"), 8), 8);
+    }
+
+    // `concurrentRate` 的完整语义：`N/interval` → 并发 N + 每 N 次等待 interval
+    #[test]
+    fn parse_source_limit_reads_rate_and_interval() {
+        let l = parse_source_limit(Some("3/1000"), 8);
+        assert_eq!(l.concurrency, 3);
+        assert_eq!(l.per, 3);
+        assert_eq!(l.interval, Duration::from_millis(1000));
+
+        let l = parse_source_limit(Some("2/200"), 8);
+        assert_eq!((l.concurrency, l.per), (2, 2));
+        assert_eq!(l.interval, Duration::from_millis(200));
+
+        // 只写整数：退化为纯并发上限，不做速率等待
+        let l = parse_source_limit(Some("4"), 8);
+        assert_eq!(l.concurrency, 4);
+        assert_eq!(l.per, 0);
+        assert_eq!(l.interval, Duration::ZERO);
+
+        // 斜杠后非法/0：也不做速率等待
+        let l = parse_source_limit(Some("3/abc"), 8);
+        assert_eq!(l.concurrency, 3);
+        assert_eq!(l.per, 0);
+        assert_eq!(l.interval, Duration::ZERO);
+
+        // 间隔上限 10 分钟
+        let l = parse_source_limit(Some("1/999999"), 8);
+        assert_eq!(
+            l.interval,
+            Duration::from_millis(SOURCE_RATE_MAX_INTERVAL_MS)
+        );
+
+        // 缺省/非法 → 全局默认并发、无速率等待
+        let l = parse_source_limit(None, 8);
+        assert_eq!((l.concurrency, l.per), (8, 0));
     }
 
     // 字段缺失时使用全局默认 8；字段存在时按书源生效
