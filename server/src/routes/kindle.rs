@@ -215,11 +215,19 @@ location.replace(location.pathname+'?'+o.join('&'));}})()";
 /// 把「URL 参数视口 + 真实量到的视口/文档尺寸」回传 `/api/k/probe`。
 /// `innerWidth/innerHeight` 与 `documentElement.clientWidth/clientHeight` 同时上报，
 /// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；失败静默。
+/// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`：
+/// 若 `screen_h`/`avail_h` 明显大于 `client_h`，说明 Silk 的可视视口被系统栏或工具栏
+/// 遮住了一部分（此时即使文档高 = `clientHeight` 仍会露滚动条），量不到的数一律填 `-`。
 const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
-function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1;\
+function v(x){return typeof x=='number'?x:'-'}\
+function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
+st=document.getElementById('k-stage');\
 var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
-'&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname);\
+'&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname)+\
+'&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
+'&outer_w='+v(window.outerWidth)+'&outer_h='+v(window.outerHeight)+\
+'&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight);\
 var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
 if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
 else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
@@ -2714,6 +2722,25 @@ mod tests {
         assert!(
             html.contains("/api/k/probe?"),
             "探针必须上报到 /api/k/probe"
+        );
+        for f in [
+            "screen_w=",
+            "screen_h=",
+            "avail_h=",
+            "outer_w=",
+            "outer_h=",
+            "body_h=",
+            "stage_h=",
+        ] {
+            assert!(K_PROBE_JS.contains(f), "探针 v2 字段缺失：{f}");
+        }
+        assert!(
+            K_PROBE_JS.contains("getElementById('k-stage')"),
+            "stage_h 必须取 #k-stage 的 clientHeight"
+        );
+        assert!(
+            !K_PROBE_JS.contains("Promise") && !K_PROBE_JS.contains("fetch("),
+            "探针必须是 ES5（XHR，不用 Promise/fetch）"
         );
         assert!(
             !K_PROBE_JS.contains("location.replace") && !K_PROBE_JS.contains("location.href"),
