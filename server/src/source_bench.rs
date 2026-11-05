@@ -916,22 +916,31 @@ fn round_robin(items: &[&CorpusEntry], limit: usize, salt: usize, out: &mut Vec<
     for e in items {
         buckets.entry(e.category.as_str()).or_default().push(e);
     }
-    let offset = salt % cats.len();
+    // salt 同时参与“类间顺序”和“类内起点”：
+    // 旧实现只旋转 category 顺序、类内永远从第 0 条开始，limit=5 且每个 category
+    // 有 3 条时，24 条语料实际永远只跑到 10 条（小说 5 条 + 漫画 5 条）。
+    // 2026-11 实测：147 源体检后 DISTINCT corpus_key 只有 10。
     let mut idx: HashMap<&str, usize> = HashMap::new();
     let mut placed = 0usize;
     let mut guard = 0usize;
     while placed < limit && guard < items.len() * 2 + 8 {
         guard += 1;
         let mut any = false;
+        let offset = salt % cats.len();
         for step in 0..cats.len() {
             if placed >= limit {
                 break;
             }
-            let cat = &cats[(offset + step) % cats.len()];
+            let cat_pos = (offset + step) % cats.len();
+            let cat = &cats[cat_pos];
             let list = buckets.get(cat.as_str()).cloned().unwrap_or_default();
+            if list.is_empty() {
+                continue;
+            }
             let pos = idx.entry(cat.as_str()).or_insert(0);
             if *pos < list.len() {
-                out.push(list[*pos].clone());
+                let start = (salt + cat_pos) % list.len();
+                out.push(list[(start + *pos) % list.len()].clone());
                 *pos += 1;
                 placed += 1;
                 any = true;
@@ -2160,6 +2169,25 @@ mod tests {
         }
     }
 
+    /// 把内置常量转成运行时 CorpusEntry（与 load_corpus 的字段映射保持一致）。
+    fn builtin_entries() -> Vec<CorpusEntry> {
+        BUILTIN_CORPUS
+            .iter()
+            .map(|b| CorpusEntry {
+                id: builtin_id(b),
+                title: b.title.to_string(),
+                expected_author: b.expected_author.map(str::to_string),
+                category: b.category.to_string(),
+                source_type: b.source_type,
+                enabled: true,
+                builtin: true,
+                norm_title: normalize_title(b.title),
+                created_at: None,
+                updated_at: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn builtin_corpus_has_expected_shape() {
         assert_eq!(BUILTIN_CORPUS.len(), 24);
@@ -2354,6 +2382,31 @@ mod tests {
             bench_score: BENCH_FAST_TRACK_MIN_SCORE - 1,
             ..base
         }));
+    }
+
+    #[test]
+    fn salt_covers_all_24_builtin_entries() {
+        let corpus = builtin_entries();
+        let mut seen = HashSet::new();
+        // 12 次不同 salt：小说源覆盖 12 条小说语料，漫画源覆盖 12 条漫画语料。
+        for salt in 0..12 {
+            for ty in [TYPE_NOVEL, TYPE_COMIC] {
+                for e in pick_samples(&corpus, ty, 5, salt) {
+                    seen.insert(e.id);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            BUILTIN_CORPUS.len(),
+            "12 次抽样必须覆盖全部内置语料（旧实现固定只跑 10 条）"
+        );
+        // 单次盐值不应重复抽同一条
+        for salt in 0..12 {
+            let picked = pick_samples(&corpus, TYPE_COMIC, 5, salt);
+            let ids: HashSet<_> = picked.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(ids.len(), picked.len(), "同一批内不得重复抽样");
+        }
     }
 
     #[test]
