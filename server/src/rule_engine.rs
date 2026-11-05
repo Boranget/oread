@@ -2689,7 +2689,7 @@ impl AnalyzeRule {
         // 预算只算规则自身耗时（页面里 Date.now 包裹 eval 的那段），固定垫片/lib 的
         // 解析成本与机器负载相关，不该算到源作者头上；`java.ajax` 联网时间也扣掉。
         // 拿不到回传耗时（脚本抛错等）时退回整段耗时，保守但不会放过慢规则。
-        let budget_ms = rule_ms.map_or(js_elapsed, |ms| ms).saturating_sub(net_ms);
+        let budget_ms = rule_ms.unwrap_or(js_elapsed).saturating_sub(net_ms);
         // 排队等单一 JS 线程的时间不计入预算：并发测试/并发请求下同一规则仍应通过。
         JS_LAST_MS.store(js_elapsed, Ordering::Relaxed);
         JS_MAX_MS.fetch_max(budget_ms, Ordering::Relaxed);

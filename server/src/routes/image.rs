@@ -1136,6 +1136,9 @@ fn transcode_jpeg_to_gray(
 }
 
 /// 把整段响应体读入内存（受单图上限约束），仅转码路径使用。
+// 返回 Err 时直接复用 axum 的 `Response`（几百字节），调用点无需再包一层错误类型；
+// 这条路径只在取图失败时走 `?`，装箱/自定义错误类型反而让调用点变复杂。
+#[allow(clippy::result_large_err)]
 async fn collect_image_body(
     resp: reqwest::Response,
     max_bytes: usize,
