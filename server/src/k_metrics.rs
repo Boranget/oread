@@ -465,6 +465,25 @@ pub struct ProbeLine {
     pub scroll_h: Option<String>,
     #[serde(default)]
     pub dpr: Option<String>,
+    /// v2：`screen.width`，用于判断系统栏/工具栏是否占掉了可视视口
+    #[serde(default)]
+    pub screen_w: Option<String>,
+    #[serde(default)]
+    pub screen_h: Option<String>,
+    /// v2：`screen.availHeight`（去掉系统栏后的可用高）
+    #[serde(default)]
+    pub avail_h: Option<String>,
+    /// v2：`outerWidth/outerHeight`
+    #[serde(default)]
+    pub outer_w: Option<String>,
+    #[serde(default)]
+    pub outer_h: Option<String>,
+    /// v2：`document.body.clientHeight`
+    #[serde(default)]
+    pub body_h: Option<String>,
+    /// v2：`#k-stage` 的 `clientHeight`，页面无该元素时为 `-`
+    #[serde(default)]
+    pub stage_h: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -488,6 +507,13 @@ pub struct ProbeQ {
     pub scroll_w: Option<String>,
     pub scroll_h: Option<String>,
     pub dpr: Option<String>,
+    pub screen_w: Option<String>,
+    pub screen_h: Option<String>,
+    pub avail_h: Option<String>,
+    pub outer_w: Option<String>,
+    pub outer_h: Option<String>,
+    pub body_h: Option<String>,
+    pub stage_h: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -525,6 +551,13 @@ pub async fn probe(
         scroll_w: norm(q.scroll_w),
         scroll_h: norm(q.scroll_h),
         dpr: norm(q.dpr),
+        screen_w: norm(q.screen_w),
+        screen_h: norm(q.screen_h),
+        avail_h: norm(q.avail_h),
+        outer_w: norm(q.outer_w),
+        outer_h: norm(q.outer_h),
+        body_h: norm(q.body_h),
+        stage_h: norm(q.stage_h),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -549,6 +582,9 @@ struct ProbeStat {
     overflow_v: usize,
     /// `scroll_w > client_w` 的条数（有横向滚动）
     overflow_h: usize,
+    /// v2：`screen_h − client_h` 的分布；正值表示屏幕比布局视口高，
+    /// 差额就是系统栏/工具栏可能占掉的可视高度
+    gap: BTreeMap<String, usize>,
 }
 
 fn num(v: &Option<String>) -> Option<i64> {
@@ -585,6 +621,7 @@ pub async fn probe_summary(
             scroll: BTreeMap::new(),
             overflow_v: 0,
             overflow_h: 0,
+            gap: BTreeMap::new(),
         });
         stat.count += 1;
         let dim = |a: &Option<String>, b: &Option<String>| match (a.as_deref(), b.as_deref()) {
@@ -623,13 +660,19 @@ pub async fn probe_summary(
                 stat.overflow_h += 1;
             }
         }
+        if let (Some(s), Some(c)) = (num(&line.screen_h), ch) {
+            *stat.gap.entry((s - c).to_string()).or_default() += 1;
+        }
     }
 
     let recent: Vec<ProbeLine> = lines.iter().rev().take(20).cloned().collect();
+    // 最近一条的完整字典（含 v2 新字段），方便直接判断"可视视口是否更小"
+    let latest = lines.last().cloned();
     Ok(Json(serde_json::json!({
         "date": date,
         "probes": lines.len(),
         "paths": stats,
+        "latest": latest,
         "recent": recent,
     })))
 }
@@ -788,6 +831,13 @@ mod tests {
             scroll_w: Some("1072".into()),
             scroll_h: Some("1244".into()),
             dpr: Some("1".into()),
+            screen_w: Some("1072".into()),
+            screen_h: Some("1268".into()),
+            avail_h: Some("1268".into()),
+            outer_w: Some("1072".into()),
+            outer_h: Some("1268".into()),
+            body_h: Some("1244".into()),
+            stage_h: Some("1056".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -796,13 +846,25 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&line).unwrap();
         for k in [
             "ts", "path", "vw_param", "vh_param", "inner_w", "inner_h", "client_w", "client_h",
-            "scroll_w", "scroll_h", "dpr", "fs", "ua_class", "ua", "sid",
+            "scroll_w", "scroll_h", "dpr", "screen_w", "screen_h", "avail_h", "outer_w", "outer_h",
+            "body_h", "stage_h", "fs", "ua_class", "ua", "sid",
         ] {
             assert!(v.get(k).is_some(), "探针字段缺失：{k}");
         }
         // 反序列化也能还原（聚合读取依赖它）
         let back: ProbeLine = serde_json::from_value(v).unwrap();
         assert_eq!(back.client_h.as_deref(), Some("1200"));
+        assert_eq!(back.screen_h.as_deref(), Some("1268"));
+        assert_eq!(back.stage_h.as_deref(), Some("1056"));
+    }
+
+    /// v1 的历史行没有 v2 字段，聚合读旧文件不能整行丢掉。
+    #[test]
+    fn probe_old_line_without_v2_fields_still_parses() {
+        let old = r#"{"ts":"2026-11-05T19:26:59+08:00","path":"/k/read","vw_param":"1072","vh_param":"1268","inner_w":"1072","inner_h":"1268","client_w":"1072","client_h":"1268","scroll_w":"1072","scroll_h":"1268","dpr":"1.7964072227478027","fs":"2","ua_class":"kindle","ua":"Mozilla/5.0 Kindle","sid":"ad620038"}"#;
+        let back: ProbeLine = serde_json::from_str(old).unwrap();
+        assert_eq!(back.client_h.as_deref(), Some("1268"));
+        assert_eq!(back.screen_h, None);
     }
 
     #[test]
@@ -818,12 +880,33 @@ mod tests {
             scroll_w: None,
             scroll_h: None,
             dpr: None,
+            screen_w: Some(long.clone()),
+            screen_h: Some(" 1268 ".into()),
+            avail_h: Some(long.clone()),
+            outer_w: Some(long.clone()),
+            outer_h: None,
+            body_h: Some(long.clone()),
+            stage_h: Some("-".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
         assert_eq!(norm(p.vw_param).unwrap().chars().count(), PROBE_LIMIT);
         assert_eq!(norm(p.vh_param).as_deref(), Some("1268"));
         assert_eq!(norm(p.path).unwrap().chars().count(), PROBE_LIMIT);
+        for v in [
+            norm(p.screen_w),
+            norm(p.avail_h),
+            norm(p.outer_w),
+            norm(p.body_h),
+        ] {
+            assert_eq!(
+                v.unwrap().chars().count(),
+                PROBE_LIMIT,
+                "v2 字段同样 32 字符截断"
+            );
+        }
+        assert_eq!(norm(p.screen_h).as_deref(), Some("1268"));
+        assert_eq!(norm(p.stage_h).as_deref(), Some("-"));
         assert_eq!(norm(Some("   ".into())), None);
     }
 }
