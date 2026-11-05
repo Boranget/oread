@@ -4,19 +4,16 @@
 //! - `innerWidth×innerHeight = 1072×1268`，且 `innerWidth == screen.width`：
 //!   浏览器没有按 DPR 1.7964 缩放，**1 CSS px ≈ 1 物理 px**，字号必须按 px 直接给。
 //! - 版心 1000px（左右各留 36px）；顶栏 73px（72 内容 + 1px 线）。
-//! - 页面按 `vh − SAFE_BOTTOM(24)` 布局：真机浏览器底栏/滚动条会吃掉十几像素，
-//!   按 `vh` 精确填满必然顶出纵向滚动条并把贴底栏裁掉。底栏 `position:fixed;bottom:24px`，
-//!   阅读页正文容器 = 页面高 − 64（底栏），列表页正文区 = 页面高 − 73（顶栏）。
-//! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
-//!   不用 `border-radius`；底栏用 `position:fixed`，不用 transform/transition。
 //! - 文档高不再取 `100%`/`vh`：`K_FIT_JS` 在 `<head>` 里按实测
 //!   `documentElement.clientHeight − SAFE_BOTTOM(24)` 写死（1268 → 1244）。
 //!   这样即使老引擎在「文档高 == 视口高」时也画滚动条、或 URL 里的 `vh` 比真实
 //!   布局视口大，文档也永远比视口矮 24px，不会出现第二屏；底栏
 //!   `position:fixed;bottom:0`（总高 88 = 64 内容 + 24 安全区）压在这 24px 上，
 //!   视觉与原来一致。正文区仍然由 `#k-stage` 的 `top/bottom` 贴视口，不读任何参数。
-//! - 两个内联脚本：文档高兜底（`K_FIT_JS`，不重载）与视口补参（`K_VP_FIX_JS`，ES5、
-//!   最多重载一次），其余翻页/切换字号全部是真实链接或原生 form。
+//! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
+//!   不用 `border-radius`；底栏用 `position:fixed`，不用 transform/transition。
+//! - 三个内联脚本：文档高兜底（`K_FIT_JS`，不重载）、视口补参（`K_VP_FIX_JS`，ES5、
+//!   最多重载一次）、自报探针（`K_PROBE_JS`，不重载）；其余翻页/切换字号全部是真实链接或原生 form。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -67,6 +64,13 @@ const BAR_H: usize = 64;
 /// 页面按 `vh` 精确填满会顶出纵向滚动条、把贴底栏裁掉，这里统一预留 24px。
 /// 代价是 1072×1268 下小档/标准档各少 1 行（24→23、21→20），大档/超小档行数不变。
 const SAFE_BOTTOM: usize = 24;
+/// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，
+/// 四档字号只各让出 1–2 行；顶栏固定贴视口顶，正文区从它下沿开始。
+const READ_NAV_H: usize = 56;
+/// 顶栏左格「← 书架」宽（160px，两字 + 箭头 + 分隔留白）
+const READ_NAV_BACK_W: usize = 160;
+/// 顶栏右格「目录」宽（120px）
+const READ_NAV_TOC_W: usize = 120;
 /// 阅读页正文顶部留白：与左右版心一致 36px（此前贴顶 10px，视觉上像被裁切）
 const READ_PAD_TOP: usize = 36;
 /// 正文底部页码行：28px 行高 + 上下各 14px = 56
@@ -114,9 +118,10 @@ impl Vp {
     fn nav_h(self) -> usize {
         self.layout_h().saturating_sub(NAV_H + 1)
     }
-    /// 小说正文可用高 = 正文容器 − 顶部留白 − 页码行（1268 → 1088）
+    /// 小说正文可用高 = 正文容器 − 顶栏 − 顶部留白 − 页码行（1268 → 1032）
     fn text_h(self) -> usize {
-        self.body_h().saturating_sub(READ_PAD_TOP + READ_PAGENO_H)
+        self.body_h()
+            .saturating_sub(READ_NAV_H + READ_PAD_TOP + READ_PAGENO_H)
     }
     /// 漫画整图/单片可用高 = 页面高 − 底栏 − 8（1268 → 1172，即切片可用高 vh）
     fn content_h(self) -> usize {
@@ -569,12 +574,16 @@ fn pager_bar(
     )
 }
 
-/// 左右透明翻页热区：各占屏宽 1/3、`top:0;bottom:0` 撑满真实视口高。
+/// 左右透明翻页热区：各占屏宽 1/3，`top:{READ_NAV_H}`（从顶栏下沿开始）到底。
 /// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
-/// `z-index:5` 高于正文（0）低于贴底栏（10）；不再写死 `height:vh−24`，
+/// `z-index:5` 高于正文（0）低于底栏（10）与顶栏（12）；顶栏整格可点，
+/// 热区又整整让开 56px，所以点书名/「书架」不会误翻页。不再写死 `height:vh−24`，
 /// 否则视口比参数矮时热区自己会顶出第二屏。
 fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
-    let css = "position:absolute;top:0;bottom:0;width:33%;z-index:5;display:block";
+    let css = format!(
+        "position:absolute;top:{nav}px;bottom:0;width:33%;z-index:5;display:block",
+        nav = READ_NAV_H
+    );
     let mut out = String::new();
     if let Some(pv) = prev {
         out.push_str(&format!(
@@ -593,12 +602,60 @@ fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
     out
 }
 
+/// 按像素宽度截断文本：CJK/全角按 `size` 像素计，ASCII 按 `half` 计；超宽用 `…` 收尾。
+/// 墨水屏不能用 `text-overflow`（老 Silk 不稳定），所以服务端直接把书名截到能放下的长度，
+/// 再配 `white-space:nowrap` + `overflow:hidden` 双保险，保证顶栏高度不被撑开。
+fn fit_px(s: &str, max_px: usize, size: usize, half: usize) -> String {
+    let mut w = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cw = if (ch as u32) < 0x2E80 { half } else { size };
+        if w + cw > max_px {
+            out.push('…');
+            return out;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out
+}
+
+/// 阅读页顶栏（小说页/漫画页共用）：左「← 书架」、中书名（按像素截断）、右「目录」。
+/// 高度 `READ_NAV_H`(56)，`position:fixed` 贴视口顶，白底 + 1px 黑分隔线，`z-index:12`
+/// 高于翻页热区（5）与底栏（10）；三格全部 `display:block` 整格可点，
+/// 书架/目录链接都带当前 `fs/vw/vh`，点一次就能带着同一档字号与视口回去。
+fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp) -> String {
+    let title_px = vp
+        .page_w()
+        .saturating_sub(READ_NAV_BACK_W + READ_NAV_TOC_W)
+        .saturating_sub(24);
+    let title = fit_px(title, title_px, 20, 10);
+    format!(
+        "<div id=\"k-read-nav\"><table cellpadding=\"0\" cellspacing=\"0\"><tr>\
+<td width=\"{bw}\" align=\"center\" style=\"border-right:1px solid #ccc\"><a href=\"{back}\">&larr; 书架</a></td>\
+<td align=\"center\">{title}</td>\
+<td width=\"{tw}\" align=\"center\" style=\"border-left:1px solid #ccc\"><a href=\"{toc}\">目录</a></td>\
+</tr></table></div>",
+        bw = READ_NAV_BACK_W,
+        tw = READ_NAV_TOC_W,
+        back = back_href,
+        toc = toc_href,
+        title = esc(&title)
+    )
+}
+
 fn read_only_css() -> String {
     format!(
         "html,body{{height:100%;overflow:hidden}}\
-         #k-stage{{position:absolute;top:0;left:{pad}px;right:{pad}px;bottom:{safe}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
+         #k-read-nav{{position:fixed;top:0;left:0;right:0;height:{nav}px;padding:0 {pad}px;background:#fff;border-bottom:1px solid #000;z-index:12}}\
+         #k-read-nav table{{width:100%;table-layout:fixed;border-collapse:collapse}}\
+         #k-read-nav td{{height:{tdh}px;padding:0;font-size:20px;line-height:28px;vertical-align:middle;overflow:hidden;white-space:nowrap;color:#000}}\
+         #k-read-nav td a{{display:block;height:{tdh}px;line-height:{tdh}px;color:#000;text-decoration:none}}\
+         #k-stage{{position:absolute;top:{nav}px;left:{pad}px;right:{pad}px;bottom:{safe}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
         pad = SIDE_PAD,
+        nav = READ_NAV_H,
+        tdh = READ_NAV_H - 1,
         safe = BAR_H + SAFE_BOTTOM,
         pt = READ_PAD_TOP
     )
@@ -1616,8 +1673,9 @@ fn comic_stage(
         )
     };
     format!(
-        "<div id=\"k-stage\" style=\"position:relative;top:0;left:0;right:auto;bottom:auto;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
-        h = vp.layout_h(),
+        "<div id=\"k-stage\" style=\"position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:{nav}px;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
+        nav = READ_NAV_H,
+        h = vp.layout_h().saturating_sub(READ_NAV_H),
         w = vp.page_w(),
         pad = SIDE_PAD,
         pb = BAR_H + 8,
@@ -1809,8 +1867,17 @@ async fn read(
         vp,
     );
 
+    // 顶栏：书名（无书名时回落到章节名）+「← 书架」+「目录」，两者都带当前 fs/vw/vh
+    let nav_title = if book_name.is_empty() {
+        ch_title.as_str()
+    } else {
+        book_name.as_str()
+    };
+    let nav = read_nav_html(nav_title, &qlink("/k", fs, vp), &toc_url, vp);
+
     let body = format!(
-        "{stage}{hot}{bottom}",
+        "{nav}{stage}{hot}{bottom}",
+        nav = nav,
         stage = stage,
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
@@ -1876,11 +1943,13 @@ async fn comic_read(
             }
         }
     }
-    // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），可用高 = 页面高 − 底栏 − 8（1268 → 1172）
+    // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），
+    // 可用高 = 页面高 − 底栏 − 8 − 顶栏（1268 → 1172 − 56 = 1116），
+    // 少切这一刀，整图/切片才不会被新顶栏压掉最后 56px
     let sp = image::SliceParams::from_config(
         &s.cfg,
         Some(vp.content_w() as u32),
-        Some(vp.content_h() as u32),
+        Some(vp.content_h().saturating_sub(READ_NAV_H) as u32),
         None,
     );
     let pages = comic_pages(&images, &dims, &s.cfg, &sp);
@@ -1923,8 +1992,22 @@ async fn comic_read(
         .title
         .clone()
         .unwrap_or_else(|| format!("第 {} 章", ch + 1));
+    // 与小说页同一套顶栏：书名优先，取不到回落章节名
+    let book_name = load_book_meta(pool, &q.book)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| b.name)
+        .unwrap_or_default();
+    let nav_title = if book_name.is_empty() {
+        title.as_str()
+    } else {
+        book_name.as_str()
+    };
+    let nav = read_nav_html(nav_title, &qlink("/k", fs, vp), &toc_url, vp);
     let body = format!(
-        "{stage}{hot}{bottom}",
+        "{nav}{stage}{hot}{bottom}",
+        nav = nav,
         stage = stage,
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
@@ -2524,14 +2607,15 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 阅读页页面高 1244（=1268−24 安全余量）、可用 1172；四档行预算按「正文可用高 ÷ 行高」动态算出。
+    /// 阅读页页面高 1244（=1268−24 安全余量）、可用 1172；四档行预算按
+    /// 「正文可用高 − 56 顶栏 ÷ 行高」动态算出。
     #[test]
     fn font_specs_fit_read_stage() {
         assert_eq!(vp().h, 1268);
         assert_eq!(vp().layout_h(), 1244);
         assert_eq!(vp().content_h(), 1172);
-        // 1072×1268 下：1088/46=23、1088/52=20、1088/62=17、1088/36=30（超小档不再被 25 行封顶）
-        let expect = [(28, 46, 23), (32, 52, 20), (38, 62, 17), (20, 36, 30)];
+        // 1072×1268 下表：1032/46=22、1032/52=19、1032/62=16、1032/36=28（已扣 56px 顶栏）
+        let expect = [(28, 46, 22), (32, 52, 19), (38, 62, 16), (20, 36, 28)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -2545,8 +2629,8 @@ mod tests {
                 vp().text_h()
             );
             assert!(
-                (400..=1500).contains(&chars),
-                "fs={size} 每页字数 {chars} 超出合理区间"
+                (350..=1500).contains(&chars),
+                "fs={size} 每页字数 {chars} 超出合理区间（顶栏占 56px，最大档少 1 行）"
             );
         }
         // 标准档 32px：20 行 × 29 字/行 = 580 字，落在 500–800 的参考区间
@@ -2661,11 +2745,15 @@ mod tests {
         assert!(!is_spa_entry("/favicon.ico"));
     }
 
-    /// 版式硬约束：底栏 64 不压正文、正文区 = 页面高（1268−24）− 64 − 36（顶部留白）− 56（页码行）；标准档显式 32/52。
+    /// 版式硬约束：底栏 64 不压正文、正文区 = 页面高（1268−24）− 56（顶栏）− 64 − 36（顶部留白）
+    /// − 56（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
         assert_eq!(vp().body_h(), vp().h - SAFE_BOTTOM - BAR_H);
-        assert_eq!(vp().text_h(), vp().body_h() - READ_PAD_TOP - READ_PAGENO_H);
+        assert_eq!(
+            vp().text_h(),
+            vp().body_h() - READ_NAV_H - READ_PAD_TOP - READ_PAGENO_H
+        );
         assert!(vp().text_h() <= vp().content_h(), "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
         assert_eq!(
@@ -2683,8 +2771,9 @@ mod tests {
         assert!(budget(spec) <= vp().text_h() / spec.line);
     }
 
-    /// 四档行预算全部由视口高动态算出：1072×1268 → 23/20/17/30，
-    /// 1024×1200 同档位按更低可用高再算一遍（22/19/16/28），且总高始终 ≤ 可用高。
+    /// 四档行预算全部由视口高动态算出（已扣 56px 顶栏）：
+    /// 1072×1268 → 22/19/16/28，1024×1200 同档位按更低可用高再算一遍（20/18/15/26），
+    /// 且总高始终 ≤ 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
         assert_eq!(
@@ -2692,7 +2781,7 @@ mod tests {
                 .iter()
                 .map(|s| line_budget(vp(), s.line))
                 .collect::<Vec<_>>(),
-            vec![23, 20, 17, 30]
+            vec![22, 19, 16, 28]
         );
         for s in FS_SPECS.iter() {
             assert!(budget(s) * s.line <= vp().text_h(), "{}px 行高溢出", s.line);
@@ -2706,7 +2795,7 @@ mod tests {
             .collect();
         assert_eq!(
             small_lines,
-            vec![22, 19, 16, 28],
+            vec![20, 18, 15, 26],
             "1024×1200 行预算应按可用高重算"
         );
         for s in FS_SPECS.iter() {
@@ -2770,8 +2859,12 @@ mod tests {
             "文档高兜底不得改写 location：{fit}"
         );
         assert!(
-            css.contains("#k-stage{position:absolute;top:0;left:36px;right:36px;bottom:88px;padding:36px 36px 0;overflow:hidden}"),
-            "{css}"
+            css.contains("#k-stage{position:absolute;top:56px;left:36px;right:36px;bottom:88px;padding:36px 36px 0;overflow:hidden}"),
+            "正文区必须从 56px 顶栏下沿开始：{css}"
+        );
+        assert!(
+            css.contains("#k-read-nav{position:fixed;top:0;left:0;right:0;height:56px;padding:0 36px;background:#fff;border-bottom:1px solid #000;z-index:12}"),
+            "顶栏必须固定贴顶、白底 1px 分隔线，且 z-index 高于热区(5)：{css}"
         );
         assert!(
             !css.contains("height:1180px"),
@@ -2793,6 +2886,38 @@ mod tests {
             "底栏必须贴视口底并内置 {SAFE_BOTTOM}px 安全区：{bar}"
         );
         assert!(!bar.contains("width:1072px"), "底栏宽度不得写死像素：{bar}");
+    }
+
+    /// 阅读页顶栏：左「← 书架」回 `/k`、右「目录」回目录页，两者都透传当前 fs/vw/vh；
+    /// 书名按像素截断成单行（超长加 `…`），z-index 12 高于翻页热区 5。
+    #[test]
+    fn read_page_has_nav_with_shelf_entry_and_params() {
+        let v = vp();
+        let back = qlink("/k", 2, v);
+        let toc = qlink("/k/toc", 2, v);
+        assert!(
+            back.contains("fs=2") && back.contains("vw=1072") && back.contains("vh=1268"),
+            "书架入口必须透传参数：{back}"
+        );
+        let long = "一个特别特别长的书名".repeat(6);
+        let nav = read_nav_html(&long, &back, &toc, v);
+        assert!(nav.contains("id=\"k-read-nav\""), "{nav}");
+        assert!(nav.contains("&larr; 书架"), "必须有返回书架入口：{nav}");
+        assert!(nav.contains("目录"), "必须有目录入口：{nav}");
+        assert!(nav.contains(&format!("href=\"{}\"", back)), "{nav}");
+        assert!(nav.contains(&format!("href=\"{}\"", toc)), "{nav}");
+        assert!(
+            nav.contains('…'),
+            "超长书名必须按像素截断并用省略号收尾：{nav}"
+        );
+        let short = read_nav_html("三体", &back, &toc, v);
+        assert!(!short.contains('…'), "短书名不得加省略号：{short}");
+        assert!(short.contains(">三体<"), "{short}");
+        // 顶栏整格可点（链接 display:block 撑满 55px），热区又让开 56px
+        assert!(
+            read_only_css().contains("z-index:12"),
+            "顶栏须高于热区/底栏"
+        );
     }
 
     /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
@@ -2868,7 +2993,8 @@ mod tests {
         assert!(!bar.contains("background:#e6e6e6"));
     }
 
-    /// 左右热区：CSS `top:0;bottom:0;width:33%` 跟随真实视口（1072 → 353），无下一页时右区不渲染。
+    /// 左右热区：CSS `top:56px;bottom:0;width:33%`（从顶栏下沿开始）跟随真实视口
+    /// （1072 → 353），无下一页时右区不渲染。
     #[test]
     fn hot_zones_are_one_third_screen_and_clickable() {
         assert_eq!(vp().hot_w(), 1072 / 3);
@@ -2880,9 +3006,11 @@ mod tests {
         assert!(z.contains("left:0"), "{z}");
         assert!(z.contains("right:0"), "{z}");
         assert!(
-            z.contains("top:0;bottom:0;width:33%") && !z.contains("height:"),
-            "热区必须跟随真实视口（top/bottom + 33%），不得写死像素：{z}"
+            z.contains("top:56px;bottom:0;width:33%") && !z.contains("height:"),
+            "热区必须从顶栏下沿跟随真实视口（top/bottom + 33%），不得写死像素：{z}"
         );
+        // 顶栏整格可点，热区 z-index 5 < 顶栏 12：点书名/「书架」不会落到翻页区
+        assert!(z.contains("z-index:5"), "{z}");
         assert_eq!(
             hot_zones(Some("/k/read?p=1"), None).matches("<a ").count(),
             1
@@ -2910,7 +3038,11 @@ mod tests {
             assert!(v.content_h() >= 320, "可用高不能小于 320");
             assert_eq!(v.content_w(), w - 144);
             assert_eq!(v.content_h(), h - SAFE_BOTTOM - 72);
-            assert_eq!(v.text_h(), h - SAFE_BOTTOM - 64 - 36 - 56);
+            assert_eq!(
+                v.text_h(),
+                h - SAFE_BOTTOM - READ_NAV_H - 64 - 36 - 56,
+                "正文可用高必须扣掉 56px 顶栏"
+            );
         }
     }
 
@@ -3036,10 +3168,13 @@ mod tests {
         // 1024×1200 缩到 928 宽 → 高 1088（≤1172 漫画可用高），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
-        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1244px"));
-        // 漫画页保留像素高，但必须把 read_only_css 的绝对定位偏移清零，否则整页会被 right 挤向右
+        // 漫画页保留像素高（1244 − 56 顶栏 = 1188），并整体下移到顶栏下沿
+        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1188px"));
+        // 漫画页同样清零 read_only_css 的绝对定位偏移，否则整页会被 right 挤向右
         assert!(
-            html.contains("position:relative;top:0;left:0;right:auto;bottom:auto;height:1244px"),
+            html.contains(
+                "position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:56px;height:1188px"
+            ),
             "{html}"
         );
         // 短图在开关开/关两种模式下 HTML 必须逐字节一致（回归要求）
