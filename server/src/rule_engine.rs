@@ -1820,6 +1820,13 @@ impl AnalyzeRule {
                 }
                 return String::new();
             }
+            // `{{@@.ltim@text}}` / `{{@css:.x@text}}`：模板里嵌套的选择器规则
+            // （爱轻写真 search.intro）。这不是 JS 表达式，先按规则管道求值再拼回文本。
+            if key.starts_with('@') || key.starts_with('<') || key.starts_with("//") {
+                if let Ok(v) = self.get_string_inner(content, key, false, "") {
+                    return v;
+                }
+            }
             if let Some(v) = self.variables.borrow().get(key).cloned() {
                 return v;
             }
@@ -6476,7 +6483,8 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         );
         // 米读看书的 last_chapter：单花括号模板
         assert_eq!(
-            ar.get_string(json, "第{$.chapterNum}章", false, "").unwrap(),
+            ar.get_string(json, "第{$.chapterNum}章", false, "")
+                .unwrap(),
             "第184章"
         );
         // SF 轻小说搜索的 coverUrl：URL 前缀 + 模板（该字段不是 is_url）
@@ -6487,6 +6495,28 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         );
         // 普通 JSONPath 不受影响
         assert_eq!(ar.get_string(json, "$.title", false, "").unwrap(), "书名A");
+    }
+
+    // 爱轻写真 search.intro：`{{@@.ltim@text}}` 是模板里嵌套的选择器规则，不是 JS。
+    #[test]
+    fn template_with_nested_css_rule_expands() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<li><div class="ltim">2025-01-02</div><h2>标题</h2></li>"#;
+        assert_eq!(
+            ar.get_string(html, "发布：{{@@.ltim@text}}", false, "")
+                .unwrap(),
+            "发布：2025-01-02"
+        );
+        // 展开成 HTML 字面量的模板整体返回原文，不能再当选择器解析成空串
+        let intro = ar
+            .get_string(
+                html,
+                r#"<br>📆{{@@.ltim@text}} 发布<br>{"©2025"}"#,
+                false,
+                "",
+            )
+            .unwrap();
+        assert!(intro.contains("<br>📆2025-01-02 发布"), "intro={intro}");
     }
 
     #[test]
