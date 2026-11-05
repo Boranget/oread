@@ -1,14 +1,20 @@
 # rust-toolchain.toml —— 仓库级工具链约定
-# 目的：新人 clone 后直接 cargo build 即可，不需要手工记住目标/通道。
+# 目的：本地与 CI 使用同一个编译器版本，杜绝「本机绿、云端红」。
 #
-# 为什么写 "stable" 而不锁 "1.96.0"：
-#   - 本机（RUSTUP_HOME=D:\rust\rustup）已装 stable-x86_64-pc-windows-msvc = 1.96.0；
-#   - 写 "stable" 时 rustup 会直接复用「已安装的 stable（本机 host 工具链）」，不触发下载；
-#   - 若硬锁 "1.96.0"，rustup 会按版本号解析并校验/安装该版本，存在多余下载与
-#     「本机 stable 已更新到更高版本后被迫回退」的风险。
+# 为什么锁具体版本 1.96.0（不再写 "stable"）：
+#   - 2026-11 的教训：CI runner 的 stable 前进到 1.99.0，本机仍是 1.96.0；
+#     同一提交在本地 clippy 全绿，云端 check job 却被两个新 lint 拦下
+#     （clippy::result_large_err、clippy::map_or_identity），v0.3.10 起全线变红。
+#   - 固定版本后 clippy 的 lint 集合与 rustfmt 行为可复现；升级是显式动作，
+#     需要改这里的版本号并在本地、CI 一起验证（见 docs/BUILD.md §2.3）。
+#   - 1.96.0 是 v0.3.12 / v0.3.13 的发布工具链，产物与已验证二进制一致。
 #
-# 注意：不要在这里写 components = ["rustfmt"] 之类，否则每次 rustup show / cargo 调用
-# 都会校验并可能补装组件（本机未装时就会产生下载）。
+# 代价（实测，见 docs/BUILD.md §2.3）：首次在新机器 / CI runner 上会按版本号下载
+# 该工具链与组件；本机已装 1.96.0，无额外开销。
+#
+# components 声明 rustfmt / clippy，确保门禁依赖的组件一定存在（缺失时 rustup 自动补装，
+# 而不是在 cargo clippy 阶段才报 “no such command”）。
 [toolchain]
-channel = "stable"
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
 targets = ["aarch64-unknown-linux-musl"]

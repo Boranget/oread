@@ -17,6 +17,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# 工具链版本只由仓库根 `rust-toolchain.toml` 决定（当前固定 1.96.0，含 rustfmt/clippy
+# 与 aarch64-unknown-linux-musl 目标）。runner 上没有该版本时，第一个 cargo 步骤会自动
+# 按版本安装（实测 ~20-30s，见 docs/BUILD.md §2.3）；本机已装则无额外开销。
+# 不要换成 `dtolnay/rust-toolchain@stable` 之类：会绕过仓库级固定，重新引入
+# 「本机绿、云端红」的漂移（v0.3.10 起 clippy 1.99 新 lint 曾让 check 全线变红）。
+
 jobs:
   # ------------------------------------------------------------------
   # 校验与测试：分支 push / PR / tag 全部必跑。
@@ -100,6 +106,8 @@ jobs:
 
       # 代码洁净度门禁：格式化与 clippy 全部零容忍（-D warnings）。
       # 迁移文件为 .sql，cargo fmt 只处理 .rs，不会改动 migrations 的血缘字节。
+      # 版本严格跟随 rust-toolchain.toml 的 1.96.0：不要用 `cargo +stable` 或
+      # 升级 runner 默认工具链，否则 clippy 的 lint 集合会与本地分叉。
       - name: cargo fmt --check
         run: cargo fmt --check
 
