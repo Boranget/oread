@@ -133,6 +133,12 @@ fn new_js_context(conf: JsConf) -> boa_engine::Context {
         0,
         boa_engine::NativeFunction::from_fn_ptr(native_ajax),
     );
+    // jsLib / `java.importScript` 的脚本文本下载桥（进程内 TTL 缓存，见 native_import_script）。
+    let _ = ctx.register_global_callable(
+        boa_engine::JsString::from("__nativeImportScript"),
+        0,
+        boa_engine::NativeFunction::from_fn_ptr(native_import_script),
+    );
     // java.setContent 之后的 DOM 选择器求值桥（惰性解析，见 native_select）。
     let _ = ctx.register_global_callable(
         boa_engine::JsString::from("__nativeSelect"),
@@ -339,6 +345,100 @@ fn ajax_error(msg: &str) -> boa_engine::JsError {
     )
 }
 
+/// 脚本类资源（jsLib / `java.importScript` 的子规则脚本）的进程内 TTL 缓存。
+///
+/// Reload 在同一个源的详情/目录/正文里会被反复调用，每次都重新下载会让源作者的第
+/// 三方脚本站承压，也让单次规则变慢；脚本内容本身不随请求变化，600s 足够。
+static JS_SCRIPT_CACHE: OnceLock<std::sync::Mutex<HashMap<String, (Instant, String)>>> =
+    OnceLock::new();
+const JS_SCRIPT_TTL_SECS: u64 = 600;
+
+fn script_cache() -> &'static std::sync::Mutex<HashMap<String, (Instant, String)>> {
+    JS_SCRIPT_CACHE.get_or_init(Default::default)
+}
+
+fn cached_script(url: &str) -> Option<String> {
+    let guard = script_cache().lock().ok()?;
+    guard
+        .get(url)
+        .and_then(|(at, text)| (at.elapsed().as_secs() < JS_SCRIPT_TTL_SECS).then(|| text.clone()))
+}
+
+fn store_script(url: &str, text: &str) {
+    if let Ok(mut guard) = script_cache().lock() {
+        guard.insert(url.to_string(), (Instant::now(), text.to_string()));
+    }
+}
+
+/// `java.importScript` 的地址形态判定。Legado `p0.i0` 还支持 file/content/storage
+/// （App 私有目录），服务端放开会变成“书源可读部署机任意路径”，故只允许 http(s)。
+fn import_script_supported(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// 取脚本文本：先查 TTL 缓存，未命中再走 `fetch_checked`（复用超时/体积/私网策略）。
+fn import_script(path: &str) -> Result<String, String> {
+    if let Some(text) = cached_script(path) {
+        return Ok(text);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("初始化运行时失败：{e}"))?;
+    let text = rt
+        .block_on(crate::req::fetch_checked(
+            path,
+            "GET",
+            &HashMap::new(),
+            None,
+            false,
+        ))
+        .map_err(|e| e.to_string())?;
+    store_script(path, &text);
+    Ok(text)
+}
+
+/// `java.importScript(path)` 的原生实现。空内容与非 http(s) 形态都以可读文案抛回 JS，
+/// 不把 `SyntaxError`/底层解码错误泄漏给规则作者。
+fn native_import_script(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let path = args
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(ajax_error("java.importScript：缺少脚本地址"));
+    }
+    if !import_script_supported(path) {
+        return Err(ajax_error(&format!(
+            "UNSUPPORTED_JS_API:java.importScript（仅支持 http(s) 脚本地址，当前为 {path}）"
+        )));
+    }
+    let started = Instant::now();
+    let res = import_script(path);
+    JS_AJAX_NET_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    match res {
+        Ok(text) if !text.trim().is_empty() => {
+            Ok(boa_engine::JsValue::from(boa_engine::JsString::from(text)))
+        }
+        Ok(_) => Err(ajax_error(&format!(
+            "java.importScript：{path} 内容获取失败或者为空"
+        ))),
+        Err(e) => {
+            tracing::warn!(url = path, error = %e, "importScript fetch failed");
+            Err(ajax_error(&format!(
+                "java.importScript 请求失败：{path}（{e}）"
+            )))
+        }
+    }
+}
+
 /// `java.setContent` 之后 DOM 三件套的按需求值（`__nativeSelect(content, rule, wantList)`）。
 ///
 /// 上游的 `java.setContent` 把内容设到同一个 `AnalyzeRule` 上，后续 `getElements` 在该
@@ -471,29 +571,33 @@ fn jsoup_add_handle(doc: usize, node: usize) -> u32 {
     })
 }
 
-/// 解析 jsoup 选择器；jsoup 专有扩展伪类显式报“未支持”，不静默降级。
-fn jsoup_selector(text: &str) -> Result<Selector, String> {
+/// 解析 jsoup 选择器；jsoup 专有扩展伪类由 Rust 侧统一处理，`:matches`/`:nth`
+/// 这类尚未实现的形态显式报“未支持”，不静默降级。
+struct JsoupPlan {
+    base: Selector,
+    filters: Vec<JqFilter>,
+}
+
+fn jsoup_plan(text: &str) -> Result<JsoupPlan, String> {
     let s = text.trim();
     if s.is_empty() {
         return Err("空选择器".to_string());
     }
-    for ext in [
-        ":contains(",
-        ":containsOwn(",
-        ":matches(",
-        ":matchesOwn(",
-        ":eq(",
-        ":lt(",
-        ":gt(",
-        ":nth(",
-    ] {
+    for ext in [":matches(", ":matchesOwn(", ":nth("] {
         if s.contains(ext) {
             return Err(format!(
                 "选择器使用了 jsoup 专有扩展伪类 {ext}…，当前后端(scraper)不支持：{s}"
             ));
         }
     }
-    Selector::parse(s).map_err(|e| format!("CSS 选择器不合法：{s}（{e:?}）"))
+    let (base, filters) = split_jquery_filters(s);
+    let base = if base.is_empty() {
+        "*".to_string()
+    } else {
+        base
+    };
+    let base = Selector::parse(&base).map_err(|e| format!("CSS 选择器不合法：{s}（{e:?}）"))?;
+    Ok(JsoupPlan { base, filters })
 }
 
 fn jsoup_with_handle<R>(h: u32, f: impl FnOnce(&Html, &str, usize) -> R) -> Option<R> {
@@ -505,7 +609,7 @@ fn jsoup_with_handle<R>(h: u32, f: impl FnOnce(&Html, &str, usize) -> R) -> Opti
     })
 }
 
-fn jsoup_select_handles(h: u32, sel: &Selector) -> Vec<u32> {
+fn jsoup_select_handles(h: u32, plan: &JsoupPlan) -> Vec<u32> {
     let (doc_idx, nodes) = JSOUP_REG.with(|r| {
         let r = r.borrow();
         let Some((doc, node)) = (h as usize)
@@ -520,11 +624,13 @@ fn jsoup_select_handles(h: u32, sel: &Selector) -> Vec<u32> {
         };
         let mut out = Vec::new();
         if node == 0 {
-            for el in d.html.select(sel) {
+            let els: Vec<_> = d.html.select(&plan.base).collect();
+            for el in apply_jq_filters(els, &plan.filters) {
                 out.push(jsoup_preorder_index(&d.html, &el));
             }
         } else if let Some(el) = jsoup_element_at(&d.html, node) {
-            for e in el.select(sel) {
+            let els: Vec<_> = el.select(&plan.base).collect();
+            for e in apply_jq_filters(els, &plan.filters) {
                 out.push(jsoup_preorder_index(&d.html, &e));
             }
         }
@@ -573,9 +679,8 @@ fn native_jsoup_select(
     let h = jsoup_arg_handle(args, 0)
         .ok_or_else(|| jsoup_error("org.jsoup.select（无效的文档/元素句柄）"))?;
     let sel_text = jsoup_arg_str(args, 1);
-    let sel =
-        jsoup_selector(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup select：{e}")))?;
-    let handles = jsoup_select_handles(h, &sel);
+    let plan = jsoup_plan(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup select：{e}")))?;
+    let handles = jsoup_select_handles(h, &plan);
     let json = serde_json::to_string(&handles).unwrap_or_else(|_| "[]".into());
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from(json)))
 }
@@ -756,9 +861,11 @@ fn native_jsoup_is(
     let h = jsoup_arg_handle(args, 0)
         .ok_or_else(|| jsoup_error("org.jsoup.is（无效的文档/元素句柄）"))?;
     let sel_text = jsoup_arg_str(args, 1);
-    let sel = jsoup_selector(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup is：{e}")))?;
+    let plan = jsoup_plan(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup is：{e}")))?;
     let matched = jsoup_with_handle(h, |html, _base, node| {
-        jsoup_element_at(html, node).map(|el| sel.matches(&el))
+        jsoup_element_at(html, node).map(|el| {
+            plan.base.matches(&el) && !apply_jq_filters(vec![el], &plan.filters).is_empty()
+        })
     })
     .flatten()
     .unwrap_or(false);
@@ -1258,6 +1365,16 @@ var java = {
       headers == null ? "" : (typeof headers === "string" ? headers : JSON.stringify(headers)));
   },
   post: function(url, body, headers){ return java.ajax(url, "POST", body, headers); },
+  // Legado `java.importScript(path)`：下载脚本文本供规则 `eval(String(...))`。本服务只接受
+  // http(s)（进程内 TTL 缓存，见 __nativeImportScript）；file/content/storage 形态会读取
+  // 部署机本地文件，等于把书源变成任意文件读取面，故显式报未支持而不是静默失败。
+  importScript: function(path){
+    return String(__nativeImportScript(path == null ? "" : String(path)));
+  },
+  // Legado `java.head(url)` 返回响应对象（header/code/body 等）。本服务抓取层只回正文文本、
+  // 不保留响应头，这里显式报未支持：依赖 etag 的 jsLib（如哔哩哔哩漫画 Reload）在自己的
+  // try/catch 里会降级为“无缓存直接下载”，不会把错误抛给规则作者。
+  head: function(){ throw new Error("UNSUPPORTED_JS_API:java.head（抓取层不暴露响应头/状态码）"); },
   connect: function(){ throw new Error("UNSUPPORTED_JS_API:java.connect（本服务无 socket 桥接）"); },
   // DOM 桥：`java.setContent(html)` 之后按需在“当前文档”上求值（Rust 原生解析，
   // 不再依赖预抽取的只读表）；未 setContent 时仍用 Phase 1 的字面量选择器快路。
@@ -1576,6 +1693,77 @@ fn js_unescape(s: &str) -> String {
             None => out.push('\\'),
         }
     }
+    out
+}
+
+/// 解析书源 `jsLib` 字段（Legado 约定：`{库名: 脚本URL}` 的 JSON map）为脚本地址列表。
+///
+/// 真实源里存在三种形态：空串/非法 JSON（忽略）、JSON map（取非空字符串值）、
+/// JSON 数组；个别源把整个字段直接写成单个 http(s) URL，也接受。
+fn js_lib_urls(js_lib: &str) -> Vec<String> {
+    let s = js_lib.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |u: &str| {
+        let u = u.trim();
+        if u.is_empty() || out.iter().any(|x| x == u) {
+            return;
+        }
+        out.push(u.to_string());
+    };
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::Object(map)) => {
+            for v in map.values() {
+                if let Some(u) = v.as_str() {
+                    push(u);
+                }
+            }
+        }
+        Ok(Value::Array(list)) => {
+            for v in list {
+                if let Some(u) = v.as_str() {
+                    push(u);
+                }
+            }
+        }
+        Ok(Value::String(u)) => push(&u),
+        _ => {
+            if s.starts_with("http://") || s.starts_with("https://") {
+                push(s);
+            }
+        }
+    }
+    out
+}
+
+/// jsLib 预载片段。**必须插在 `JAVA_BOOK_SHIM` 之后**：jsLib 是 Legado 的共享作用域脚本
+/// （`const { java, source, cookie, cache } = this;`），需要 `this` 上已有这些对象；
+/// 它定义的 `Reload/Get` 等函数声明要能被执行规则代码的作用域看到，规则
+/// `<js> eval(String(Reload('url'))) </js>` 才能直接调用。
+///
+/// 用**间接 eval**（`(0, eval)(src)`）把 jsLib 放到全局作用域执行，对齐 Legado：
+/// jsLib 内部大量 `this.testUrl(...)`/`this.Option()` 依赖“顶层函数声明成为共享作用域
+/// 的成员、函数里的 this 就是该作用域”。若用直接 eval 落进 IIFE 的局部作用域，
+/// 这些 `this.xxx` 会全部 undefined。代价是这些全局名在单一 JS Context 里跨源留存；
+/// 同名定义会被下一个带 jsLib 的源覆盖，没有 jsLib 的源不会引用这些名字。
+///
+/// 下载失败只降级（打日志，规则本身照常求值）：jsLib 是第三方站点资源，不能因为
+/// 它不可达就把整个源的所有 JS 规则变成报错。
+fn js_lib_preload_js(urls: &[String]) -> String {
+    if urls.is_empty() {
+        return String::new();
+    }
+    let list = serde_json::to_string(urls).unwrap_or_else(|_| "[]".into());
+    let mut out = String::new();
+    out.push_str("var __jsLibUrls = ");
+    out.push_str(&list);
+    out.push_str(";\nvar __g = (typeof globalThis !== 'undefined') ? globalThis : this;\n");
+    out.push_str("__g.java = java; __g.source = source; __g.cookie = cookie; __g.cache = cache; __g.book = book;\n");
+    out.push_str("for (var __li = 0; __li < __jsLibUrls.length; __li++) {\n");
+    out.push_str("  try {\n    var __ls = String(__nativeImportScript(__jsLibUrls[__li]));\n");
+    out.push_str("    if (__ls) { (0, eval)(__ls); }\n  } catch (__le) {}\n}\n");
     out
 }
 
@@ -2587,7 +2775,7 @@ impl AnalyzeRule {
         let vars_init =
             serde_json::to_string(&self.variables.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\nvar __bookName={bn}; var __bookAuthor={ba}; var __bookKind={bk}; var __bookIntro={bi}; var __bookCoverUrl={bc};\n{vars}\n{cachejs}\n{lib}\n{shim}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\nvar __bookName={bn}; var __bookAuthor={ba}; var __bookKind={bk}; var __bookIntro={bi}; var __bookCoverUrl={bc};\n{vars}\n{cachejs}\n{shim}\n{lib}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
             r = lit,
             b = js_string_literal(base_url),
             page = js_string_literal(&self.current_content.borrow()),
@@ -2603,7 +2791,8 @@ impl AnalyzeRule {
             vars = vars_js,
             varsinit = vars_init,
             cachejs = JS_CACHE,
-            lib = self.js_lib,
+            // jsLib 是共享作用域脚本，必须排在 shim 之后求值（见 js_lib_preload_js）。
+            lib = js_lib_preload_js(&js_lib_urls(&self.js_lib)),
             shim = shim,
             cacheinit = cache_init,
             dom = dom_js,
@@ -4202,6 +4391,10 @@ enum JqFilter {
     Lt(i64),
     Gt(i64),
     Contains(String),
+    /// jsoup `:containsOwn(text)`：只看元素自身直接文本（不含子元素文本）。
+    ContainsOwn(String),
+    /// jsoup `:has(selector)`：存在匹配的后代元素。
+    Has(String),
 }
 
 fn starts_at(cs: &[char], i: usize, pat: &str) -> bool {
@@ -4316,11 +4509,31 @@ fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
                     }
                     base.push(c);
                     i += 1;
+                } else if starts_at(&cs, i, ":containsOwn(") {
+                    let open = i + 12;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::ContainsOwn(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
                 } else if starts_at(&cs, i, ":contains(") {
                     let open = i + 9;
                     if let Some(close) = find_close_paren(&cs, open) {
                         let arg: String = cs[open + 1..close].iter().collect();
                         filters.push(JqFilter::Contains(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
+                } else if starts_at(&cs, i, ":has(") {
+                    let open = i + 4;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::Has(unquote_arg(&arg)));
                         i = close + 1;
                     } else {
                         base.push(c);
@@ -4377,10 +4590,33 @@ fn apply_jq_filters<'a>(
                     els.into_iter().skip((bound + 1) as usize).collect()
                 }
             }
-            JqFilter::Contains(text) => els
-                .into_iter()
-                .filter(|e| e.text().collect::<String>().contains(text))
-                .collect(),
+            JqFilter::Contains(text) => {
+                // jsoup 语义：`Element.text()` 包含匹配，**不区分大小写**
+                let needle = text.to_lowercase();
+                els.into_iter()
+                    .filter(|e| {
+                        e.text()
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .to_lowercase()
+                            .contains(&needle)
+                    })
+                    .collect()
+            }
+            JqFilter::ContainsOwn(text) => {
+                let needle = text.to_lowercase();
+                els.into_iter()
+                    .filter(|e| own_text_contains(e, &needle))
+                    .collect()
+            }
+            JqFilter::Has(sel) => {
+                let sel = scraper::Selector::parse(sel).ok();
+                els.into_iter()
+                    .filter(|e| sel.as_ref().is_some_and(|s| e.select(s).next().is_some()))
+                    .collect()
+            }
         };
     }
     els
@@ -5413,6 +5649,114 @@ mod tests {
         assert!(err.contains("webView"), "应点名缺失的 API，实际: {err}");
     }
 
+    // ---- jsLib / java.importScript（哔哩哔哩漫画整源依赖 Reload）----
+
+    #[test]
+    fn js_lib_urls_parses_real_source_map() {
+        // sources.json 里哔哩哔哩漫画的 jsLib 原值（少数非空 jsLib 之一）
+        let map = r#"{"哔哩哔哩漫画":"https://qyyuapi.com/sy/js/哔哩哔哩漫画/jsLib.js"}"#;
+        let urls = js_lib_urls(map);
+        assert_eq!(
+            urls,
+            vec!["https://qyyuapi.com/sy/js/哔哩哔哩漫画/jsLib.js".to_string()]
+        );
+        // 常见空字段/空 map/非法 JSON 都不该产出地址，也不该让规则求值报错
+        assert!(js_lib_urls("").is_empty());
+        assert!(js_lib_urls("{}").is_empty());
+        assert!(js_lib_urls("不是JSON").is_empty());
+        // 个别源把整个字段写成单个 URL
+        assert_eq!(js_lib_urls("https://a.test/lib.js").len(), 1);
+    }
+
+    #[test]
+    fn js_lib_json_is_not_injected_as_statements() {
+        // 回归：jsLib 曾把 JSON map 原样插进脚本（`{"库":"url"}` 出现在语句位置），
+        // 导致该源每一次 JS 求值都 SyntaxError。现在只解析出 URL 去下载，规则照常求值。
+        let mut ar = AnalyzeRule::new();
+        ar.js_lib = r#"{"哔哩哔哩漫画":"ftp://example.invalid/jsLib.js"}"#.to_string();
+        assert_eq!(ar.get_string("", "<js>1+1</js>", false, "").unwrap(), "2");
+    }
+
+    #[test]
+    fn import_script_rejects_non_http_forms_explicitly() {
+        // Legado 还支持 file/content/storage；服务端不放开（避免读部署机文件），
+        // 必须抛可读的未支持错误，而不是让 SyntaxError/IO 错误泄漏。
+        let ar = AnalyzeRule::new();
+        let err = ar
+            .get_string("", "<js>java.importScript('ftp://x/y.js')</js>", false, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
+        assert!(err.contains("importScript"), "应点名 API，实际: {err}");
+        assert!(
+            !err.contains("SyntaxError"),
+            "不应泄漏 SyntaxError，实际: {err}"
+        );
+    }
+
+    #[test]
+    fn import_script_empty_content_reports_readable_error() {
+        // Legado p0.i0 对空内容抛「内容获取失败或者为空」，这里同样给可读文案。
+        let url = "https://lib.test/empty.js";
+        store_script(url, "  ");
+        let ar = AnalyzeRule::new();
+        let err = ar
+            .get_string(
+                "",
+                &format!("<js>java.importScript('{url}')</js>"),
+                false,
+                "",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("内容获取失败或者为空"), "实际: {err}");
+    }
+
+    #[test]
+    fn java_head_reports_explicit_unsupported() {
+        // 抓取层不保留响应头，`java.head(...).header('etag')` 显式报未支持；
+        // jsLib 的 Reload 用 try/catch 包住这段，因此只降级不致命。
+        let ar = AnalyzeRule::new();
+        let err = ar
+            .get_string("", "<js>java.head('https://x.com/a')</js>", false, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
+        assert!(err.contains("head"), "应点名 API，实际: {err}");
+    }
+
+    #[test]
+    fn js_lib_reload_and_import_script_work_in_rule_scope() {
+        // 哔哩哔哩漫画 jsLib 的结构：`const { java, source, cookie, cache } = this;`
+        // 解构共享作用域，再由 Reload 用 java.importScript 取子规则脚本。
+        // 两个脚本都预置进 TTL 缓存，走完整链路但不发起真实网络请求。
+        let lib_url = "https://lib.test/bili-manga/jsLib.js";
+        let sub_url = "https://lib.test/bili-manga/detail.js";
+        store_script(
+            lib_url,
+            r#"const { java, cache } = this;
+function Reload(e){
+  var etag = '';
+  try { etag = String(java.head(e, {}).header('etag')); }
+  catch (err) { etag = String(cache.get(e) || 'noetag'); }
+  return String(java.importScript(e));
+}"#,
+        );
+        store_script(sub_url, "(function(){ return 'sub-rule-ok'; })()");
+        let mut ar = AnalyzeRule::new();
+        ar.js_lib = serde_json::json!({"哔哩哔哩漫画": lib_url}).to_string();
+        assert_eq!(
+            ar.get_string(
+                "",
+                &format!("<js>eval(String(Reload('{sub_url}')));</js>"),
+                false,
+                ""
+            )
+            .unwrap(),
+            "sub-rule-ok"
+        );
+    }
+
     /// 奇怪小说的真实 toc 规则（节选自 yetianlian 页面结构）：
     /// java.getElements 取 dl 的 children，再用 String(node) + 正则过滤出正文分卷的 dd。
     #[test]
@@ -5540,11 +5884,21 @@ href+"|"+rev"#,
 
     #[test]
     fn jsoup_extended_selector_reports_unsupported() {
-        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:contains(第一章)")"#)
+        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:matches(第一)")"#)
             .unwrap_err()
             .to_string();
         assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
         assert!(err.contains("jsoup 专有"), "实际: {err}");
+    }
+
+    // jsoup 扩展伪类走 select 结果集过滤（与 Legado/jsoup 语义一致），不再整体抛未支持。
+    #[test]
+    fn jsoup_pseudo_classes_select() {
+        let out = run_js(
+            r#"@js:var d=org.jsoup.Jsoup.parse(result);d.select("li:has(span)").size()+"|"+d.select("li:contains(第二章)").size()+"|"+d.select("li:containsOwn(第二章)").size()"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1|1|0");
     }
 
     // ---- AES / 字节桥（哔哩漫画解图链路的基础）----
@@ -7132,6 +7486,45 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ar.get_string(NEWS_HTML, "ul@li:eq(3)@a@text", false, "")
                 .unwrap(),
             "第四章"
+        );
+    }
+
+    // jsoup 扩展伪类在规则 CSS 路径同样生效，且语义对齐 jsoup：
+    // `:contains` 不分大小写、`:containsOwn` 只看自身文本、`:has` 看后代。
+    #[test]
+    fn jsoup_pseudo_classes_full_semantics() {
+        let ar = AnalyzeRule::new();
+        // 大小写不敏感（jsoup Element.text() 包含匹配）
+        let html = r#"<div id="x">Hello World</div>"#;
+        assert_eq!(
+            ar.get_string(html, "div:contains(hello)@text", false, "")
+                .unwrap(),
+            "Hello World"
+        );
+        // contains 命中后代文本；containsOwn 只认自身直接文本
+        let nested = r#"<div id="y"><span>子文本</span></div>"#;
+        assert_eq!(
+            ar.get_string(nested, "div:contains(子文本)@span@text", false, "")
+                .unwrap(),
+            "子文本"
+        );
+        assert_eq!(
+            ar.get_string(nested, "div:containsOwn(子文本)", false, "")
+                .unwrap(),
+            ""
+        );
+        // :has 要求存在匹配后代
+        let has = r#"<div class="a"><p>正文</p></div><div class="b"><span>x</span></div>"#;
+        assert_eq!(
+            ar.get_string(has, "div:has(p)@p@text", false, "").unwrap(),
+            "正文"
+        );
+        assert_eq!(ar.get_string(has, "div.b:has(p)", false, "").unwrap(), "");
+        // :eq 负数从尾部取
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:eq(-2)@a@text", false, "")
+                .unwrap(),
+            "第三章"
         );
     }
 
