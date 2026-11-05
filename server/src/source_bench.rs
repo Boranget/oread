@@ -184,35 +184,35 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     BuiltinCorpus {
         title: "海贼王",
         expected_author: Some("尾田荣一郎"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "火影忍者",
         expected_author: Some("岸本齐史"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "名侦探柯南",
         expected_author: Some("青山刚昌"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "一人之下",
         expected_author: Some("米二"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "鬼灭之刃",
         expected_author: Some("吾峠呼世晴"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
@@ -220,49 +220,49 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
     BuiltinCorpus {
         title: "斗罗大陆",
         expected_author: Some("穆逢春"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "秦时明月",
         expected_author: None,
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "狐妖小红娘",
         expected_author: Some("小新"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "镇魂街",
         expected_author: Some("许辰"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "灌篮高手",
         expected_author: Some("井上雄彦"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "进击的巨人",
         expected_author: Some("谏山创"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
     BuiltinCorpus {
         title: "咒术回战",
         expected_author: Some("芥见下下"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
         scored: true,
     },
@@ -2467,6 +2467,16 @@ mod tests {
             "出版/实体书 3 条（活着/平凡的世界/三体）标记为不计分"
         );
         assert!(unscored.iter().all(|b| b.source_type == TYPE_NOVEL));
+        let comic_cats: HashSet<_> = BUILTIN_CORPUS
+            .iter()
+            .filter(|b| b.source_type == TYPE_COMIC)
+            .map(|b| b.category)
+            .collect();
+        assert_eq!(
+            comic_cats,
+            HashSet::from(["日漫", "国漫"]),
+            "漫画语料按日漫/国漫拆分 category"
+        );
     }
 
     #[test]
