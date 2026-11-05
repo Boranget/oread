@@ -471,29 +471,33 @@ fn jsoup_add_handle(doc: usize, node: usize) -> u32 {
     })
 }
 
-/// 解析 jsoup 选择器；jsoup 专有扩展伪类显式报“未支持”，不静默降级。
-fn jsoup_selector(text: &str) -> Result<Selector, String> {
+/// 解析 jsoup 选择器；jsoup 专有扩展伪类由 Rust 侧统一处理，`:matches`/`:nth`
+/// 这类尚未实现的形态显式报“未支持”，不静默降级。
+struct JsoupPlan {
+    base: Selector,
+    filters: Vec<JqFilter>,
+}
+
+fn jsoup_plan(text: &str) -> Result<JsoupPlan, String> {
     let s = text.trim();
     if s.is_empty() {
         return Err("空选择器".to_string());
     }
-    for ext in [
-        ":contains(",
-        ":containsOwn(",
-        ":matches(",
-        ":matchesOwn(",
-        ":eq(",
-        ":lt(",
-        ":gt(",
-        ":nth(",
-    ] {
+    for ext in [":matches(", ":matchesOwn(", ":nth("] {
         if s.contains(ext) {
             return Err(format!(
                 "选择器使用了 jsoup 专有扩展伪类 {ext}…，当前后端(scraper)不支持：{s}"
             ));
         }
     }
-    Selector::parse(s).map_err(|e| format!("CSS 选择器不合法：{s}（{e:?}）"))
+    let (base, filters) = split_jquery_filters(s);
+    let base = if base.is_empty() {
+        "*".to_string()
+    } else {
+        base
+    };
+    let base = Selector::parse(&base).map_err(|e| format!("CSS 选择器不合法：{s}（{e:?}）"))?;
+    Ok(JsoupPlan { base, filters })
 }
 
 fn jsoup_with_handle<R>(h: u32, f: impl FnOnce(&Html, &str, usize) -> R) -> Option<R> {
@@ -505,7 +509,7 @@ fn jsoup_with_handle<R>(h: u32, f: impl FnOnce(&Html, &str, usize) -> R) -> Opti
     })
 }
 
-fn jsoup_select_handles(h: u32, sel: &Selector) -> Vec<u32> {
+fn jsoup_select_handles(h: u32, plan: &JsoupPlan) -> Vec<u32> {
     let (doc_idx, nodes) = JSOUP_REG.with(|r| {
         let r = r.borrow();
         let Some((doc, node)) = (h as usize)
@@ -520,11 +524,13 @@ fn jsoup_select_handles(h: u32, sel: &Selector) -> Vec<u32> {
         };
         let mut out = Vec::new();
         if node == 0 {
-            for el in d.html.select(sel) {
+            let els: Vec<_> = d.html.select(&plan.base).collect();
+            for el in apply_jq_filters(els, &plan.filters) {
                 out.push(jsoup_preorder_index(&d.html, &el));
             }
         } else if let Some(el) = jsoup_element_at(&d.html, node) {
-            for e in el.select(sel) {
+            let els: Vec<_> = el.select(&plan.base).collect();
+            for e in apply_jq_filters(els, &plan.filters) {
                 out.push(jsoup_preorder_index(&d.html, &e));
             }
         }
@@ -573,9 +579,8 @@ fn native_jsoup_select(
     let h = jsoup_arg_handle(args, 0)
         .ok_or_else(|| jsoup_error("org.jsoup.select（无效的文档/元素句柄）"))?;
     let sel_text = jsoup_arg_str(args, 1);
-    let sel =
-        jsoup_selector(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup select：{e}")))?;
-    let handles = jsoup_select_handles(h, &sel);
+    let plan = jsoup_plan(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup select：{e}")))?;
+    let handles = jsoup_select_handles(h, &plan);
     let json = serde_json::to_string(&handles).unwrap_or_else(|_| "[]".into());
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from(json)))
 }
@@ -756,9 +761,11 @@ fn native_jsoup_is(
     let h = jsoup_arg_handle(args, 0)
         .ok_or_else(|| jsoup_error("org.jsoup.is（无效的文档/元素句柄）"))?;
     let sel_text = jsoup_arg_str(args, 1);
-    let sel = jsoup_selector(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup is：{e}")))?;
+    let plan = jsoup_plan(&sel_text).map_err(|e| jsoup_error(&format!("org.jsoup is：{e}")))?;
     let matched = jsoup_with_handle(h, |html, _base, node| {
-        jsoup_element_at(html, node).map(|el| sel.matches(&el))
+        jsoup_element_at(html, node).map(|el| {
+            plan.base.matches(&el) && !apply_jq_filters(vec![el], &plan.filters).is_empty()
+        })
     })
     .flatten()
     .unwrap_or(false);
@@ -4202,6 +4209,10 @@ enum JqFilter {
     Lt(i64),
     Gt(i64),
     Contains(String),
+    /// jsoup `:containsOwn(text)`：只看元素自身直接文本（不含子元素文本）。
+    ContainsOwn(String),
+    /// jsoup `:has(selector)`：存在匹配的后代元素。
+    Has(String),
 }
 
 fn starts_at(cs: &[char], i: usize, pat: &str) -> bool {
@@ -4316,11 +4327,31 @@ fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
                     }
                     base.push(c);
                     i += 1;
+                } else if starts_at(&cs, i, ":containsOwn(") {
+                    let open = i + 12;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::ContainsOwn(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
                 } else if starts_at(&cs, i, ":contains(") {
                     let open = i + 9;
                     if let Some(close) = find_close_paren(&cs, open) {
                         let arg: String = cs[open + 1..close].iter().collect();
                         filters.push(JqFilter::Contains(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
+                } else if starts_at(&cs, i, ":has(") {
+                    let open = i + 4;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::Has(unquote_arg(&arg)));
                         i = close + 1;
                     } else {
                         base.push(c);
@@ -4377,10 +4408,33 @@ fn apply_jq_filters<'a>(
                     els.into_iter().skip((bound + 1) as usize).collect()
                 }
             }
-            JqFilter::Contains(text) => els
-                .into_iter()
-                .filter(|e| e.text().collect::<String>().contains(text))
-                .collect(),
+            JqFilter::Contains(text) => {
+                // jsoup 语义：`Element.text()` 包含匹配，**不区分大小写**
+                let needle = text.to_lowercase();
+                els.into_iter()
+                    .filter(|e| {
+                        e.text()
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .to_lowercase()
+                            .contains(&needle)
+                    })
+                    .collect()
+            }
+            JqFilter::ContainsOwn(text) => {
+                let needle = text.to_lowercase();
+                els.into_iter()
+                    .filter(|e| own_text_contains(e, &needle))
+                    .collect()
+            }
+            JqFilter::Has(sel) => {
+                let sel = scraper::Selector::parse(sel).ok();
+                els.into_iter()
+                    .filter(|e| sel.as_ref().is_some_and(|s| e.select(s).next().is_some()))
+                    .collect()
+            }
         };
     }
     els
@@ -5540,11 +5594,21 @@ href+"|"+rev"#,
 
     #[test]
     fn jsoup_extended_selector_reports_unsupported() {
-        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:contains(第一章)")"#)
+        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:matches(第一)")"#)
             .unwrap_err()
             .to_string();
         assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
         assert!(err.contains("jsoup 专有"), "实际: {err}");
+    }
+
+    // jsoup 扩展伪类走 select 结果集过滤（与 Legado/jsoup 语义一致），不再整体抛未支持。
+    #[test]
+    fn jsoup_pseudo_classes_select() {
+        let out = run_js(
+            r#"@js:var d=org.jsoup.Jsoup.parse(result);d.select("li:has(span)").size()+"|"+d.select("li:contains(第二章)").size()+"|"+d.select("li:containsOwn(第二章)").size()"#,
+        )
+        .unwrap();
+        assert_eq!(out, "1|1|0");
     }
 
     // ---- AES / 字节桥（哔哩漫画解图链路的基础）----
@@ -7132,6 +7196,45 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ar.get_string(NEWS_HTML, "ul@li:eq(3)@a@text", false, "")
                 .unwrap(),
             "第四章"
+        );
+    }
+
+    // jsoup 扩展伪类在规则 CSS 路径同样生效，且语义对齐 jsoup：
+    // `:contains` 不分大小写、`:containsOwn` 只看自身文本、`:has` 看后代。
+    #[test]
+    fn jsoup_pseudo_classes_full_semantics() {
+        let ar = AnalyzeRule::new();
+        // 大小写不敏感（jsoup Element.text() 包含匹配）
+        let html = r#"<div id="x">Hello World</div>"#;
+        assert_eq!(
+            ar.get_string(html, "div:contains(hello)@text", false, "")
+                .unwrap(),
+            "Hello World"
+        );
+        // contains 命中后代文本；containsOwn 只认自身直接文本
+        let nested = r#"<div id="y"><span>子文本</span></div>"#;
+        assert_eq!(
+            ar.get_string(nested, "div:contains(子文本)@span@text", false, "")
+                .unwrap(),
+            "子文本"
+        );
+        assert_eq!(
+            ar.get_string(nested, "div:containsOwn(子文本)", false, "")
+                .unwrap(),
+            ""
+        );
+        // :has 要求存在匹配后代
+        let has = r#"<div class="a"><p>正文</p></div><div class="b"><span>x</span></div>"#;
+        assert_eq!(
+            ar.get_string(has, "div:has(p)@p@text", false, "").unwrap(),
+            "正文"
+        );
+        assert_eq!(ar.get_string(has, "div.b:has(p)", false, "").unwrap(), "");
+        // :eq 负数从尾部取
+        assert_eq!(
+            ar.get_string(NEWS_HTML, "li:eq(-2)@a@text", false, "")
+                .unwrap(),
+            "第三章"
         );
     }
 
