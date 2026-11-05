@@ -804,7 +804,7 @@
         ? `全部可搜索源（${searchableSources.length} 个）`
         : sourceScope === 'curated'
           ? curatedTotal
-            ? `精选源（${curatedTotal} 个；集合为空或不可用时自动回退）`
+            ? `精选源（${curatedTotal} 个；集合为空时自动回退）`
             : '精选源（集合尚未生成，搜索会自动回退）'
           : `已选 ${pickedSourceIds.length} 个源`}
       {#if sourceScope === 'custom' && !pickedSourceIds.length}&nbsp;· 至少选 1 个才能搜索{/if}
@@ -877,9 +877,9 @@
     {:else if sourceMode === 'curated'}
       精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
     {:else if sourceMode === 'curated_fallback'}
-      （精选集不可用，已回退；实际 {sourceTotal} 个源）
+      （{curatedTotal ? '精选集暂无可用条目' : '尚未生成精选集'}，本次用兜底源；实际 {sourceTotal} 个源）
     {:else if sourceMode === 'all_fallback'}
-      （精选/常用源不可用，已改用全部 {sourceTotal} 个源）
+      （{curatedTotal ? '精选集与常用源暂无可用条目' : '尚未生成精选集'}，已改用全部 {sourceTotal} 个源）
     {:else}
       （全部可搜索源）
     {/if}
@@ -953,9 +953,9 @@
       {#if sourceMode === 'curated' || (!sourceMode && requestedScope === 'curated')}
         &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
       {:else if sourceMode === 'curated_fallback'}
-        &nbsp;· 精选集不可用，已回退
+        &nbsp;· {curatedTotal ? '精选集暂无可用条目，已回退' : '尚未生成精选集，已回退'}
       {:else if sourceMode === 'all_fallback'}
-        &nbsp;· 精选/常用源不可用，已改用全部源
+        &nbsp;· {curatedTotal ? '精选集与常用源暂无可用条目，已改用全部源' : '尚未生成精选集，已改用全部源'}
       {:else if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
         &nbsp;· 指定源
       {:else}
@@ -975,7 +975,13 @@
       精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用全部可搜索源重试</button>，或把上方范围切到「全部可搜索源」再试。
     </p>
   {:else if requestedScope === 'curated'}
-    <p class="muted empty-hint">精选集尚未生成（或不可用），已回退到优选/全部可搜索源，仍无结果；可换个关键词再试。</p>
+    {#if curatedTotal}
+      <p class="muted empty-hint">精选集暂无可用条目，已回退到常用/全部可搜索源，仍无结果；可换个关键词再试。</p>
+    {:else}
+      <p class="muted empty-hint">
+        尚未生成精选集，本次已用兜底源，仍无结果；可到<button class="ghost empty-retry" on:click={goSources}>书源管理</button>点「跑一次体检」生成精选集后重试。
+      </p>
+    {/if}
   {:else}
     <p class="muted empty-hint">没有找到结果，可换个关键词再试。</p>
   {/if}

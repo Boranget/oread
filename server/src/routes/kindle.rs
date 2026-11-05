@@ -2062,14 +2062,28 @@ async fn search(
             None
         } else {
             match plan.source_mode {
-                "curated_fallback" => Some(format!(
-                    "精选源当前不可用，已改用常用源（{n} 个源）。",
-                    n = plan.source_total
-                )),
-                "all_fallback" => Some(format!(
-                    "精选/常用源暂不可用，已改用全部 {n} 个源。",
-                    n = plan.source_total
-                )),
+                "curated_fallback" => Some(if plan.curated_total == 0 {
+                    format!(
+                        "尚未生成精选集，已改用常用源（{n} 个源）。可在书源设置里跑一次体检生成精选。",
+                        n = plan.source_total
+                    )
+                } else {
+                    format!(
+                        "精选集暂无可用条目，已改用常用源（{n} 个源）。",
+                        n = plan.source_total
+                    )
+                }),
+                "all_fallback" => Some(if plan.curated_total == 0 {
+                    format!(
+                        "尚未生成精选集，已改用全部 {n} 个源。可在书源设置里跑一次体检生成精选。",
+                        n = plan.source_total
+                    )
+                } else {
+                    format!(
+                        "精选集与常用源暂无可用条目，已改用全部 {n} 个源。",
+                        n = plan.source_total
+                    )
+                }),
                 _ => None,
             }
         };
