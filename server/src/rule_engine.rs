@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use jsonpath_rust::JsonPathQuery;
 use once_cell::sync::OnceCell;
@@ -78,9 +78,23 @@ struct JsJob {
 /// 全局唯一的 JS 执行线程入口（容量 8，避免无界排队）。
 static JS_TX: OnceLock<SyncSender<JsJob>> = OnceLock::new();
 
-/// 等待 JS 线程回传结果。
+/// JS 求值在途上限：1 个在跑 + 最多 2 个排队。慢规则占满这 3 个名额后，
+/// 新来的规则最多只等 `JS_ADMIT_WAIT` 就降级失败，不会排十几秒队。
+/// 上限取 3 的依据：`block_in_place` 的替身 worker 会占用 blocking 池线程
+/// （`max_blocking_threads = 4`），3 个在途留 1 个给图片解码等其它阻塞任务；
+/// 再放大会耗尽 blocking 池，被移交的 worker 核心反而无处执行。
+#[cfg(not(test))]
+const JS_MAX_INFLIGHT: usize = 3;
+/// 单测里 400+ 用例并行跑、共用同一条 JS 线程，按生产上限会互相抢名额并触发降级；
+/// 测试环境下放宽，生产语义由 `js_gate_fast_fails_when_saturated` 直接覆盖。
+#[cfg(test)]
+const JS_MAX_INFLIGHT: usize = 64;
+/// 拿不到 JS 在途名额时的最长等待；超过即返回可读错误（调用方按空字段降级）。
+const JS_ADMIT_WAIT: Duration = Duration::from_millis(250);
+
+/// 投递 JS 任务并等待回执（含在途名额限制）。
 ///
-/// 规则解析整条调用链是同步的（`AnalyzeRule` 内含 `RefCell`/`Rc`，既不能 `await`
+/// 规则解析整条调用链是同步的（`AnalyzeRule` 内含 `RefCell`，既不能 `await`
 /// 也不满足 `Send + 'static`，无法整体搬进 `spawn_blocking`）。因此这里在
 /// tokio 多线程 runtime 上用 `block_in_place`：它会把当前 worker 的调度核心
 /// 迁移到 blocking 线程并从 blocking 池补一个执行者，本线程只做等待，
@@ -88,18 +102,32 @@ static JS_TX: OnceLock<SyncSender<JsJob>> = OnceLock::new();
 ///
 /// 单线程 runtime（`current_thread`）与纯同步上下文（单测/CLI）没有该能力，
 /// 退回直接阻塞，行为与原实现一致。
-fn wait_js_reply(
+///
+/// 名额限制让最坏情况有界：并发慢规则超过 `JS_MAX_INFLIGHT` 时只等
+/// `JS_ADMIT_WAIT`，随后按“规则降级”返回错误，而不是排队等前一条慢规则跑完。
+fn run_js_job(
+    job: JsJob,
     rx: Receiver<(Result<String, String>, u64, u64)>,
 ) -> Result<(Result<String, String>, u64, u64), RuleError> {
-    let wait = || {
+    let work = || {
+        let _slot = js_gate()
+            .acquire(JS_MAX_INFLIGHT, JS_ADMIT_WAIT)
+            .ok_or_else(|| {
+                RuleError::Other(format!(
+                    "js 执行队列繁忙（在途上限 {JS_MAX_INFLIGHT}），本次规则降级"
+                ))
+            })?;
+        js_sender()
+            .send(job)
+            .map_err(|_| RuleError::Other("js worker unavailable".into()))?;
         rx.recv()
             .map_err(|_| RuleError::Other("js worker dropped".into()))
     };
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(wait)
+            tokio::task::block_in_place(work)
         }
-        _ => wait(),
+        _ => work(),
     }
 }
 
@@ -114,6 +142,65 @@ fn js_sender() -> &'static SyncSender<JsJob> {
             .expect("spawn boa js worker");
         tx
     })
+}
+
+/// JS 在途名额（有界排队 + 超限快速失败）。
+struct JsGate {
+    inflight: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl JsGate {
+    fn new() -> Self {
+        Self {
+            inflight: Mutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// 最多等 `wait` 拿到名额；满额超时返回 `None`。
+    fn acquire(&self, limit: usize, wait: Duration) -> Option<JsSlot<'_>> {
+        let mut n = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if *n >= limit {
+            let deadline = Instant::now() + wait;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                let (guard, timed) = self
+                    .ready
+                    .wait_timeout(n, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                n = guard;
+                if *n < limit {
+                    break;
+                }
+                if timed.timed_out() {
+                    return None;
+                }
+            }
+        }
+        *n += 1;
+        Some(JsSlot(self))
+    }
+}
+
+/// 名额守卫：离开作用域即归还并唤醒一个等待者。
+struct JsSlot<'a>(&'a JsGate);
+
+impl Drop for JsSlot<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.0.ready.notify_one();
+    }
+}
+
+static JS_GATE: OnceLock<JsGate> = OnceLock::new();
+
+fn js_gate() -> &'static JsGate {
+    JS_GATE.get_or_init(JsGate::new)
 }
 
 /// 创建 JS 执行上下文（含预算配置与 `java.ajax` 网络桥）。
@@ -2805,11 +2892,8 @@ impl AnalyzeRule {
             msent = js_string_literal(JS_RULE_MS_SENTINEL),
         );
         let (tx, rx) = channel::<(Result<String, String>, u64, u64)>();
-        js_sender()
-            .send(JsJob { script, reply: tx })
-            .map_err(|_| RuleError::Other("js worker unavailable".into()))?;
-        // 慢 JS 只阻塞本次规则求值，不再占住 tokio worker（见 `wait_js_reply`）。
-        let (result, net_ms, js_elapsed) = wait_js_reply(rx)?;
+        // 慢 JS 只阻塞本次规则求值，不再占住 tokio worker；在途超限则快速降级（见 `run_js_job`）。
+        let (result, net_ms, js_elapsed) = run_js_job(JsJob { script, reply: tx }, rx)?;
         // 结果串尾部依次带回 cache 变更与规则自身耗时（非法/超大都忽略，不影响主结果）
         let mut rule_ms: Option<u64> = None;
         let result = match result {
@@ -7957,6 +8041,72 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         assert_eq!(
             ar.get_string(html, "class.text@text", false, "").unwrap(),
             "二月二，龙抬头。 暮色里，小镇名叫泥瓶巷。"
+        );
+    }
+
+    // ---------------- 慢 JS 隔离 ----------------
+
+    // 在途名额满额后只等一个短窗口就快速失败（而不是排到前一条慢规则跑完）。
+    #[test]
+    fn js_gate_fast_fails_when_saturated() {
+        let gate = JsGate::new();
+        let held = gate.acquire(1, Duration::ZERO).expect("首个名额");
+        let t = Instant::now();
+        assert!(
+            gate.acquire(1, Duration::from_millis(120)).is_none(),
+            "满额时必须在等待窗口后返回 None"
+        );
+        let waited = t.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "应先等满窗口再放弃，实际 {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(600),
+            "失败必须快，实际 {waited:?}"
+        );
+        drop(held);
+        assert!(
+            gate.acquire(1, Duration::from_millis(50)).is_some(),
+            "名额归还后应能重新拿到"
+        );
+    }
+
+    // 慢 JS 只许占住 JS 线程，不许饿死 tokio worker：等价 /healthz 的轻任务必须持续被调度。
+    #[test]
+    fn slow_js_does_not_starve_multi_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(512 * 1024)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        // 40000 次拼接在压测机上约 5.3s；15000 次约 0.7s（平方缩放），两条脚本串行耗时足够覆盖心跳窗口。
+        let slow = "@js:var s='';for(var i=0;i<15000;i++){s=s+'boranlib-slow-js-padding-0123456789';}s.length";
+        let worst = rt.block_on(async move {
+            // 模拟搜索路径：在 async 任务里同步调用规则引擎，占住 2 个 worker
+            for _ in 0..2 {
+                let code = slow.to_string();
+                tokio::spawn(async move {
+                    let ar = AnalyzeRule::new();
+                    let _ = ar.get_string("", &code, false, "");
+                });
+            }
+            // 等价 /healthz 的心跳：每 50ms 一次，记录最大调度间隔
+            let mut last = Instant::now();
+            let mut worst = Duration::ZERO;
+            for _ in 0..24 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let now = Instant::now();
+                worst = worst.max(now - last);
+                last = now;
+            }
+            worst
+        });
+        assert!(
+            worst < Duration::from_millis(500),
+            "慢 JS 占住了 worker，心跳最大间隔 {worst:?}"
         );
     }
 }
