@@ -3,12 +3,13 @@
 //! 真机硬约束（来自 KPW3 上报 JSON + 照片）：
 //! - `innerWidth×innerHeight = 1072×1268`，且 `innerWidth == screen.width`：
 //!   浏览器没有按 DPR 1.7964 缩放，**1 CSS px ≈ 1 物理 px**，字号必须按 px 直接给。
-//! - 版心固定 1000px（左右各留 36px）；顶栏 96px、正文区 1172px（=1268−96），
-//!   底部固定栏 64px 覆盖在正文区之上，正文容器留 72px 底 padding 保证不遮最后一行。
-//! - 只用 table / block / inline-block + px；不用 flex/grid/vw/vh/calc/clamp/rem/CSS 变量，
-//!   不用 `border-radius`（探测与照片冲突，暂缓）；底栏用 `position:fixed;bottom:0`
-//!   （真机实测可用、rect 贴 (0,0)），不用 transform/transition；不引入任何 JS
-//!   （翻页/切换字号/提交进度全部是真实链接或原生 form）。
+//! - 版心 1000px（左右各留 36px）；顶栏 73px（72 内容 + 1px 线）。
+//! - 页面按 `vh − SAFE_BOTTOM(24)` 布局：真机浏览器底栏/滚动条会吃掉十几像素，
+//!   按 `vh` 精确填满必然顶出纵向滚动条并把贴底栏裁掉。底栏 `position:fixed;bottom:24px`，
+//!   阅读页正文容器 = 页面高 − 64（底栏），列表页正文区 = 页面高 − 73（顶栏）。
+//! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
+//!   不用 `border-radius`；底栏用 `position:fixed`，不用 transform/transition。
+//! - 唯一脚本是视口补参（`K_VP_FIX_JS`，ES5、最多重载一次），其余翻页/切换字号全部是真实链接或原生 form。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -55,6 +56,10 @@ const K_H: usize = 1268;
 const NAV_H: usize = 72;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
+/// 底部安全余量：真机浏览器底栏/滚动条会占掉几到十几像素。
+/// 页面按 `vh` 精确填满会顶出纵向滚动条、把贴底栏裁掉，这里统一预留 24px。
+/// 代价是 1072×1268 下小档/标准档各少 1 行（24→23、21→20），大档/超小档行数不变。
+const SAFE_BOTTOM: usize = 24;
 /// 阅读页正文顶部留白：与左右版心一致 36px（此前贴顶 10px，视觉上像被裁切）
 const READ_PAD_TOP: usize = 36;
 /// 正文底部页码行：28px 行高 + 上下各 14px = 56
@@ -89,25 +94,42 @@ impl Vp {
     fn content_w(self) -> usize {
         self.w.saturating_sub(SIDE_PAD * 4)
     }
-    /// 阅读页正文容器高 = 视口高 − 底栏（1268 → 1204）
+    /// 页面实际高度 = 视口高 − 底部安全余量（1268 → 1244）。
+    /// 真机浏览器会留底栏/滚动条等几到十几像素，按 vh 精确填满必然顶出滚动条。
+    fn layout_h(self) -> usize {
+        self.h.saturating_sub(SAFE_BOTTOM)
+    }
+    /// 阅读页正文容器高 = 页面高 − 底栏（1268 → 1180）
     fn body_h(self) -> usize {
-        self.h.saturating_sub(BAR_H)
+        self.layout_h().saturating_sub(BAR_H)
     }
-    /// 带顶栏页面的正文区高 = 视口高 − 顶栏 − 1（1268 → 1195）
+    /// 带顶栏页面的正文区高 = 页面高 − 顶栏 − 1（1268 → 1171）
     fn nav_h(self) -> usize {
-        self.h.saturating_sub(NAV_H + 1)
+        self.layout_h().saturating_sub(NAV_H + 1)
     }
-    /// 小说正文可用高 = 正文容器 − 顶部留白 − 页码行（1268 → 1112）
+    /// 小说正文可用高 = 正文容器 − 顶部留白 − 页码行（1268 → 1088）
     fn text_h(self) -> usize {
         self.body_h().saturating_sub(READ_PAD_TOP + READ_PAGENO_H)
     }
-    /// 漫画整图/单片可用高 = 视口高 − 底栏 − 8（1268 → 1196，即切片可用高 vh）
+    /// 漫画整图/单片可用高 = 页面高 − 底栏 − 8（1268 → 1172，即切片可用高 vh）
     fn content_h(self) -> usize {
-        self.h.saturating_sub(BAR_H + 8)
+        self.layout_h().saturating_sub(BAR_H + 8)
     }
     /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357）
     fn hot_w(self) -> usize {
         self.w / 3
+    }
+    /// 书架每页本数与行高：优先保持 10 本/页，把可用高（`nav_h − 底栏`）等分给 10 行，
+    /// 行高上限 112；视口极矮（行高不足 56）才减少每页本数，保证列表永不超过 stage。
+    fn shelf_layout(self) -> (usize, usize) {
+        let avail = self.nav_h().saturating_sub(BAR_H);
+        let row_h = (avail / K_SHELF_PAGE).clamp(56, 112);
+        let per_page = if avail / K_SHELF_PAGE >= 56 {
+            K_SHELF_PAGE
+        } else {
+            (avail / 56).clamp(1, K_SHELF_PAGE)
+        };
+        (per_page, row_h)
     }
 }
 
@@ -134,13 +156,26 @@ const PARA_GAP_LINES: f64 = 0.6;
 const fn para_gap_px(line: usize) -> usize {
     (line * 6) / 10
 }
-/// 目录每页章节数：两列各 15 行 × 72px = 1080
+/// 目录每页章节数 = 每列行数 × 2；每列行数按可用高实算（72px/行，上限 15 行/列）。
+fn toc_page_size(vp: Vp) -> usize {
+    ((vp.nav_h().saturating_sub(BAR_H)) / 72).clamp(1, K_TOC_PAGE / K_TOC_COLS) * K_TOC_COLS
+}
+/// 搜索结果每页条数 = （正文区 − 表单 88 − 翻页条 64）/ 112；有回退说明/升级按钮时再少一条。
+fn search_page_size(vp: Vp, extra_row: bool) -> usize {
+    let base = ((vp.nav_h().saturating_sub(BAR_H + 88)) / 112).clamp(1, K_SEARCH_PAGE);
+    if extra_row {
+        base.saturating_sub(1).max(1)
+    } else {
+        base
+    }
+}
+/// 目录每页章节数上限：两列各 15 行 × 72px = 1080（实际行数按可用高实算）
 const K_TOC_PAGE: usize = 30;
 /// 目录每列行数
 const K_TOC_COLS: usize = 2;
-/// 书架每页本数：10 行 × 112px = 1120 ≤ 1131
+/// 书架每页本数上限：10 行 × 112px = 1120（实际行高按可用高等分，见 `Vp::shelf_layout`）
 const K_SHELF_PAGE: usize = 10;
-/// 搜索结果每页条数：9 行 × 112px = 1008 ≤ 1043（表单 88 + 翻页 64 之后）
+/// 搜索结果每页条数上限：9 行 × 112px = 1008（实际条数按可用高实算）
 const K_SEARCH_PAGE: usize = 9;
 /// /k 渲染前对正文纯文本的硬截断（防御超大章节把分页临时索引撑爆内存）
 const K_MAX_TEXT_CHARS: usize = 800_000;
@@ -149,13 +184,15 @@ const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
 
-/// 视口补参脚本（ES5，≤300 字节）：URL 缺 `vw`/`vh` 或与真实窗口不符时，
+/// 视口补参脚本（ES5，≤340 字节）：URL 缺 `vw`/`vh` 或与真实窗口不符时，
 /// 用 `location.replace` 补参并重载一次；`kfix=1` 是防循环标记，最多重载一次。
+/// `innerWidth/innerHeight` 为 0（浏览器预取/过早执行）时不再补参，
+/// 否则会把 `vw=0&vh=0` 写进 URL，退化成 `device-width` 布局并再次溢出。
 /// 服务端渲染的翻页/换章链接已带参，正常翻页不会触发重载。
 const K_VP_FIX_JS: &str = "(function(){var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
 for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
 if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}\
-if(!f&&(vw!=innerWidth||vh!=innerHeight)){o.push('vw='+innerWidth,'vh='+innerHeight,'kfix=1');\
+if(!f&&innerWidth>0&&innerHeight>0&&(vw!=innerWidth||vh!=innerHeight)){o.push('vw='+innerWidth,'vh='+innerHeight,'kfix=1');\
 location.replace(location.pathname+'?'+o.join('&'));}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
@@ -364,7 +401,7 @@ table{{border-collapse:collapse}}\
         pw = vp.page_w(),
         pad = SIDE_PAD,
         w = vp.w,
-        h = vp.h,
+        h = vp.layout_h(),
         extra = extra_css,
         body = body,
         js = K_VP_FIX_JS
@@ -420,10 +457,11 @@ fn nav_link(href: &str, label: &str) -> String {
 /// 每格：图标 28px 方框 + 4px 缝 + 文字 20px；格顶 1px `#ccc` 连成整条分隔线。
 fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
-        "<div id=\"k-bar\" style=\"position:fixed;left:0;bottom:0;width:{w}px;height:{h}px;background:#fff;z-index:10\">\
+        "<div id=\"k-bar\" style=\"position:fixed;left:0;bottom:{safe}px;width:{w}px;height:{h}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
         w = vp.w,
         h = BAR_H,
+        safe = SAFE_BOTTOM,
         pw = vp.page_w(),
         pad = SIDE_PAD,
         row = row
@@ -490,9 +528,9 @@ fn pager_bar(
     )
 }
 
-/// 左右透明翻页热区：各占屏宽 1/3（357px）、整屏高 1268px。
+/// 左右透明翻页热区：各占屏宽 1/3（357px）、整页高 1244px（=vh−24）。
 /// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
-/// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1268 ≫ 200×200。
+/// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1244 ≫ 200×200。
 fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
     let mut out = String::new();
     if let Some(pv) = prev {
@@ -500,7 +538,7 @@ fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
             "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
             prev = pv,
             w = vp.hot_w(),
-            h = vp.h
+            h = vp.layout_h()
         ));
     }
     if let Some(nx) = next {
@@ -509,7 +547,7 @@ fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
             nx = nx,
             l = vp.w - vp.hot_w(),
             w = vp.hot_w(),
-            h = vp.h
+            h = vp.layout_h()
         ));
     }
     out
@@ -519,7 +557,7 @@ fn read_only_css(vp: Vp) -> String {
     format!(
         "html,body{{height:{h}px;overflow:hidden}}#k-stage{{position:relative;height:{b}px;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
-        h = vp.h,
+        h = vp.layout_h(),
         b = vp.body_h(),
         pad = SIDE_PAD
     )
@@ -1139,10 +1177,12 @@ async fn shelf(
 
     let next_fs = cycle_fs(fs);
     let total_books = rows.len();
-    let t_pages = total_books.div_ceil(K_SHELF_PAGE).max(1);
+    // 每页本数与行高按「页面高 − 顶栏 − 底部分页条 − 安全余量」实算（1268 → 10 本 × 110px）
+    let (per_page, row_h) = vp.shelf_layout();
+    let t_pages = total_books.div_ceil(per_page).max(1);
     let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
-    let start = (sp - 1) * K_SHELF_PAGE;
-    let end = (start + K_SHELF_PAGE).min(total_books);
+    let start = (sp - 1) * per_page;
+    let end = (start + per_page).min(total_books);
     let fs_url = format!("/k?fs={}&sp={}", next_fs, sp.min(t_pages.max(1)));
     // 导航只出现一次：书架/搜索/目录用顶部导航，底栏只留给阅读页
     let nav = format!(
@@ -1178,7 +1218,7 @@ async fn shelf(
             let first = title.chars().next().unwrap_or('书');
             list.push_str(&format!(
                 "<tr><td style=\"padding:0\">\
-                 <a href=\"{read}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
+                 <a href=\"{read}\" style=\"display:block;height:{rh}px;border-bottom:1px solid #ccc\">\
                  <table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
                  <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
                  <td style=\"padding-left:24px\" valign=\"middle\">\
@@ -1188,6 +1228,7 @@ async fn shelf(
                  <td align=\"right\" style=\"font-size:20px;line-height:32px;color:#555\">{pct:.0}%</td>\
                  </tr></table></td></tr></table></a></td></tr>",
                 read = read,
+                rh = row_h,
                 iw = vp.page_w(),
                 first = esc(&first.to_string()),
                 title = esc(&title),
@@ -1251,10 +1292,13 @@ async fn toc(
     // 保留 `BookChapter.index`（原始下标），链接仍按原 index 生成，/k/read 才能对得上。
     let visible = visible_chapters(&chapters);
     let total = visible.len() as i64;
-    let t_pages = ((total + K_TOC_PAGE as i64 - 1) / K_TOC_PAGE as i64).max(1);
+    // 每列行数按「页面高 − 顶栏 − 底部分页条 − 安全余量」实算，30 只是上限
+    let toc_page = toc_page_size(vp);
+    let rows_per_col = toc_page / K_TOC_COLS;
+    let t_pages = ((total + toc_page as i64 - 1) / toc_page as i64).max(1);
     let tp = q.tp.unwrap_or(1).clamp(1, t_pages);
-    let start = ((tp - 1) * K_TOC_PAGE as i64) as usize;
-    let end = (start + K_TOC_PAGE).min(visible.len());
+    let start = ((tp - 1) * toc_page as i64) as usize;
+    let end = (start + toc_page).min(visible.len());
     let name = load_book_meta(&db.0, &q.book)
         .await
         .ok()
@@ -1284,8 +1328,7 @@ async fn toc(
     );
     let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
-    // 两列各 15 行 = 每页 30 条；列宽随版心自适应（1072 → 452，1024 → 428）
-    let rows_per_col = K_TOC_PAGE / K_TOC_COLS;
+    // 两列各 rows_per_col 行（1268 → 15 行/列）；列宽随版心自适应（1072 → 452，1024 → 428）
     let col_w = vp.content_w().saturating_sub(24) / K_TOC_COLS;
     let mut cols = [String::new(), String::new()];
     for (i, c) in visible[start..end].iter().enumerate() {
@@ -1404,10 +1447,10 @@ struct ComicPage {
     height: usize,
 }
 
-/// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ `READ_STAGE_CONTENT_H`。
+/// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ 漫画可用高（`vp.content_h()`，1268 → 1172）。
 /// - 长条页（切片开关开启且 `slice_count_window` > 1）：一图拆 `layers` 页，
-///   非末片 1196、末片取剩余；
-/// - 一屏内：整图按版心 928 宽，显示高超过 1196 时按高度等比缩小；
+///   非末片按可用高、末片取剩余；
+/// - 一屏内：整图按版心 928 宽，显示高超过可用高时按高度等比缩小；
 /// - 尺寸未知：整图一页，只给宽度。
 fn comic_pages(
     images: &[BookImage],
@@ -1441,8 +1484,8 @@ fn comic_pages(
             1
         };
         if n > 1 {
-            // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1196/620），
-            // 写死 height 会把图拉扁；这里只给宽度，页面高度由固定 1268 的 stage 兜住。
+            // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1172/620），
+            // 写死 height 会把图拉扁；这里只给宽度，页面高度由固定 1244 的 stage 兜住。
             for k in 0..n {
                 pages.push(ComicPage {
                     img: i,
@@ -1528,7 +1571,7 @@ fn comic_stage(
     };
     format!(
         "<div id=\"k-stage\" style=\"position:relative;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
-        h = vp.h,
+        h = vp.layout_h(),
         w = vp.page_w(),
         pad = SIDE_PAD,
         pb = BAR_H + 8,
@@ -1701,7 +1744,7 @@ async fn read(
             para = esc(para)
         ));
     }
-    // 阅读页无顶栏：正文区 1204（底栏 64 贴底），底部 52 留页码行
+    // 阅读页无顶栏：正文区 1180（页面高 1244 − 底栏 64），底部 56 留页码行
     let stage = format!(
         "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:{pt}px {pad}px 0;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
         h = vp.body_h(),
@@ -1792,7 +1835,7 @@ async fn comic_read(
             }
         }
     }
-    // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），可用高 = vh − 72（1268 → 1196）
+    // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），可用高 = 页面高 − 底栏 − 8（1268 → 1172）
     let sp = image::SliceParams::from_config(
         &s.cfg,
         Some(vp.content_w() as u32),
@@ -2024,11 +2067,7 @@ async fn search(
         let upgrade_link = plan.scope == crate::req::SearchScope::Curated
             && (books.is_empty() || strong_total < crate::search_rank::STRONG_MIN_RESULTS);
         // 回退说明 / 升级按钮要占纵向空间：多一行时少放一条结果，避免被贴底栏盖住。
-        let per_page = if fallback_note.is_some() || upgrade_link {
-            K_SEARCH_PAGE - 1
-        } else {
-            K_SEARCH_PAGE
-        };
+        let per_page = search_page_size(vp, fallback_note.is_some() || upgrade_link);
         if books.is_empty() {
             if plan.source_total == 0 {
                 list.push_str(
@@ -2236,7 +2275,7 @@ mod tests {
 
     #[test]
     fn paginate_lines_respects_budget_and_char_boundaries() {
-        // 行预算由视口高动态算出（32px 档 1112/52 = 21 行）：前 4 段占 16 行，
+        // 行预算由视口高动态算出（标准档 1088/52 = 20 行）：前 4 段占 16 行，
         // 第 5 段再放会超预算，余文进第 2 页。
         let text = "字".repeat(100)
             + "\n"
@@ -2443,13 +2482,14 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 阅读页整页 1268、可用 1196；四档行预算按「可用高 ÷ 行高」动态算出。
+    /// 阅读页页面高 1244（=1268−24 安全余量）、可用 1172；四档行预算按「正文可用高 ÷ 行高」动态算出。
     #[test]
     fn font_specs_fit_read_stage() {
         assert_eq!(vp().h, 1268);
-        assert_eq!(vp().content_h(), 1196);
-        // 1072×1268 下：1112/46=24、1112/52=21、1112/62=17、1112/36=30（超小档不再被 25 行封顶）
-        let expect = [(28, 46, 24), (32, 52, 21), (38, 62, 17), (20, 36, 30)];
+        assert_eq!(vp().layout_h(), 1244);
+        assert_eq!(vp().content_h(), 1172);
+        // 1072×1268 下：1088/46=23、1088/52=20、1088/62=17、1088/36=30（超小档不再被 25 行封顶）
+        let expect = [(28, 46, 23), (32, 52, 20), (38, 62, 17), (20, 36, 30)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -2467,7 +2507,7 @@ mod tests {
                 "fs={size} 每页字数 {chars} 超出合理区间"
             );
         }
-        // 标准档 32px：29 字/行 × 21 行 = 609 字，落在 500–800 的参考区间
+        // 标准档 32px：20 行 × 29 字/行 = 580 字，落在 500–800 的参考区间
         let std_chars = budget(&FS_SPECS[1]) * (vp().page_w() - SIDE_PAD * 2) / FS_SPECS[1].size;
         assert!(
             (500..=800).contains(&std_chars),
@@ -2558,10 +2598,10 @@ mod tests {
         assert!(!is_spa_entry("/favicon.ico"));
     }
 
-    /// 版式硬约束：底栏 64 不压正文、正文区 = 1268 − 64 − 36（顶部留白）− 56（页码行）；标准档显式 32/52。
+    /// 版式硬约束：底栏 64 不压正文、正文区 = 页面高（1268−24）− 64 − 36（顶部留白）− 56（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
-        assert_eq!(vp().body_h(), vp().h - BAR_H);
+        assert_eq!(vp().body_h(), vp().h - SAFE_BOTTOM - BAR_H);
         assert_eq!(vp().text_h(), vp().body_h() - READ_PAD_TOP - READ_PAGENO_H);
         assert!(vp().text_h() <= vp().content_h(), "正文不得越过一屏可用高");
         let spec = &FS_SPECS[1];
@@ -2580,8 +2620,8 @@ mod tests {
         assert!(budget(spec) <= vp().text_h() / spec.line);
     }
 
-    /// 四档行预算全部由视口高动态算出：1072×1268 → 24/21/17/30，
-    /// 1024×1200 同档位按更低可用高再算一遍（22/20/16/29），且总高始终 ≤ 可用高。
+    /// 四档行预算全部由视口高动态算出：1072×1268 → 23/20/17/30，
+    /// 1024×1200 同档位按更低可用高再算一遍（22/19/16/28），且总高始终 ≤ 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
         assert_eq!(
@@ -2589,7 +2629,7 @@ mod tests {
                 .iter()
                 .map(|s| line_budget(vp(), s.line))
                 .collect::<Vec<_>>(),
-            vec![24, 21, 17, 30]
+            vec![23, 20, 17, 30]
         );
         for s in FS_SPECS.iter() {
             assert!(budget(s) * s.line <= vp().text_h(), "{}px 行高溢出", s.line);
@@ -2603,7 +2643,7 @@ mod tests {
             .collect();
         assert_eq!(
             small_lines,
-            vec![22, 20, 16, 29],
+            vec![22, 19, 16, 28],
             "1024×1200 行预算应按可用高重算"
         );
         for s in FS_SPECS.iter() {
@@ -2611,28 +2651,65 @@ mod tests {
         }
     }
 
-    /// 一屏一页：`html`/`body` 锁死视口高并禁滚动，`#k-stage` = 视口高 − 底栏，阅读页不会产生第二屏。
+    /// 列表页（书架/目录/搜索）每页条数按「页面高 − 顶栏 − 分页条 − 安全余量」实算：
+    /// 1072×1268 与 1024×1200 两档都必须装得下，也不允许多留一整行。
+    #[test]
+    fn list_pages_fit_inside_stage_at_reference_viewports() {
+        // 1268：正文区 1171；书架 10×110+64=1164、目录 15×72+64=1144、搜索 9×112+152=1160
+        let v = vp();
+        assert_eq!((v.nav_h(), v.shelf_layout()), (1171, (10, 110)));
+        assert_eq!(toc_page_size(v), 30);
+        assert_eq!(search_page_size(v, false), 9);
+        let s = vps(1024, 1200);
+        assert_eq!((s.nav_h(), s.shelf_layout()), (1103, (10, 103)));
+        assert_eq!(toc_page_size(s), 28);
+        assert_eq!(search_page_size(s, false), 8);
+        for vp in [v, s] {
+            let (pp, rh) = vp.shelf_layout();
+            assert!(pp * rh + BAR_H <= vp.nav_h(), "书架列表溢出正文区");
+            assert!(
+                (pp + 1) * rh + BAR_H > vp.nav_h(),
+                "书架应贴近填满，别多留一整行"
+            );
+            let t = toc_page_size(vp);
+            assert!(t / K_TOC_COLS * 72 + BAR_H <= vp.nav_h(), "目录溢出");
+            let q = search_page_size(vp, false);
+            assert!(q * 112 + BAR_H + 88 <= vp.nav_h(), "搜索结果溢出");
+        }
+        // 极矮视口：行高触底后减少每页本数，绝不溢出
+        let tiny = vps(1072, 600);
+        let (pp, rh) = tiny.shelf_layout();
+        assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
+    }
+
+    /// 一屏一页：`html`/`body` 锁死页面高（`vh − 24`）并禁滚动，`#k-stage` = 页面高 − 底栏，
+    /// 阅读页不会产生第二屏；贴底栏 `bottom:24px`，真机浏览器底栏/滚动条不会把它裁掉。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
         let css = read_only_css(vp());
         assert!(
-            css.contains("html,body{height:1268px;overflow:hidden}"),
+            css.contains("html,body{height:1244px;overflow:hidden}"),
             "{css}"
         );
         assert!(
-            css.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"),
+            css.contains("#k-stage{position:relative;height:1180px;overflow:hidden}"),
             "{css}"
         );
         let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp());
-        assert!(html.contains("html,body{height:1268px;overflow:hidden}"));
-        assert!(html.contains("#k-stage{position:relative;height:1204px;overflow:hidden}"));
-        // 换尺寸后仍然锁一屏（1200 − 64 = 1136）
+        assert!(html.contains("html,body{height:1244px;overflow:hidden}"));
+        assert!(html.contains("#k-stage{position:relative;height:1180px;overflow:hidden}"));
+        // 换尺寸后仍然锁一屏（1200 − 24 − 64 = 1112）
         let small = read_only_css(vps(1024, 1200));
         assert!(
-            small.contains("html,body{height:1200px;overflow:hidden}"),
+            small.contains("html,body{height:1176px;overflow:hidden}"),
             "{small}"
         );
-        assert!(small.contains("height:1136px;overflow:hidden}"), "{small}");
+        assert!(small.contains("height:1112px;overflow:hidden}"), "{small}");
+        let bar = fixed_bar("", vp());
+        assert!(
+            bar.contains("position:fixed;left:0;bottom:24px"),
+            "底栏必须留出 {SAFE_BOTTOM}px 安全区：{bar}"
+        );
     }
 
     /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
@@ -2652,7 +2729,7 @@ mod tests {
     fn empty_shelf_is_outlined_and_centered() {
         let html = empty_shelf(2, vp());
         assert!(html.contains("border:1px solid #000"), "{html}");
-        assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
+        assert!(html.contains("width=\"1000\" height=\"1171\""), "{html}");
         assert!(
             html.contains("align=\"center\" valign=\"middle\""),
             "{html}"
@@ -2708,7 +2785,7 @@ mod tests {
         assert!(!bar.contains("background:#e6e6e6"));
     }
 
-    /// 左右热区：各占屏宽 1/3（357px）、整屏 1268 高，右区左边界 715；无下一页时右区不渲染。
+    /// 左右热区：各占屏宽 1/3（357px）、整页高 1244（=vh−24），右区左边界 715；无下一页时右区不渲染。
     #[test]
     fn hot_zones_are_one_third_screen_and_clickable() {
         assert_eq!(vp().hot_w(), 1072 / 3);
@@ -2717,8 +2794,8 @@ mod tests {
         assert!(vp().h >= 200, "热区高必须 ≥ 200px");
         let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"), vp());
         assert_eq!(z.matches("<a ").count(), 2);
-        assert!(z.contains("left:0;width:357px;height:1268px;z-index:5"));
-        assert!(z.contains("left:715px;width:357px;height:1268px;z-index:5"));
+        assert!(z.contains("left:0;width:357px;height:1244px;z-index:5"));
+        assert!(z.contains("left:715px;width:357px;height:1244px;z-index:5"));
         assert_eq!(
             hot_zones(Some("/k/read?p=1"), None, vp())
                 .matches("<a ")
@@ -2747,8 +2824,8 @@ mod tests {
             assert!(v.content_w() >= 320, "版心宽不能小于 320");
             assert!(v.content_h() >= 320, "可用高不能小于 320");
             assert_eq!(v.content_w(), w - 144);
-            assert_eq!(v.content_h(), h - 72);
-            assert_eq!(v.text_h(), h - 64 - 36 - 56);
+            assert_eq!(v.content_h(), h - SAFE_BOTTOM - 72);
+            assert_eq!(v.text_h(), h - SAFE_BOTTOM - 64 - 36 - 56);
         }
     }
 
@@ -2871,10 +2948,10 @@ mod tests {
             &sp0,
         );
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
-        // 1024×1200 缩到 928 宽 → 高 1088（≤1196），显式宽高防抖动
+        // 1024×1200 缩到 928 宽 → 高 1088（≤1172 漫画可用高），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
-        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1268px"));
+        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1244px"));
         // 短图在开关开/关两种模式下 HTML 必须逐字节一致（回归要求）
         let off_html = {
             let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false), &sp0);
@@ -2911,8 +2988,8 @@ mod tests {
             &sp0,
         );
         assert!(s2.contains("slice=1&i=1"), "{s2}");
-        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离
-        assert!(s2.contains("dw=928") && s2.contains("vh=1196"), "{s2}");
+        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离（vh 取漫画可用高 1172）
+        assert!(s2.contains("dw=928") && s2.contains("vh=1172"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
         assert!(
             !s2.contains("height=\""),
