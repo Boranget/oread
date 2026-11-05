@@ -67,6 +67,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // HTTP 抓取预算与 JS 规则预算在启动时一次性固化（进程内单例）
     req::init(&cfg);
     rule_engine::init_js(cfg.js_enabled, cfg.js_timeout_ms);
+    // `cache.getFile/putFile` 的落盘目录固定到数据目录下，不暴露任意路径。
+    rule_engine::init_rule_cache_dir(
+        std::path::Path::new(&cfg.data_dir)
+            .join("cache")
+            .join("rule"),
+    );
     image_cache::init(cfg.image_cache_limit_bytes());
 
     // 初始化共享桶（书源/账户），缺失则自动建库并执行迁移；
