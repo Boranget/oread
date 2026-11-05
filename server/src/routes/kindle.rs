@@ -115,7 +115,8 @@ impl Vp {
     fn content_h(self) -> usize {
         self.layout_h().saturating_sub(BAR_H + 8)
     }
-    /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357）
+    /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357，CSS 用 33% 自适应）
+    #[allow(dead_code)] // 仅单测引用：渲染改用 CSS 百分比，不再需要服务端算像素
     fn hot_w(self) -> usize {
         self.w / 3
     }
@@ -184,16 +185,32 @@ const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
 
-/// 视口补参脚本（ES5，≤340 字节）：URL 缺 `vw`/`vh` 或与真实窗口不符时，
+/// 视口补参脚本（ES5，≤420 字节）：URL 缺 `vw`/`vh` 或与真实布局视口不符时，
 /// 用 `location.replace` 补参并重载一次；`kfix=1` 是防循环标记，最多重载一次。
-/// `innerWidth/innerHeight` 为 0（浏览器预取/过早执行）时不再补参，
-/// 否则会把 `vw=0&vh=0` 写进 URL，退化成 `device-width` 布局并再次溢出。
+/// 高一律取 `documentElement.clientHeight`（真正参与排版、决定滚动存不存在的布局视口高；
+/// Kindle Silk 的 `innerHeight` 可能报整屏高，比布局视口大，不能作为排版依据），取不到才退回 `innerHeight`。
+/// 宽仍用 `innerWidth`（含滚动条占位），避免横滚条把宽度算窄后反复补参。
 /// 服务端渲染的翻页/换章链接已带参，正常翻页不会触发重载。
 const K_VP_FIX_JS: &str = "(function(){var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
 for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
 if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}\
-if(!f&&innerWidth>0&&innerHeight>0&&(vw!=innerWidth||vh!=innerHeight)){o.push('vw='+innerWidth,'vh='+innerHeight,'kfix=1');\
+var d=document.documentElement,H=innerHeight;\
+if(d&&d.clientHeight>0)H=d.clientHeight;\
+if(!f&&innerWidth>0&&H>0&&(vw!=innerWidth||vh!=H)){o.push('vw='+innerWidth,'vh='+H,'kfix=1');\
 location.replace(location.pathname+'?'+o.join('&'));}})()";
+
+/// 自报探针（ES5，零依赖，不重载页面）：`load` 后 200ms 用 `XMLHttpRequest`
+/// 把「URL 参数视口 + 真实量到的视口/文档尺寸」回传 `/api/k/probe`。
+/// `innerWidth/innerHeight` 与 `documentElement.clientWidth/clientHeight` 同时上报，
+/// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；失败静默。
+const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
+function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1;\
+var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
+'&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
+'&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname);\
+var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
+if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
+else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
@@ -384,27 +401,26 @@ fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) ->
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
-html{{-webkit-text-size-adjust:none}}\
-html,body{{margin:0;padding:0;width:{w}px;height:{h}px;overflow:hidden;background:#fff;color:#000}}\
-body{{font-family:serif;font-size:{size}px;line-height:{line}px}}\
+html{{-webkit-text-size-adjust:none;height:100%;overflow:hidden}}\
+html,body{{margin:0;padding:0;width:100%;background:#fff;color:#000}}\
+body{{height:100%;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
 *{{box-sizing:border-box}}\
 a{{color:#000;text-decoration:none}}\
 h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style></head><body><div class=\"wrap\">{body}</div><script>{js}</script></body></html>",
+</style></head><body><div class=\"wrap\">{body}</div><script>{js}</script><script>{probe}</script></body></html>",
         viewport = viewport,
         title = esc(title),
         size = spec.size,
         line = spec.line,
         pw = vp.page_w(),
         pad = SIDE_PAD,
-        w = vp.w,
-        h = vp.layout_h(),
         extra = extra_css,
         body = body,
-        js = K_VP_FIX_JS
+        js = K_VP_FIX_JS,
+        probe = K_PROBE_JS
     )
 }
 
@@ -453,14 +469,14 @@ fn nav_link(href: &str, label: &str) -> String {
     )
 }
 
-/// 贴底固定栏（仅阅读页）：`position:fixed` + table 5 格等宽 200px、高 64px。
-/// 每格：图标 28px 方框 + 4px 缝 + 文字 20px；格顶 1px `#ccc` 连成整条分隔线。
+/// 贴视口底部的固定栏（仅阅读页）：`left:0;right:0;bottom:0`，总高 88 =
+/// 上 64 内容（5 格各 200px）+ 下 24 安全区（`padding-bottom`，避免被系统栏/滚动条遮住）。
+/// 不再用 `bottom:24px` + 视口宽像素：页面高由 100% 决定，底栏必须贴住真实视口底。
 fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
-        "<div id=\"k-bar\" style=\"position:fixed;left:0;bottom:{safe}px;width:{w}px;height:{h}px;background:#fff;z-index:10\">\
+        "<div id=\"k-bar\" style=\"position:fixed;left:0;right:0;bottom:0;height:{h}px;padding-bottom:{safe}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
-        w = vp.w,
-        h = BAR_H,
+        h = BAR_H + SAFE_BOTTOM,
         safe = SAFE_BOTTOM,
         pw = vp.page_w(),
         pad = SIDE_PAD,
@@ -496,7 +512,7 @@ fn bar_cell_off(icon: &str, label: &str) -> String {
     )
 }
 
-/// 列表页翻页条（书架/搜索/目录）：64px 高、两格各占一半，贴 stage 底部。
+/// 列表页翻页条（书架/搜索/目录）：64px 高、两格各占一半，贴 stage 底部（左右跟随 stage）。
 /// 禁用态用 `#555` 弱灰且不可点。
 fn pager_bar(
     prev: Option<(String, &'static str)>,
@@ -519,7 +535,7 @@ fn pager_bar(
     }
     };
     format!(
-        "<div id=\"k-pager\" style=\"position:absolute;left:0;bottom:0;width:{pw}px;height:{h}px;background:#fff;z-index:8\">\
+        "<div id=\"k-pager\" style=\"position:absolute;left:0;right:0;bottom:0;height:{h}px;background:#fff;z-index:8\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"table-layout:fixed\"><tr>{p}{n}</tr></table></div>",
         pw = vp.page_w(),
         h = BAR_H,
@@ -528,38 +544,38 @@ fn pager_bar(
     )
 }
 
-/// 左右透明翻页热区：各占屏宽 1/3（357px）、整页高 1244px（=vh−24）。
+/// 左右透明翻页热区：各占屏宽 1/3、`top:0;bottom:0` 撑满真实视口高。
 /// `position:absolute` 相对初始包含块（`.wrap` 不是定位元素，故不受其裁剪），
-/// `z-index:5` 高于正文（0）低于贴底栏（10）；点击面积 357×1244 ≫ 200×200。
-fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
+/// `z-index:5` 高于正文（0）低于贴底栏（10）；不再写死 `height:vh−24`，
+/// 否则视口比参数矮时热区自己会顶出第二屏。
+fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
+    let css = "position:absolute;top:0;bottom:0;width:33%;z-index:5;display:block";
     let mut out = String::new();
     if let Some(pv) = prev {
         out.push_str(&format!(
-            "<a href=\"{prev}\" style=\"position:absolute;top:0;left:0;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
+            "<a href=\"{prev}\" style=\"{css};left:0\"></a>",
             prev = pv,
-            w = vp.hot_w(),
-            h = vp.layout_h()
+            css = css
         ));
     }
     if let Some(nx) = next {
         out.push_str(&format!(
-            "<a href=\"{nx}\" style=\"position:absolute;top:0;left:{l}px;width:{w}px;height:{h}px;z-index:5;display:block\"></a>",
+            "<a href=\"{nx}\" style=\"{css};right:0\"></a>",
             nx = nx,
-            l = vp.w - vp.hot_w(),
-            w = vp.hot_w(),
-            h = vp.layout_h()
+            css = css
         ));
     }
     out
 }
 
-fn read_only_css(vp: Vp) -> String {
+fn read_only_css() -> String {
     format!(
-        "html,body{{height:{h}px;overflow:hidden}}#k-stage{{position:relative;height:{b}px;overflow:hidden}}\
+        "html,body{{height:100%;overflow:hidden}}\
+         #k-stage{{position:absolute;top:0;left:{pad}px;right:{pad}px;bottom:{safe}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
-        h = vp.layout_h(),
-        b = vp.body_h(),
-        pad = SIDE_PAD
+        pad = SIDE_PAD,
+        safe = BAR_H + SAFE_BOTTOM,
+        pt = READ_PAD_TOP
     )
 }
 
@@ -1261,8 +1277,10 @@ async fn shelf(
         String::new()
     };
     let stage = format!(
-        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
-        h = vp.nav_h(),
+        "<div id=\"k-stage\" style=\"position:absolute;top:{top}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{list}{pager}</div>",
+        top = NAV_H + 1,
+        pad = SIDE_PAD,
+        safe = SAFE_BOTTOM,
         list = list,
         pager = pager
     );
@@ -1418,8 +1436,10 @@ async fn toc(
         None
     };
     let stage = format!(
-        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{list}{pager}</div>",
-        h = vp.nav_h(),
+        "<div id=\"k-stage\" style=\"position:absolute;top:{top}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{list}{pager}</div>",
+        top = NAV_H + 1,
+        pad = SIDE_PAD,
+        safe = SAFE_BOTTOM,
         list = list,
         pager = pager_bar(prev, next, vp)
     );
@@ -1485,7 +1505,8 @@ fn comic_pages(
         };
         if n > 1 {
             // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1172/620），
-            // 写死 height 会把图拉扁；这里只给宽度，页面高度由固定 1244 的 stage 兜住。
+            // 写死 height 会把图拉扁；这里只给宽度，页面高度由 `vh−24` 的 stage 兜住
+            // （漫画页保留像素高：切片高度按 `sp.vh` 生成，改成拉伸填满会丢图）。
             for k in 0..n {
                 pages.push(ComicPage {
                     img: i,
@@ -1570,7 +1591,7 @@ fn comic_stage(
         )
     };
     format!(
-        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
+        "<div id=\"k-stage\" style=\"position:relative;top:0;left:0;right:auto;bottom:auto;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
         h = vp.layout_h(),
         w = vp.page_w(),
         pad = SIDE_PAD,
@@ -1744,13 +1765,9 @@ async fn read(
             para = esc(para)
         ));
     }
-    // 阅读页无顶栏：正文区 1180（页面高 1244 − 底栏 64），底部 56 留页码行
+    // 阅读页无顶栏：正文区由 `#k-stage` 绝对定位填满（视口高 − 88 底栏/安全区）
     let stage = format!(
-        "<div id=\"k-stage\" style=\"height:{h}px;width:{w}px;padding:{pt}px {pad}px 0;overflow:hidden\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
-        h = vp.body_h(),
-        w = vp.page_w(),
-        pad = SIDE_PAD,
-        pt = READ_PAD_TOP,
+        "<div id=\"k-stage\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
         paras = paras,
         meta = esc(&meta)
     );
@@ -1773,11 +1790,10 @@ async fn read(
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
             next.as_ref().map(|x| x.0.as_str()),
-            vp
         ),
         bottom = bottom
     );
-    let mut res = page_css(&ch_title, fs, &body, &read_only_css(vp), vp);
+    let mut res = page_css(&ch_title, fs, &body, &read_only_css(), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1888,11 +1904,10 @@ async fn comic_read(
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
             next.as_ref().map(|x| x.0.as_str()),
-            vp
         ),
         bottom = bottom
     );
-    let mut res = page_css(&title, fs, &body, &read_only_css(vp), vp);
+    let mut res = page_css(&title, fs, &body, &read_only_css(), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2159,8 +2174,10 @@ async fn search(
         }
     }
     let stage = format!(
-        "<div id=\"k-stage\" style=\"position:relative;height:{h}px;overflow:hidden\">{form}{list}{pager}</div>",
-        h = vp.nav_h(),
+        "<div id=\"k-stage\" style=\"position:absolute;top:{top}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{form}{list}{pager}</div>",
+        top = NAV_H + 1,
+        pad = SIDE_PAD,
+        safe = SAFE_BOTTOM,
         form = form,
         list = list,
         pager = pager
@@ -2555,9 +2572,21 @@ mod tests {
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
         );
-        // 唯一的脚本是视口补参（ES5、带 kfix 防循环标记），不是业务 JS
-        assert_eq!(html.matches("<script").count(), 1, "只允许视口补参脚本");
+        // 两个脚本：视口补参（ES5、带 kfix 防循环标记）+ 自报探针（只上报不重载）
+        assert_eq!(
+            html.matches("<script").count(),
+            2,
+            "只允许补参脚本与自报探针"
+        );
         assert!(html.contains("kfix=1"), "补参脚本必须带防循环标记");
+        assert!(
+            html.contains("/api/k/probe?"),
+            "探针必须上报到 /api/k/probe"
+        );
+        assert!(
+            !K_PROBE_JS.contains("location.replace") && !K_PROBE_JS.contains("location.href"),
+            "探针不得改写 location（不能引起额外重载）"
+        );
         assert!(
             html.contains("location.replace"),
             "补参用 replace，不产生历史记录"
@@ -2682,34 +2711,40 @@ mod tests {
         assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
     }
 
-    /// 一屏一页：`html`/`body` 锁死页面高（`vh − 24`）并禁滚动，`#k-stage` = 页面高 − 底栏，
-    /// 阅读页不会产生第二屏；贴底栏 `bottom:24px`，真机浏览器底栏/滚动条不会把它裁掉。
+    /// 一屏一页（不依赖参数视口是否准确）：`html`/`body` 用 `height:100%` 链式撑满真实视口，
+    /// `#k-stage` 绝对定位填满「视口 − 88」，底栏贴 `bottom:0` 且内置 24px 安全区；
+    /// 文档高度恒等于视口高度，不会再出现第二屏/滚动条。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
-        let css = read_only_css(vp());
+        let css = read_only_css();
         assert!(
-            css.contains("html,body{height:1244px;overflow:hidden}"),
+            css.contains("html,body{height:100%;overflow:hidden}"),
             "{css}"
         );
         assert!(
-            css.contains("#k-stage{position:relative;height:1180px;overflow:hidden}"),
+            css.contains("#k-stage{position:absolute;top:0;left:36px;right:36px;bottom:88px;padding:36px 36px 0;overflow:hidden}"),
             "{css}"
+        );
+        assert!(
+            !css.contains("height:1180px"),
+            "正文容器不得再写死像素高：{css}"
         );
         let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp());
-        assert!(html.contains("html,body{height:1244px;overflow:hidden}"));
-        assert!(html.contains("#k-stage{position:relative;height:1180px;overflow:hidden}"));
-        // 换尺寸后仍然锁一屏（1200 − 24 − 64 = 1112）
-        let small = read_only_css(vps(1024, 1200));
+        assert!(html.contains("html,body{height:100%;overflow:hidden}"));
         assert!(
-            small.contains("html,body{height:1176px;overflow:hidden}"),
-            "{small}"
+            html.contains("html{-webkit-text-size-adjust:none;height:100%;overflow:hidden}"),
+            "{html}"
         );
-        assert!(small.contains("height:1112px;overflow:hidden}"), "{small}");
+        assert!(
+            html.contains("body{height:100%;overflow:hidden;"),
+            "body 也必须撑满视口：{html}"
+        );
         let bar = fixed_bar("", vp());
         assert!(
-            bar.contains("position:fixed;left:0;bottom:24px"),
-            "底栏必须留出 {SAFE_BOTTOM}px 安全区：{bar}"
+            bar.contains("position:fixed;left:0;right:0;bottom:0;height:88px;padding-bottom:24px"),
+            "底栏必须贴视口底并内置 {SAFE_BOTTOM}px 安全区：{bar}"
         );
+        assert!(!bar.contains("width:1072px"), "底栏宽度不得写死像素：{bar}");
     }
 
     /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
@@ -2785,24 +2820,26 @@ mod tests {
         assert!(!bar.contains("background:#e6e6e6"));
     }
 
-    /// 左右热区：各占屏宽 1/3（357px）、整页高 1244（=vh−24），右区左边界 715；无下一页时右区不渲染。
+    /// 左右热区：CSS `top:0;bottom:0;width:33%` 跟随真实视口（1072 → 353），无下一页时右区不渲染。
     #[test]
     fn hot_zones_are_one_third_screen_and_clickable() {
         assert_eq!(vp().hot_w(), 1072 / 3);
         assert_eq!(vp().w - vp().hot_w(), 1072 - vp().hot_w());
         assert!(vp().hot_w() >= 200, "热区宽必须 ≥ 200px");
         assert!(vp().h >= 200, "热区高必须 ≥ 200px");
-        let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"), vp());
+        let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"));
         assert_eq!(z.matches("<a ").count(), 2);
-        assert!(z.contains("left:0;width:357px;height:1244px;z-index:5"));
-        assert!(z.contains("left:715px;width:357px;height:1244px;z-index:5"));
+        assert!(z.contains("left:0"), "{z}");
+        assert!(z.contains("right:0"), "{z}");
+        assert!(
+            z.contains("top:0;bottom:0;width:33%") && !z.contains("height:"),
+            "热区必须跟随真实视口（top/bottom + 33%），不得写死像素：{z}"
+        );
         assert_eq!(
-            hot_zones(Some("/k/read?p=1"), None, vp())
-                .matches("<a ")
-                .count(),
+            hot_zones(Some("/k/read?p=1"), None).matches("<a ").count(),
             1
         );
-        assert_eq!(hot_zones(None, None, vp()).matches("<a ").count(), 0);
+        assert_eq!(hot_zones(None, None).matches("<a ").count(), 0);
     }
 
     /// `vw`/`vh` 参数优先，缺参回落默认 1072×1268，越界值直接忽略。
@@ -2952,6 +2989,11 @@ mod tests {
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
         assert!(html.contains("id=\"k-stage\"") && html.contains("height:1244px"));
+        // 漫画页保留像素高，但必须把 read_only_css 的绝对定位偏移清零，否则整页会被 right 挤向右
+        assert!(
+            html.contains("position:relative;top:0;left:0;right:auto;bottom:auto;height:1244px"),
+            "{html}"
+        );
         // 短图在开关开/关两种模式下 HTML 必须逐字节一致（回归要求）
         let off_html = {
             let off_pages = comic_pages(&images, &[Some((1024, 1200))], &test_cfg(false), &sp0);

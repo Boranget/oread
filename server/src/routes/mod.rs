@@ -63,6 +63,9 @@ pub fn build_router(shared: SqlitePool, cfg: Config) -> Router {
         .route("/api/admin/users/status", post(auth::admin_set_user_status))
         .route("/api/k/metrics", get(crate::k_metrics::metrics))
         .route("/api/k/metrics/export", get(crate::k_metrics::export))
+        // 页内自报视口探针：写（任意登录用户）+ 聚合（仅管理员）
+        .route("/api/k/probe", get(crate::k_metrics::probe))
+        .route("/api/k/probe/summary", get(crate::k_metrics::probe_summary))
         .merge(sources::routes())
         .merge(books::routes())
         .merge(export::routes())
