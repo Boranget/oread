@@ -80,6 +80,9 @@ pub struct BuiltinCorpus {
     pub expected_author: Option<&'static str>,
     pub category: &'static str,
     pub source_type: i64,
+    /// false = 可测但不计分。用于出版/实体书这类网文站普遍搜不到的条目：
+    /// 它们仍会跑、仍能用来诊断站点，但不进入 hit_rate / 分数的分母。
+    pub scored: bool,
 }
 
 /// 24 条：覆盖玄幻/都市/历史/科幻/出版/漫画，选长期存在的常见书名。
@@ -91,18 +94,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("天蚕土豆"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "凡人修仙传",
         expected_author: Some("忘语"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "遮天",
         expected_author: Some("辰东"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 都市（小说）
     BuiltinCorpus {
@@ -110,18 +116,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("蝴蝶蓝"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "校花的贴身高手",
         expected_author: Some("鱼人二代"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "黄金瞳",
         expected_author: Some("打眼"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 历史（小说）
     BuiltinCorpus {
@@ -129,18 +138,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("猫腻"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "明朝那些事儿",
         expected_author: Some("当年明月"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "赘婿",
         expected_author: Some("愤怒的香蕉"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 科幻（小说）
     BuiltinCorpus {
@@ -148,6 +160,8 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("刘慈欣"),
         category: "科幻",
         source_type: TYPE_NOVEL,
+        // 出版/实体书：147 源实测命中率 13.6%（9/66），拉低整类而不代表源质量
+        scored: false,
     },
     // 出版（小说）
     BuiltinCorpus {
@@ -155,12 +169,16 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("余华"),
         category: "出版",
         source_type: TYPE_NOVEL,
+        // 出版/实体书：147 源实测命中率 3.0%（2/67），保留可测但不计分
+        scored: false,
     },
     BuiltinCorpus {
         title: "平凡的世界",
         expected_author: Some("路遥"),
         category: "出版",
         source_type: TYPE_NOVEL,
+        // 同属出版类，与《活着》同一问题（网文站覆盖率低），保留可测但不计分
+        scored: false,
     },
     // 漫画（type=2）：12 条长期存在的常见书名
     BuiltinCorpus {
@@ -168,30 +186,35 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("尾田荣一郎"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "火影忍者",
         expected_author: Some("岸本齐史"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "名侦探柯南",
         expected_author: Some("青山刚昌"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "一人之下",
         expected_author: Some("米二"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "鬼灭之刃",
         expected_author: Some("吾峠呼世晴"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     // 漫画版《斗罗大陆》：用不带后缀的书名，否则与站点标题的包含率不足 0.6 会永远匹配不上
     BuiltinCorpus {
@@ -199,42 +222,49 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("穆逢春"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "秦时明月",
         expected_author: None,
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "狐妖小红娘",
         expected_author: Some("小新"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "镇魂街",
         expected_author: Some("许辰"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "灌篮高手",
         expected_author: Some("井上雄彦"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "进击的巨人",
         expected_author: Some("谏山创"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "咒术回战",
         expected_author: Some("芥见下下"),
         category: "漫画",
         source_type: TYPE_COMIC,
+        scored: true,
     },
 ];
 
@@ -529,6 +559,8 @@ pub struct CorpusEntry {
     pub norm_title: String,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
+    /// false = 可测但不计分（当前只用于内置的出版/实体书条目）。用户条目恒为 true。
+    pub scored: bool,
 }
 
 pub fn builtin_id(item: &BuiltinCorpus) -> String {
@@ -581,6 +613,7 @@ pub async fn load_corpus(pool: &SqlitePool) -> AppResult<Vec<CorpusEntry>> {
             norm_title: normalize_title(b.title),
             created_at,
             updated_at,
+            scored: b.scored,
         });
     }
     user_rows.sort_by(|a, b| {
@@ -604,6 +637,7 @@ pub async fn load_corpus(pool: &SqlitePool) -> AppResult<Vec<CorpusEntry>> {
         norm_title: r.norm_title,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        scored: true,
     }));
     Ok(out)
 }
@@ -695,6 +729,7 @@ pub async fn add_user_corpus(pool: &SqlitePool, input: CorpusInput) -> AppResult
         norm_title: norm,
         created_at: Some(now),
         updated_at: Some(now),
+        scored: true,
     })
 }
 
@@ -775,6 +810,7 @@ pub async fn update_user_corpus(
         norm_title: norm,
         created_at: existing.created_at,
         updated_at: Some(now),
+        scored: true,
     })
 }
 
@@ -1280,9 +1316,10 @@ fn mark_suspicious(runs: &mut [BenchRun], corpus: &[CorpusEntry]) {
             e.0 += 1;
         }
     }
-    // 同 category 中位数只用内置样本计算（用户冷门书名不应拉低基线）
+    // 同 category 中位数只用内置且计分的样本计算
+    // （用户冷门书名、出版/实体书这类 scored=false 的条目都不应拉低基线）
     let mut cat_rates: HashMap<String, Vec<f64>> = HashMap::new();
-    for e in corpus.iter().filter(|e| e.builtin) {
+    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
         if let Some((hits, obs, _)) = per_key.get(&e.id) {
             if *obs >= MIN_CURATED_SAMPLES {
                 cat_rates
@@ -1331,14 +1368,20 @@ fn compute_source_rows(
     for r in runs {
         by_source.entry(r.source_url.clone()).or_default().push(r);
     }
-    // 参与计分的 category：每个 type 下至少含 1 条内置样本
+    // 参与计分的 category：每个 type 下至少含 1 条内置、且 scored=true 的样本
     let mut scoring_cats: HashMap<i64, HashSet<String>> = HashMap::new();
-    for e in corpus.iter().filter(|e| e.builtin) {
+    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
         scoring_cats
             .entry(e.source_type)
             .or_default()
             .insert(e.category.clone());
     }
+    // scored=false 的内置条目：照常跑、照常落库，但不进入 samples/hits/latency/分数。
+    let unscored_keys: HashSet<&str> = corpus
+        .iter()
+        .filter(|e| !e.scored)
+        .map(|e| e.id.as_str())
+        .collect();
 
     let mut out: Vec<SourceBenchRow> = Vec::new();
     for (url, list) in by_source.iter() {
@@ -1349,7 +1392,11 @@ fn compute_source_rows(
         let source_type = src.map(|s| s.book_source_type).unwrap_or(TYPE_NOVEL);
         let total = list.len() as i64;
         let excluded = list.iter().filter(|r| r.suspicious).count() as i64;
-        let usable: Vec<&BenchRun> = list.iter().filter(|r| !r.suspicious).copied().collect();
+        let usable: Vec<&BenchRun> = list
+            .iter()
+            .filter(|r| !r.suspicious && !unscored_keys.contains(r.corpus_key.as_str()))
+            .copied()
+            .collect();
         let obs = usable.len() as i64;
         // 只有真正拿到响应的样本才算“有效样本”：
         // 体检整批 deadline 到了还没发出的请求不能算样本，更不能按 latency=0 拿满分。
@@ -2166,6 +2213,7 @@ mod tests {
             norm_title: normalize_title(title),
             created_at: None,
             updated_at: None,
+            scored: true,
         }
     }
 
@@ -2184,6 +2232,7 @@ mod tests {
                 norm_title: normalize_title(b.title),
                 created_at: None,
                 updated_at: None,
+                scored: b.scored,
             })
             .collect()
     }
@@ -2407,6 +2456,17 @@ mod tests {
             let ids: HashSet<_> = picked.iter().map(|e| e.id.as_str()).collect();
             assert_eq!(ids.len(), picked.len(), "同一批内不得重复抽样");
         }
+    }
+
+    #[test]
+    fn scored_flags_and_comic_categories() {
+        let unscored: Vec<_> = BUILTIN_CORPUS.iter().filter(|b| !b.scored).collect();
+        assert_eq!(
+            unscored.len(),
+            3,
+            "出版/实体书 3 条（活着/平凡的世界/三体）标记为不计分"
+        );
+        assert!(unscored.iter().all(|b| b.source_type == TYPE_NOVEL));
     }
 
     #[test]
