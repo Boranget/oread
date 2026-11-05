@@ -2197,6 +2197,12 @@ impl AnalyzeRule {
                 if js_spans.iter().any(|(a, b)| start >= *a && start < *b) {
                     return whole.to_string();
                 }
+                // `{{规则##正则[##替换[###]]}}`：Legado 把 `{{}}` 内带规则标志的内容包成
+                // SourceRule，`##` 属于规则本身，必须在求值之后应用。若把 `##…` 直接当路径/
+                // 选择器的一部分，JSONPath 会解析失败，整段展开为空（源包 11 处真实规则）。
+                if let Some(s) = self.template_rule_replace(content, key, json.as_ref()) {
+                    return s;
+                }
             }
             if key.starts_with("$.") || key.starts_with("$[") {
                 if let Some(v) = json.as_ref() {
@@ -2232,6 +2238,45 @@ impl AnalyzeRule {
             String::new()
         })
         .to_string()
+    }
+
+    /// `{{规则##…}}` 里的 `##` 替换：先按规则标志求值前半段，再对结果做正则替换。
+    /// 与 Legado `AnalyzeRule.getString` 一致：`##pat` 删匹配、`##pat##repl` 全替换、
+    /// 出现第 4 段（常见写法 `##pat##repl###`）时只替换第一个匹配。
+    /// 非规则标志内容（纯 JS）返回 `None`，维持原有的 JS 求值路径。
+    fn template_rule_replace(
+        &self,
+        content: &str,
+        key: &str,
+        json: Option<&Value>,
+    ) -> Option<String> {
+        let parts = split_outside_js(key, "##")?;
+        let base = parts[0].trim();
+        let is_rule = base.starts_with("$.")
+            || base.starts_with("$[")
+            || base.starts_with('@')
+            || base.starts_with('<')
+            || base.starts_with("//");
+        if !is_rule {
+            return None;
+        }
+        let pattern = parts.get(1).copied().unwrap_or("");
+        if pattern.is_empty() {
+            return None;
+        }
+        let value = if base.starts_with("$.") || base.starts_with("$[") {
+            json.and_then(|v| json_query(v, base).ok())
+                .and_then(|mut vals| vals.pop())
+                .map(value_to_string)?
+        } else {
+            self.get_string_inner(content, base, false, "").ok()?
+        };
+        Some(apply_replace_regex(
+            &value,
+            pattern,
+            parts.get(2).copied().unwrap_or(""),
+            parts.len() > 3,
+        ))
     }
 
     /// 进入 boa 前展开 JS 源码里的 `{{表达式}}`（Legado 规则级模板语义：模板优先于脚本）。
@@ -2597,7 +2642,14 @@ impl AnalyzeRule {
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
         // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
         if let Some(parts) = split_outside_js(rule, "##") {
-            let sub = self.get_string_inner(content, parts[0].trim(), is_url, base_url)?;
+            // `##` 前半段可能只是模板展开后的字面量（如 `📂 简介：{{$.introduction}}##…`）：
+            // Legado 里整条规则按模板求值，前半段不再当选择器解析，否则会得到空串。
+            let head = parts[0].trim();
+            let sub = if had_template && expanded_is_literal(head) {
+                head.to_string()
+            } else {
+                self.get_string_inner(content, head, is_url, base_url)?
+            };
             let pattern = parts.get(1).copied().unwrap_or("");
             if pattern.is_empty() {
                 return Ok(sub);
@@ -8223,5 +8275,85 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ""
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- pass6：`{{规则##正则[##替换[###]]}}` 与 Legado 对齐 ----
+
+    #[test]
+    fn p6_template_jsonpath_replace_delete() {
+        // 免费追书/♨️免费追书 真实规则 `{{$.lastUpdateChapterDate##\s.*}}`：
+        // 单段 `##` = 正则替换为空（此前 `##…` 被当作 JSONPath 的一部分，整段变空）。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"lastUpdateChapterDate":"2026-11-05 12:00:00"}"#;
+        assert_eq!(
+            ar.get_string(json, r"{{$.lastUpdateChapterDate##\s.*}}", true, "")
+                .unwrap(),
+            "2026-11-05"
+        );
+    }
+
+    #[test]
+    fn p6_template_jsonpath_replace_with_replacement() {
+        // 两段 `##pat##repl` = 全替换；含 `$.tags..name` 深扫描路径。
+        let ar = AnalyzeRule::new();
+        let json =
+            r#"{"lastUpdateChapterDate":"2026-11-05 12:00:00","tags":[{"name":"奇幻 冒险"}]}"#;
+        assert_eq!(
+            ar.get_string(json, r"{{$.lastUpdateChapterDate##\s##🔸}}", true, "")
+                .unwrap(),
+            "2026-11-05🔸12:00:00"
+        );
+        assert_eq!(
+            ar.get_string(json, r"{{$.tags..name##\s##，}}", true, "")
+                .unwrap(),
+            "奇幻，冒险"
+        );
+    }
+
+    #[test]
+    fn p6_template_jsonpath_replace_first_only() {
+        // 快看漫画 真实写法 `…##(\d+)##$1章###`：第 4 段存在 → 只替换第一个匹配。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"data":[{"topicInfo":{"topic_intro":"12 34 56"}}]}"#;
+        assert_eq!(
+            ar.get_string(
+                json,
+                r"{{$.data[0].topicInfo.topic_intro##(\d+)##$1章###}}",
+                true,
+                ""
+            )
+            .unwrap(),
+            "12章 34 56"
+        );
+    }
+
+    #[test]
+    fn p6_template_nested_css_replace() {
+        // 免费追书 真实规则 `{{@@[property="og:novel:update_time"]@content##\s##🔸}}`。
+        let ar = AnalyzeRule::new();
+        let html = r#"<p property="og:novel:update_time" content="2026-11-05 12:00:00"></p>"#;
+        assert_eq!(
+            ar.get_string(
+                html,
+                r#"{{@@[property="og:novel:update_time"]@content##\s##🔸}}"#,
+                false,
+                ""
+            )
+            .unwrap(),
+            "2026-11-05🔸12:00:00"
+        );
+    }
+
+    #[test]
+    fn p6_composed_literal_with_trailing_replace() {
+        // 免费追书 intro：字面量前缀 + 模板 + 整串 `##…##$1<br>`。
+        // 前半段展开后是字面量，不能再当选择器解析（此前整条 intro 变空）。
+        let ar = AnalyzeRule::new();
+        let json = r#"{"introduction":"第一句。第二句！第三句？"}"#;
+        let rule = r#"📂 简介：{{$.introduction}}##(^|[。！？]+[”」）】]?)##$1<br>"#;
+        assert_eq!(
+            ar.get_string(json, rule, true, "").unwrap(),
+            "<br>📂 简介：第一句。<br>第二句！<br>第三句？<br>"
+        );
     }
 }
