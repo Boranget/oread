@@ -58,6 +58,30 @@ function Test-Writable([string]$path) {
     }
 }
 
+# 发布构建禁止写进运行目录：D:\tools\oread-target-win 是本机 :3000 的运行目录，
+# 曾因未指定 -TargetDir 把 v0.3.12 的 release 产物直接写进它的 release\boranlib.exe。
+$RunDir = 'D:\tools\oread-target-win'
+if ($Release) {
+    $dirExplicit = $PSBoundParameters.ContainsKey('TargetDir') -or $env:OREAD_TARGET_WIN
+    if (-not $dirExplicit) {
+        $tag = (& git -C $repoRoot describe --tags --exact-match HEAD 2>$null | Select-Object -First 1)
+        $suffix = if ($LASTEXITCODE -eq 0 -and $tag) {
+            ($tag.Trim() -replace '\.', '')
+        } else {
+            'wip-' + (& git -C $repoRoot rev-parse --short HEAD 2>$null | Select-Object -First 1)
+        }
+        $TargetDir = "D:\tools\oread-target-$suffix"
+        Write-Host "[build-dev] release 构建未指定 -TargetDir，改用版本目录 $TargetDir" -ForegroundColor Cyan
+    }
+    if ($TargetDir.TrimEnd('\') -ieq $RunDir) {
+        Fail "release 构建不能写进运行目录 $RunDir" @(
+            '改用版本目录：.\scripts\build-dev.ps1 -Release -TargetDir D:\tools\oread-target-vX.Y.Z',
+            'Windows 包交给 D:\tools\release-pack\make-pack.ps1 产出；Linux 包落 D:\tools\openstick\<version>',
+            '运行目录只在人工升级时替换 exe，不要由构建脚本写入'
+        )
+    }
+}
+
 Write-Host "[build-dev] 仓库根：$repoRoot"
 
 if (-not (Test-Path (Join-Path $serverDir 'Cargo.toml'))) {
