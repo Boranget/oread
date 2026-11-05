@@ -18,7 +18,7 @@ use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 
 use crate::config::Config;
-use crate::entities::BookSource;
+use crate::entities::{BookSource, SearchBook};
 use crate::error::{AppError, AppResult};
 use crate::source_health::{self, classify, FailureKind, Outcome};
 use crate::web_book;
@@ -1207,6 +1207,34 @@ struct RawSample {
     error_kind: Option<String>,
 }
 
+/// 每条语料最多看搜索结果的前 N 条。
+/// 2026-11 复测：10 个 0 命中源里，看书网《庆余年》/顶点小说《全职高手》的**第一条**
+/// 就是精确同名同作者，而体检当时只取第一条却记成未命中（排名/接口抖动）。
+/// 放宽到前 3–5 条可消除这类漏判；`is_hit` 口径保持不变（仍要求近似同名，或包含+作者匹配）。
+const CHECK_TOP_N: usize = 5;
+
+fn judge_books(books: &[SearchBook], item: &CorpusEntry) -> (bool, bool, bool) {
+    let mut found = false;
+    let mut title_match = false;
+    let mut author_match = false;
+    for b in books.iter().take(CHECK_TOP_N) {
+        let Some(name) = b.name.as_deref() else {
+            continue;
+        };
+        let tm = title_matches(name, &item.title);
+        title_match |= tm;
+        let am = author_matches(b.author.as_deref(), item.expected_author.as_deref());
+        author_match |= tm && am;
+        found |= is_hit(
+            name,
+            &item.title,
+            b.author.as_deref(),
+            item.expected_author.as_deref(),
+        );
+    }
+    (found, title_match, author_match)
+}
+
 async fn run_one_sample(src: &BookSource, item: &CorpusEntry, deadline: Instant) -> RawSample {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining < Duration::from_millis(100) {
@@ -1228,23 +1256,7 @@ async fn run_one_sample(src: &BookSource, item: &CorpusEntry, deadline: Instant)
     let latency_ms = started.elapsed().as_millis() as i64;
     match result {
         Ok(Ok(books)) => {
-            let first = books.first();
-            let got_title = first.and_then(|b| b.name.as_deref());
-            let got_author = first.and_then(|b| b.author.as_deref());
-            let title_match = got_title
-                .map(|name| title_matches(name, &item.title))
-                .unwrap_or(false);
-            let author_match = author_matches(got_author, item.expected_author.as_deref());
-            let found = got_title
-                .map(|name| {
-                    is_hit(
-                        name,
-                        &item.title,
-                        got_author,
-                        item.expected_author.as_deref(),
-                    )
-                })
-                .unwrap_or(false);
+            let (found, title_match, author_match) = judge_books(&books, item);
             RawSample {
                 corpus_key: item.id.clone(),
                 title: item.title.clone(),
@@ -2477,6 +2489,34 @@ mod tests {
             HashSet::from(["日漫", "国漫"]),
             "漫画语料按日漫/国漫拆分 category"
         );
+    }
+
+    #[test]
+    fn judge_books_scans_top_results_without_loosening_is_hit() {
+        let mut item = entry("庆余年", "历史", TYPE_NOVEL, true);
+        item.expected_author = Some("猫腻".into());
+        let mut derivative = SearchBook::default();
+        derivative.name = Some("庆余年之无上之境".into());
+        derivative.author = Some("路人甲".into());
+        let mut exact = SearchBook::default();
+        exact.name = Some("庆余年".into());
+        exact.author = Some("猫腻".into());
+
+        // 衍生作排第一、原书排第二：旧实现（只看第一条）会误判为未命中
+        let (found, tm, am) = judge_books(&[derivative.clone(), exact.clone()], &item);
+        assert!(found && tm && am);
+
+        // 只有衍生作：仍然判未命中，is_hit 口径没有被放宽成“包含即可”
+        let (found, tm, _) = judge_books(&[derivative], &item);
+        assert!(!found);
+        assert!(tm, "标题包含仍应记录 title_match，但不能算命中");
+
+        // 只扫前 CHECK_TOP_N 条
+        let filler = vec![SearchBook::default(); CHECK_TOP_N];
+        let mut books = filler;
+        books.push(exact);
+        let (found, _, _) = judge_books(&books, &item);
+        assert!(!found, "第 {} 条之后不再匹配", CHECK_TOP_N + 1);
     }
 
     #[test]
