@@ -1129,6 +1129,11 @@ var book = {
   bookUrl: __bookUrl,
   tocUrl: __bookTocUrl,
   canUpdate: true,
+  name: __bookName,
+  author: __bookAuthor,
+  kind: __bookKind,
+  intro: __bookIntro,
+  coverUrl: __bookCoverUrl,
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
 };
@@ -1633,6 +1638,20 @@ pub struct AnalyzeRule {
     pub book_url: RefCell<String>,
     /// JS 环境里的 `book.tocUrl`。
     pub book_toc_url: RefCell<String>,
+    /// JS 环境里的 `book.name/book.author/book.kind/book.intro/book.coverUrl`。
+    /// 上游 `book` 绑定的是完整 Book 实体，规则（尤其简介模板）会直接读这些元信息；
+    /// 编排层在详情/目录/正文阶段按当前 Book 值注入（搜索阶段为空）。
+    pub book_meta: RefCell<BookMeta>,
+}
+
+/// `book` 绑定里的只读元信息（对应 Legado `Book` 的同名属性）。
+#[derive(Clone, Default)]
+pub struct BookMeta {
+    pub name: String,
+    pub author: String,
+    pub kind: String,
+    pub intro: String,
+    pub cover_url: String,
 }
 
 impl Default for AnalyzeRule {
@@ -1650,6 +1669,7 @@ impl Default for AnalyzeRule {
             refresh_toc: Cell::new(false),
             book_url: RefCell::new(String::new()),
             book_toc_url: RefCell::new(String::new()),
+            book_meta: RefCell::new(BookMeta::default()),
         }
     }
 }
@@ -1661,6 +1681,11 @@ impl AnalyzeRule {
 
     pub fn set_var(&self, k: impl Into<String>, v: impl Into<String>) {
         self.variables.borrow_mut().insert(k.into(), v.into());
+    }
+
+    /// 注入 `book.*` 只读元信息（详情/目录/正文阶段由编排层调用）。
+    pub fn set_book_meta(&self, meta: BookMeta) {
+        *self.book_meta.borrow_mut() = meta;
     }
 
     /// 执行一段独立 JS（`pre_update_js` 等编排层钩子）；`content` 作为 `result`/`__input`。
@@ -2131,8 +2156,18 @@ impl AnalyzeRule {
         if only_get {
             return Ok(rule.trim().to_string());
         }
+        // 整条规则就是一个 `{{…}}` 模板：Legado 直接返回模板求值结果，不能把结果再当
+        // 规则/选择器解析。此前 `{{book.name}}`、`{{java.timeFormat(...)}}` 展开后会被
+        // 当作 CSS 选择器，解析失败返回空串（库内 5 条规则 / 3 源）。
+        let whole_template = {
+            let t = rule.trim();
+            t.starts_with("{{") && t.ends_with("}}") && !t[2..t.len() - 2].contains("}}")
+        };
         let rule = self.expand_vars(&rule, content);
         let rule = rule.trim().to_string();
+        if whole_template && !rule.starts_with("{{") {
+            return Ok(rule);
+        }
         if rule.is_empty() {
             return Ok(String::new());
         }
@@ -2534,7 +2569,7 @@ impl AnalyzeRule {
         let vars_init =
             serde_json::to_string(&self.variables.borrow().clone()).unwrap_or_else(|_| "{}".into());
         let script = format!(
-            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\n{vars}\n{cachejs}\n{lib}\n{shim}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
+            "(function(){{ var result={r}; var __input={r}; var __base={b}; var baseUrl=__base;\nvar __page={page}; var __sourceKey={sk}; var __sourceLoginUrl={lu}; var __refreshToc=false; var __bookUrl={bu}; var __bookTocUrl={bt};\nvar __bookName={bn}; var __bookAuthor={ba}; var __bookKind={bk}; var __bookIntro={bi}; var __bookCoverUrl={bc};\n{vars}\n{cachejs}\n{lib}\n{shim}\n__vars={varsinit};\n__cache={cacheinit};\n__DOM={dom};\n__DOMS={doms};\nvar __t0 = Date.now();\nvar __r = eval({code});\nvar __ms = Date.now() - __t0;\nvar __out;\nif (Array.isArray(__r)) {{ try {{ __out = JSON.stringify(__r); }} catch(__e) {{}} }}\nelse __out = String(__r);\nif (typeof __out === 'undefined') __out = String(__r);\nreturn __out + {vsent} + JSON.stringify(__vars) + {sent} + JSON.stringify(__cache) + {book} + JSON.stringify({{bookUrl: book.bookUrl, tocUrl: book.tocUrl}}) + {tocs} + (__refreshToc ? '1' : '0') + {msent} + String(__ms); }})()",
             r = lit,
             b = js_string_literal(base_url),
             page = js_string_literal(&self.current_content.borrow()),
@@ -2542,6 +2577,11 @@ impl AnalyzeRule {
             lu = js_string_literal(&self.source_login_url.borrow()),
             bu = js_string_literal(&self.book_url.borrow()),
             bt = js_string_literal(&self.book_toc_url.borrow()),
+            bn = js_string_literal(&self.book_meta.borrow().name),
+            ba = js_string_literal(&self.book_meta.borrow().author),
+            bk = js_string_literal(&self.book_meta.borrow().kind),
+            bi = js_string_literal(&self.book_meta.borrow().intro),
+            bc = js_string_literal(&self.book_meta.borrow().cover_url),
             vars = vars_js,
             varsinit = vars_init,
             cachejs = JS_CACHE,
@@ -3886,6 +3926,16 @@ fn parse_token(tok: &str) -> Token {
             exclude: false,
         };
     }
+    if let Some(rest) = tok.strip_prefix("text.") {
+        // `@text.xxx`：Legado 的「自身文本包含」遍历步骤，保留 text. 前缀交给 apply_tag 处理。
+        let (name, index) = split_name_index(rest);
+        return Token::Tag {
+            name: format!("text.{name}"),
+            index,
+            indices: vec![],
+            exclude: false,
+        };
+    }
     if is_extract_keyword(tok) {
         return Token::Terminal(tok.to_string());
     }
@@ -4330,7 +4380,15 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
         None => (selector, Vec::new()),
     };
     let (core, jq) = split_jquery_filters(core.trim());
-    let (css, idx) = if let Some(rest) = core.trim().strip_prefix("class.") {
+    let mut text_filter: Option<String> = None;
+    let (css, idx) = if let Some(rest) = core.trim().strip_prefix("text.") {
+        // Legado `text.xxx`：元素**自身**直接文本包含 xxx（jsoup
+        // `getElementsContainingOwnText`）。此前被当成 CSS「标签 text + 类名 xxx」，
+        // 永远匹配不到元素，正文下一页/目录翻页/完整目录入口因此全空（28 源）。
+        let (name, i) = split_name_index(rest);
+        text_filter = Some(name);
+        ("*".to_string(), i)
+    } else if let Some(rest) = core.trim().strip_prefix("class.") {
         let (name, i) = split_name_index(rest);
         (class_name_css(shorthand_segment(&name)), i)
     } else if let Some(rest) = core.trim().strip_prefix("id.") {
@@ -4365,7 +4423,10 @@ fn select_initial<'a>(doc: &'a scraper::Html, selector: &str) -> Vec<scraper::El
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    let els: Vec<scraper::ElementRef<'a>> = doc.select(&sel).collect();
+    let els: Vec<scraper::ElementRef<'a>> = match &text_filter {
+        Some(needle) => text_contains_from(&[doc.root_element()], needle),
+        None => doc.select(&sel).collect(),
+    };
     let els = filter_indices(els, &excluded, true);
     let els = match &index_expr {
         Some(expr) => apply_index_expr(els, expr),
@@ -4396,19 +4457,26 @@ fn apply_tag<'a>(els: Vec<scraper::ElementRef<'a>>, spec: &str) -> Vec<scraper::
     let (spec, index_expr) = split_bracket_indices(spec.trim());
     let (tag, idx) = split_name_index(spec.trim());
     let (tag, jq) = split_jquery_filters(tag.trim());
-    let css = if tag.trim().is_empty() {
-        "*".to_string()
-    } else {
-        tag
-    };
-    let sel = match scraper::Selector::parse(&css) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let mut matched: Vec<scraper::ElementRef<'a>> = Vec::new();
-    for e in &els {
-        matched.extend(e.select(&sel));
-    }
+    let matched: Vec<scraper::ElementRef<'a>> =
+        if let Some(needle) = tag.trim().strip_prefix("text.") {
+            // `@text.xxx`：在当前元素及其后代中，按自身文本包含关系筛选（上游同一语义）。
+            text_contains_from(&els, needle)
+        } else {
+            let css = if tag.trim().is_empty() {
+                "*".to_string()
+            } else {
+                tag
+            };
+            let sel = match scraper::Selector::parse(&css) {
+                Ok(s) => s,
+                Err(_) => return vec![],
+            };
+            let mut m: Vec<scraper::ElementRef<'a>> = Vec::new();
+            for e in &els {
+                m.extend(e.select(&sel));
+            }
+            m
+        };
     let matched = apply_jq_filters(matched, &jq);
     let matched = match &index_expr {
         Some(expr) => apply_index_expr(matched, expr),
@@ -4429,6 +4497,37 @@ fn text_nodes(el: &scraper::ElementRef) -> String {
     el.children()
         .filter_map(|n| n.value().as_text().map(|t| t.to_string()))
         .collect()
+}
+
+/// Legado `text.xxx` 的单元素判定：自身直接文本（空白归一、忽略大小写）包含 needle。
+fn own_text_contains(el: &scraper::ElementRef, needle_lower: &str) -> bool {
+    let own = text_nodes(el)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    own.contains(needle_lower)
+}
+
+/// 从给定根元素（含自身）按文档序收集「自身文本包含 needle」的元素，
+/// 对应 jsoup `Element.getElementsContainingOwnText`。
+fn text_contains_from<'a>(
+    roots: &[scraper::ElementRef<'a>],
+    needle: &str,
+) -> Vec<scraper::ElementRef<'a>> {
+    let needle = needle.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<scraper::ElementRef<'a>> = Vec::new();
+    for root in roots {
+        let mut candidates = vec![*root];
+        candidates.extend(root.descendants().filter_map(scraper::ElementRef::wrap));
+        for c in candidates {
+            if own_text_contains(&c, &needle) && seen.insert(c.id()) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// 裸抽取标记（`text` / `href` 等）：Legado 语义是对“当前节点”直接取值。
@@ -6244,6 +6343,133 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
         assert_eq!(
             ar.get_string(html, "class.au@text", false, "").unwrap(),
             "作者"
+        );
+    }
+
+    #[test]
+    fn text_prefix_selector_matches_own_text() {
+        // Legado `text.下一页` = 自身文本包含（jsoup getElementsContainingOwnText）。
+        // 147 源中 28 源用它做正文翻页/目录翻页/完整目录入口，此前被当成 CSS
+        // 「标签 text + 类名 下一页」而永远为空。
+        let ar = AnalyzeRule::new();
+        let html = r#"
+        <div class="pages">
+          <a href="/p/1">上一页</a>
+          <a href="/p/3">下一页</a>
+        </div>
+        <div class="wrap"><a href="/toc">完整目录</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "text.下一页@href", true, "").unwrap(),
+            "/p/3"
+        );
+        assert_eq!(
+            ar.get_string(html, "text.完整目录@href", true, "").unwrap(),
+            "/toc"
+        );
+    }
+
+    #[test]
+    fn text_prefix_uses_own_text_not_descendant_text() {
+        // 上游取的是「自身直接文本」：容器只有子元素文本时不能命中，
+        // 否则 `text.下一页@href` 会先选中容器并取到空 href。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="wrap"><a href="/p/2">下一页</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "text.下一页@href", true, "").unwrap(),
+            "/p/2"
+        );
+        // 容器自身无直接文本 → 不会被选中（选中容器会取到空 href）
+        assert_eq!(
+            ar.get_string(html, "text.下一页@tag.span@href", true, "")
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn text_prefix_is_traversal_step_after_at() {
+        // `class.next_chapter@text.下一页@href`（cn.bzmanga 章末翻页的原始写法）。
+        let ar = AnalyzeRule::new();
+        let html = r#"<div class="next_chapter"><a href="/next">下一页</a></div>"#;
+        assert_eq!(
+            ar.get_string(html, "class.next_chapter@text.下一页@href", true, "")
+                .unwrap(),
+            "/next"
+        );
+    }
+
+    #[test]
+    fn text_prefix_handles_empty_and_case_insensitive() {
+        let ar = AnalyzeRule::new();
+        let html = r#"<a href="/n">Next Page</a><span>无关</span>"#;
+        // 大小写不敏感（上游对 needle 与文本都做了 lowercase）
+        assert_eq!(
+            ar.get_string(html, "text.next page@href", true, "")
+                .unwrap(),
+            "/n"
+        );
+        // 未命中 → 空串，不 panic
+        assert_eq!(
+            ar.get_string(html, "text.没有这段@href", true, "").unwrap(),
+            ""
+        );
+        assert_eq!(ar.get_string("", "text.下一页@href", true, "").unwrap(), "");
+    }
+
+    #[test]
+    fn whole_rule_template_returns_value() {
+        // 整条规则恰为 `{{…}}`：上游直接返回模板值；旧实现把展开结果当 CSS，返回空串。
+        let ar = AnalyzeRule::new();
+        assert_eq!(ar.get_string("", "{{1+1}}", false, "").unwrap(), "2");
+        assert_eq!(
+            ar.get_string(r#"{"title":"书名A"}"#, "{{$.title}}", false, "")
+                .unwrap(),
+            "书名A"
+        );
+        // 展开失败时按原有行为返回空串，不 panic
+        assert_eq!(
+            ar.get_string("", "{{没有这个变量}}", false, "").unwrap(),
+            ""
+        );
+        // 非“整条模板”的写法不受影响
+        assert_eq!(
+            ar.get_string("<a href='/x'>下一页</a>", "{{'a'}}@text", false, "")
+                .unwrap(),
+            "下一页"
+        );
+    }
+
+    #[test]
+    fn js_book_meta_is_visible() {
+        // Legado 的 `book` 绑定是完整 Book 实体；快看/漫画源在详情简介模板里直接读
+        // `book.name/book.author/book.kind`，缺这些字段会把 `undefined` 拼进简介。
+        let ar = AnalyzeRule::new();
+        ar.set_book_meta(BookMeta {
+            name: "书名".into(),
+            author: "作者".into(),
+            kind: "类型".into(),
+            intro: "简介".into(),
+            cover_url: "https://c/x.jpg".into(),
+        });
+        assert_eq!(
+            ar.get_string("", "{{book.name}}", false, "").unwrap(),
+            "书名"
+        );
+        assert_eq!(
+            ar.get_string("", "@js:book.kind + '/' + book.author", false, "")
+                .unwrap(),
+            "类型/作者"
+        );
+        assert_eq!(
+            ar.get_string("", "@js:book.coverUrl", false, "").unwrap(),
+            "https://c/x.jpg"
+        );
+        // 未注入时是空串而非 `undefined`（避免 JS 模板拼出字面量 undefined）
+        assert_eq!(
+            AnalyzeRule::new()
+                .get_string("", "@js:String(book.name)", false, "")
+                .unwrap(),
+            ""
         );
     }
 

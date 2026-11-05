@@ -12,7 +12,7 @@ use crate::entities::{
     SearchBook, SearchRule, TocRule,
 };
 use crate::req;
-use crate::rule_engine::AnalyzeRule;
+use crate::rule_engine::{AnalyzeRule, BookMeta};
 
 /// 判断书源是否为 JSON 型（规则以 $. 开头或 url 含 json）
 fn is_json_source(source: &BookSource) -> bool {
@@ -174,6 +174,18 @@ impl BookStore {
         }
         out
     }
+}
+
+/// 把当前 Book 的元信息注入 JS 的 `book.*`（Legado 规则里的
+/// `book.name/author/kind/intro/coverUrl`，简介模板类规则会直接引用）。
+fn inject_book_meta(ar: &AnalyzeRule, book: &Book) {
+    ar.set_book_meta(BookMeta {
+        name: book.name.clone().unwrap_or_default(),
+        author: book.author.clone().unwrap_or_default(),
+        kind: book.kind.clone().unwrap_or_default(),
+        intro: book.intro.clone().unwrap_or_default(),
+        cover_url: book.cover_url.clone().unwrap_or_default(),
+    });
 }
 
 /// 按 `book_url` 创建带 book 作用域的 AnalyzeRule（空 URL 时退化为普通请求作用域）。
@@ -878,6 +890,7 @@ pub fn parse_book_info_html(
     };
     let url = book.book_url.clone();
     let ar = make_ar_book(source, store, &url);
+    inject_book_meta(&ar, book);
     // `init` 的返回值在 Legado 里就是后续详情规则的输入内容（快看用它把
     // `__NUXT__` JSON 设为当前文档，name 等规则再在 JSON 上求值）。
     let mut content = html.to_string();
@@ -1031,6 +1044,7 @@ pub async fn chapter_list_book(
     // 目录地址本身也可以是分页模板（`.../toc_{{page}}.html`），首屏固定为第 1 页
     url = url.replace("{{page}}", "1").replace("${page}", "1");
     let ar = make_ar_book(source, store, &book.book_url);
+    inject_book_meta(&ar, book);
     ar.book_toc_url.replace(url.clone());
     // Legado `TocRule.preUpdateJs`：刷新目录前执行；可改写 book.bookUrl / 调 refreshTocUrl。
     // 上游规则异常会中断目录更新；本服务按“解析不拖垮源”的原则降级为日志 + 台账后继续。
