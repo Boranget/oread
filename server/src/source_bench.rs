@@ -18,9 +18,9 @@ use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 
 use crate::config::Config;
-use crate::entities::BookSource;
+use crate::entities::{BookSource, SearchBook};
 use crate::error::{AppError, AppResult};
-use crate::source_health::{self, classify, FailureKind};
+use crate::source_health::{self, classify, FailureKind, Outcome};
 use crate::web_book;
 
 pub const TYPE_NOVEL: i64 = 0;
@@ -45,6 +45,18 @@ pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 
 /// 精选所需的最少样本数；不足的源不参与精选（冷启动回退现有 tier 逻辑）。
 pub const MIN_CURATED_SAMPLES: i64 = 2;
 
+/// 冷启动直通 preferred 的体检质量分下限。
+///
+/// 规则（每次体检都重新计算，是运行时判定而不是一次性名单）：
+/// `samples >= MIN_CURATED_SAMPLES` 且 `hit_rate > 0` 且 `bench_score >= 50` 且未隔离
+/// → 直接授予 `preferred`（`promote_streak` 抬到 promote 阈值），跳过“连续 3 次好观测”。
+///
+/// 50 ≈ 2/5 命中（60×0.4=24）+ 约 1.3s 平均耗时（30×0.74≈22）+ 全成功（10），
+/// 0 命中或全超时的源过不了；真实搜索的降级路径（demote_streak）仍然生效。
+/// 依据：2026-11 用 147 源实测，导入后 preferred=0、observing=142，一轮体检后精选恒为 0；
+/// 去掉 tier 门槛时小说可取 14、漫画可取 4，卡点只在 tier 与体检脱节。
+pub const BENCH_FAST_TRACK_MIN_SCORE: i32 = 50;
+
 /// 精选资格：体检命中率必须 > 0。0 命中的源即使分数够、下限 min 未满也不入选，
 /// 不拿低分源凑数——让“加强搜索”只跑真的能搜到书的源。
 pub fn curated_hit_ok(hit_rate: f64) -> bool {
@@ -68,6 +80,9 @@ pub struct BuiltinCorpus {
     pub expected_author: Option<&'static str>,
     pub category: &'static str,
     pub source_type: i64,
+    /// false = 可测但不计分。用于出版/实体书这类网文站普遍搜不到的条目：
+    /// 它们仍会跑、仍能用来诊断站点，但不进入 hit_rate / 分数的分母。
+    pub scored: bool,
 }
 
 /// 24 条：覆盖玄幻/都市/历史/科幻/出版/漫画，选长期存在的常见书名。
@@ -79,18 +94,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("天蚕土豆"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "凡人修仙传",
         expected_author: Some("忘语"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "遮天",
         expected_author: Some("辰东"),
         category: "玄幻",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 都市（小说）
     BuiltinCorpus {
@@ -98,18 +116,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("蝴蝶蓝"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "校花的贴身高手",
         expected_author: Some("鱼人二代"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "黄金瞳",
         expected_author: Some("打眼"),
         category: "都市",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 历史（小说）
     BuiltinCorpus {
@@ -117,18 +138,21 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("猫腻"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "明朝那些事儿",
         expected_author: Some("当年明月"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     BuiltinCorpus {
         title: "赘婿",
         expected_author: Some("愤怒的香蕉"),
         category: "历史",
         source_type: TYPE_NOVEL,
+        scored: true,
     },
     // 科幻（小说）
     BuiltinCorpus {
@@ -136,6 +160,8 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("刘慈欣"),
         category: "科幻",
         source_type: TYPE_NOVEL,
+        // 出版/实体书：147 源实测命中率 13.6%（9/66），拉低整类而不代表源质量
+        scored: false,
     },
     // 出版（小说）
     BuiltinCorpus {
@@ -143,86 +169,102 @@ pub const BUILTIN_CORPUS: &[BuiltinCorpus] = &[
         expected_author: Some("余华"),
         category: "出版",
         source_type: TYPE_NOVEL,
+        // 出版/实体书：147 源实测命中率 3.0%（2/67），保留可测但不计分
+        scored: false,
     },
     BuiltinCorpus {
         title: "平凡的世界",
         expected_author: Some("路遥"),
         category: "出版",
         source_type: TYPE_NOVEL,
+        // 同属出版类，与《活着》同一问题（网文站覆盖率低），保留可测但不计分
+        scored: false,
     },
     // 漫画（type=2）：12 条长期存在的常见书名
     BuiltinCorpus {
         title: "海贼王",
         expected_author: Some("尾田荣一郎"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "火影忍者",
         expected_author: Some("岸本齐史"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "名侦探柯南",
         expected_author: Some("青山刚昌"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "一人之下",
         expected_author: Some("米二"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "鬼灭之刃",
         expected_author: Some("吾峠呼世晴"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     // 漫画版《斗罗大陆》：用不带后缀的书名，否则与站点标题的包含率不足 0.6 会永远匹配不上
     BuiltinCorpus {
         title: "斗罗大陆",
         expected_author: Some("穆逢春"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "秦时明月",
         expected_author: None,
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "狐妖小红娘",
         expected_author: Some("小新"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "镇魂街",
         expected_author: Some("许辰"),
-        category: "漫画",
+        category: "国漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "灌篮高手",
         expected_author: Some("井上雄彦"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "进击的巨人",
         expected_author: Some("谏山创"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
     BuiltinCorpus {
         title: "咒术回战",
         expected_author: Some("芥见下下"),
-        category: "漫画",
+        category: "日漫",
         source_type: TYPE_COMIC,
+        scored: true,
     },
 ];
 
@@ -517,6 +559,8 @@ pub struct CorpusEntry {
     pub norm_title: String,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
+    /// false = 可测但不计分（当前只用于内置的出版/实体书条目）。用户条目恒为 true。
+    pub scored: bool,
 }
 
 pub fn builtin_id(item: &BuiltinCorpus) -> String {
@@ -569,6 +613,7 @@ pub async fn load_corpus(pool: &SqlitePool) -> AppResult<Vec<CorpusEntry>> {
             norm_title: normalize_title(b.title),
             created_at,
             updated_at,
+            scored: b.scored,
         });
     }
     user_rows.sort_by(|a, b| {
@@ -592,6 +637,7 @@ pub async fn load_corpus(pool: &SqlitePool) -> AppResult<Vec<CorpusEntry>> {
         norm_title: r.norm_title,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        scored: true,
     }));
     Ok(out)
 }
@@ -683,6 +729,7 @@ pub async fn add_user_corpus(pool: &SqlitePool, input: CorpusInput) -> AppResult
         norm_title: norm,
         created_at: Some(now),
         updated_at: Some(now),
+        scored: true,
     })
 }
 
@@ -763,6 +810,7 @@ pub async fn update_user_corpus(
         norm_title: norm,
         created_at: existing.created_at,
         updated_at: Some(now),
+        scored: true,
     })
 }
 
@@ -904,22 +952,31 @@ fn round_robin(items: &[&CorpusEntry], limit: usize, salt: usize, out: &mut Vec<
     for e in items {
         buckets.entry(e.category.as_str()).or_default().push(e);
     }
-    let offset = salt % cats.len();
+    // salt 同时参与“类间顺序”和“类内起点”：
+    // 旧实现只旋转 category 顺序、类内永远从第 0 条开始，limit=5 且每个 category
+    // 有 3 条时，24 条语料实际永远只跑到 10 条（小说 5 条 + 漫画 5 条）。
+    // 2026-11 实测：147 源体检后 DISTINCT corpus_key 只有 10。
     let mut idx: HashMap<&str, usize> = HashMap::new();
     let mut placed = 0usize;
     let mut guard = 0usize;
     while placed < limit && guard < items.len() * 2 + 8 {
         guard += 1;
         let mut any = false;
+        let offset = salt % cats.len();
         for step in 0..cats.len() {
             if placed >= limit {
                 break;
             }
-            let cat = &cats[(offset + step) % cats.len()];
+            let cat_pos = (offset + step) % cats.len();
+            let cat = &cats[cat_pos];
             let list = buckets.get(cat.as_str()).cloned().unwrap_or_default();
+            if list.is_empty() {
+                continue;
+            }
             let pos = idx.entry(cat.as_str()).or_insert(0);
             if *pos < list.len() {
-                out.push(list[*pos].clone());
+                let start = (salt + cat_pos) % list.len();
+                out.push(list[(start + *pos) % list.len()].clone());
                 *pos += 1;
                 placed += 1;
                 any = true;
@@ -1150,6 +1207,34 @@ struct RawSample {
     error_kind: Option<String>,
 }
 
+/// 每条语料最多看搜索结果的前 N 条。
+/// 2026-11 复测：10 个 0 命中源里，看书网《庆余年》/顶点小说《全职高手》的**第一条**
+/// 就是精确同名同作者，而体检当时只取第一条却记成未命中（排名/接口抖动）。
+/// 放宽到前 3–5 条可消除这类漏判；`is_hit` 口径保持不变（仍要求近似同名，或包含+作者匹配）。
+const CHECK_TOP_N: usize = 5;
+
+fn judge_books(books: &[SearchBook], item: &CorpusEntry) -> (bool, bool, bool) {
+    let mut found = false;
+    let mut title_match = false;
+    let mut author_match = false;
+    for b in books.iter().take(CHECK_TOP_N) {
+        let Some(name) = b.name.as_deref() else {
+            continue;
+        };
+        let tm = title_matches(name, &item.title);
+        title_match |= tm;
+        let am = author_matches(b.author.as_deref(), item.expected_author.as_deref());
+        author_match |= tm && am;
+        found |= is_hit(
+            name,
+            &item.title,
+            b.author.as_deref(),
+            item.expected_author.as_deref(),
+        );
+    }
+    (found, title_match, author_match)
+}
+
 async fn run_one_sample(src: &BookSource, item: &CorpusEntry, deadline: Instant) -> RawSample {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining < Duration::from_millis(100) {
@@ -1171,23 +1256,7 @@ async fn run_one_sample(src: &BookSource, item: &CorpusEntry, deadline: Instant)
     let latency_ms = started.elapsed().as_millis() as i64;
     match result {
         Ok(Ok(books)) => {
-            let first = books.first();
-            let got_title = first.and_then(|b| b.name.as_deref());
-            let got_author = first.and_then(|b| b.author.as_deref());
-            let title_match = got_title
-                .map(|name| title_matches(name, &item.title))
-                .unwrap_or(false);
-            let author_match = author_matches(got_author, item.expected_author.as_deref());
-            let found = got_title
-                .map(|name| {
-                    is_hit(
-                        name,
-                        &item.title,
-                        got_author,
-                        item.expected_author.as_deref(),
-                    )
-                })
-                .unwrap_or(false);
+            let (found, title_match, author_match) = judge_books(&books, item);
             RawSample {
                 corpus_key: item.id.clone(),
                 title: item.title.clone(),
@@ -1259,9 +1328,10 @@ fn mark_suspicious(runs: &mut [BenchRun], corpus: &[CorpusEntry]) {
             e.0 += 1;
         }
     }
-    // 同 category 中位数只用内置样本计算（用户冷门书名不应拉低基线）
+    // 同 category 中位数只用内置且计分的样本计算
+    // （用户冷门书名、出版/实体书这类 scored=false 的条目都不应拉低基线）
     let mut cat_rates: HashMap<String, Vec<f64>> = HashMap::new();
-    for e in corpus.iter().filter(|e| e.builtin) {
+    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
         if let Some((hits, obs, _)) = per_key.get(&e.id) {
             if *obs >= MIN_CURATED_SAMPLES {
                 cat_rates
@@ -1310,14 +1380,20 @@ fn compute_source_rows(
     for r in runs {
         by_source.entry(r.source_url.clone()).or_default().push(r);
     }
-    // 参与计分的 category：每个 type 下至少含 1 条内置样本
+    // 参与计分的 category：每个 type 下至少含 1 条内置、且 scored=true 的样本
     let mut scoring_cats: HashMap<i64, HashSet<String>> = HashMap::new();
-    for e in corpus.iter().filter(|e| e.builtin) {
+    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
         scoring_cats
             .entry(e.source_type)
             .or_default()
             .insert(e.category.clone());
     }
+    // scored=false 的内置条目：照常跑、照常落库，但不进入 samples/hits/latency/分数。
+    let unscored_keys: HashSet<&str> = corpus
+        .iter()
+        .filter(|e| !e.scored)
+        .map(|e| e.id.as_str())
+        .collect();
 
     let mut out: Vec<SourceBenchRow> = Vec::new();
     for (url, list) in by_source.iter() {
@@ -1328,7 +1404,11 @@ fn compute_source_rows(
         let source_type = src.map(|s| s.book_source_type).unwrap_or(TYPE_NOVEL);
         let total = list.len() as i64;
         let excluded = list.iter().filter(|r| r.suspicious).count() as i64;
-        let usable: Vec<&BenchRun> = list.iter().filter(|r| !r.suspicious).copied().collect();
+        let usable: Vec<&BenchRun> = list
+            .iter()
+            .filter(|r| !r.suspicious && !unscored_keys.contains(r.corpus_key.as_str()))
+            .copied()
+            .collect();
         let obs = usable.len() as i64;
         // 只有真正拿到响应的样本才算“有效样本”：
         // 体检整批 deadline 到了还没发出的请求不能算样本，更不能按 latency=0 拿满分。
@@ -1733,6 +1813,12 @@ pub async fn run_bench(
     }
     tx.commit().await?;
 
+    // 体检也是真实搜索：把本批结果回写健康观测，并给冷启动一条“体检直通 preferred”的通路。
+    // 失败只告警，不让健康写回拖垮体检结果本身。
+    if let Err(e) = record_bench_health(pool, &rows, &by_url, cfg).await {
+        tracing::warn!(error = %e, "record bench health failed");
+    }
+
     // 重算精选：用当前库内最新分数（含本次批次），资格要求 preferred + 样本足够 + 未连续失败 2 批。
     let (novel_sel, comic_sel) = recompute_curated(pool, cfg).await?;
     let mut flags: HashMap<String, bool> = HashMap::new();
@@ -1761,6 +1847,74 @@ pub async fn run_bench(
         excluded_from_score: runs.iter().filter(|r| r.suspicious).count() as i64,
         suspicious,
     })
+}
+
+/// 冷启动直通的纯规则，供单测与写库共用。
+fn bench_fast_track_ok(row: &SourceBenchRow) -> bool {
+    row.samples >= MIN_CURATED_SAMPLES
+        && row.hit_rate > 0.0
+        && row.bench_score >= BENCH_FAST_TRACK_MIN_SCORE
+}
+
+/// 体检回写健康：每源每批折合成 1 条观测，再按 [`BENCH_FAST_TRACK_MIN_SCORE`] 直通 preferred。
+///
+/// - 有有效响应 → `ok`（parsed=true，hits=本批命中数）；全失败 → `partial`
+///   （按引擎类处理：不因为“体检没响应”把站点连续失败计数拉高、进而误隔离）。
+/// - `usage=true`：体检也是真实搜索，命中/搜索计数进入健康分口径。
+async fn record_bench_health(
+    pool: &SqlitePool,
+    rows: &[SourceBenchRow],
+    by_url: &HashMap<String, BookSource>,
+    cfg: &Config,
+) -> AppResult<()> {
+    let tier_cfg = crate::source_quality::TierConfig::from_config(cfg);
+    let outcomes: Vec<Outcome> = rows
+        .iter()
+        .map(|r| {
+            let ok = r.samples > 0;
+            let rule_complete = by_url
+                .get(&r.source_url)
+                .map(crate::source_quality::rule_completeness)
+                .unwrap_or(0.0);
+            Outcome {
+                source_url: r.source_url.clone(),
+                status: if ok {
+                    source_health::STATUS_OK
+                } else {
+                    source_health::STATUS_PARTIAL
+                },
+                latency_ms: r.avg_latency_ms,
+                error: if ok {
+                    None
+                } else {
+                    Some("bench: no usable response".into())
+                },
+                hits: r.hits,
+                parsed: ok,
+                usage: true,
+                rule_complete,
+            }
+        })
+        .collect();
+    source_health::record_outcomes(pool, &outcomes, cfg.source_cooldown_secs, &tier_cfg).await?;
+
+    let now = now_ms();
+    let promote = cfg.source_tier_promote_streak.max(1);
+    for r in rows.iter().filter(|r| bench_fast_track_ok(r)) {
+        sqlx::query(
+            "UPDATE source_health SET tier = ?1, promote_streak = MAX(promote_streak, ?2), \
+             demote_streak = 0, last_eval_at = ?3 \
+             WHERE source_url = ?4 AND tier <> ?5",
+        )
+        .bind(crate::source_quality::TIER_PREFERRED)
+        .bind(promote)
+        .bind(now)
+        .bind(&r.source_url)
+        .bind(crate::source_quality::TIER_QUARANTINED)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 fn category_medians(runs: &[BenchRun], corpus: &[CorpusEntry]) -> HashMap<String, f64> {
@@ -2071,7 +2225,28 @@ mod tests {
             norm_title: normalize_title(title),
             created_at: None,
             updated_at: None,
+            scored: true,
         }
+    }
+
+    /// 把内置常量转成运行时 CorpusEntry（与 load_corpus 的字段映射保持一致）。
+    fn builtin_entries() -> Vec<CorpusEntry> {
+        BUILTIN_CORPUS
+            .iter()
+            .map(|b| CorpusEntry {
+                id: builtin_id(b),
+                title: b.title.to_string(),
+                expected_author: b.expected_author.map(str::to_string),
+                category: b.category.to_string(),
+                source_type: b.source_type,
+                enabled: true,
+                builtin: true,
+                norm_title: normalize_title(b.title),
+                created_at: None,
+                updated_at: None,
+                scored: b.scored,
+            })
+            .collect()
     }
 
     #[test]
@@ -2235,6 +2410,113 @@ mod tests {
             is_hit("斗破苍穹番外篇", "斗破苍穹", None, None),
             "无期望作者时包含即命中"
         );
+    }
+
+    #[test]
+    fn fast_track_requires_samples_hit_and_score() {
+        let base = SourceBenchRow {
+            source_url: "u".into(),
+            name: "n".into(),
+            source_type: TYPE_NOVEL,
+            samples: 2,
+            hits: 1,
+            hit_rate: 0.4,
+            avg_latency_ms: 1200,
+            errors: 0,
+            error_kinds: serde_json::Value::Null,
+            bench_score: BENCH_FAST_TRACK_MIN_SCORE,
+            curated: false,
+            excluded_samples: 0,
+            per_category_hit_rate: Vec::new(),
+        };
+        assert!(bench_fast_track_ok(&base));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            samples: 1,
+            ..base.clone()
+        }));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            hit_rate: 0.0,
+            hits: 0,
+            ..base.clone()
+        }));
+        assert!(!bench_fast_track_ok(&SourceBenchRow {
+            bench_score: BENCH_FAST_TRACK_MIN_SCORE - 1,
+            ..base
+        }));
+    }
+
+    #[test]
+    fn salt_covers_all_24_builtin_entries() {
+        let corpus = builtin_entries();
+        let mut seen = HashSet::new();
+        // 12 次不同 salt：小说源覆盖 12 条小说语料，漫画源覆盖 12 条漫画语料。
+        for salt in 0..12 {
+            for ty in [TYPE_NOVEL, TYPE_COMIC] {
+                for e in pick_samples(&corpus, ty, 5, salt) {
+                    seen.insert(e.id);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            BUILTIN_CORPUS.len(),
+            "12 次抽样必须覆盖全部内置语料（旧实现固定只跑 10 条）"
+        );
+        // 单次盐值不应重复抽同一条
+        for salt in 0..12 {
+            let picked = pick_samples(&corpus, TYPE_COMIC, 5, salt);
+            let ids: HashSet<_> = picked.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(ids.len(), picked.len(), "同一批内不得重复抽样");
+        }
+    }
+
+    #[test]
+    fn scored_flags_and_comic_categories() {
+        let unscored: Vec<_> = BUILTIN_CORPUS.iter().filter(|b| !b.scored).collect();
+        assert_eq!(
+            unscored.len(),
+            3,
+            "出版/实体书 3 条（活着/平凡的世界/三体）标记为不计分"
+        );
+        assert!(unscored.iter().all(|b| b.source_type == TYPE_NOVEL));
+        let comic_cats: HashSet<_> = BUILTIN_CORPUS
+            .iter()
+            .filter(|b| b.source_type == TYPE_COMIC)
+            .map(|b| b.category)
+            .collect();
+        assert_eq!(
+            comic_cats,
+            HashSet::from(["日漫", "国漫"]),
+            "漫画语料按日漫/国漫拆分 category"
+        );
+    }
+
+    #[test]
+    fn judge_books_scans_top_results_without_loosening_is_hit() {
+        let mut item = entry("庆余年", "历史", TYPE_NOVEL, true);
+        item.expected_author = Some("猫腻".into());
+        let mut derivative = SearchBook::default();
+        derivative.name = Some("庆余年之无上之境".into());
+        derivative.author = Some("路人甲".into());
+        let mut exact = SearchBook::default();
+        exact.name = Some("庆余年".into());
+        exact.author = Some("猫腻".into());
+
+        // 衍生作排第一、原书排第二：旧实现（只看第一条）会误判为未命中
+        let (found, tm, am) = judge_books(&[derivative.clone(), exact.clone()], &item);
+        assert!(found && tm && am);
+
+        // 只有衍生作：仍然判未命中，is_hit 口径没有被放宽成“包含即可”
+        let (found, tm, _) = judge_books(&[derivative], &item);
+        assert!(!found);
+        assert!(tm, "标题包含仍应记录 title_match，但不能算命中");
+
+        // 只扫前 CHECK_TOP_N 条
+        let filler = vec![SearchBook::default(); CHECK_TOP_N];
+        let mut books = filler;
+        books.push(exact);
+        let (found, _, _) = judge_books(&books, &item);
+        assert!(!found, "第 {} 条之后不再匹配", CHECK_TOP_N + 1);
     }
 
     #[test]
