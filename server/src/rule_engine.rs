@@ -2163,9 +2163,20 @@ impl AnalyzeRule {
             let t = rule.trim();
             t.starts_with("{{") && t.ends_with("}}") && !t[2..t.len() - 2].contains("}}")
         };
+        // 局部模板（`{{$.a}}\n{{$.b}}`、`第{$.n}章`、`https://…/{{$.cover}}`）展开后是**字面量值**；
+        // Legado 里含模板的规则整条按模板求值，不会再把展开结果当 JSONPath/选择器。
+        // 此前 JSON 源被强制走 JSONPath，把值当路径报“必须以 $ 开头”，kind / cover_url /
+        // last_chapter 因此全空（pass4 真实日志 187 条）。
+        let had_template = rule.contains("{{") || rule.contains("{$");
         let rule = self.expand_vars(&rule, content);
         let rule = rule.trim().to_string();
         if whole_template && !rule.starts_with("{{") {
+            return Ok(rule);
+        }
+        // 模板展开后的字面量：Legado 里含 `{{…}}` 的规则整条按模板求值，结果直接返回，
+        // 不能当 JSONPath/选择器。仅当展开后仍带规则语法（`$.`、`<js>`、抽取后缀
+        // `@text`、`##` 等）时才继续走规则管道（如 `{{'a'}}@text`）。
+        if had_template && expanded_is_literal(&rule) {
             return Ok(rule);
         }
         if rule.is_empty() {
@@ -5084,6 +5095,40 @@ fn strip_prefix_ci<'a>(rule: &'a str, prefix: &str) -> &'a str {
     }
 }
 
+/// 模板展开后的整串是否就是最终值（而非还需要继续解析的规则）。
+/// 依据 Legado 语义：含 `{{…}}` 的规则整体按模板求值，展开结果即字段值；
+/// 只有仍带 `@text` 这类抽取后缀、`$.`/`@js:`/`<js>` 前缀或 `##`/`||` 管道时才继续解析。
+fn expanded_is_literal(rule: &str) -> bool {
+    let t = rule.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with('$') || t.starts_with('@') || starts_with_ci(t, "<js>") {
+        return false;
+    }
+    // 模板没能展开（变量/JS 失败后保留原文）：沿用旧行为继续解析，最终得到空值。
+    if t.contains("{{") || t.contains("{$") {
+        return false;
+    }
+    if t.starts_with('/') || t.starts_with(':') {
+        return false;
+    }
+    if t.contains("##") || t.contains("||") || t.contains("&&") || t.contains("%%") {
+        return false;
+    }
+    // `a@text` / `…@href`：模板拼出的选择器 + 抽取标记，仍需走规则管道。
+    // 值本身含 `@`（如邮箱）时尾段不是纯标识符，按字面量处理。
+    match t.rsplit_once('@') {
+        Some((pre, tail)) => {
+            !pre.is_empty()
+                && !tail
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        }
+        None => true,
+    }
+}
+
 fn contains_ci(haystack: &str, needle: &str) -> bool {
     haystack.to_ascii_lowercase().contains(needle)
 }
@@ -6414,6 +6459,34 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             ""
         );
         assert_eq!(ar.get_string("", "text.下一页@href", true, "").unwrap(), "");
+    }
+
+    // pass4 真实日志：JSON 源里“局部模板”展开后的字面量被当成 JSONPath 求值，
+    // 报“路径必须以 $ 开头”，kind / cover_url / last_chapter 全空（187 条）。
+    #[test]
+    fn partial_template_field_is_literal_on_json() {
+        let mut ar = AnalyzeRule::new();
+        ar.is_json = true;
+        let json = r#"{"categoryName":"玄幻","grade":"8.5","chapterNum":"184","NovelCover":"2020/09/x.jpg","title":"书名A"}"#;
+        // 免费追书 / 全免漫画的 kind：多段模板拼接
+        assert_eq!(
+            ar.get_string(json, "{{$.categoryName}}\n{{$.grade}}分", false, "")
+                .unwrap(),
+            "玄幻\n8.5分"
+        );
+        // 米读看书的 last_chapter：单花括号模板
+        assert_eq!(
+            ar.get_string(json, "第{$.chapterNum}章", false, "").unwrap(),
+            "第184章"
+        );
+        // SF 轻小说搜索的 coverUrl：URL 前缀 + 模板（该字段不是 is_url）
+        assert_eq!(
+            ar.get_string(json, "https://rs.x/{{$.NovelCover}}", false, "")
+                .unwrap(),
+            "https://rs.x/2020/09/x.jpg"
+        );
+        // 普通 JSONPath 不受影响
+        assert_eq!(ar.get_string(json, "$.title", false, "").unwrap(), "书名A");
     }
 
     #[test]
