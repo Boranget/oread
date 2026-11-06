@@ -296,30 +296,42 @@ try{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}catch(e){}\
 fin((H+2000)-y,y,1)},50)},50)}}\
 }catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'calib')}catch(x){}}})()";
 
-/// 全局错误兜底（ES5，注入 `<head>` 且在 `calib` 之前）：`window.onerror` 与各段
-/// `try/catch` 都走 `window.__kerr(msg, ln, stage)`，用 `<img>` 打点上报，**不依赖
-/// `load` 事件与 XHR**——v0.3.18 真机「探针一条没到」就是静默失败，这条保证下次
-/// 日志里能直接看到断在哪一段（`stage=gerr|calib|probe`）。
+/// 全局错误兜底 + 纵向手势拦截（ES5，注入 `<head>` 且在 `calib` 之前）。
+/// 错误：`window.onerror` 与各段 `try/catch` 都走 `window.__kerr(msg, ln, stage)`，
+/// 用 `<img>` 打点上报（`stage=gerr|calib|probe`），**不依赖 `load` 与 XHR**。
+/// 手势：真机已确认「正文连同顶栏、底栏一起移动」= 整页真实滚动，且该引擎里
+/// `position:fixed` 被当普通元素 + `pageYOffset` 恒 0，所以**纵向手势必须在这里吃掉**：
+/// 本页无横向滚动需求，整体拦截（`touchmove` 可取消就 `preventDefault`）；
+/// 只调 `preventDefault`，不碰 `touchstart/touchend`，因此不影响链接点击。
 const K_GUARD_JS: &str = "(function(){\
 function e(m,l,st){try{var i=new Image();\
 i.src='/api/k/probe?stage='+st+'&err='+encodeURIComponent((''+(m||'-')).substring(0,60))+\
 '&ln='+(l||0)+'&vw_param='+encodeURIComponent((''+(location.search||'')).substring(0,80))}catch(x){}}\
 function ke(m,s,l){e(m,l,'gerr');return false}\
-window.__kerr=e;window.onerror=ke})()";
+function tm(ev){try{if(ev.cancelable)ev.preventDefault()}catch(x){}}\
+window.__kerr=e;window.onerror=ke;\
+try{if(document.addEventListener){\
+var op=false;try{op={passive:false}}catch(x){}\
+document.addEventListener('touchmove',tm,op)}else if(document.attachEvent){document.attachEvent('ontouchmove',tm)}}catch(x){}\
+})()";
 
-/// 自报探针（ES5，零依赖，不重载页面）：**以 `<img>` 打点为主通道**（同步立即发一条
-/// `stage=sync`，`load` 时再补一条 `stage=load`，用户滑动后再补一条 `stage=scroll`），
-/// `XMLHttpRequest` 只作为 img `onerror` 时的可选回退，**不再是唯一通道**——v0.3.18
-/// 真机「探针一条没到」正是依赖 `load`+XHR 的教训。整段包在 `try/catch` 里，异常走
-/// `window.__kerr`（`stage=probe`）。
+/// 自报探针（ES5，零依赖，不重载页面）：**只保留 `<img>` 单通道**（v0.3.19 的教训：
+/// img 请求 204 触发 `onerror` 后又走 XHR = 每个 stage 打两条，统计翻倍）。
+/// 打点时机：`sync`（`setTimeout(...,0)` 延后到首次布局完成，避免 `inner_h=0`）、
+/// `load`、`scroll`、`touchmove`（200ms 节流）、`touchend`，后三者统一 `stage=move`
+/// 并用 `move_src` 区分来源。整段包在 `try/catch` 里，异常走 `window.__kerr`（`stage=probe`）。
 /// `innerWidth/innerHeight` 与 `documentElement.clientWidth/clientHeight` 同时上报，
 /// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；量不到的数一律填 `-`。
 /// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`；
 /// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`；
 /// v4 追加 `calib`（`ok`/`fail`，来自 `k_ck`）、`meas_y`、`bar_bottom`、`page_y`、
 /// `body_scroll_h` 与 `kfix`；
-/// v5 追加 `body_rect_bottom`、`lowest_el_bottom` 与 `stage`（sync/load/scroll），
-/// 用于区分「body 真实溢出」与「老 WebKit 钳制/可视视口平移」。
+/// v5 追加 `body_rect_bottom`、`lowest_el_bottom` 与 `stage`；
+/// v6（v0.3.20）：该引擎 `pageYOffset` 滚动时恒 0，位移改用
+/// `body.scrollTop || documentElement.scrollTop || pageYOffset`，并新增
+/// `doc_top`/`scroll_top_body`/`scroll_top_doc`/`max_seen`（生命周期最大位移）、
+/// `vv_off`（`visualViewport.pageTop`/`offsetTop`，不支持填 `-`）、`bar_rect_top`、
+/// `move_src`（touchmove/scroll/touchend）。
 const K_PROBE_JS: &str = "(function(){try{\
 function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
@@ -330,29 +342,42 @@ function bb(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingCl
 function bre(){var b=document.body;if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return '-'}}\
 function lb(){var b=document.body;if(!b||!b.children)return '-';var m=-1;try{for(var i=0;i<b.children.length;i++){\
 var r=b.children[i].getBoundingClientRect(),x=r.top+(r.height||(r.bottom-r.top));if(x>m)m=x}}catch(e){return '-'}return m>=0?Math.round(m):'-'}\
+function stb(){try{return (document.body&&document.body.scrollTop)||0}catch(e){return 0}}\
+function std(){try{var d=document.documentElement;return (d&&d.scrollTop)||0}catch(e){return 0}}\
+var max_seen=0;\
+function py(){var y=stb();if(!y)y=std();if(!y)y=(window.pageYOffset||0);\
+y=Math.round(y);if(y>max_seen)max_seen=y;return y}\
+function vo(){try{var vv=window.visualViewport;if(!vv)return '-';\
+var t=(typeof vv.pageTop=='number')?vv.pageTop:vv.offsetTop;\
+return typeof t=='number'?Math.round(t):'-'}catch(e){return '-'}}\
 function qs(ev){var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
-st=document.getElementById('k-stage'),ock=ck('k_ck');\
+st=document.getElementById('k-stage'),ock=ck('k_ck'),sb=stb(),sd=std();\
 return 'vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
 '&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname)+\
 '&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
 '&outer_w='+v(window.outerWidth)+'&outer_h='+v(window.outerHeight)+\
 '&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight)+\
-'&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+\
-'&page_y='+v(window.pageYOffset||0)+'&body_scroll_h='+v(b&&b.scrollHeight)+\
+'&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+'&bar_rect_top='+bt()+\
+'&page_y='+py()+'&doc_top='+sd+'&scroll_top_body='+sb+'&scroll_top_doc='+sd+'&max_seen='+max_seen+'&vv_off='+vo()+\
+'&body_scroll_h='+v(b&&b.scrollHeight)+\
 '&body_rect_bottom='+bre()+'&lowest_el_bottom='+lb()+'&scroll_evt='+(ev?1:0)+\
 '&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix')}\
-function xh(u){try{if(!window.XMLHttpRequest)return;var x=new XMLHttpRequest();\
-x.open('GET',u,true);x.send(null)}catch(e){}}\
-function s(stage){try{var u='/api/k/probe?'+qs(stage=='scroll'?1:0)+'&stage='+stage;\
-try{var i=new Image();i.onerror=function(){xh(u)};i.src=u}catch(e){xh(u)}}catch(e){\
+function s(stage,src){try{var u='/api/k/probe?'+qs(src=='scroll'?1:0)+\
+'&stage='+stage+'&move_src='+(src||'-');var i=new Image();i.src=u}catch(e){\
 try{window.__kerr&&window.__kerr((e&&e.message)||e,0,'probe')}catch(x){}}}\
-var fired=0;s('sync');\
-function ld(){s('load')}\
-function rs(){if(fired)return;fired=1;s('scroll')}\
+var last=0;\
+function mv(src){var t=new Date().getTime();if(t-last<200)return;last=t;s('move',src)}\
+function tm(){mv('touchmove')}\
+function te(){last=0;s('move','touchend')}\
+function ld(){s('load','-')}\
+function rs(){mv('scroll')}\
+setTimeout(function(){s('sync','-')},0);\
 if(window.addEventListener){window.addEventListener('load',ld,false);\
-window.addEventListener('scroll',rs,false)}\
-else if(window.attachEvent){window.attachEvent('onload',ld);window.attachEvent('onscroll',rs)}\
+window.addEventListener('scroll',rs,false);document.addEventListener('touchmove',tm,false);\
+document.addEventListener('touchend',te,false)}\
+else if(window.attachEvent){window.attachEvent('onload',ld);window.attachEvent('onscroll',rs);\
+document.attachEvent('ontouchmove',tm);document.attachEvent('ontouchend',te)}\
 }catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'probe')}catch(x){}}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
@@ -761,15 +786,21 @@ fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp) -> String
     )
 }
 
-fn read_only_css() -> String {
+fn read_only_css(vp: Vp) -> String {
     format!(
-        "html,body{{height:100%;overflow:hidden}}\
-         #k-read-nav{{position:fixed;top:0;left:0;right:0;height:{nav}px;padding:0 {pad}px;background:#fff;border-bottom:1px solid #000;z-index:12}}\
+        // 「硬性不可滚动」：根元素与 body 都改成 fixed（老引擎里 fixed 仍锚布局视口，
+        // 但这里再配合像素高 + overflow:hidden，文档层面就完全没有可滚动余量；
+        // 剩下的“能平移”只能来自 Silk 的可视视口平移，需靠 touchmove 拦截）。
+        // 像素高直接用 `visibleH − SAFE_BOTTOM`（老引擎不支持 calc，不能写表达式）。
+        // 顶栏/正文/底栏仍以 body 为包含块（absolute），几何不变。
+        "html,body{{position:fixed;top:0;left:0;width:100%;height:{doc}px;overflow:hidden;overscroll-behavior:none}}\
+         #k-read-nav{{position:absolute;top:0;left:0;right:0;height:{nav}px;padding:0 {pad}px;background:#fff;border-bottom:1px solid #000;z-index:12}}\
          #k-read-nav table{{width:100%;table-layout:fixed;border-collapse:collapse}}\
          #k-read-nav td{{height:{tdh}px;padding:0;font-size:20px;line-height:28px;vertical-align:middle;overflow:hidden;white-space:nowrap;color:#000}}\
          #k-read-nav td a{{display:block;height:{tdh}px;line-height:{tdh}px;color:#000;text-decoration:none}}\
          #k-stage{{position:absolute;top:{nav}px;left:{pad}px;right:{pad}px;bottom:{safe}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
+        doc = vp.layout_h(),
         pad = SIDE_PAD,
         nav = READ_NAV_H,
         tdh = READ_NAV_H - 1,
@@ -1992,7 +2023,7 @@ async fn read(
         ),
         bottom = bottom
     );
-    let mut res = page_css(&ch_title, fs, &body, &read_only_css(), vp);
+    let mut res = page_css(&ch_title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2129,7 +2160,7 @@ async fn comic_read(
         ),
         bottom = bottom
     );
-    let mut res = page_css(&title, fs, &body, &read_only_css(), vp);
+    let mut res = page_css(&title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2771,28 +2802,40 @@ mod tests {
             "lowest_el_bottom=",
             "scroll_evt=",
             "stage=",
+            "doc_top=",
+            "scroll_top_body=",
+            "scroll_top_doc=",
+            "max_seen=",
+            "vv_off=",
+            "bar_rect_top=",
+            "move_src=",
         ] {
-            assert!(K_PROBE_JS.contains(f), "探针 v3/v4/v5 字段缺失：{f}");
+            assert!(K_PROBE_JS.contains(f), "探针 v3~v6 字段缺失：{f}");
         }
         assert!(
             K_PROBE_JS.contains("addEventListener('scroll',rs,false)"),
-            "必须注册一次 scroll 事件补报滑动后的证据：{K_PROBE_JS}"
+            "必须注册 scroll 事件补报滑动后的证据：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("addEventListener('touchmove',tm,false)")
+                && K_PROBE_JS.contains("addEventListener('touchend',te,false)"),
+            "滑动过程必须连续打点（touchmove 节流 + touchend）：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("if(t-last<200)return"),
+            "touchmove/scroll 打点必须 200ms 节流，避免洪水：{K_PROBE_JS}"
         );
         assert!(
             K_PROBE_JS.contains("var i=new Image()"),
-            "img 打点是主通道，不依赖 load/XHR：{K_PROBE_JS}"
+            "img 打点是唯一通道，不依赖 load/XHR：{K_PROBE_JS}"
         );
         assert!(
-            K_PROBE_JS.contains("s('sync')"),
-            "必须在脚本执行后同步立即打一条：{K_PROBE_JS}"
+            K_PROBE_JS.contains("setTimeout(function(){s('sync','-')},0)"),
+            "sync 必须延后到首次布局后再发（否则 inner_h=0）：{K_PROBE_JS}"
         );
         assert!(
-            K_PROBE_JS.contains("i.onerror=function(){xh(u)}"),
-            "XHR 只能作为 img 失败时的可选回退：{K_PROBE_JS}"
-        );
-        assert!(
-            html.contains("window.__kerr") && html.contains("window.onerror"),
-            "必须在 calib 之前注册全局错误兜底"
+            !K_PROBE_JS.contains("XMLHttpRequest"),
+            "不得再有 XHR 回退通道（同 stage 会重复打点）：{K_PROBE_JS}"
         );
         assert!(
             K_PROBE_JS.contains("ck('k_ck')"),
@@ -2808,11 +2851,18 @@ mod tests {
         );
         assert!(
             !K_PROBE_JS.contains("Promise") && !K_PROBE_JS.contains("fetch("),
-            "探针必须是 ES5（XHR，不用 Promise/fetch）"
+            "探针必须是 ES5（img 单通道，不用 Promise/fetch）"
         );
         assert!(
             !K_PROBE_JS.contains("location.replace") && !K_PROBE_JS.contains("location.href"),
             "探针不得改写 location（不能引起额外重载）"
+        );
+        assert!(
+            html.contains("window.__kerr")
+                && html.contains("window.onerror")
+                && html.contains("addEventListener('touchmove',tm,")
+                && html.contains("function tm(ev){try{if(ev.cancelable)ev.preventDefault()}"),
+            "必须在 calib 之前注册全局错误兜底与纵向手势拦截"
         );
         assert!(
             html.contains("location.replace"),
@@ -2962,15 +3012,20 @@ mod tests {
         assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
     }
 
-    /// 一屏一页（不依赖参数视口是否准确）：`#k-stage` 绝对定位填满「可见区 − 76」，
-    /// 底栏 `absolute;bottom:0` 相对 `body`（`body` 高 = `visibleH − 12`）贴可见区底；
-    /// 文档高由 `calib_js()` 按**标定出的真实可见高**锁成 `visibleH − 12`，永远比可见高矮。
+    /// 一屏一页（不依赖参数视口是否准确）：根元素与 body 都硬锁成 `visibleH − 12` 像素高、
+    /// `overflow:hidden`，文档层面无可滚动余量；顶栏/正文/底栏全部以 body 为包含块（absolute）。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
-        let css = read_only_css();
+        // 真机标定值 vh=1224 → 文档高 = 1224 − 12 = 1212
+        let dev = vps(1072, 1224);
+        let css = read_only_css(dev);
         assert!(
-            css.contains("html,body{height:100%;overflow:hidden}"),
-            "{css}"
+            css.contains("html,body{position:fixed;top:0;left:0;width:100%;height:1212px;overflow:hidden;overscroll-behavior:none}"),
+            "根元素与 body 必须硬锁成 1212px 且不可滚动：{css}"
+        );
+        assert!(
+            !css.contains("height:100%"),
+            "硬锁必须写像素高（老引擎不支持 calc）：{css}"
         );
         // 老引擎可能在「文档高 == 视口高」时仍画滚动条：根元素与正文区都要显式关掉滚动条绘制
         let html_css = page_html_css("测试", 2, "", "", vp());
@@ -3076,15 +3131,15 @@ mod tests {
             "正文区必须从 56px 顶栏下沿开始、底边让出 76：{css}"
         );
         assert!(
-            css.contains("#k-read-nav{position:fixed;top:0;left:0;right:0;height:56px;padding:0 36px;background:#fff;border-bottom:1px solid #000;z-index:12}"),
-            "顶栏必须固定贴顶、白底 1px 分隔线，且 z-index 高于热区(5)：{css}"
+            css.contains("#k-read-nav{position:absolute;top:0;left:0;right:0;height:56px;padding:0 36px;background:#fff;border-bottom:1px solid #000;z-index:12}"),
+            "顶栏必须以 body 为包含块贴顶（老引擎 fixed 不可靠）、白底 1px 分隔线，且 z-index 高于热区(5)：{css}"
         );
         assert!(
             !css.contains("height:1180px"),
             "正文容器不得再写死像素高：{css}"
         );
         let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp());
-        assert!(html.contains("html,body{height:100%;overflow:hidden}"));
+        assert!(html.contains("html,body{position:fixed;top:0;left:0;width:100%;height:1212px;overflow:hidden;overscroll-behavior:none}"));
         assert!(
             html.contains("html{-webkit-text-size-adjust:none;height:100%;overflow:hidden}"),
             "{html}"
@@ -3132,7 +3187,7 @@ mod tests {
         assert!(short.contains(">三体<"), "{short}");
         // 顶栏整格可点（链接 display:block 撑满 55px），热区又让开 56px
         assert!(
-            read_only_css().contains("z-index:12"),
+            read_only_css(v).contains("z-index:12"),
             "顶栏须高于热区/底栏"
         );
     }
