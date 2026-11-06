@@ -508,6 +508,15 @@ pub struct ProbeLine {
     /// v4：URL 上是否还带旧版 `kfix` 闩锁（1/0/空）
     #[serde(default)]
     pub kfix: Option<String>,
+    /// v5：`body` 的 `getBoundingClientRect().bottom`，判断 `body` 是否真的超出可见区
+    #[serde(default)]
+    pub body_rect_bottom: Option<String>,
+    /// v5：`body` 直接子元素 `top+height` 的最大值（漏排/贴底元素是否越界）
+    #[serde(default)]
+    pub lowest_el_bottom: Option<String>,
+    /// v5：是否为用户滑动后补报（1 = scroll 事件触发的那条）
+    #[serde(default)]
+    pub scroll_evt: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -546,6 +555,9 @@ pub struct ProbeQ {
     pub page_y: Option<String>,
     pub body_scroll_h: Option<String>,
     pub kfix: Option<String>,
+    pub body_rect_bottom: Option<String>,
+    pub lowest_el_bottom: Option<String>,
+    pub scroll_evt: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -598,6 +610,9 @@ pub async fn probe(
         page_y: norm(q.page_y),
         body_scroll_h: norm(q.body_scroll_h),
         kfix: norm(q.kfix),
+        body_rect_bottom: norm(q.body_rect_bottom),
+        lowest_el_bottom: norm(q.lowest_el_bottom),
+        scroll_evt: norm(q.scroll_evt),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -886,6 +901,9 @@ mod tests {
             page_y: Some("0".into()),
             body_scroll_h: Some("1168".into()),
             kfix: Some("0".into()),
+            body_rect_bottom: Some("1168".into()),
+            lowest_el_bottom: Some("1168".into()),
+            scroll_evt: Some("0".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -919,6 +937,9 @@ mod tests {
             "page_y",
             "body_scroll_h",
             "kfix",
+            "body_rect_bottom",
+            "lowest_el_bottom",
+            "scroll_evt",
             "fs",
             "ua_class",
             "ua",
@@ -972,6 +993,9 @@ mod tests {
             page_y: Some(" 12 ".into()),
             body_scroll_h: Some(long.clone()),
             kfix: Some("1".into()),
+            body_rect_bottom: Some(long.clone()),
+            lowest_el_bottom: Some(long.clone()),
+            scroll_evt: Some("1".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -997,7 +1021,13 @@ mod tests {
         assert_eq!(norm(p.meas_y).as_deref(), Some("0"));
         assert_eq!(norm(p.page_y).as_deref(), Some("12"));
         assert_eq!(norm(p.kfix).as_deref(), Some("1"));
-        for v in [norm(p.bar_bottom), norm(p.body_scroll_h)] {
+        assert_eq!(norm(p.scroll_evt).as_deref(), Some("1"));
+        for v in [
+            norm(p.bar_bottom),
+            norm(p.body_scroll_h),
+            norm(p.body_rect_bottom),
+            norm(p.lowest_el_bottom),
+        ] {
             assert_eq!(
                 v.unwrap().chars().count(),
                 PROBE_LIMIT,
