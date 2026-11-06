@@ -6,13 +6,14 @@
 //! - 版心 1000px（左右各留 36px）；顶栏 73px（72 内容 + 1px 线）。
 //! - **版面基准是「真实可见高」`visibleH`**，不是 `clientHeight`（1268）：Silk 的
 //!   布局视口比可见区高，`bottom:0` 会把它底栏顶到可见区之外。`calib_js` 在 `<head>`
-//!   用「文档撑高 → 滚到底 → 文档高−最大滚动量」标定 `visibleH`，写 Cookie `k_vh`，
-//!   再把 `html` 高度锁成 `visibleH − SAFE_BOTTOM(12)`（严格小于可见高）。
+//!   用「文档撑高 → 滚到底（延时两次采样，老 Silk 滚动是异步的） → 文档高−最大滚动量」
+//!   标定 `visibleH`，写 Cookie `k_vh`，再把 `html` 高度锁成 `visibleH − SAFE_BOTTOM(12)`
+//!   （严格小于可见高）；标定失败回退 `clientHeight − 24`，最终文档 = `clientHeight − 36`。
 //! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
 //!   不用 `border-radius`；底栏与贴底元素用 `position:absolute`（相对 `body`，`body` 为
 //!   `position:relative` 且高 = `visibleH − 12`），不用 transform/transition。
-//! - 两个内联脚本：视口标定（`calib_js`，ES5、`kfix` 最多重载一次）、自报探针
-//!   （`K_PROBE_JS`，不重载）；其余翻页/切换字号全部是真实链接。
+//! - 两个内联脚本：视口标定（`calib_js`，ES5、`sessionStorage` 一次性去环，**不再写 `kfix`** 闩锁）、
+//!   自报探针（`K_PROBE_JS`，v4，不重载）；其余翻页/切换字号全部是真实链接。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -65,6 +66,10 @@ const BAR_H: usize = 64;
 /// 实测可见高 `visibleH`（见 `calib_js`）：文档高锁成 `visibleH − 12`，**严格小于**
 /// 可见高，既不出滚动条，也不会让贴底元素溢到第二屏。
 const SAFE_BOTTOM: usize = 12;
+/// 标定失败时的兜底差额：`visibleH = clientHeight − 24`（真机 `clientHeight=1268` 时
+/// 得 1244，与实测可见高一致），再减去 `SAFE_BOTTOM`，最终文档高 = `clientHeight − 36`
+/// = 1232，比真实可见高再留 12px 硬余量，底栏底边 1232 仍在可见区内。
+const CALIB_FALLBACK_GAP: usize = 24;
 /// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，
 /// 四档字号只各让出 1–2 行；顶栏固定贴视口顶，正文区从它下沿开始。
 const READ_NAV_H: usize = 56;
@@ -210,32 +215,49 @@ const K_FS_COOKIE: &str = "k_fs";
 ///   2. 临时把 `html` 撑到 `H + 2000`，并临时把 `html` 的 `overflow` 改成 `visible`
 ///      （页面 CSS 里根元素是 `overflow:hidden`，会传播到视口、让 `scrollTo` 完全无效），
 ///      再 `scrollTo(0, 3000)` 滚到底；
-///   3. 读 `scrollY`（最大滚动量），则 `visibleH = (H + 2000) − scrollY`；
-///   4. 先复原高度、`scrollTo(0, 0)`，再复原 `overflow`（放在 `finally` 里，异常也不留后患）；
-///   5. 守卫：`scrollY <= 0` 或 `visibleH` 不在 `[200, H]` 内 → 标定失败，回退 `H − 12`。
+///   3. **不能立刻读 `scrollY`**：老 Silk 的滚动是异步的（真机上立即读恒为 0，这正是
+///      之前一直走回退值的原因）。改为 `setTimeout(50)` 后连采两次，取较大值 `y`；
+///   4. 复原高度、`scrollTo(0, 0)`、`overflow` 与 `visibility`（测量期间整页 `hidden`，
+///      避免 e-ink 上出现“撑高再回弹”的残影）；
+///   5. 守卫：`y <= 0` 或 `visibleH = (H + 2000) − y` 不在 `[200, H]` 内 → 标定失败，
+///      回退 `H − CALIB_FALLBACK_GAP`（24）。
 ///
 /// 结果写 Cookie `k_vh`（Path=/，30 天）；**后续页面优先读它、不再重复标定**。
-/// 参数 `vh` 与 `visibleH` 不一致时用 `location.replace` 带 `vh=visibleH` 重载一次
-/// （`kfix=1` 防循环），让服务端按真实可见高重算行预算与全部像素几何。
+/// 参数 `vh` 与 `visibleH` 不一致时用 `location.replace` 带 `vh=visibleH` 重载，
+/// 让服务端按真实可见高重算行预算与全部像素几何；**不再写 `kfix` 永久闩锁**，
+/// 去环只靠 `sessionStorage.k_vhfix`（只挡连续两次，`vh` 对上后即清除）。
 /// 文档高统一锁成 `visibleH − SAFE_BOTTOM`，**严格小于**可见高。
 fn calib_js() -> String {
     format!(
         "(function(){{var d=document.documentElement,W=innerWidth,H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight;\
-var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
+var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,dV='',done=0;\
 for(var i=0;i<p.length;i++){{var k=p[i].split('=')[0];\
-if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}}\
-function ck(){{var m=new RegExp('(?:^|; )k_vh=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):0}}\
-function meas(){{try{{var oldH=d.style.height,oldO=d.style.overflow,y=0;\
-try{{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);\
-y=window.scrollY||window.pageYOffset||0;}}finally{{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO;}}\
-var v=(H+2000)-y;if(y>0&&v>200&&v<=H)return Math.round(v);}}catch(e){{}}return 0}}\
-var V=ck();if(!(V>200&&V<=H))V=meas();\
-if(!V)V=H-{safe};\
-try{{document.cookie='k_vh='+V+'; path=/; max-age=2592000';}}catch(e){{}}\
-try{{if(V>{min})d.style.height=(V-{safe})+'px';}}catch(e){{}}\
-if(!f&&W>0&&V>0&&(vw!=W||vh!=V)){{o.push('vw='+W,'vh='+V,'kfix=1');\
-location.replace(location.pathname+'?'+o.join('&'));}}}})()",
+if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k!='kfix'&&p[i])o.push(p[i]);}}\
+function ck(n){{var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):-1}}\
+function sy(){{return window.scrollY||window.pageYOffset||0}}\
+function rep(V){{if(!W||!V)return;\
+if(vw==W&&vh==V){{try{{sessionStorage.removeItem('k_vhfix')}}catch(e){{}}return}}\
+var once=0;try{{once=sessionStorage.getItem('k_vhfix')=='1'}}catch(e){{}}\
+if(once)return;try{{sessionStorage.setItem('k_vhfix','1')}}catch(e){{}}\
+o.push('vw='+W,'vh='+V);location.replace(location.pathname+'?'+o.join('&'))}}\
+function fin(V,y,meas){{if(done)return;done=1;try{{d.style.visibility=dV}}catch(e){{}}\
+var okv=(V>200&&V<=H)?1:0;if(!okv)V=H-{gap};\
+if(meas){{try{{document.cookie='k_ck='+okv+'; path=/';\
+document.cookie='k_my='+y+'; path=/'}}catch(e){{}}}}\
+try{{document.cookie='k_vh='+V+'; path=/; max-age=2592000'}}catch(e){{}}\
+try{{if(V>{min})d.style.height=(V-{safe})+'px'}}catch(e){{}}\
+rep(V)}}\
+var V=ck('k_vh');if(V>200&&V<=H){{fin(V,-1,0)}}else{{\
+var oldH=d.style.height,oldO=d.style.overflow,y1=0,y2=0,ok=0;\
+dV=d.style.visibility;d.style.visibility='hidden';\
+try{{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);ok=1}}\
+catch(e){{try{{d.style.height=oldH;d.style.overflow=oldO}}catch(x){{}}}}\
+if(!ok){{fin(0,0,0)}}else{{setTimeout(function(){{y1=sy();\
+setTimeout(function(){{y2=sy();var y=y1>y2?y1:y2;\
+try{{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}}catch(e){{}}\
+fin((H+2000)-y,y,1)}},50)}},50)}}}}}})()",
         safe = SAFE_BOTTOM,
+        gap = CALIB_FALLBACK_GAP,
         min = 400
     )
 }
@@ -249,19 +271,26 @@ location.replace(location.pathname+'?'+o.join('&'));}}}})()",
 /// 遮住了一部分（此时即使文档高 = `clientHeight` 仍会露滚动条），量不到的数一律填 `-`。
 /// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`（底栏实际 top），用于真机自证
 /// 「标定出的可见高」与「底栏是否落在可见区内」。
+/// v4 追加 `calib`（`ok`/`fail`，来自标定脚本写的 `k_ck`）、`meas_y`（实测最大滚动量，
+/// 失败时也会上报，不再静默回退）、`bar_bottom`（底栏底边）、`page_y`（当前 `pageYOffset`，
+/// 区分「浏览器平移」与「文档真溢出」）、`body_scroll_h` 与 `kfix`（URL 上是否带旧闩锁）。
 const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
-function ck(){var m=new RegExp('(?:^|; )k_vh=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
-function bt(){var b=document.getElementById('k-bar');if(!b)return '-';try{var r=b.getBoundingClientRect();return Math.round(r.top)}catch(e){return b.offsetTop}}\
+function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
+function bar(){return document.getElementById('k-bar')}\
+function bt(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().top)}catch(e){return b.offsetTop}}\
+function bb(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return b.offsetTop+b.offsetHeight}}\
 function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
-st=document.getElementById('k-stage');\
+st=document.getElementById('k-stage'),ock=ck('k_ck');\
 var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
 '&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname)+\
 '&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
 '&outer_w='+v(window.outerWidth)+'&outer_h='+v(window.outerHeight)+\
 '&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight)+\
-'&visible_h='+ck()+'&bar_top='+bt();\
+'&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+\
+'&page_y='+v(window.pageYOffset||0)+'&body_scroll_h='+v(b&&b.scrollHeight)+\
+'&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix');\
 var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
 if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
 else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
@@ -2629,7 +2658,11 @@ mod tests {
             html.contains("</style><script>(function(){"),
             "视口标定脚本必须进 head，首帧就生效"
         );
-        assert!(html.contains("kfix=1"), "标定脚本必须带防循环标记");
+        assert!(
+            html.contains("sessionStorage"),
+            "去环要靠 sessionStorage 一次性标记（不再写 kfix 闩锁）"
+        );
+        assert!(!html.contains("kfix=1"), "不得再带 kfix 永久闩锁");
         assert!(
             html.contains("/api/k/probe?"),
             "探针必须上报到 /api/k/probe"
@@ -2644,9 +2677,23 @@ mod tests {
             "stage_h=",
             "visible_h=",
             "bar_top=",
+            "bar_bottom=",
+            "page_y=",
+            "body_scroll_h=",
+            "calib=",
+            "meas_y=",
+            "kfix=",
         ] {
-            assert!(K_PROBE_JS.contains(f), "探针 v3 字段缺失：{f}");
+            assert!(K_PROBE_JS.contains(f), "探针 v3/v4 字段缺失：{f}");
         }
+        assert!(
+            K_PROBE_JS.contains("ck('k_ck')"),
+            "calib 必须来自标定脚本写的 k_ck Cookie"
+        );
+        assert!(
+            K_PROBE_JS.contains("ck('k_my')"),
+            "meas_y 必须来自 k_my Cookie（失败时也能上报）"
+        );
         assert!(
             K_PROBE_JS.contains("getElementById('k-stage')"),
             "stage_h 必须取 #k-stage 的 clientHeight"
@@ -2816,23 +2863,33 @@ mod tests {
             "根元素是 overflow:hidden，测量前必须临时放开，否则 scrollTo 无效：{calib}"
         );
         assert!(
-            calib.contains(
-                "finally{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO;}"
-            ),
-            "高度与 overflow 必须无条件复原（异常也不留后患）：{calib}"
+            calib.contains("setTimeout(function(){y1=sy()"),
+            "老 Silk 滚动是异步的，必须延时后再采第一次：{calib}"
+        );
+        assert!(
+            calib.contains("setTimeout(function(){y2=sy();var y=y1>y2?y1:y2;"),
+            "必须两次采样并取较大值：{calib}"
+        );
+        assert!(
+            calib.contains("d.style.visibility='hidden'"),
+            "测量期间整页隐藏，避免 e-ink 上「撑高再回弹」的残影：{calib}"
+        );
+        assert!(
+            calib.contains("try{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}"),
+            "高度、滚动位置与 overflow 必须复原：{calib}"
         );
         assert!(calib.contains("window.scrollTo(0,3000)"), "{calib}");
         assert!(
-            calib.contains("v=(H+2000)-y"),
+            calib.contains("(H+2000)-y"),
             "可见高 = 文档高 − 最大滚动量：{calib}"
         );
         assert!(
-            calib.contains("y>0&&v>200&&v<=H"),
+            calib.contains("var okv=(V>200&&V<=H)?1:0"),
             "标定失败必须回退而不是写坏值：{calib}"
         );
         assert!(
-            calib.contains("V=H-12"),
-            "回退值 = clientHeight − 12：{calib}"
+            calib.contains("if(!okv)V=H-24"),
+            "回退值 = clientHeight − 24：{calib}"
         );
         assert!(
             calib.contains("k_vh="),
@@ -2843,7 +2900,22 @@ mod tests {
             calib.contains("location.replace"),
             "参数不符时要重载一次：{calib}"
         );
-        assert!(calib.contains("kfix=1"), "必须有防循环标记：{calib}");
+        assert!(
+            calib.contains("sessionStorage"),
+            "去环必须靠 sessionStorage 一次性标记，不能再写 kfix 永久闩锁：{calib}"
+        );
+        assert!(
+            !calib.contains("kfix=1"),
+            "replace 时不得再带 kfix（否则 vh 永远同步不到真实值）：{calib}"
+        );
+        assert!(
+            calib.contains("k_ck="),
+            "标定结果（ok/fail）要写 Cookie 供探针上报：{calib}"
+        );
+        assert!(
+            calib.contains("k_my="),
+            "实测滚动量要写 Cookie，失败时也能上报：{calib}"
+        );
         assert!(
             calib.contains("d.style.height=(V-12)+'px'"),
             "文档高锁成 visibleH − 12（严格小于可见高）：{calib}"
