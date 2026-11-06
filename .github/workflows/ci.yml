@@ -24,12 +24,13 @@ env:
 # 「本机绿、云端红」的漂移（v0.3.10 起 clippy 1.99 新 lint 曾让 check 全线变红）。
 
 jobs:
+  # ------------------------------------------------------------------ 
+  # Rust：fmt / clippy / test，全部 debug 构建。
+  # release（opt-level=z + fat LTO）只在 tag / 手动触发的平台 job 跑，
+  # 避免每次 push 都付出数分钟链接成本。
   # ------------------------------------------------------------------
-  # 校验与测试：分支 push / PR / tag 全部必跑。
-  # tag 也跑是为了让 Release 建立在「测试已通过」之上，而不是只有分支才测。
-  # ------------------------------------------------------------------
-  check:
-    name: check + test (linux x86_64)
+  rust:
+    name: rust check + test (linux x86_64, debug)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -44,6 +45,31 @@ jobs:
           workspaces: server
           key: linux-gnu
 
+      # 代码洁净度门禁：格式化与 clippy 全部零容忍（-D warnings）。
+      # 版本严格跟随 rust-toolchain.toml：不要用 `cargo +stable` 或
+      # 升级 runner 默认工具链，否则 clippy 的 lint 集合会与本地分叉。
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  # ------------------------------------------------------------------
+  # 前端：单测 + 构建 + Svelte 检查 + 首屏体积门禁。
+  # ------------------------------------------------------------------
+  web:
+    name: frontend test + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server/web
+
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -51,38 +77,57 @@ jobs:
           cache: npm
           cache-dependency-path: server/web/package-lock.json
 
-      # 前端先构建：ServeDir 是运行期相对路径（web/dist），不在编译期内嵌，
-      # 但保持「先出 dist 再编 Rust」的现场顺序，便于排查。
       - name: Install frontend deps
-        working-directory: server/web
         run: npm ci
 
+      - name: Frontend tests
+        run: npm test
+
       - name: Build frontend
-        working-directory: server/web
         run: npm run build
 
       # Svelte 类型/模板检查：0 error 才通过（现存 a11y 类 warning 不阻断）。
       - name: Svelte check
-        working-directory: server/web
         run: npm run check
 
       # 首屏体积门禁：口径 = 入口 chunk + 其静态 import 的 chunk（gzip），
-      # 不是 dist/*.js 总量。阈值在 scripts/budget.json。
-      # 脚本与 budget.json 在仓库根目录的 scripts/，必须显式覆盖 job 级的 server/。
+      # 不是 dist/*.js 总量。阈值在 scripts/budget.json；
+      # 脚本在仓库根目录，需显式把工作目录切回根。
       - name: Budget gate (frontend)
         working-directory: .
         run: node scripts/check-budget.mjs --frontend-only
 
-      # /k 墨水屏样式门禁：只扫 server/src/routes/kindle.rs 的内联 CSS，
-      # 排除 fn selftest 诊断样例；SPA（web/src）不在此约束内。
-      - name: Eink CSS gate (/k only)
-        working-directory: .
+  # ------------------------------------------------------------------
+  # /k 墨水屏样式门禁：扫描 kindle.rs 与 kindle/ 子模块，排除 selftest。
+  # ------------------------------------------------------------------
+  eink:
+    name: eink css gate (/k)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Eink CSS gate
         run: node scripts/eink-lint.mjs
 
-      # 迁移字节门禁（构建前）：索引/工作区全 LF，且工作区字节与索引 blob 完全一致。
-      # 内嵌字节（sqlx::migrate! 的 include_str!）由 tests/migrations_lf.rs 在 cargo test 中断言。
+  # ------------------------------------------------------------------
+  # 迁移字节门禁：索引/工作区全 LF，且工作区字节与索引 blob 完全一致。
+  # 内嵌字节（sqlx::migrate! 的 include_str!）由 cargo test 中的
+  # tests/migrations_lf.rs 断言。
+  # ------------------------------------------------------------------
+  migrations:
+    name: migrations LF gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Migrations LF gate
-        working-directory: .
         run: |
           set -euo pipefail
           bad_eol=$(git ls-files --eol server/migrations | grep -c 'crlf' || true)
@@ -103,22 +148,6 @@ jobs:
             }
           done
           echo "migrations LF gate: PASS"
-
-      # 代码洁净度门禁：格式化与 clippy 全部零容忍（-D warnings）。
-      # 迁移文件为 .sql，cargo fmt 只处理 .rs，不会改动 migrations 的血缘字节。
-      # 版本严格跟随 rust-toolchain.toml 的 1.96.0：不要用 `cargo +stable` 或
-      # 升级 runner 默认工具链，否则 clippy 的 lint 集合会与本地分叉。
-      - name: cargo fmt --check
-        run: cargo fmt --check
-
-      - name: cargo clippy (-D warnings)
-        run: cargo clippy --all-targets --locked -- -D warnings
-
-      - name: cargo build --release
-        run: cargo build --release --locked
-
-      - name: cargo test
-        run: cargo test --locked
 
   # ------------------------------------------------------------------
   # tag v* / 手动触发：三平台产物
@@ -294,7 +323,7 @@ jobs:
   # ------------------------------------------------------------------
   budget:
     name: budget
-    needs: [check, windows, linux-x64, linux-arm64]
+    needs: [rust, web, eink, migrations, windows, linux-x64, linux-arm64]
     if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
 
@@ -316,7 +345,7 @@ jobs:
   # ------------------------------------------------------------------
   release:
     name: release
-    needs: [check, budget, windows, linux-x64, linux-arm64]
+    needs: [rust, web, eink, migrations, budget, windows, linux-x64, linux-arm64]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:

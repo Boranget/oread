@@ -134,4 +134,4 @@ contrast = (L_max + 0.05) / (L_min + 0.05)
 
 ## 8. 校验
 
-`scripts/eink-lint.mjs` 扫描 `server/src/routes/kindle.rs` 内联 CSS（仅字符串字面量，排除 `_selftest` 与 `#[cfg(test)]`），命中第 4 节禁止项即 `exit 1`，并打印文件、行号、命中词。CI 的 `check` job 会在前端构建后执行。
+`scripts/eink-lint.mjs` 扫描 `server/src/routes/kindle.rs` 与 `server/src/routes/kindle/**/*.rs` 的内联 CSS（仅字符串字面量，排除 `_selftest` 与 `#[cfg(test)]`），命中第 4 节禁止项即 `exit 1`，并打印文件、行号、命中词。CI 的独立 `eink` job 会在每次 push/PR/tag 执行。
