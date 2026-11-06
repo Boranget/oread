@@ -4,18 +4,21 @@
 //! - `innerWidth×innerHeight = 1072×1268`，且 `innerWidth == screen.width`：
 //!   浏览器没有按 DPR 1.7964 缩放，**1 CSS px ≈ 1 物理 px**，字号必须按 px 直接给。
 //! - 版心 1000px（左右各留 36px）；顶栏 73px（72 内容 + 1px 线）。
-//! - **版面基准是「真实可见高」`visibleH`**，不是 `clientHeight`（1268）：Silk 的
-//!   布局视口比可见区高，`bottom:0` 会把它底栏顶到可见区之外。`calib_js` 在 `<head>`
-//!   用「文档撑高 → 滚到底（延时两次采样，老 Silk 滚动是异步的） → 文档高−最大滚动量」
-//!   标定 `visibleH`，写 Cookie `k_vh`，再把 `html` 高度锁成 `visibleH − SAFE_BOTTOM(12)`
-//!   （严格小于可见高）；标定失败回退 `min(client−24, outer−8, inner)`。服务端渲染也直接读
-//!   `k_vh`（版本一致时优先于 URL 参数），所以重定向失败也不影响版面。
+//! - **版面高 = 运行时现算**（`K_VP_JS` 写在 `<head>`，每进页面重算一次）：以
+//!   `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）为主，`screen.availHeight`
+//!   作上限保护，都拿不到时退到 `innerHeight`；算出的 `H` 写进 URL 的 `?vh=`（用
+//!   `location.replace`，不落 Cookie / sessionStorage），服务端从 `vh` 取版面高，
+//!   顶栏、底栏、正文切片全部从这一个值派生。`innerHeight/clientHeight = 1268` 只用于
+//!   识别机型，绝不作版面高。
+//! - **整屏分页**：文档高 = 运行时 `H`，正文区写死高度且 `overflow:hidden`，
+//!   结构上没有可滚内容；**不做任何「隐藏/消除滚动条」的补偿**（若 Silk 仍自绘视口竖条，
+//!   就让它留着）。翻页交互只用 `click`（左右三分热区 + 底栏按钮），不依赖滑动/touch。
 //! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
 //!   不用 `border-radius`；底栏与贴底元素用 `position:absolute`（相对 `body`，`body` 为
-//!   `position:relative` 且高 = `visibleH − DOC_BOTTOM_MARGIN(88)`），不用 transform/transition。
-//! - 三个内联脚本：错误兜底（`K_GUARD_JS`，注册 `window.onerror` + `__kerr` img 打点，并上报
-//!   `stage=touch` 触摸探测）、视口标定（`calib_js`，ES5、fallback-only，**不写 `kfix`** 闩锁）、
-//!   自报探针（`K_PROBE_JS`，v7，img 单通道）；其余翻页/切换字号全部是真实链接。
+//!   `position:relative` 且高 = 运行时 `H`），不用 transform/transition。
+//! - 三个内联脚本：错误兜底（`K_GUARD_JS`，注册 `window.onerror` + `__kerr` img 打点）、
+//!   运行时视口标定（`K_VP_JS`，算 `H` 并补 `?vh=`）、自报探针（`K_PROBE_JS`，img 单通道）；
+//!   其余翻页/切换字号全部是真实链接。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -23,7 +26,7 @@ use axum::{
     body::Body,
     extract::{Query, Request, State},
     http::{
-        header::{self, SET_COOKIE},
+        header::SET_COOKIE,
         HeaderMap, HeaderValue, Method, StatusCode,
     },
     middleware::Next,
@@ -67,34 +70,14 @@ const NAV_H: usize = 72;
 const BAR_H: usize = 64;
 /// 底栏内部的底部安全留白（12px）：底栏总高 = 64 内容 + 12 安全区，避免文字贴屏幕底。
 const SAFE_BOTTOM: usize = 12;
-/// 文档高相对可见高的收缩量：**文档取 `visibleH − 88`**（v0.3.21 外部同行建议）：
-/// 真机 `visibleH=1224` → 文档 **1136**，等价 `outerHeight(1232) − 96`。Silk 把工具栏
-/// 从可用高度里扣掉了（实际可用高比上报值都小），纵向拖拽又在浏览器层被接管，
-/// 所以只能从文档高继续让。可按实测平移量再调这个常量。
-const DOC_BOTTOM_MARGIN: usize = 88;
-/// 标定失败时的保守兜底：`visibleH = min(clientHeight − 24, outerHeight − 8, innerHeight)`
-/// （取不到的项忽略）。真机 `clientHeight=1268`、`outerHeight=1232` → `V=1224`，
-/// 再减 `DOC_BOTTOM_MARGIN` 得文档 1136（即 `outerHeight − 96`），与目标文档高一致，
-/// 不再维护第二套数。
-const CALIB_FALLBACK_GAP: usize = 24;
-/// 一键切到更保守档：若真机证据仍显示「文档比可见矮却还能平移」，把这里改成
-/// `true` 即整体换成 `− 48` 档（`CALIB_VER` 必须 +1，让旧 Cookie 失效重测）。
-/// 注意：v0.3.20 真机结论后分析师明确「不要再切这一档」，方向已改为 `DOC_BOTTOM_MARGIN`。
-const CALIB_CONSERVATIVE: bool = false;
-/// 更保守档的裁切量（`clientHeight − 48`）
-const CALIB_FALLBACK_GAP_SAFE: usize = 48;
-/// 实际使用的兜底裁切量
-const fn calib_gap() -> usize {
-    if CALIB_CONSERVATIVE {
-        CALIB_FALLBACK_GAP_SAFE
-    } else {
-        CALIB_FALLBACK_GAP
-    }
-}
-/// 标定算法版本（写 Cookie `k_vv`）。**任何会改变 `visibleH`/兜底值的改动都必须 +1**：
-/// 旧版本写的 `k_vh` 一律作废并强制重测一次，避免升级后继续沿用旧值（v0.3.17 的教训）。
-/// 同时用于 `sessionStorage` 去环键，版本升级后旧闩锁自动失效。
-const CALIB_VER: usize = 2;
+/// **版面高不写死**（v0.3.22）：每次进页面由 `K_VP_JS` 在浏览器里现算可用高，写成
+/// `?vh=<px>` 随请求带回，服务端 `layout_h()` 直接用这个运行时值排版/切片。
+/// 可信度顺序：`outerHeight − 1`（真机 1232 → 1231）为主，`screen.availHeight` 做上限
+/// 保护，两者都取不到才退 `innerHeight`；`clientHeight/innerHeight=1268` 只作机型识别，
+/// 不当画布高。不落 Cookie、不写 sessionStorage，同机型每次重算结果一致。
+/// 首屏（链接未带 `vh`）用 `Config.kindle_vh` 的默认值渲染一次，脚本在 `<head>` 里
+/// 立刻 `location.replace` 到实测值，用户看不到错误版面。
+///
 /// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，
 /// 四档字号只各让出 1–2 行；顶栏固定贴视口顶，正文区从它下沿开始。
 const READ_NAV_H: usize = 56;
@@ -136,14 +119,23 @@ impl Vp {
     fn content_w(self) -> usize {
         self.w.saturating_sub(SIDE_PAD * 4)
     }
-    /// 文档高 = 可见高 − `DOC_BOTTOM_MARGIN`（1268 → 1180，真机 1224 → 1136）。真机可见高
-    /// 由 `calib_js` 标定后以 `vh` 参数传回，所以这里的 `h` 就是真实可见高。
+    /// 文档高 = 请求带回来的运行时实测可见高（`K_VP_JS` 现算，见 `layout_h` 上方说明）。
+    /// 不再做任何固定 px 收缩/夹取：顶栏、底栏、正文切片都从这一个值派生。
     fn layout_h(self) -> usize {
-        self.h.saturating_sub(DOC_BOTTOM_MARGIN)
+        self.h
     }
-    /// 阅读页正文容器高 = 文档高 − 底栏（1268 → 1116）
+    /// 阅读页底栏总高（含底部安全区）：随运行时可用高派生，约 5.2%（1231 → 64），
+    /// 不写死像素；顶栏、底栏、正文区都从 `layout_h()` 这一个值派生。
+    fn bar_h(self) -> usize {
+        (self.layout_h() * 13 / 250).max(48)
+    }
+    /// 底栏内容高（去掉 `SAFE_BOTTOM` 安全区）
+    fn bar_content_h(self) -> usize {
+        self.bar_h().saturating_sub(SAFE_BOTTOM).max(40)
+    }
+    /// 阅读页正文容器高 = 文档高 − 底栏
     fn body_h(self) -> usize {
-        self.layout_h().saturating_sub(BAR_H)
+        self.layout_h().saturating_sub(self.bar_h())
     }
     /// 带顶栏页面的正文区高 = 文档高 − 顶栏 − 1（1268 → 1107）
     fn nav_h(self) -> usize {
@@ -154,9 +146,9 @@ impl Vp {
         self.body_h()
             .saturating_sub(READ_NAV_H + READ_PAD_TOP + READ_PAGENO_H)
     }
-    /// 漫画整图/单片可用高 = 文档高 − 底栏 − 8（1268 → 1108，即切片可用高 vh）
+    /// 漫画整图/单片可用高 = 文档高 − 底栏 − 8（同一运行时高派生）
     fn content_h(self) -> usize {
-        self.layout_h().saturating_sub(BAR_H + 8)
+        self.layout_h().saturating_sub(self.bar_h() + 8)
     }
     /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357，CSS 用 33% 自适应）
     #[allow(dead_code)] // 仅单测引用：渲染改用 CSS 百分比，不再需要服务端算像素
@@ -228,121 +220,63 @@ const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
 
-/// 可见高标定脚本（ES5，注入 `<head>`，首帧前生效，最多重载一次）。
+/// 运行时视口高脚本（ES5，注入 `<head>`，首帧前生效；不落 Cookie、不写 sessionStorage）。
 ///
-/// 真机根因：Silk 的布局视口高 `clientHeight`（1268）比**真实可见高**（约 1180，
-/// 被系统栏/浏览器工具栏盖住）大，`position:fixed;bottom:0` 与一切 `bottom` 定位都锚在
-/// 布局视口底，于是底栏落在可见区外，必须向下滑才能看到。光“留 24px 余量”治不了，
-/// 因为差距是可见高与布局视口高的差，不是滚动条厚度。
-///
-/// **不再用 `scrollTo` 测可见高**：真机 `scrollY`/`scrollTop` 恒 0（Silk 把滚动接管在
-/// 浏览器层），测量永远不可能成功——v0.3.19~20 已两次证实。现在标定只做两件事：
-///   1. 版本一致且 `k_vh` 合法 → 直通（按 Cookie 排版、写回像素高）；
-///   2. 否则取**保守兜底** `F = min(H − GAP, outerHeight − 8, innerHeight)`（取不到的项
-///      忽略；真机 `outerHeight=1232` → `F=1224`，文档 `1224 − 88 = 1136`，即
-///      `outerHeight − 96`，与目标文档高一致），并写 `k_ck=0`/`k_my=-1` 作为
-///      「未实测/失败」标记（页面不依赖它排版）。
-///
-/// 文档高统一锁成 `visibleH − DOC_BOTTOM_MARGIN`（`{SAFE}` 占位即该常量），**明显小于**可见高。
-/// 整段包在 `try/catch` 里，异常经 `window.__kerr` 走 img 通道上报（见 `K_GUARD_JS`）。
-fn calib_js() -> String {
-    CALIB_JS
-        .replace("{SAFE}", &DOC_BOTTOM_MARGIN.to_string())
-        .replace("{GAP}", &calib_gap().to_string())
-        .replace("{VER}", &CALIB_VER.to_string())
-        .replace("{MIN}", "400")
-}
+/// 每次进页面现算可用高，再把 `vh=<算出值>` 带回 URL：
+///   1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）；
+///   2. `screen.availHeight` 做上限保护；
+///   3. 两者都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
+/// 首次进入（链接没带 `vh`）用默认值渲染一次，脚本在 `<head>` 里立刻 `location.replace`；
+/// `load` 后把同一 `vh` 补到页内所有链接，翻页不再二次重载。同机型反复进入结果一致。
 
-const CALIB_JS: &str = "(function(){try{\
-var d=document.documentElement,W=innerWidth,H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight;\
-var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null;\
-for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
-if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k!='kfix'&&p[i])o.push(p[i]);}\
-function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):-1}\
+
+
+///
+
+const K_VP_JS: &str = "(function(){try{\
+var d=document.documentElement,ih=window.innerHeight||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
-var F=mn(mn(H-{GAP},(window.outerHeight||0)-8),innerHeight);if(!(F>200))F=H-{GAP};\
-function rep(V){if(!W||!V)return;\
-if(vw==W&&vh==V){try{sessionStorage.removeItem('k_vhfix{VER}')}catch(e){}return}\
-var once=0;try{once=sessionStorage.getItem('k_vhfix{VER}')=='1'}catch(e){}\
-if(once)return;try{sessionStorage.setItem('k_vhfix{VER}','1')}catch(e){}\
-o.push('vw='+W,'vh='+V);location.replace(location.pathname+'?'+o.join('&'))}\
-function fin(V){var okv=(V>200&&V<=H)?1:0;if(!okv)V=F;\
-try{document.cookie='k_ck=0; path=/';document.cookie='k_my=-1; path=/'}catch(e){}\
-try{document.cookie='k_vv={VER}; path=/; max-age=2592000'}catch(e){}\
-try{document.cookie='k_vh='+V+'; path=/; max-age=2592000'}catch(e){}\
-try{if(V>{MIN})d.style.height=(V-{SAFE})+'px'}catch(e){}\
-rep(V)}\
-var V=ck('k_vh'),vv=ck('k_vv');\
-if(V>200&&V<=H&&vv=={VER}){try{d.style.height=(V-{SAFE})+'px'}catch(e){}}else{\
-if(!(vv=={VER})){try{document.cookie='k_vh=; path=/; max-age=0'}catch(e){}}\
-fin(F)}\
-}catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'calib')}catch(x){}}})()";
+var H=(window.outerHeight||0)-1,AH=(sh.availHeight||0);\
+if(!(H>200))H=AH;\
+if(AH>200)H=mn(H,AH);\
+if(!(H>200))H=ih;\
+if(!(H>200))H=(d&&d.clientHeight>0)?d.clientHeight:ih;\
+var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],cur=null;\
+for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
+if(k=='vh')cur=p[i].substring(3);if(p[i]&&k!='vh')o.push(p[i]);}\
+window.__kvh=H;\
+if(cur!=''+H){o.push('vh='+H);location.replace(location.pathname+'?'+o.join('&'));return}\
+function fix(){if(!document.links)return;try{\
+for(var j=0;j<document.links.length;j++){var a=document.links[j],h=a.getAttribute('href');\
+if(!h||h.charAt(0)=='#'||h.indexOf('javascript:')==0||h.indexOf('vh=')>-1)continue;\
+a.setAttribute('href',h+(h.indexOf('?')>-1?'&':'?')+'vh='+H)}}catch(e){}}\
+if(document.addEventListener){document.addEventListener('load',fix,false)}setTimeout(fix,0)\
+}catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'vp')}catch(x){}}})()";
 
-/// 全局错误兜底 + 纵向手势拦截（ES5，注入 `<head>` 且在 `calib` 之前）。
-/// 错误：`window.onerror` 与各段 `try/catch` 都走 `window.__kerr(msg, ln, stage)`，
-/// 用 `<img>` 打点上报（`stage=gerr|calib|probe`），**不依赖 `load` 与 XHR**。
-/// 手势：真机已确认「正文连同顶栏、底栏一起移动」= 整页真实滚动，且该引擎里
-/// `position:fixed` 被当普通元素 + `pageYOffset` 恒 0，所以**纵向手势必须在这里吃掉**：
-/// 本页无横向滚动需求，整体拦截（`touchmove` 可取消就 `preventDefault`）；
-/// 只调 `preventDefault`，不碰 `touchstart/touchend`，因此不影响链接点击。
+/// 全局错误兜底（ES5，注入 `<head>`）。错误统一走 `window.__kerr`，用 `<img>` 打点上报
+/// （`stage=gerr`），不依赖 `load` 与 XHR。**不再拦截 touchmove、也不再上报 touch 事件**
+/// （真机实测 touch 不触发；且已明确不做任何「骗浏览器」的补偿）。
 const K_GUARD_JS: &str = "(function(){\
 function e(m,l,st){try{var i=new Image();\
 i.src='/api/k/probe?stage='+st+'&err='+encodeURIComponent((''+(m||'-')).substring(0,60))+\
 '&ln='+(l||0)+'&vw_param='+encodeURIComponent((''+(location.search||'')).substring(0,80))}catch(x){}}\
 function ke(m,s,l){e(m,l,'gerr');return false}\
-function tm(ev){try{if(ev.cancelable)ev.preventDefault()}catch(x){}}\
-function tn(t){try{if(t.touches&&t.touches.length)return t.touches.length;\
-if(t.targetTouches&&t.targetTouches.length)return t.targetTouches.length;return 0}catch(x){return 0}}\
-function ty(t){try{if(t.touches&&t.touches.length)return Math.round(t.touches[0].clientY);\
-if(typeof t.clientY=='number')return Math.round(t.clientY)}catch(x){}return '-'}\
-function tpy(t){try{if(t.touches&&t.touches.length)return Math.round(t.touches[0].pageY);\
-if(typeof t.pageY=='number')return Math.round(t.pageY)}catch(x){}return '-'}\
-var lt={};\
-function tp(ev,st){var n=new Date().getTime();if(lt[st]&&n-lt[st]<200)return;lt[st]=n;\
-try{var i=new Image();i.src='/api/k/probe?stage=touch&tev='+st+'&cancelable='+(ev.cancelable?1:0)+\
-'&touches_len='+tn(ev)+'&clientY='+ty(ev)+'&pageY='+tpy(ev)+\
-'&vw_param='+encodeURIComponent((''+(location.search||'')).substring(0,80))}catch(x){}}\
-function ts(ev){tp(ev,'start')}function tv(ev){tp(ev,'move')}function te2(ev){tp(ev,'end')}\
-window.__kerr=e;window.onerror=ke;\
-try{if(document.addEventListener){\
-var op=false;try{op={passive:false}}catch(x){}\
-document.addEventListener('touchmove',tm,op);\
-document.addEventListener('touchstart',ts,false);\
-document.addEventListener('touchmove',tv,false);\
-document.addEventListener('touchend',te2,false)}else if(document.attachEvent){\
-document.attachEvent('ontouchmove',tm);document.attachEvent('ontouchstart',ts);\
-document.attachEvent('ontouchmove',tv);document.attachEvent('ontouchend',te2)}}catch(x){}\
-})()";
+window.__kerr=e;window.onerror=ke})()";
 
 /// 自报探针（ES5，零依赖，不重载页面）：**只保留 `<img>` 单通道**（v0.3.19 的教训：
 /// img 请求 204 触发 `onerror` 后又走 XHR = 每个 stage 打两条，统计翻倍）。
 /// 打点时机：`sync`（`setTimeout(...,0)` 延后到首次布局完成，避免 `inner_h=0`）、
-/// `load`、`scroll`、`touchmove`（200ms 节流）、`touchend`，后三者统一 `stage=move`
-/// 并用 `move_src` 区分来源。整段包在 `try/catch` 里，异常走 `window.__kerr`（`stage=probe`）。
-/// `innerWidth/innerHeight` 与 `documentElement.clientWidth/clientHeight` 同时上报，
-/// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；量不到的数一律填 `-`。
-/// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`；
-/// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`；
-/// v4 追加 `calib`（`ok`/`fail`，来自 `k_ck`）、`meas_y`、`bar_bottom`、`page_y`、
-/// `body_scroll_h` 与 `kfix`；
-/// v5 追加 `body_rect_bottom`、`lowest_el_bottom` 与 `stage`；
-/// v6（v0.3.20）：该引擎 `pageYOffset` 滚动时恒 0，位移改用
-/// `body.scrollTop || documentElement.scrollTop || pageYOffset`，并新增
-/// `doc_top`/`scroll_top_body`/`scroll_top_doc`/`max_seen`（生命周期最大位移）、
-/// `vv_off`（`visualViewport.pageTop`/`offsetTop`，不支持填 `-`）、`bar_rect_top`、
-/// `move_src`（touchmove/scroll/touchend）。
-/// v7（v0.3.21）：真机纵向拖拽被 Silk 接管、`touch` 到不了 JS，位移属性又全 0，
-/// 因此 `max_seen` 改为取 `scrollTop | scrollY | |bar_rect_top 变化|` 的最大值，
-/// 并上报 `bar_top_delta`（相对 `load` 时底栏 top 的位移，当前唯一能量到 pan 的代理量）；
-/// 打点时机增加 `touchend`（`move_src=end`）与「最后一次 scroll 后 800ms」
-/// （`move_src=settle`）。
-/// 注意：`body_scroll_h` 在该引擎里是**假象**（文档已 fixed/overflow:hidden，仍可能
-/// 报出大于视口的高度），保留字段仅供对拍，**不能当作溢出证据**；判断溢出看
-/// `doc_h − outer_h` / `doc_h − client_h` / `bar_top_delta`。
+/// `load`、`scroll`（200ms 节流 + 800ms settle）、`click`。整段包在 `try/catch` 里，
+/// 异常走 `window.__kerr`（`stage=probe`）。
+/// v0.3.22 瘦身：删掉标定/vmh 字段（`calib`/`meas_y`/`vv_off`/`vw_meta_height`/`meta_h`/
+/// `visible_h`），改为上报运行时参与计算的原值与结果：`outer_h`/`inner_h`/`screen_h`/
+/// `avail_h` + `rt_h`（`window.__kvh` 现算高）+ `lines`（`#k-stage` 的 `data-lb` 每页行数）。
+/// 溢出证据看 `doc_h` / `documentElement.scrollHeight` / `outer_minus_doc` /
+/// `outer_minus_scroll`；`body_scroll_h` 在该引擎里是假象，只作对拍。
+/// `click` 上报 `pageX/pageY`（真机 touch 不触发，click 可用）与内层滚动容器 `scrollTop`。
 const K_PROBE_JS: &str = "(function(){try{\
 function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
-function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
 function bar(){return document.getElementById('k-bar')}\
 function btn(){var b=bar();if(!b)return -1;try{return Math.round(b.getBoundingClientRect().top)}catch(e){\
 return typeof b.offsetTop=='number'?b.offsetTop:-1}}\
@@ -359,15 +293,12 @@ function py(){var y=stb();if(!y)y=std();if(!y)y=sy();\
 y=Math.round(y);if(y>max_seen)max_seen=y;return y}\
 function btd(){if(base_bt<0)return '-';var n=btn();if(n<0)return '-';var d=n-base_bt;\
 if(d<0)d=-d;if(d>max_seen)max_seen=d;return n-base_bt}\
-function vo(){try{var vv=window.visualViewport;if(!vv)return '-';\
-var t=(typeof vv.pageTop=='number')?vv.pageTop:vv.offsetTop;\
-return typeof t=='number'?Math.round(t):'-'}catch(e){return '-'}}\
-function mh(){try{var ms=document.getElementsByTagName('meta'),c='-';\
-for(var i=0;i<ms.length;i++){var n=ms[i].getAttribute('name')||ms[i].name;\
-if(n=='viewport')c=ms[i].getAttribute('content')||ms[i].content||'-'}\
-var m=new RegExp('height=([0-9]+)').exec(c);return m?m[1]:'-'}catch(e){return '-'}}\
+function lbn(){try{var s=document.getElementById('k-stage');\
+var n=s?parseInt(s.getAttribute('data-lb'),10):NaN;return isNaN(n)?'-':n}catch(e){return '-'}}\
+function ist(){try{var s=document.getElementById('k-scroll');\
+return s?Math.round(s.scrollTop||0):'-'}catch(e){return '-'}}\
 function qs(ev){var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
-st=document.getElementById('k-stage'),ock=ck('k_ck'),sb=stb(),sd=std(),dlt=btd(),\
+st=document.getElementById('k-stage'),sb=stb(),sd=std(),dlt=btd(),\
 dh=parseFloat(d.style.height);if(!(dh>0))dh=d.clientHeight;var oh=window.outerHeight||0;\
 return 'vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
@@ -375,30 +306,31 @@ return 'vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h
 '&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
 '&outer_w='+v(window.outerWidth)+'&outer_h='+v(window.outerHeight)+\
 '&doc_h='+Math.round(dh)+'&doc_minus_outer='+Math.round(dh-oh)+'&doc_minus_client='+Math.round(dh-d.clientHeight)+\
-'&outer_minus_doc='+Math.round(oh-dh)+'&vw_meta_height='+mh()+'&meta_h='+mh()+\
+'&outer_minus_doc='+Math.round(oh-dh)+'&rt_h='+v(window.__kvh)+'&lines='+lbn()+\
 '&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight)+\
-'&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+'&bar_rect_top='+bt()+'&bar_top_delta='+dlt+\
+'&bar_top='+bt()+'&bar_bottom='+bb()+'&bar_rect_top='+bt()+'&bar_top_delta='+dlt+\
 '&page_y='+py()+'&doc_top='+sd+'&scroll_top_body='+sb+'&scroll_top_doc='+sd+'&scroll_y='+sy()+\
-'&max_seen='+max_seen+'&vv_off='+vo()+\
+'&max_seen='+max_seen+\
 '&body_scroll_h='+v(b&&b.scrollHeight)+\
 '&body_rect_bottom='+bre()+'&lowest_el_bottom='+lb()+'&scroll_evt='+(ev?1:0)+\
-'&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix')}\
+'&outer_minus_scroll='+Math.round(oh-d.scrollHeight)+'&inner_scroll_top='+ist()}\
 function s(stage,src){try{var u='/api/k/probe?'+qs(src=='scroll'?1:0)+\
 '&stage='+stage+'&move_src='+(src||'-');var i=new Image();i.src=u}catch(e){\
 try{window.__kerr&&window.__kerr((e&&e.message)||e,0,'probe')}catch(x){}}}\
 var last=0,stt=0;\
 function mv(src){var t=new Date().getTime();if(t-last<200)return;last=t;s('move',src)}\
-function tm(){mv('touchmove')}\
-function te(){last=0;s('move','end')}\
 function ld(){if(base_bt<0)base_bt=btn();s('load','-')}\
 function rs(){mv('scroll');if(stt)clearTimeout(stt);\
 stt=setTimeout(function(){s('move','settle')},800)}\
+function cl(ev){try{var d=document.documentElement,x=ev.pageX,y=ev.pageY;\
+if(typeof x!='number')x=ev.clientX;if(typeof y!='number')y=ev.clientY;\
+var i=new Image();i.src='/api/k/probe?stage=click&click_x='+Math.round(x)+'&click_y='+Math.round(y)+\
+'&scroll_h='+d.scrollHeight+'&outer_minus_scroll='+Math.round((window.outerHeight||0)-d.scrollHeight)+\
+'&inner_scroll_top='+ist()+'&vw_param='+encodeURIComponent((''+(location.search||'')).substring(0,60))}catch(e){}}\
 setTimeout(function(){s('sync','-')},0);\
 if(window.addEventListener){window.addEventListener('load',ld,false);\
-window.addEventListener('scroll',rs,false);document.addEventListener('touchmove',tm,false);\
-document.addEventListener('touchend',te,false)}\
-else if(window.attachEvent){window.attachEvent('onload',ld);window.attachEvent('onscroll',rs);\
-document.attachEvent('ontouchmove',tm);document.attachEvent('ontouchend',te)}\
+window.addEventListener('scroll',rs,false);document.addEventListener('click',cl,false)}\
+else if(window.attachEvent){window.attachEvent('onload',ld);window.attachEvent('onscroll',rs)}\
 }catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'probe')}catch(x){}}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
@@ -420,7 +352,7 @@ const FS_SPECS: [FsSpec; 4] = [
     FsSpec {
         size: 32,
         line: 52,
-        label: "标准",
+        label: "中",
     },
     FsSpec {
         size: 38,
@@ -571,47 +503,38 @@ fn remember_fs(res: &mut Response, fs: usize) {
 /// 生产渲染走 `page_html_css`（需要页面级 CSS）；本函数为无额外 CSS 的便捷封装，仅单测使用。
 #[allow(dead_code)]
 fn page_html(title: &str, fs: usize, body: &str, vp: Vp) -> String {
-    page_html_css(title, fs, body, "", vp, None)
+    page_html_css(title, fs, body, "", vp)
 }
 
-/// 与 `page_html` 相同，额外拼接一段页面级 CSS（阅读页用「一屏一页」锁高，其它页不受影响）。
-/// `vmh` 为 `Some(px)` 时在 viewport meta 里追加 `height=<px>`（试验开关 `?vmh=`，
-/// 老引擎若认，布局视口会变矮，平移与竖条应同时消失；默认 `None` 不输出）。
-fn page_html_css(
-    title: &str,
-    fs: usize,
-    body: &str,
-    extra_css: &str,
-    vp: Vp,
-    vmh: Option<usize>,
-) -> String {
+/// 与 `page_html` 相同，额外拼接一段页面级 CSS（阅读页用「一屏一页」锁高）。
+/// viewport 只声明宽度与 scale：**不再输出 `height=`**（真机实测该 meta 整条不被认，
+/// 且方向已定为「不靠骗浏览器」）。可用高由 `K_VP_JS` 现算并以 `vh` 参数传回；
+/// `html/body` 高度统一锁成运行时 `H`，任何页的贴底元素都落在真实可见区内。
+fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> String {
     let spec = &FS_SPECS[fs - 1];
-    // 显式 vw → 锁死版心宽（1:1 不缩放）；缺参 → device-width，交给补参脚本量出真实宽度
+    // 显式 vw → 锁死版心宽（1:1 不缩放）；缺参 → device-width
     let width = if vp.fixed {
         format!("width={}", vp.w)
     } else {
         "width=device-width".to_string()
     };
-    let viewport = match vmh {
-        Some(h) => format!("{width},height={h},initial-scale=1,maximum-scale=1,user-scalable=0"),
-        None => format!("{width},initial-scale=1,maximum-scale=1,user-scalable=0"),
-    };
+    let viewport = format!("{width},initial-scale=1,maximum-scale=1,user-scalable=0");
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"{viewport}\"><title>{title}</title><style>\
-html{{-webkit-text-size-adjust:none;height:100%;overflow:hidden}}\
+html{{-webkit-text-size-adjust:none;height:{doc}px;overflow:hidden}}\
 html,body{{margin:0;padding:0;width:100%;background:#fff;color:#000}}\
-html::-webkit-scrollbar,body::-webkit-scrollbar,#k-stage::-webkit-scrollbar{{width:0;height:0;display:none}}\
-body{{position:relative;height:100%;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
+body{{position:relative;height:{doc}px;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
 *{{box-sizing:border-box}}\
 a{{color:#000;text-decoration:none}}\
 h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style><script>{guard}</script><script>{calib}</script></head><body><div class=\"wrap\">{body}</div><script>{probe}</script></body></html>",
+</style><script>{guard}</script><script>{vpjs}</script></head><body><div class=\"wrap\">{body}</div><script>{probe}</script></body></html>",
         viewport = viewport,
         title = esc(title),
+        doc = vp.layout_h(),
         size = spec.size,
         line = spec.line,
         pw = vp.page_w(),
@@ -619,35 +542,22 @@ table{{border-collapse:collapse}}\
         extra = extra_css,
         body = body,
         guard = K_GUARD_JS,
-        calib = calib_js(),
+        vpjs = K_VP_JS,
         probe = K_PROBE_JS
     )
 }
 
-fn page(title: &str, fs: usize, body: &str, vp: Vp, vmh: VmhSel) -> Response {
-    page_css(title, fs, body, "", vp, vmh)
+fn page(title: &str, fs: usize, body: &str, vp: Vp) -> Response {
+    page_css(title, fs, body, "", vp)
 }
 
-fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp, vmh: VmhSel) -> Response {
-    let html = page_html_css(title, fs, body, extra_css, vp, vmh.meta());
-    let mut res = axum::http::Response::builder()
+fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> Response {
+    let html = page_html_css(title, fs, body, extra_css, vp);
+    axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
         .body(axum::body::Body::from(html))
-        .expect("html response");
-    // 先解析参数再决定写/删：`vmh=0`/`off` 删除 Cookie，本次不输出 height。
-    let cookie = match vmh {
-        VmhSel::Set(h) => Some(format!("k_vmh={h}; path=/; max-age=2592000")),
-        VmhSel::Off => Some("k_vmh=; path=/; max-age=0".to_string()),
-        VmhSel::Unset => None,
-    };
-    if let Some(c) = cookie {
-        res.headers_mut().insert(
-            axum::http::header::SET_COOKIE,
-            axum::http::HeaderValue::from_str(&c).expect("cookie header"),
-        );
-    }
-    res
+        .expect("html response")
 }
 
 /// 顶栏（73px = 72 内容 + 1px 下边线，白底，只有一条）：
@@ -682,17 +592,16 @@ fn nav_link(href: &str, label: &str) -> String {
     )
 }
 
-/// 阅读页底栏：形如贴视口底，但用 `position:absolute;bottom:0`，因为它的包含块
-/// （`body{position:relative}`）高度 = `visibleH − DOC_BOTTOM_MARGIN`，明显低于真实可见区。
-/// **不能用 `position:fixed`**：老 Silk 把 fixed 元素锚在布局视口（1268）而不是真实可见区，
-/// `bottom:0` 会掉到可见区外（真机"要下滑才看到底栏"的根因）；absolute + top/bottom
-/// 相对 body 则在所有 WebKit 版本上一致。
-/// 总高 76 = 64 内容（4 格各 250px）+ 12 安全区（`padding-bottom`）。
+/// 阅读页底栏：形如贴视口底，但用 `position:absolute;bottom:0`，它的包含块
+/// （`body{position:relative}`）高度 = 运行时现算的版面高 `H`。
+/// **不能用 `position:fixed`**：老 Silk 把 fixed 元素锚在布局视口（1268）而不是真实可见区。
+/// 总高 `vp.bar_h()`（随运行时可用高派生，约 5.2%），内含 `SAFE_BOTTOM` 安全区。
+/// 底栏只有 3 格等分（前 / 当前字号 / 后），整格都是 `click` 热区。
 fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
         "<div id=\"k-bar\" style=\"position:absolute;left:0;right:0;bottom:0;height:{h}px;padding-bottom:{safe}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
-        h = BAR_H + SAFE_BOTTOM,
+        h = vp.bar_h(),
         safe = SAFE_BOTTOM,
         pw = vp.page_w(),
         pad = SIDE_PAD,
@@ -700,31 +609,26 @@ fn fixed_bar(row: &str, vp: Vp) -> String {
     )
 }
 
-/// 底栏格内容：粗体字符（28px/700，无边框）+ 标签（20px）
-fn bar_inner(icon: &str, label: &str) -> String {
+/// 底栏格：等分 1/3、整格可点，只有一行主标签（无下方小字）。
+fn bar_cell(href: &str, label: &str, vp: Vp) -> String {
+    let ch = vp.bar_content_h().saturating_sub(1);
     format!(
-        "<div style=\"width:28px;height:28px;margin:0 auto;font-size:28px;line-height:28px;font-weight:700;text-align:center\">{icon}</div>\
-         <div style=\"font-size:20px;line-height:20px;margin-top:4px\">{label}</div>",
-        icon = esc(icon),
+        "<td width=\"33.33%\" height=\"{ch}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc\">\
+         <a href=\"{href}\" style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:34px;font-weight:700\">{label}</a></td>",
+        href = href,
+        ch = ch,
         label = esc(label)
     )
 }
 
-fn bar_cell(href: &str, icon: &str, label: &str) -> String {
+/// 底栏格：禁用态（弱灰、不可点），用于全书末页的「后」
+fn bar_cell_off(label: &str, vp: Vp) -> String {
+    let ch = vp.bar_content_h().saturating_sub(1);
     format!(
-        "<td width=\"25%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
-         <a href=\"{href}\" style=\"display:block;height:63px;padding-top:6px\">{inner}</a></td>",
-        href = href,
-        inner = bar_inner(icon, label)
-    )
-}
-
-/// 底栏格：禁用态（弱灰、不可点），用于全书末页的「下一页」
-fn bar_cell_off(icon: &str, label: &str) -> String {
-    format!(
-        "<td width=\"25%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
-         <span style=\"display:block;height:63px;padding-top:6px;color:#555\">{inner}</span></td>",
-        inner = bar_inner(icon, label)
+        "<td width=\"33.33%\" height=\"{ch}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc\">\
+         <span style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:34px;font-weight:700;color:#555\">{label}</span></td>",
+        ch = ch,
+        label = esc(label)
     )
 }
 
@@ -832,26 +736,32 @@ fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp) -> String
 
 fn read_only_css(vp: Vp) -> String {
     format!(
-        // 「硬性不可滚动」：根元素与 body 都改成 fixed（老引擎里 fixed 仍锚布局视口，
-        // 但这里再配合像素高 + overflow:hidden，文档层面就完全没有可滚动余量；
-        // 剩下的“能平移”只能来自 Silk 的可视视口平移，需靠 touchmove 拦截）。
-        // 像素高直接用 `visibleH − DOC_BOTTOM_MARGIN`（老引擎不支持 calc，不能写表达式）。
-        // 顶栏/正文/底栏仍以 body 为包含块（absolute），几何不变。
-        "html,body{{position:fixed;top:0;left:0;width:100%;height:{doc}px;overflow:hidden;overscroll-behavior:none}}\
+        // 整屏分页（v0.3.22）：文档高 = 运行时实测可用高（`layout_h()`，来自 `vh` 参数），
+        // 顶栏/正文/底栏全部从它派生；正文区写死高度（= 文档高 − 顶栏 − 底栏）且
+        // `overflow:hidden`，页面结构上就没有可滚内容。**不做任何隐藏滚动条的补偿**：
+        // 若 Silk 仍自绘视口竖条，就让它留着。也绝不用 `position:fixed`（老 Silk 会把它
+        // 锚到布局视口 1268 而不是真实可见高），`body` 作 absolute 子元素的包含块。
+        "html,body{{position:relative;top:0;left:0;width:100%;height:{doc}px;overflow:hidden}}\
          #k-read-nav{{position:absolute;top:0;left:0;right:0;height:{nav}px;padding:0 {pad}px;background:#fff;border-bottom:1px solid #000;z-index:12}}\
          #k-read-nav table{{width:100%;table-layout:fixed;border-collapse:collapse}}\
          #k-read-nav td{{height:{tdh}px;padding:0;font-size:20px;line-height:28px;vertical-align:middle;overflow:hidden;white-space:nowrap;color:#000}}\
          #k-read-nav td a{{display:block;height:{tdh}px;line-height:{tdh}px;color:#000;text-decoration:none}}\
-         #k-stage{{position:absolute;top:{nav}px;left:{pad}px;right:{pad}px;bottom:{safe}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
+         #k-stage{{position:absolute;top:{nav}px;left:{pad}px;width:{sw}px;height:{sh}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
          #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
         doc = vp.layout_h(),
         pad = SIDE_PAD,
         nav = READ_NAV_H,
         tdh = READ_NAV_H - 1,
-        safe = BAR_H + SAFE_BOTTOM,
+        sw = vp.page_w(),
+        sh = vp.layout_h().saturating_sub(READ_NAV_H + vp.bar_h()),
         pt = READ_PAD_TOP
     )
 }
+
+
+
+
+
 
 /// 阅读页内部链接：始终带目标档位的 `fs`，切档后不会被当前档位拼成重复参数。
 fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
@@ -869,14 +779,15 @@ fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
 }
 
 /// 目录链接（按 30 章/页定位到当前章所在目录页，并带上当前章用于高亮）
-fn toc_link(q: &ReadQ, fs: usize, ch: i64, vp: Vp) -> String {
+fn toc_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
     qlink(
         &format!(
-            "/k/toc?book={}&source={}&tp={}&ch={}",
+            "/k/toc?book={}&source={}&tp={}&ch={}&p={}",
             qenc(&q.book),
             qenc(&q.source),
             (ch / K_TOC_PAGE as i64) + 1,
-            ch
+            ch,
+            p
         ),
         fs,
         vp,
@@ -916,18 +827,18 @@ fn read_nav(
 }
 
 /// 底栏「上一页」格：章首变「上一章」，全书首页为禁用态
-fn bar_cell_prev(prev: Option<&(String, &'static str)>) -> String {
+fn bar_cell_prev(prev: Option<&(String, &'static str)>, vp: Vp) -> String {
     match prev {
-        Some((href, label)) => bar_cell(href, "前", label),
-        None => bar_cell_off("前", "上一页"),
+        Some((href, _)) => bar_cell(href, "前", vp),
+        None => bar_cell_off("前", vp),
     }
 }
 
 /// 底栏「下一页」格：有下一页/下一章则给链接，全书末页给弱灰不可点的禁用态。
-fn bar_cell_next(next: Option<&(String, &'static str)>) -> String {
+fn bar_cell_next(next: Option<&(String, &'static str)>, vp: Vp) -> String {
     match next {
-        Some((href, label)) => bar_cell(href, "后", label),
-        None => bar_cell_off("后", "下一页"),
+        Some((href, _)) => bar_cell(href, "后", vp),
+        None => bar_cell_off("后", vp),
     }
 }
 
@@ -982,7 +893,6 @@ fn err_page(msg: &str) -> Response {
         2,
         &notice_page("出错了", msg, "/k", "返回书架"),
         Vp::default(),
-        VmhSel::Unset,
     )
 }
 
@@ -1001,7 +911,7 @@ fn visible_chapters(chapters: &[BookChapter]) -> Vec<&BookChapter> {
 }
 
 /// 直接访问分卷行时返回的友好提示页（沿用现有版心，不新增版式）。
-fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp, vmh: VmhSel) -> Response {
+fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp) -> Response {
     let back = qlink(
         &format!("/k/toc?book={}&source={}", qenc(&q.book), qenc(&q.source)),
         fs,
@@ -1013,7 +923,7 @@ fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp, vmh: VmhSel) -> R
         &back,
         "返回目录",
     );
-    let mut res = page("分卷标题", fs, &body, vp, vmh);
+    let mut res = page("分卷标题", fs, &body, vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1233,11 +1143,11 @@ pub struct TocQ {
     fs: Option<i64>,
     /// 当前所在章（从阅读页跳目录时带上，用于「▸ + 加粗」高亮）
     ch: Option<i64>,
+    /// 进入目录前阅读页的页码：右上角「✕」返回阅读页时原样带回，不重置到第一页
+    p: Option<i64>,
     /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
-    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ReadQ {
@@ -1249,8 +1159,6 @@ pub struct ReadQ {
     /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
-    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct SearchQ {
@@ -1264,8 +1172,6 @@ pub struct SearchQ {
     include_cooled: Option<String>,
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
-    vmh: Option<String>,
 }
 
 /// `/k` 的 scope 解析：只有显式 `all`/`expanded` 走全量，其余（含缺省、未知值）一律 curated。
@@ -1281,8 +1187,6 @@ pub struct FsQ {
     sp: Option<i64>,
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
-    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct LoginQ {
@@ -1292,89 +1196,12 @@ pub struct LoginQ {
 
 // ---------------- 数据辅助 ----------------
 
-/// 读 `k_vh`/`k_vv`：版本一致且值在合法区间时返回，服务端直接用它排版。
-/// 这样即使 `location.replace` 没跑成（v0.3.18 真机探针一条未到），
-/// 只要 Cookie 已写成功，下一屏仍是按真实可见高渲染的版本。
-fn cookie_vh(headers: &HeaderMap) -> Option<i64> {
-    let raw = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
-    let mut vh = None;
-    let mut vv = None;
-    for part in raw.split(';') {
-        let pair = part.trim();
-        if let Some(v) = pair.strip_prefix("k_vh=") {
-            vh = v.trim().parse::<i64>().ok();
-        } else if let Some(v) = pair.strip_prefix("k_vv=") {
-            vv = v.trim().parse::<i64>().ok();
-        }
-    }
-    match (vh, vv) {
-        (Some(v), Some(x)) if x == CALIB_VER as i64 && (480..=2400).contains(&v) => Some(v),
-        _ => None,
-    }
-}
-
-/// 解析请求视口：**`k_vh` Cookie（版本一致）优先** > `vh` 参数 > 环境默认；
-/// `vw` 只用参数/默认（Cookie 里没有宽度）。
-fn vp_of(s: &AppState, headers: &HeaderMap, vw: Option<i64>, vh: Option<i64>) -> Vp {
-    let vh = cookie_vh(headers).or(vh);
+/// 解析请求视口：`vh` 参数（`K_VP_JS` 现算的可用高）优先，缺参回落环境默认。
+/// **不再读 Cookie**：高度不做任何持久缓存，每次进页面重新现算。
+fn vp_of(s: &AppState, _headers: &HeaderMap, vw: Option<i64>, vh: Option<i64>) -> Vp {
     Vp::resolve(vw, vh, (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize))
 }
 
-/// 试验开关的三态：未设置、清除（`vmh=0`/`off`）、设置（400..=2400）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VmhSel {
-    Unset,
-    Off,
-    Set(usize),
-}
-
-impl VmhSel {
-    /// 渲染用的 meta height：只有 `Set` 才输出。
-    fn meta(self) -> Option<usize> {
-        match self {
-            VmhSel::Set(h) => Some(h),
-            VmhSel::Unset | VmhSel::Off => None,
-        }
-    }
-}
-
-fn vmh_cookie(headers: &HeaderMap) -> Option<usize> {
-    let raw = headers
-        .get_all(axum::http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect::<Vec<_>>()
-        .join("; ");
-    raw.split(';')
-        .find_map(|part| {
-            part.trim()
-                .strip_prefix("k_vmh=")
-                .and_then(|v| v.trim().parse::<i64>().ok())
-        })
-        .filter(|v| (400..=2400).contains(v))
-        .map(|v| v as usize)
-}
-
-/// 试验开关：**先解析参数、再决定写/删/沿用**——
-/// `vmh=0`/`off` 清除（不输出 height，也不看旧 Cookie）；合法值 `400..=2400` 写入；
-/// 其他非法值忽略参数、沿用 Cookie（不清除）；无参数时沿用 Cookie。
-fn vmh_sel(headers: &HeaderMap, q: Option<&str>) -> VmhSel {
-    if let Some(raw) = q {
-        let t = raw.trim().to_ascii_lowercase();
-        if t == "0" || t == "off" {
-            return VmhSel::Off;
-        }
-        if let Ok(v) = t.parse::<i64>() {
-            if (400..=2400).contains(&v) {
-                return VmhSel::Set(v as usize);
-            }
-        }
-    }
-    match vmh_cookie(headers) {
-        Some(h) => VmhSel::Set(h),
-        None => VmhSel::Unset,
-    }
-}
 
 /// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
 async fn ensure_chapters(
@@ -1431,7 +1258,6 @@ async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) 
             err = err
         ),
         Vp::default(),
-        VmhSel::Unset,
     )
 }
 
@@ -1504,7 +1330,6 @@ async fn shelf(
     Query(q): Query<FsQ>,
 ) -> Response {
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let rows: Vec<BookshelfItem> = match sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
         .bind(None::<String>)
@@ -1608,7 +1433,7 @@ async fn shelf(
         list = list,
         pager = pager
     );
-    let mut res = page("书架", fs, &format!("{top}{stage}"), vp, vmh);
+    let mut res = page("书架", fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1625,7 +1450,6 @@ async fn toc(
     Query(q): Query<TocQ>,
 ) -> Response {
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let (_source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
@@ -1653,21 +1477,38 @@ async fn toc(
     let fs_href = with_vp(
         &with_fs(
             &format!(
-                "/k/toc?book={}&source={}&tp={}&ch={}",
+                "/k/toc?book={}&source={}&tp={}&ch={}&p={}",
                 qenc(&q.book),
                 qenc(&q.source),
                 tp,
-                q.ch.unwrap_or(-1)
+                q.ch.unwrap_or(-1),
+                q.p.unwrap_or(1)
             ),
             next_fs,
         ),
         vp,
     );
-    // 导航只出现一次：标题=书名，右侧=书架 / 字号
+    // 导航只出现一次：标题=书名，右侧=书架 / 字号 / ✕（回到进入目录前的阅读页，
+    // 章节与页码原样带回；✕ 用 80×72 的整格热区，墨水屏上也好点）。
+    let read_back = qlink(
+        &format!(
+            "/k/read?book={}&source={}&ch={}&p={}",
+            qenc(&q.book),
+            qenc(&q.source),
+            q.ch.unwrap_or(0),
+            q.p.unwrap_or(1)
+        ),
+        fs,
+        vp,
+    );
     let nav = format!(
-        "{}{}",
+        "{}{}{}",
         nav_link(&qlink("/k", fs, vp), "书架"),
         nav_link(&fs_href, FS_SPECS[next_fs - 1].label),
+        format!(
+            "<a href=\"{}\" style=\"display:inline-block;min-width:80px;text-align:center;font-size:34px;line-height:72px;font-weight:400\">&#10005;</a>",
+            read_back
+        ),
     );
     let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
@@ -1728,11 +1569,12 @@ async fn toc(
         Some((
             qlink(
                 &format!(
-                    "/k/toc?book={}&source={}&tp={}&ch={}",
+                    "/k/toc?book={}&source={}&tp={}&ch={}&p={}",
                     qenc(&q.book),
                     qenc(&q.source),
                     tp - 1,
-                    q.ch.unwrap_or(-1)
+                    q.ch.unwrap_or(-1),
+                    q.p.unwrap_or(1)
                 ),
                 fs,
                 vp,
@@ -1746,11 +1588,12 @@ async fn toc(
         Some((
             qlink(
                 &format!(
-                    "/k/toc?book={}&source={}&tp={}&ch={}",
+                    "/k/toc?book={}&source={}&tp={}&ch={}&p={}",
                     qenc(&q.book),
                     qenc(&q.source),
                     tp + 1,
-                    q.ch.unwrap_or(-1)
+                    q.ch.unwrap_or(-1),
+                    q.p.unwrap_or(1)
                 ),
                 fs,
                 vp,
@@ -1769,7 +1612,7 @@ async fn toc(
         pager = pager_bar(prev, next, vp)
     );
 
-    let mut res = page(&name, fs, &format!("{top}{stage}"), vp, vmh);
+    let mut res = page(&name, fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -1921,7 +1764,7 @@ fn comic_stage(
         h = vp.layout_h().saturating_sub(READ_NAV_H),
         w = vp.page_w(),
         pad = SIDE_PAD,
-        pb = BAR_H + 8,
+        pb = vp.bar_h() + 8,
         img = img,
         meta = esc(meta)
     )
@@ -1988,7 +1831,6 @@ async fn read(
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
         Err(e) => return err_to_page(e),
@@ -2000,11 +1842,11 @@ async fn read(
     let chapter: &BookChapter = &chapters[ch as usize];
     // 目录已不展示分卷行；兜底拦截直接访问（合成 URL `volume:`）时给出友好提示，不抛错误页。
     if volume_entry(chapter) {
-        return volume_notice(&q, fs, explicit, vp, vmh);
+        return volume_notice(&q, fs, explicit, vp);
     }
     // 漫画源：一屏一页（整图或切片），不走正文分页
     if source.book_source_type == 2 {
-        return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp, vmh).await;
+        return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp).await;
     }
 
     let mut c: BookContent =
@@ -2066,7 +1908,7 @@ async fn read(
         Some(chapters.len() as i64),
     )
     .await;
-    let toc_url = toc_link(&q, fs, ch, vp);
+    let toc_url = toc_link(&q, fs, ch, p, vp);
     let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
     let mut meta = if blocks > 1 {
         // 超长章节按 20 万字符分块：底栏“目录”格下方同时给出页内进度、页码与分块号
@@ -2100,20 +1942,22 @@ async fn read(
             para = esc(para)
         ));
     }
-    // 阅读页无顶栏：正文区由 `#k-stage` 绝对定位填满（视口高 − 88 底栏/安全区）
+    // 阅读页正文区：高度 = 运行时可用高 − 顶栏 − 底栏（`read_only_css` 里写死），
+    // 服务端按 `line_budget` 切好一屏文字，`data-lb` 供探针回报「本屏行数」。
     let stage = format!(
-        "<div id=\"k-stage\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
+        "<div id=\"k-stage\" data-lb=\"{lb}\">{paras}<div id=\"k-page-no\">{meta}</div></div>",
+        lb = budget,
         paras = paras,
         meta = esc(&meta)
     );
-    // 贴底固定栏 4 格（各 250px）：上一页 / 下一页 / 目录 / 字号
+    // 贴底固定栏 3 格等分：前 ｜ 当前字号档位（点一下切下一档）｜ 后。
+    // 目录入口只在顶栏右上角保留，底栏不再放「目录」；格内只留主标签，无第二行小字。
     let bottom = fixed_bar(
         &format!(
-            "{prev}{next}{toc}{fs}",
-            prev = bar_cell_prev(prev.as_ref()),
-            next = bar_cell_next(next.as_ref()),
-            toc = bar_cell(&toc_url, "目", "目录"),
-            fs = bar_cell(&fs_href, "字", "字号"),
+            "{prev}{fs}{next}",
+            prev = bar_cell_prev(prev.as_ref(), vp),
+            fs = bar_cell(&fs_href, spec.label, vp),
+            next = bar_cell_next(next.as_ref(), vp),
         ),
         vp,
     );
@@ -2136,7 +1980,7 @@ async fn read(
         ),
         bottom = bottom
     );
-    let mut res = page_css(&ch_title, fs, &body, &read_only_css(vp), vp, vmh);
+    let mut res = page_css(&ch_title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2155,7 +1999,6 @@ async fn comic_read(
     fs: usize,
     explicit: bool,
     vp: Vp,
-    vmh: VmhSel,
 ) -> Response {
     let chapter = &chapters[ch as usize];
     let images = match load_comic_images(s, pool, source, chapter, &q.book).await {
@@ -2212,7 +2055,7 @@ async fn comic_read(
     let p = q.p.unwrap_or(1).clamp(1, n);
     let pg = &pages[(p - 1) as usize];
 
-    let toc_url = toc_link(q, fs, ch, vp);
+    let toc_url = toc_link(q, fs, ch, p, vp);
     // 打开漫画页即落库（与小说页一致，幂等）
     let _ = record_progress(
         pool,
@@ -2239,11 +2082,10 @@ async fn comic_read(
     );
     let bottom = fixed_bar(
         &format!(
-            "{prev}{next}{toc}{fs}",
-            prev = bar_cell_prev(prev.as_ref()),
-            next = bar_cell_next(next.as_ref()),
-            toc = bar_cell(&toc_url, "目", "目录"),
-            fs = bar_cell(&fs_href, "字", "字号"),
+            "{prev}{fs}{next}",
+            prev = bar_cell_prev(prev.as_ref(), vp),
+            fs = bar_cell(&fs_href, FS_SPECS[fs - 1].label, vp),
+            next = bar_cell_next(next.as_ref(), vp),
         ),
         vp,
     );
@@ -2274,7 +2116,7 @@ async fn comic_read(
         ),
         bottom = bottom
     );
-    let mut res = page_css(&title, fs, &body, &read_only_css(vp), vp, vmh);
+    let mut res = page_css(&title, fs, &body, &read_only_css(vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2292,7 +2134,6 @@ async fn search(
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
     let fs_url = format!("/k/search?fs={}&key={}", next_fs, qenc(&key));
@@ -2483,7 +2324,7 @@ async fn search(
         list = list,
         pager = pager
     );
-    let mut res = page("搜索", fs, &format!("{top}{stage}"), vp, vmh);
+    let mut res = page("搜索", fs, &format!("{top}{stage}"), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -2551,7 +2392,7 @@ async fn selftest(_u: AuthUser) -> Response {
          KPW3 视觉自测 · <a href=\"/k\">返回书架</a></div>\
          <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">{rows}</table>"
     );
-    page("KPW3 视觉自测", 2, &body, Vp::default(), VmhSel::Unset)
+    page("KPW3 视觉自测", 2, &body, Vp::default())
 }
 
 #[cfg(test)]
@@ -2581,12 +2422,12 @@ mod tests {
     fn budget(spec: &FsSpec) -> usize {
         line_budget(vp(), spec.line)
     }
-    /// 默认视口下的切片参数（与 `comic_read` 推出来的完全一致）。
+    /// 默认视口下的切片参数（与 `comic_read` 推出来的完全一致：漫画可用高再扣 56 顶栏）。
     fn slice_p() -> image::SliceParams {
         image::SliceParams::from_config(
             &test_cfg(true),
             Some(vp().content_w() as u32),
-            Some(vp().content_h() as u32),
+            Some(vp().content_h().saturating_sub(READ_NAV_H) as u32),
             None,
         )
     }
@@ -2800,15 +2641,15 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 阅读页文档高 1180（=1268−88 余量）、正文可用 968；四档行预算按
+    /// 阅读页版面高 = 运行时现算可用高（vp.h）；四档行预算按
     /// 「正文可用高 − 56 顶栏 − 36 上留白 − 56 页码」动态算出。
     #[test]
     fn font_specs_fit_read_stage() {
         assert_eq!(vp().h, 1268);
-        assert_eq!(vp().layout_h(), 1180);
-        assert_eq!(vp().content_h(), 1108);
-        // 1072×1268 下表：968/46=21、968/52=18、968/62=15、968/36=26（已扣 56px 顶栏）
-        let expect = [(28, 46, 21), (32, 52, 18), (38, 62, 15), (20, 36, 26)];
+        assert_eq!(vp().layout_h(), 1268);
+        assert_eq!(vp().content_h(), vp().h - vp().bar_h() - 8);
+        // 1072×1268（运行时高 1268，底栏派生 65）下表：1055/46=22、1055/52=20、1055/62=17、1055/36=29
+        let expect = [(28, 46, 22), (32, 52, 20), (38, 62, 17), (20, 36, 29)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -2874,74 +2715,76 @@ mod tests {
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
         );
-        // 三个脚本：错误兜底（head 内、先于标定）+ 视口标定（head 内、按实测可见高）+ 自报探针
+        // 三个脚本：错误兜底（head 内）+ 视口标定（head 内）+ 自报探针
         assert_eq!(
             html.matches("<script").count(),
             3,
             "只允许错误兜底、视口标定与自报探针"
         );
+        // 运行时现算：outerHeight − 1 为主、availHeight 作上限、innerHeight 兜底
+        assert!(html.contains("(window.outerHeight||0)-1"), "{html}");
+        assert!(html.contains("sh.availHeight"), "{html}");
+        assert!(html.contains("window.__kvh=H"), "算出的高必须可供探针上报");
         assert!(
-            html.contains("d.style.height=(V-88)+'px'"),
-            "文档高必须锁成 visibleH − DOC_BOTTOM_MARGIN(88)：{html}"
+            html.contains("location.replace(location.pathname+'?'"),
+            "补参用 replace，不产生历史记录"
         );
         assert!(
-            html.contains("</style><script>(function(){"),
-            "视口标定脚本必须进 head，首帧就生效"
+            html.contains("document.links") && html.contains("a.setAttribute('href'"),
+            "load 后必须把同一 vh 补到所有站内链接"
         );
-        assert!(
-            html.contains("sessionStorage"),
-            "去环要靠 sessionStorage 一次性标记（不再写 kfix 闩锁）"
-        );
+        // 不落任何持久化：Cookie / sessionStorage / localStorage 一律不出现
+        assert!(!html.contains("document.cookie"), "不得用 Cookie 缓存高度");
+        assert!(!html.contains("sessionStorage") && !html.contains("localStorage"));
         assert!(!html.contains("kfix=1"), "不得再带 kfix 永久闩锁");
         assert!(
             html.contains("/api/k/probe?"),
             "探针必须上报到 /api/k/probe"
         );
         for f in [
+            "vw_param=",
+            "vh_param=",
+            "inner_w=",
+            "inner_h=",
+            "client_w=",
+            "client_h=",
+            "scroll_w=",
+            "scroll_h=",
             "screen_w=",
             "screen_h=",
             "avail_h=",
             "outer_w=",
             "outer_h=",
-            "body_h=",
-            "stage_h=",
-            "visible_h=",
-            "bar_top=",
-            "bar_bottom=",
-            "page_y=",
-            "body_scroll_h=",
-            "calib=",
-            "meas_y=",
-            "kfix=",
-            "body_rect_bottom=",
-            "lowest_el_bottom=",
-            "scroll_evt=",
-            "stage=",
-            "doc_top=",
-            "scroll_top_body=",
-            "scroll_top_doc=",
-            "max_seen=",
-            "vv_off=",
-            "bar_rect_top=",
-            "move_src=",
-            "bar_top_delta=",
-            "scroll_y=",
             "doc_h=",
             "doc_minus_outer=",
             "doc_minus_client=",
             "outer_minus_doc=",
-            "meta_h=",
-            "vw_meta_height=",
+            "rt_h=",
+            "lines=",
+            "body_h=",
+            "stage_h=",
+            "bar_top=",
+            "bar_bottom=",
+            "bar_rect_top=",
+            "bar_top_delta=",
+            "page_y=",
+            "doc_top=",
+            "scroll_top_body=",
+            "scroll_top_doc=",
+            "scroll_y=",
+            "max_seen=",
+            "body_scroll_h=",
+            "body_rect_bottom=",
+            "lowest_el_bottom=",
+            "scroll_evt=",
+            "outer_minus_scroll=",
+            "inner_scroll_top=",
         ] {
-            assert!(K_PROBE_JS.contains(f), "探针 v3~v7 字段缺失：{f}");
+            assert!(K_PROBE_JS.contains(f), "探针字段缺失：{f}");
         }
         assert!(
             K_PROBE_JS.contains("stt=setTimeout(function(){s('move','settle')},800)"),
             "最后一次 scroll 后 800ms 必须补一条 settle：{K_PROBE_JS}"
-        );
-        assert!(
-            K_PROBE_JS.contains("s('move','end')"),
-            "touchend 必须补一条 move_src=end：{K_PROBE_JS}"
         );
         assert!(
             K_PROBE_JS.contains("if(d>max_seen)max_seen=d"),
@@ -2952,13 +2795,8 @@ mod tests {
             "必须注册 scroll 事件补报滑动后的证据：{K_PROBE_JS}"
         );
         assert!(
-            K_PROBE_JS.contains("addEventListener('touchmove',tm,false)")
-                && K_PROBE_JS.contains("addEventListener('touchend',te,false)"),
-            "滑动过程必须连续打点（touchmove 节流 + touchend）：{K_PROBE_JS}"
-        );
-        assert!(
             K_PROBE_JS.contains("if(t-last<200)return"),
-            "touchmove/scroll 打点必须 200ms 节流，避免洪水：{K_PROBE_JS}"
+            "scroll 打点必须 200ms 节流，避免洪水：{K_PROBE_JS}"
         );
         assert!(
             K_PROBE_JS.contains("var i=new Image()"),
@@ -2973,16 +2811,21 @@ mod tests {
             "不得再有 XHR 回退通道（同 stage 会重复打点）：{K_PROBE_JS}"
         );
         assert!(
-            K_PROBE_JS.contains("ck('k_ck')"),
-            "calib 必须来自标定脚本写的 k_ck Cookie"
-        );
-        assert!(
-            K_PROBE_JS.contains("ck('k_my')"),
-            "meas_y 必须来自 k_my Cookie（失败时也能上报）"
-        );
-        assert!(
             K_PROBE_JS.contains("getElementById('k-stage')"),
             "stage_h 必须取 #k-stage 的 clientHeight"
+        );
+        assert!(
+            K_PROBE_JS.contains("getElementById('k-scroll')"),
+            "内层滚动容器 scrollTop 必须上报（当前结构下预期为 '-'）"
+        );
+        // 交互只走 click：pageX/pageY 必须有值并上报
+        assert!(
+            K_PROBE_JS.contains("ev.pageX") && K_PROBE_JS.contains("ev.pageY"),
+            "click 必须上报 pageX/pageY：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("stage=click&click_x="),
+            "click 打点必须带分区坐标：{K_PROBE_JS}"
         );
         assert!(
             !K_PROBE_JS.contains("Promise") && !K_PROBE_JS.contains("fetch("),
@@ -2993,31 +2836,26 @@ mod tests {
             "探针不得改写 location（不能引起额外重载）"
         );
         assert!(
-            html.contains("window.__kerr")
-                && html.contains("window.onerror")
-                && html.contains("addEventListener('touchmove',tm,")
-                && html.contains("function tm(ev){try{if(ev.cancelable)ev.preventDefault()}"),
-            "必须在 calib 之前注册全局错误兜底与纵向手势拦截"
+            html.contains("window.__kerr") && html.contains("window.onerror"),
+            "必须在页面最前面注册全局错误兜底"
         );
-        for f in [
-            "stage=touch",
-            "&tev=",
-            "&cancelable=",
-            "&touches_len=",
-            "&clientY=",
-            "&pageY=",
+        // 删除所有「骗浏览器」的补偿与已弃用字段
+        for gone in [
+            "touchmove",
+            "touchstart",
+            "touchend",
+            "preventDefault",
+            "calib",
+            "meas_y",
+            "k_ck",
+            "meta_h",
+            "vw_meta_height",
+            "visible_h",
+            "::-webkit-scrollbar",
+            "scrollbar-width",
         ] {
-            assert!(html.contains(f), "guard 触摸打点字段缺失：{f}");
+            assert!(!html.contains(gone), "已弃用的补偿/字段不得残留：{gone}");
         }
-        assert!(
-            html.contains("addEventListener('touchstart',ts,false)")
-                && html.contains("addEventListener('touchend',te2,false)"),
-            "touchstart/touchmove/touchend 都必须上报（下一步据此判断事件是否可达）"
-        );
-        assert!(
-            !K_GUARD_JS.contains("function tp(ev,st){try{if(ev.cancelable)ev.preventDefault()"),
-            "触摸打点不得 preventDefault，否则会掩盖「事件是否可达」的证据"
-        );
         assert!(
             html.contains("location.replace"),
             "补参用 replace，不产生历史记录"
@@ -3058,11 +2896,11 @@ mod tests {
         assert!(!is_spa_entry("/favicon.ico"));
     }
 
-    /// 版式硬约束：底栏 64 不压正文、正文区 = 文档高（`visibleH − 88`）− 56（顶栏）− 64 − 36（顶部留白）
-    /// − 56（页码行）；标准档显式 32/52。
+    /// 版式硬约束：底栏高随运行时可用高派生、不压正文；
+    /// 正文区 = 文档高 − 底栏 − 56（顶栏）− 36（顶部留白）− 56（页码行）；标准档显式 32/52。
     #[test]
     fn fixed_bar_keeps_content_clear_of_bar() {
-        assert_eq!(vp().body_h(), vp().h - DOC_BOTTOM_MARGIN - BAR_H);
+        assert_eq!(vp().body_h(), vp().h - vp().bar_h());
         assert_eq!(
             vp().text_h(),
             vp().body_h() - READ_NAV_H - READ_PAD_TOP - READ_PAGENO_H
@@ -3085,7 +2923,7 @@ mod tests {
     }
 
     /// 四档行预算全部由视口高动态算出（已扣 56px 顶栏）：
-    /// 1072×1268 → 21/19/16/27，1024×1200 同档位按更低可用高再算一遍（20/17/14/25），
+    /// 1072×1268 → 22/20/17/29，1024×1200 同档位按更低可用高再算一遍（21/19/15/27），
     /// 且总高始终 ≤ 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
@@ -3094,7 +2932,7 @@ mod tests {
                 .iter()
                 .map(|s| line_budget(vp(), s.line))
                 .collect::<Vec<_>>(),
-            vec![21, 18, 15, 26]
+            vec![22, 20, 17, 29]
         );
         for s in FS_SPECS.iter() {
             assert!(budget(s) * s.line <= vp().text_h(), "{}px 行高溢出", s.line);
@@ -3108,27 +2946,27 @@ mod tests {
             .collect();
         assert_eq!(
             small_lines,
-            vec![19, 17, 14, 25],
+            vec![21, 19, 15, 27],
             "1024×1200 行预算应按可用高重算"
         );
         for s in FS_SPECS.iter() {
             assert!(line_budget(small, s.line) * s.line <= small.text_h());
         }
-        // 四档行预算：文档 1136（vh=1224）→ 正文可用 924 → 20/17/14/25
+        // 运行时低高（vh=1224）：底栏派生 63 → 正文可用 1013 → 22/19/16/28
         let fb = vps(1072, 1224);
         let fb_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(fb, s.line)).collect();
         assert_eq!(
             fb_lines,
-            vec![20, 17, 14, 25],
-            "1224 行预算应按新文档高重算（文档 1136）"
+            vec![22, 19, 16, 28],
+            "1224 行预算应按运行时可用来重算"
         );
         for s in FS_SPECS.iter() {
             let last_bottom = 56 + 36 + line_budget(fb, s.line) * s.line;
             assert!(
-                last_bottom <= fb.layout_h() - BAR_H,
+                last_bottom <= fb.layout_h() - fb.bar_h(),
                 "{}px 末行越界：{last_bottom} > {}",
                 s.line,
-                fb.layout_h() - BAR_H
+                fb.layout_h() - fb.bar_h()
             );
             assert!(line_budget(fb, s.line) * s.line <= fb.text_h());
         }
@@ -3138,15 +2976,15 @@ mod tests {
     /// 1072×1268 与 1024×1200 两档都必须装得下，也不允许多留一整行。
     #[test]
     fn list_pages_fit_inside_stage_at_reference_viewports() {
-        // 1268：正文区 1107；书架 10×104+64=1104、目录 14×2=28 行、搜索 8×112+152=1048
+        // 1268：正文区 1195；书架 10×112+64=1184、目录 15×2=30 行、搜索 9×112+152=1160
         let v = vp();
-        assert_eq!((v.nav_h(), v.shelf_layout()), (1107, (10, 104)));
-        assert_eq!(toc_page_size(v), 28);
-        assert_eq!(search_page_size(v, false), 8);
+        assert_eq!((v.nav_h(), v.shelf_layout()), (1195, (10, 112)));
+        assert_eq!(toc_page_size(v), 30);
+        assert_eq!(search_page_size(v, false), 9);
         let s = vps(1024, 1200);
-        assert_eq!((s.nav_h(), s.shelf_layout()), (1039, (10, 97)));
-        assert_eq!(toc_page_size(s), 26);
-        assert_eq!(search_page_size(s, false), 7);
+        assert_eq!((s.nav_h(), s.shelf_layout()), (1127, (10, 106)));
+        assert_eq!(toc_page_size(s), 28);
+        assert_eq!(search_page_size(s, false), 8);
         for vp in [v, s] {
             let (pp, rh) = vp.shelf_layout();
             assert!(pp * rh + BAR_H <= vp.nav_h(), "书架列表溢出正文区");
@@ -3165,127 +3003,55 @@ mod tests {
         assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
     }
 
-    /// 一屏一页（不依赖参数视口是否准确）：根元素与 body 都硬锁成 `visibleH − 88` 像素高、
-    /// `overflow:hidden`，文档层面无可滚动余量；顶栏/正文/底栏全部以 body 为包含块（absolute）。
+    /// 一屏一页：文档高 = 请求带回的运行时可用高，正文区写死「文档高 − 顶栏 − 底栏」并
+    /// `overflow:hidden`，结构上无滚内容；不做任何隐藏滚动条的补偿。
     #[test]
-    fn read_page_locks_one_screen_and_hides_overflow() {
-        // 真机标定值 vh=1224 → 文档高 = 1224 − 88 = 1136（= outerHeight 1232 − 96）
-        let dev = vps(1072, 1224);
+    fn read_page_locks_one_screen_without_scrollbar_hacks() {
+        let dev = vps(1072, 1201);
         let css = read_only_css(dev);
         assert!(
-            css.contains("html,body{position:fixed;top:0;left:0;width:100%;height:1136px;overflow:hidden;overscroll-behavior:none}"),
-            "根元素与 body 必须硬锁成 1136px 且不可滚动：{css}"
+            css.contains("html,body{position:relative;top:0;left:0;width:100%;height:1201px;overflow:hidden}"),
+            "文档高必须等于运行时可用高：{css}"
         );
+        assert!(!css.contains("position:fixed"), "不得用 fixed 锚布局视口：{css}");
+        assert!(!css.contains("103%"), "不得再有 body 103% hack：{css}");
+        assert!(!css.contains("k-scroll"), "不得再有嵌套滚动容器：{css}");
         assert!(
-            !css.contains("height:100%"),
-            "硬锁必须写像素高（老引擎不支持 calc）：{css}"
+            css.contains(&format!(
+                "#k-stage{{position:absolute;top:56px;left:36px;width:{}px;height:{}px;padding:36px 36px 0;overflow:hidden}}",
+                dev.page_w(),
+                dev.layout_h() - READ_NAV_H - dev.bar_h()
+            )),
+            "正文区高度必须由运行时高派生：{css}"
         );
-        // 老引擎可能在「文档高 == 视口高」时仍画滚动条：根元素与正文区都要显式关掉滚动条绘制
-        let html_css = page_html_css("测试", 2, "", "", vp(), None);
+        // 页面里彻底没有滚动条相关规则
+        let html_css = page_html_css("测试", 2, "", "", vp());
         assert!(
-            html_css.contains("#k-stage::-webkit-scrollbar{width:0;height:0;display:none}"),
-            "必须显式关闭滚动条绘制：{html_css}"
+            !html_css.contains("scrollbar") && !html_css.contains("scrollbar-width"),
+            "不得保留任何滚动条隐藏规则：{html_css}"
         );
-        // 标定脚本：**不再用 scrollTo 测量**（该机 scrollY 恒 0，测不出来），
-        // 只做版本化直通 + 保守兜底，并写 k_ck=0 / k_my=-1 作为「未实测」标记
-        let calib = calib_js();
-        assert!(
-            calib.contains("H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight"),
-            "{calib}"
-        );
-        assert!(
-            !calib.contains("scrollTo(0,3000)") && !calib.contains("(H+2000)-y"),
-            "不得再用 scrollTo 撑高测量（真机 scrollY 恒 0）：{calib}"
-        );
-        assert!(
-            calib.contains("var okv=(V>200&&V<=H)?1:0"),
-            "标定失败必须回退而不是写坏值：{calib}"
-        );
-        assert!(
-            calib.contains("if(!okv)V=F"),
-            "标定失败只能回退保守值 F：{calib}"
-        );
-        assert!(
-            calib.contains("mn(mn(H-24,(window.outerHeight||0)-8),innerHeight)"),
-            "F = min(clientHeight − 24, outerHeight − 8, innerHeight)：{calib}"
-        );
-        assert!(
-            calib.contains("k_vv=2; path=/"),
-            "标定值必须带算法版本号 k_vv（升级即失效重测）：{calib}"
-        );
-        assert!(
-            calib.contains("vv==2){try{d.style.height"),
-            "版本一致即直通（服务端已按 Cookie 排版，不再强制重测）：{calib}"
-        );
-        assert!(
-            calib.contains("document.cookie='k_vh=; path=/; max-age=0'"),
-            "版本不符时必须删掉旧 k_vh 强制重测：{calib}"
-        );
-        assert!(
-            calib.contains("catch(E){try{window.__kerr"),
-            "整段包 try/catch，异常走 img 上报：{calib}"
-        );
-        assert!(
-            calib.contains("k_vhfix2"),
-            "去环键必须随算法版本变化（k_vhfix2），否则旧闩锁会让 vh 永远同步不到：{calib}"
-        );
-        assert!(
-            calib.contains("k_vh="),
-            "标定值必须落到 k_vh Cookie：{calib}"
-        );
-        assert!(calib.contains("path=/"), "Cookie 必须对全站生效：{calib}");
-        assert!(
-            calib.contains("location.replace"),
-            "参数不符时要重载一次：{calib}"
-        );
-        assert!(
-            calib.contains("sessionStorage"),
-            "去环必须靠 sessionStorage 一次性标记，不能再写 kfix 永久闩锁：{calib}"
-        );
-        assert!(
-            !calib.contains("kfix=1"),
-            "replace 时不得再带 kfix（否则 vh 永远同步不到真实值）：{calib}"
-        );
-        assert!(
-            calib.contains("k_ck="),
-            "标定结果（ok/fail）要写 Cookie 供探针上报：{calib}"
-        );
-        assert!(
-            calib.contains("k_my="),
-            "实测滚动量要写 Cookie，失败时也能上报：{calib}"
-        );
-        assert!(
-            calib.contains("d.style.height=(V-88)+'px'"),
-            "文档高锁成 visibleH − 88（真机 1224 → 1136，等价 outerHeight − 96）：{calib}"
-        );
-        assert!(
-            css.contains("#k-stage{position:absolute;top:56px;left:36px;right:36px;bottom:76px;padding:36px 36px 0;overflow:hidden}"),
-            "正文区必须从 56px 顶栏下沿开始、底边让出 76：{css}"
-        );
-        assert!(
-            css.contains("#k-read-nav{position:absolute;top:0;left:0;right:0;height:56px;padding:0 36px;background:#fff;border-bottom:1px solid #000;z-index:12}"),
-            "顶栏必须以 body 为包含块贴顶（老引擎 fixed 不可靠）、白底 1px 分隔线，且 z-index 高于热区(5)：{css}"
-        );
-        let html = page_html_css("测试", 2, "<div id=\"k-stage\"></div>", &css, vp(), None);
-        assert!(html.contains("html,body{position:fixed;top:0;left:0;width:100%;height:1136px;overflow:hidden;overscroll-behavior:none}"));
-        assert!(
-            html.contains("html{-webkit-text-size-adjust:none;height:100%;overflow:hidden}"),
-            "{html}"
-        );
-        assert!(
-            html.contains("body{position:relative;height:100%;overflow:hidden;"),
-            "body 必须是 absolute 子元素的包含块：{html}"
-        );
-        // 底栏不能再用 fixed（老 Silk 会把 fixed 锚在布局视口，掉到可见区外）
+        // 运行时视口脚本：outerHeight 为主、availHeight 上限保护、innerHeight 兜底；
+        // 不写 Cookie / sessionStorage；把 vh 写回 URL 并补到页内链接。
+        let vpjs = K_VP_JS;
+        assert!(vpjs.contains("(window.outerHeight||0)-1"), "{vpjs}");
+        assert!(vpjs.contains("screen||{}"), "{vpjs}");
+        assert!(vpjs.contains("availHeight"), "{vpjs}");
+        assert!(vpjs.contains("innerHeight"), "{vpjs}");
+        assert!(!vpjs.contains("cookie"), "不得写 Cookie：{vpjs}");
+        assert!(!vpjs.contains("sessionStorage"), "不得持久化高度：{vpjs}");
+        assert!(vpjs.contains("location.replace"), "{vpjs}");
+        assert!(vpjs.contains("document.links"), "链接要补 vh：{vpjs}");
+        // 底栏：相对 body 贴底 + 内建 12px 安全区，高度随运行时高派生（不写死）
         let bar = fixed_bar("", vp());
         assert!(
-            bar.contains(
-                "position:absolute;left:0;right:0;bottom:0;height:76px;padding-bottom:12px"
-            ),
-            "底栏必须相对 body 贴底并内置 12px 安全区：{bar}"
+            bar.contains(&format!(
+                "position:absolute;left:0;right:0;bottom:0;height:{}px;padding-bottom:12px",
+                vp().bar_h()
+            )),
+            "底栏高度必须派生：{bar}"
         );
-        assert!(!bar.contains("position:fixed"), "底栏不得用 fixed：{bar}");
-        assert!(!bar.contains("width:1072px"), "底栏宽度不得写死像素：{bar}");
+        assert!(!bar.contains("position:fixed"), "{bar}");
+        assert_ne!(vp().bar_h(), vps(1072, 1000).bar_h(), "不同可用高应得不同底栏高");
     }
 
     /// 阅读页顶栏：左「← 书架」回 `/k`、右「目录」回目录页，两者都透传当前 fs/vw/vh；
@@ -3320,106 +3086,47 @@ mod tests {
         );
     }
 
-    /// 服务端直接读 `k_vh`：版本一致才生效，旧版本写的值一律不采用（v0.3.18 的教训）。
+    /// 高度不做持久化：请求未带 `vh` 时用环境默认，带了就完全按参数排版（每次现算）。
     #[test]
-    fn cookie_vh_requires_current_version() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            header::COOKIE,
-            HeaderValue::from_static("k_vh=1224; k_vv=2"),
-        );
-        assert_eq!(cookie_vh(&h), Some(1224));
-        h.insert(
-            header::COOKIE,
-            HeaderValue::from_static("k_vh=1256; k_vv=1"),
-        );
-        assert_eq!(cookie_vh(&h), None, "旧版本写的 1256 必须作废");
-        h.insert(header::COOKIE, HeaderValue::from_static("k_vh=abc; k_vv=2"));
-        assert_eq!(cookie_vh(&h), None, "非数字不采用");
-        h.insert(header::COOKIE, HeaderValue::from_static("k_vh=1224"));
-        assert_eq!(cookie_vh(&h), None, "缺 k_vv 不采用");
-        h.insert(header::COOKIE, HeaderValue::from_static("k_fs=2"));
-        assert_eq!(cookie_vh(&h), None, "无标定 Cookie");
+    fn viewport_height_comes_from_request_only() {
+        let d = (1072, 1201);
+        assert_eq!(Vp::resolve(None, Some(1201), d).layout_h(), 1201);
+        assert_eq!(Vp::resolve(None, None, d).layout_h(), 1201, "缺参用默认");
+        assert_eq!(Vp::resolve(None, Some(999), d).layout_h(), 999, "按参数原样排版");
+        let g = vps(1072, 1201).content_h();
+        assert!(g < 1201 && g > 0, "版面必须比可用高矮（给底栏让位）");
     }
 
-    /// `?vmh=` 三态：写入（1100）、清除（0/off）、非法（300 忽略）。
-    /// 规则是「先解析参数、再决定写/删/沿用」，清除指令优先于旧 Cookie。
+    /// 只保留宽度/缩放，viewport meta 不再输出 `height=`（也不写任何高度 Cookie）。
     #[test]
-    fn viewport_meta_height_switch() {
+    fn viewport_meta_has_no_height_and_no_cookie() {
         let v = vp();
-        let mut h = HeaderMap::new();
-
-        // 写入：输出 meta height + 30 天 Cookie
-        assert_eq!(vmh_sel(&h, Some("1100")), VmhSel::Set(1100));
-        let on = page_html_css("测试", 2, "", "", v, Some(1100));
+        let html = page_html_css("测试", 2, "", "", v);
         assert!(
-            on.contains("content=\"width=1072,height=1100,initial-scale=1"),
-            "?vmh=1100 必须输出 meta height：{on}"
+            html.contains("content=\"width=1072,initial-scale=1"),
+            "viewport 只声明宽度：{html}"
         );
-        let res = page_css("测试", 2, "", "", v, VmhSel::Set(1100));
-        assert_eq!(
-            res.headers()
-                .get(header::SET_COOKIE)
-                .and_then(|v| v.to_str().ok()),
-            Some("k_vmh=1100; path=/; max-age=2592000")
-        );
-
-        // 清除：0/off 等价；旧 Cookie 存在时也先按参数清除，不沿用旧值
-        h.insert(header::COOKIE, HeaderValue::from_static("k_vmh=1100"));
-        assert_eq!(vmh_sel(&h, Some("0")), VmhSel::Off);
-        assert_eq!(vmh_sel(&h, Some("off")), VmhSel::Off);
-        assert_eq!(vmh_sel(&h, Some("OFF")), VmhSel::Off);
-        let off = page_html_css("测试", 2, "", "", v, VmhSel::Off.meta());
-        assert!(
-            off.contains("content=\"width=1072,initial-scale=1"),
-            "清除后 meta 不得带 height：{off}"
-        );
-        let res = page_css("测试", 2, "", "", v, VmhSel::Off);
-        assert_eq!(
-            res.headers()
-                .get(header::SET_COOKIE)
-                .and_then(|v| v.to_str().ok()),
-            Some("k_vmh=; path=/; max-age=0")
-        );
-
-        // 非法：忽略参数、沿用 Cookie、不写也不删
-        let empty = HeaderMap::new();
-        assert_eq!(vmh_sel(&empty, Some("300")), VmhSel::Unset, "非法值忽略");
-        assert_eq!(
-            vmh_sel(&h, Some("300")),
-            VmhSel::Set(1100),
-            "非法值不覆盖 Cookie"
-        );
-        let res = page_css("测试", 2, "", "", v, VmhSel::Unset);
+        assert!(!html.contains("height=1224") && !html.contains(",height="), "不得输出 meta height");
+        let res = page_css("测试", 2, "", "", v);
         assert!(
             res.headers().get(header::SET_COOKIE).is_none(),
-            "无指令不写 Cookie"
+            "页面不再写高度 Cookie"
         );
-        assert_eq!(vmh_sel(&h, Some("2401")), VmhSel::Set(1100), "过大同样忽略");
-        assert_eq!(vmh_sel(&h, None), VmhSel::Set(1100), "无参数沿用 Cookie");
     }
 
-    /// 兜底档位可一键切到 −48（常量开关），行预算随高度自动重算。
+    /// 版面高完全跟随请求：不同高度得出的行预算不同，且末行永不越过正文区。
     #[test]
-    fn calib_gap_switch_recomputes_budget() {
-        assert_eq!(calib_gap(), CALIB_FALLBACK_GAP);
-        let js = calib_js();
-        assert!(
-            js.contains(&format!("H-{}", calib_gap())),
-            "兜底算式必须用当前档位：{js}"
-        );
-        // 切到 −48 档时真机 H=1268 → V=1220，文档 1132：
-        // 正文可用高 920 → 四档行预算 20/17/14/25，末行仍不越过正文区下沿。
-        let hard = vps(1072, 1268 - CALIB_FALLBACK_GAP_SAFE);
-        let lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(hard, s.line)).collect();
-        assert_eq!(lines, vec![20, 17, 14, 25], "−48 档行预算");
-        for s in FS_SPECS.iter() {
-            let last_bottom = 56 + 36 + line_budget(hard, s.line) * s.line;
-            assert!(
-                last_bottom <= hard.layout_h() - BAR_H,
-                "{}px 末行越界：{last_bottom}",
-                s.line
-            );
+    fn line_budget_tracks_runtime_height() {
+        let small = vps(1072, 1100);
+        let big = vps(1072, 1280);
+        let s_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(small, s.line)).collect();
+        let b_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(big, s.line)).collect();
+        assert!(s_lines.iter().zip(b_lines.iter()).all(|(a, b)| a < b), "高越大行越多");
+        for v in [small, big] {
+            for s in FS_SPECS.iter() {
+                let last_bottom = READ_NAV_H + READ_PAD_TOP + line_budget(v, s.line) * s.line;
+                assert!(last_bottom <= v.layout_h() - v.bar_h(), "{}px 末行越界", s.line);
+            }
         }
     }
 
@@ -3440,7 +3147,7 @@ mod tests {
     fn empty_shelf_is_outlined_and_centered() {
         let html = empty_shelf(2, vp());
         assert!(html.contains("border:1px solid #000"), "{html}");
-        assert!(html.contains("width=\"1000\" height=\"1107\""), "{html}");
+        assert!(html.contains("width=\"1000\" height=\"1195\""), "{html}");
         assert!(
             html.contains("align=\"center\" valign=\"middle\""),
             "{html}"
@@ -3449,36 +3156,44 @@ mod tests {
         assert!(html.contains("width:240px;height:72px;line-height:70px;border:1px solid #000"));
     }
 
-    /// 底栏 4 格等宽（各 250 = 25%）、64 高、图标 28 + 文字 20，禁用态用 #555 且不可点。
-    /// 「记录」已删除：进度改为打开页面即自动写入。
+    /// 底栏 3 格等宽（各 33.33%）、整格 click 热区，只有一行主标签（无下方小字）。
+    /// 「目录」已删除（入口只留顶栏右上角），中间格显示当前字号档位。
     #[test]
-    fn bottom_bar_has_four_equal_cells() {
+    fn bottom_bar_has_three_equal_cells() {
         let row = format!(
-            "{}{}{}{}",
-            bar_cell("/k?a", "前", "上一页"),
-            bar_cell_off("后", "下一页"),
-            bar_cell("/k?b", "目", "目录"),
-            bar_cell("/k?c", "字", "字号"),
+            "{}{}{}",
+            bar_cell("/k?a", "前", vp()),
+            bar_cell("/k?b", "中", vp()),
+            bar_cell_off("后", vp()),
         );
         let bar = fixed_bar(&row, vp());
-        assert_eq!(bar.matches("<td ").count(), 4, "{bar}");
-        assert_eq!(bar.matches("width=\"25%\"").count(), 4, "{bar}");
-        assert_eq!(bar.matches("height=\"64\"").count(), 4, "{bar}");
-        assert!(bar.contains("width:28px;height:28px"));
-        assert!(
-            bar.contains("font-size:28px;line-height:28px;font-weight:700"),
+        let ch = vp().bar_content_h().saturating_sub(1);
+        assert_eq!(bar.matches("<td ").count(), 3, "{bar}");
+        assert_eq!(bar.matches("width=\"33.33%\"").count(), 3, "{bar}");
+        assert_eq!(
+            bar.matches(&format!("height=\"{ch}\"")).count(),
+            3,
             "{bar}"
         );
-        assert!(!bar.contains("border:1px solid #000"), "字符不得再套方框");
+        assert!(bar.contains("font-size:34px"), "{bar}");
+        assert!(!bar.contains("border:1px solid #000"), "格子不得再套方框");
         assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
-        assert_eq!(bar.matches("<a ").count(), 3, "只有目录/字号/上一页是链接");
+        assert_eq!(bar.matches("<a ").count(), 2, "前/字号两格是链接");
         assert!(!bar.contains("<form"), "记录表单已删除");
+        assert!(!bar.contains("目录") && !bar.contains(">目<"), "目录格已删除");
         assert!(
-            !bar.contains(">记<") && !bar.contains("记录"),
-            "不再有记录格"
+            !bar.contains("上一页") && !bar.contains("下一页") && !bar.contains("上一章"),
+            "不再有下方小字"
         );
         assert!(bar.contains("color:#555"), "禁用态用弱灰 #555");
         assert!(!bar.contains("background:#e6e6e6"));
+        // 底栏高随运行时可用高派生：不同高度得到不同像素，不写死
+        let tall = fixed_bar(&row, vps(1072, 1280));
+        assert!(
+            tall.contains(&format!("height:{}px", vps(1072, 1280).bar_h())),
+            "{tall}"
+        );
+        assert_ne!(vps(1072, 1280).bar_h(), vp().bar_h());
     }
 
     /// 左右热区：CSS `top:56px;bottom:0;width:33%`（从顶栏下沿开始）跟随真实视口
@@ -3525,11 +3240,11 @@ mod tests {
             assert!(v.content_w() >= 320, "版心宽不能小于 320");
             assert!(v.content_h() >= 320, "可用高不能小于 320");
             assert_eq!(v.content_w(), w - 144);
-            assert_eq!(v.content_h(), h - DOC_BOTTOM_MARGIN - 72);
+            assert_eq!(v.content_h(), h - v.bar_h() - 8);
             assert_eq!(
                 v.text_h(),
-                h - DOC_BOTTOM_MARGIN - READ_NAV_H - 64 - 36 - 56,
-                "正文可用高必须扣掉 56px 顶栏"
+                h - v.bar_h() - READ_NAV_H - READ_PAD_TOP - READ_PAGENO_H,
+                "正文可用高必须扣掉 56px 顶栏与页码行"
             );
         }
     }
@@ -3545,14 +3260,13 @@ mod tests {
             fs: Some(2),
             vw: None,
             vh: None,
-            vmh: None,
         };
         let next = read_link(&q, 2, 3, 3, vp());
         assert!(
             next.contains("vw=1072") && next.contains("vh=1268"),
             "{next}"
         );
-        let toc = toc_link(&q, 2, 3, vp());
+        let toc = toc_link(&q, 2, 3, 2, vp());
         assert!(toc.contains("vw=1072") && toc.contains("vh=1268"), "{toc}");
         // 换尺寸后链接里的参数跟着变
         let small = read_link(&q, 2, 3, 3, vps(1024, 1200));
@@ -3604,7 +3318,11 @@ mod tests {
         let off = comic_pages(&images, &dims, &test_cfg(false), &sp);
         assert_eq!(off.len(), 3, "关闭时三张图各一页");
         assert!(off.iter().all(|p| p.layers == 1 && p.slice == 0));
-        assert_eq!(off[0].height, vp().content_h(), "整图按高度约束缩到一屏");
+        assert_eq!(
+            off[0].height,
+            vp().content_h() - READ_NAV_H,
+            "整图按高度约束缩到一屏（扣顶栏）"
+        );
         // 1.1 屏（1024×1471）：不切，一屏一页，按高度约束等比缩小
         let one = vec![BookImage {
             index: 1,
@@ -3617,7 +3335,7 @@ mod tests {
         let p1 = comic_pages(&one, &one_dims, &cfg, &sp);
         assert_eq!(p1.len(), 1, "1.1 屏不切");
         assert_eq!(p1[0].layers, 1);
-        assert_eq!(p1[0].height, vp().content_h());
+        assert_eq!(p1[0].height, vp().content_h() - READ_NAV_H);
         assert!(p1[0].width <= 928, "等比缩小后不得宽于版心");
         // 尺寸未知：整图一页，height=0（渲染退化为 max-height）
         let unknown = vec![BookImage {
@@ -3654,15 +3372,15 @@ mod tests {
             &sp0,
         );
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
-        // 1024×1200 缩到 928 宽 → 高 1088（≤1132 漫画可用高），显式宽高防抖动
+        // 1024×1200 缩到 928 宽 → 高 1088（≤ 运行时漫画可用高），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
-        // 漫画页保留像素高（1180 − 56 顶栏 = 1124），并整体下移到顶栏下沿
-        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1124px"));
+        // 漫画页保留像素高（运行时 1268 − 56 顶栏 = 1212），并整体下移到顶栏下沿
+        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1212px"));
         // 漫画页同样清零 read_only_css 的绝对定位偏移，否则整页会被 right 挤向右
         assert!(
             html.contains(
-                "position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:56px;height:1124px"
+                "position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:56px;height:1212px"
             ),
             "{html}"
         );
@@ -3702,8 +3420,8 @@ mod tests {
             &sp0,
         );
         assert!(s2.contains("slice=1&i=1"), "{s2}");
-        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离（vh 取漫画可用高 1108）
-        assert!(s2.contains("dw=928") && s2.contains("vh=1108"), "{s2}");
+        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离（vh 取运行时漫画可用高 1139）
+        assert!(s2.contains("dw=928") && s2.contains("vh=1139"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
         assert!(
             !s2.contains("height=\""),
