@@ -8,19 +8,24 @@
 //!   布局视口比可见区高，`bottom:0` 会把它底栏顶到可见区之外。`calib_js` 在 `<head>`
 //!   用「文档撑高 → 滚到底（延时两次采样，老 Silk 滚动是异步的） → 文档高−最大滚动量」
 //!   标定 `visibleH`，写 Cookie `k_vh`，再把 `html` 高度锁成 `visibleH − SAFE_BOTTOM(12)`
-//!   （严格小于可见高）；标定失败回退 `clientHeight − 24`，最终文档 = `clientHeight − 36`。
+//!   （严格小于可见高）；标定失败回退 `min(client−24, outer−8, inner)`。服务端渲染也直接读
+//!   `k_vh`（版本一致时优先于 URL 参数），所以重定向失败也不影响版面。
 //! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
 //!   不用 `border-radius`；底栏与贴底元素用 `position:absolute`（相对 `body`，`body` 为
 //!   `position:relative` 且高 = `visibleH − 12`），不用 transform/transition。
-//! - 两个内联脚本：视口标定（`calib_js`，ES5、`sessionStorage` 一次性去环，**不再写 `kfix`** 闩锁）、
-//!   自报探针（`K_PROBE_JS`，v4，不重载）；其余翻页/切换字号全部是真实链接。
+//! - 三个内联脚本：错误兜底（`K_GUARD_JS`，注册 `window.onerror` + `__kerr` img 打点）、
+//!   视口标定（`calib_js`，ES5、`sessionStorage` 一次性去环，**不写 `kfix`** 闩锁）、
+//!   自报探针（`K_PROBE_JS`，v5，img 同步打点为主、XHR 仅作回退）；其余翻页/切换字号全部是真实链接。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
 use axum::{
     body::Body,
     extract::{Query, Request, State},
-    http::{header::SET_COOKIE, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{
+        header::{self, SET_COOKIE},
+        HeaderMap, HeaderValue, Method, StatusCode,
+    },
     middleware::Next,
     routing::get,
     Form, Router,
@@ -71,6 +76,19 @@ const SAFE_BOTTOM: usize = 12;
 /// 再减 `SAFE_BOTTOM` 得文档 1212，相对真实可见 1244 留 32px 硬余量——宁可少排一行，
 /// 也不留可滑动余量（行预算会按新高度自动少算，属可接受代价）。
 const CALIB_FALLBACK_GAP: usize = 24;
+/// 一键切到更保守档：若真机证据仍显示「文档比可见矮却还能平移 24px」，把这里改成
+/// `true` 即整体换成 `− 48` 档（同时 `CALIB_VER` 必须 +1，让旧 Cookie 失效重测）。
+const CALIB_CONSERVATIVE: bool = false;
+/// 更保守档的裁切量（`clientHeight − 48`）
+const CALIB_FALLBACK_GAP_SAFE: usize = 48;
+/// 实际使用的兜底裁切量
+const fn calib_gap() -> usize {
+    if CALIB_CONSERVATIVE {
+        CALIB_FALLBACK_GAP_SAFE
+    } else {
+        CALIB_FALLBACK_GAP
+    }
+}
 /// 标定算法版本（写 Cookie `k_vv`）。**任何会改变 `visibleH`/兜底值的改动都必须 +1**：
 /// 旧版本写的 `k_vh` 一律作废并强制重测一次，避免升级后继续沿用旧值（v0.3.17 的教训）。
 /// 同时用于 `sessionStorage` 去环键，版本升级后旧闩锁自动失效。
@@ -225,85 +243,96 @@ const K_FS_COOKIE: &str = "k_fs";
 ///   4. 复原高度、`scrollTo(0, 0)`、`overflow` 与 `visibility`（测量期间整页 `hidden`，
 ///      避免 e-ink 上出现“撑高再回弹”的残影）；
 ///   5. 守卫：`y <= 0` 或 `visibleH = (H + 2000) − y` 不在 `[200, H]` 内 → 标定失败，
-///      回退保守值 `F = min(H − 24, outerHeight − 8, innerHeight)`（取不到的项忽略；
+///      回退保守值 `F = min(H − GAP, outerHeight − 8, innerHeight)`（取不到的项忽略；
 ///      真机 `outerHeight=1232` → `F=1224`，文档 1212，宁可少排一行也不留可滑动余量）。
 ///
 /// 结果写 Cookie `k_vh`（Path=/，30 天）、`k_vv`（标定算法版本 `CALIB_VER`）与
-/// `k_ck`/`k_my`（成功/失败、实测滚动量，会话级）。**只有 `k_vv` 与当前版本一致、
-/// 且 `k_ck=1`（曾成功实测）才直通**；版本不符或从未成功 → 删 `k_vh` 强制重测，
-/// 保证升级后不会继续用旧版本写下的值。
-/// 参数 `vh` 与 `visibleH` 不一致时用 `location.replace` 带 `vh=visibleH` 重载，
-/// 让服务端按真实可见高重算行预算与全部像素几何；**不写 `kfix` 永久闩锁**，
-/// 去环只靠版本化的 `sessionStorage.k_vhfix{CALIB_VER}`（只挡连续两次，`vh` 对上后清除）。
+/// `k_ck`/`k_my`（成功/失败、实测滚动量，会话级）。
+///
+/// **服务端渲染直接读 `k_vh`（见 `cookie_vh`）**：版本一致时即使 URL 缺参也按 Cookie
+/// 排版，`location.replace` 只承担「把 `vw`/`vh` 补齐进 URL」的补参职责（最多一次，
+/// 失败也不影响版面）。去环只靠版本化的 `sessionStorage.k_vhfix{CALIB_VER}`。
 /// 文档高统一锁成 `visibleH − SAFE_BOTTOM`，**严格小于**可见高。
+/// 整段包在 `try/catch` 里，异常经 `window.__kerr` 走 img 通道上报（见 `K_GUARD_JS`）。
 fn calib_js() -> String {
-    format!(
-        "(function(){{var d=document.documentElement,W=innerWidth,H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight;\
-var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,dV='',done=0;\
-for(var i=0;i<p.length;i++){{var k=p[i].split('=')[0];\
-if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k!='kfix'&&p[i])o.push(p[i]);}}\
-function ck(n){{var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):-1}}\
-function sy(){{return window.scrollY||window.pageYOffset||0}}\
-function mn(a,b){{if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}}\
-var F=mn(mn(H-{gap},(window.outerHeight||0)-8),innerHeight);if(!(F>200))F=H-{gap};\
-function rep(V){{if(!W||!V)return;\
-if(vw==W&&vh==V){{try{{sessionStorage.removeItem('k_vhfix{ver}')}}catch(e){{}}return}}\
-var once=0;try{{once=sessionStorage.getItem('k_vhfix{ver}')=='1'}}catch(e){{}}\
-if(once)return;try{{sessionStorage.setItem('k_vhfix{ver}','1')}}catch(e){{}}\
-o.push('vw='+W,'vh='+V);location.replace(location.pathname+'?'+o.join('&'))}}\
-function fin(V,y,meas){{if(done)return;done=1;try{{d.style.visibility=dV}}catch(e){{}}\
-var okv=(V>200&&V<=H)?1:0;if(!okv)V=F;\
-if(meas){{try{{document.cookie='k_ck='+okv+'; path=/';\
-document.cookie='k_my='+y+'; path=/'}}catch(e){{}}}}\
-try{{document.cookie='k_vv={ver}; path=/; max-age=2592000'}}catch(e){{}}\
-try{{document.cookie='k_vh='+V+'; path=/; max-age=2592000'}}catch(e){{}}\
-try{{if(V>{min})d.style.height=(V-{safe})+'px'}}catch(e){{}}\
-rep(V)}}\
-var V=ck('k_vh'),vv=ck('k_vv'),ock=(ck('k_ck')==1);\
-if(V>200&&V<=H&&vv=={ver}&&ock){{fin(V,-1,0)}}else{{\
-if(!(vv=={ver}&&ock)){{try{{document.cookie='k_vh=; path=/; max-age=0'}}catch(e){{}}}}\
-var oldH=d.style.height,oldO=d.style.overflow,y1=0,y2=0,ok=0;\
-dV=d.style.visibility;d.style.visibility='hidden';\
-try{{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);ok=1}}\
-catch(e){{try{{d.style.height=oldH;d.style.overflow=oldO}}catch(x){{}}}}\
-if(!ok){{fin(0,0,0)}}else{{setTimeout(function(){{y1=sy();\
-setTimeout(function(){{y2=sy();var y=y1>y2?y1:y2;\
-try{{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}}catch(e){{}}\
-fin((H+2000)-y,y,1)}},50)}},50)}}}}}})()",
-        safe = SAFE_BOTTOM,
-        gap = CALIB_FALLBACK_GAP,
-        ver = CALIB_VER,
-        min = 400
-    )
+    CALIB_JS
+        .replace("{SAFE}", &SAFE_BOTTOM.to_string())
+        .replace("{GAP}", &calib_gap().to_string())
+        .replace("{VER}", &CALIB_VER.to_string())
+        .replace("{MIN}", "400")
 }
 
-/// 自报探针（ES5，零依赖，不重载页面）：`load` 后 200ms 用 `XMLHttpRequest`
-/// 把「URL 参数视口 + 真实量到的视口/文档尺寸」回传 `/api/k/probe`。
+const CALIB_JS: &str = "(function(){try{\
+var d=document.documentElement,W=innerWidth,H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight;\
+var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,vis='',done=0;\
+for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
+if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k!='kfix'&&p[i])o.push(p[i]);}\
+function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):-1}\
+function sy(){return window.scrollY||window.pageYOffset||0}\
+function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
+var F=mn(mn(H-{GAP},(window.outerHeight||0)-8),innerHeight);if(!(F>200))F=H-{GAP};\
+function rep(V){if(!W||!V)return;\
+if(vw==W&&vh==V){try{sessionStorage.removeItem('k_vhfix{VER}')}catch(e){}return}\
+var once=0;try{once=sessionStorage.getItem('k_vhfix{VER}')=='1'}catch(e){}\
+if(once)return;try{sessionStorage.setItem('k_vhfix{VER}','1')}catch(e){}\
+o.push('vw='+W,'vh='+V);location.replace(location.pathname+'?'+o.join('&'))}\
+function fin(V,y,meas){if(done)return;done=1;try{d.style.visibility=vis}catch(e){}\
+var okv=(V>200&&V<=H)?1:0;if(!okv)V=F;\
+if(meas){try{document.cookie='k_ck='+okv+'; path=/';document.cookie='k_my='+y+'; path=/';}catch(e){}}\
+try{document.cookie='k_vv={VER}; path=/; max-age=2592000'}catch(e){}\
+try{document.cookie='k_vh='+V+'; path=/; max-age=2592000'}catch(e){}\
+try{if(V>{MIN})d.style.height=(V-{SAFE})+'px'}catch(e){}\
+rep(V)}\
+var V=ck('k_vh'),vv=ck('k_vv');\
+if(V>200&&V<=H&&vv=={VER}){fin(V,-1,0)}else{\
+if(!(vv=={VER})){try{document.cookie='k_vh=; path=/; max-age=0'}catch(e){}}\
+var oldH=d.style.height,oldO=d.style.overflow,y1=0,y2=0,ok=0;\
+vis=d.style.visibility;d.style.visibility='hidden';\
+try{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);ok=1}\
+catch(e){try{d.style.height=oldH;d.style.overflow=oldO}catch(x){}}\
+if(!ok){fin(0,0,0)}else{setTimeout(function(){y1=sy();\
+setTimeout(function(){y2=sy();var y=y1>y2?y1:y2;\
+try{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}catch(e){}\
+fin((H+2000)-y,y,1)},50)},50)}}\
+}catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'calib')}catch(x){}}})()";
+
+/// 全局错误兜底（ES5，注入 `<head>` 且在 `calib` 之前）：`window.onerror` 与各段
+/// `try/catch` 都走 `window.__kerr(msg, ln, stage)`，用 `<img>` 打点上报，**不依赖
+/// `load` 事件与 XHR**——v0.3.18 真机「探针一条没到」就是静默失败，这条保证下次
+/// 日志里能直接看到断在哪一段（`stage=gerr|calib|probe`）。
+const K_GUARD_JS: &str = "(function(){\
+function e(m,l,st){try{var i=new Image();\
+i.src='/api/k/probe?stage='+st+'&err='+encodeURIComponent((''+(m||'-')).substring(0,60))+\
+'&ln='+(l||0)+'&vw_param='+encodeURIComponent((''+(location.search||'')).substring(0,80))}catch(x){}}\
+function ke(m,s,l){e(m,l,'gerr');return false}\
+window.__kerr=e;window.onerror=ke})()";
+
+/// 自报探针（ES5，零依赖，不重载页面）：**以 `<img>` 打点为主通道**（同步立即发一条
+/// `stage=sync`，`load` 时再补一条 `stage=load`，用户滑动后再补一条 `stage=scroll`），
+/// `XMLHttpRequest` 只作为 img `onerror` 时的可选回退，**不再是唯一通道**——v0.3.18
+/// 真机「探针一条没到」正是依赖 `load`+XHR 的教训。整段包在 `try/catch` 里，异常走
+/// `window.__kerr`（`stage=probe`）。
 /// `innerWidth/innerHeight` 与 `documentElement.clientWidth/clientHeight` 同时上报，
-/// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；失败静默。
-/// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`：
-/// 若 `screen_h`/`avail_h` 明显大于 `client_h`，说明 Silk 的可视视口被系统栏或工具栏
-/// 遮住了一部分（此时即使文档高 = `clientHeight` 仍会露滚动条），量不到的数一律填 `-`。
-/// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`（底栏实际 top），用于真机自证
-/// 「标定出的可见高」与「底栏是否落在可见区内」。
-/// v4 追加 `calib`（`ok`/`fail`，来自标定脚本写的 `k_ck`）、`meas_y`（实测最大滚动量，
-/// 失败时也会上报，不再静默回退）、`bar_bottom`（底栏底边）、`page_y`（当前 `pageYOffset`，
-/// 区分「浏览器平移」与「文档真溢出」）、`body_scroll_h` 与 `kfix`（URL 上是否带旧闩锁）。
-/// v5 追加 `body_rect_bottom`、`lowest_el_bottom`（`body` 直接子元素 `top+height` 的最大值），
-/// 并注册一次 `scroll` 事件再报一条（带滑动后的 `page_y` 与 `#k-bar` 的 `top`），
+/// 用来分辨「设备报的窗口高」和「真正参与排版的布局视口高」；量不到的数一律填 `-`。
+/// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`；
+/// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`；
+/// v4 追加 `calib`（`ok`/`fail`，来自 `k_ck`）、`meas_y`、`bar_bottom`、`page_y`、
+/// `body_scroll_h` 与 `kfix`；
+/// v5 追加 `body_rect_bottom`、`lowest_el_bottom` 与 `stage`（sync/load/scroll），
 /// 用于区分「body 真实溢出」与「老 WebKit 钳制/可视视口平移」。
-const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
+const K_PROBE_JS: &str = "(function(){try{\
+function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
 function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
 function bar(){return document.getElementById('k-bar')}\
 function bt(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().top)}catch(e){return b.offsetTop}}\
 function bb(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return b.offsetTop+b.offsetHeight}}\
 function bre(){var b=document.body;if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return '-'}}\
-function lb(){var b=document.body;if(!b||!b.children)return '-';var m=-1;try{for(var i=0;i<b.children.length;i++){{\
+function lb(){var b=document.body;if(!b||!b.children)return '-';var m=-1;try{for(var i=0;i<b.children.length;i++){\
 var r=b.children[i].getBoundingClientRect(),x=r.top+(r.height||(r.bottom-r.top));if(x>m)m=x}}catch(e){return '-'}return m>=0?Math.round(m):'-'}\
-function s(ev){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
+function qs(ev){var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
 st=document.getElementById('k-stage'),ock=ck('k_ck');\
-var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
+return 'vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
 '&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname)+\
 '&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
@@ -312,13 +341,19 @@ var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h=
 '&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+\
 '&page_y='+v(window.pageYOffset||0)+'&body_scroll_h='+v(b&&b.scrollHeight)+\
 '&body_rect_bottom='+bre()+'&lowest_el_bottom='+lb()+'&scroll_evt='+(ev?1:0)+\
-'&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix');\
-var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
-var fired=0;function sc(){if(fired)return;fired=1;s(1)}\
-if(window.addEventListener){window.addEventListener('load',function(){setTimeout(function(){s(0)},200)},false);\
-window.addEventListener('scroll',sc,false)}\
-else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(function(){s(0)},200)});\
-window.attachEvent('onscroll',sc)}})()";
+'&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix')}\
+function xh(u){try{if(!window.XMLHttpRequest)return;var x=new XMLHttpRequest();\
+x.open('GET',u,true);x.send(null)}catch(e){}}\
+function s(stage){try{var u='/api/k/probe?'+qs(stage=='scroll'?1:0)+'&stage='+stage;\
+try{var i=new Image();i.onerror=function(){xh(u)};i.src=u}catch(e){xh(u)}}catch(e){\
+try{window.__kerr&&window.__kerr((e&&e.message)||e,0,'probe')}catch(x){}}}\
+var fired=0;s('sync');\
+function ld(){s('load')}\
+function rs(){if(fired)return;fired=1;s('scroll')}\
+if(window.addEventListener){window.addEventListener('load',ld,false);\
+window.addEventListener('scroll',rs,false)}\
+else if(window.attachEvent){window.attachEvent('onload',ld);window.attachEvent('onscroll',rs)}\
+}catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'probe')}catch(x){}}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
@@ -518,7 +553,7 @@ h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style><script>{calib}</script></head><body><div class=\"wrap\">{body}</div><script>{probe}</script></body></html>",
+</style><script>{guard}</script><script>{calib}</script></head><body><div class=\"wrap\">{body}</div><script>{probe}</script></body></html>",
         viewport = viewport,
         title = esc(title),
         size = spec.size,
@@ -527,6 +562,7 @@ table{{border-collapse:collapse}}\
         pad = SIDE_PAD,
         extra = extra_css,
         body = body,
+        guard = K_GUARD_JS,
         calib = calib_js(),
         probe = K_PROBE_JS
     )
@@ -1172,8 +1208,31 @@ pub struct LoginQ {
 
 // ---------------- 数据辅助 ----------------
 
-/// 解析请求视口：`vw`/`vh` 参数优先，缺参/越界回落到环境默认（默认 1072×1268）。
-fn vp_of(s: &AppState, vw: Option<i64>, vh: Option<i64>) -> Vp {
+/// 读 `k_vh`/`k_vv`：版本一致且值在合法区间时返回，服务端直接用它排版。
+/// 这样即使 `location.replace` 没跑成（v0.3.18 真机探针一条未到），
+/// 只要 Cookie 已写成功，下一屏仍是按真实可见高渲染的版本。
+fn cookie_vh(headers: &HeaderMap) -> Option<i64> {
+    let raw = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
+    let mut vh = None;
+    let mut vv = None;
+    for part in raw.split(';') {
+        let pair = part.trim();
+        if let Some(v) = pair.strip_prefix("k_vh=") {
+            vh = v.trim().parse::<i64>().ok();
+        } else if let Some(v) = pair.strip_prefix("k_vv=") {
+            vv = v.trim().parse::<i64>().ok();
+        }
+    }
+    match (vh, vv) {
+        (Some(v), Some(x)) if x == CALIB_VER as i64 && (480..=2400).contains(&v) => Some(v),
+        _ => None,
+    }
+}
+
+/// 解析请求视口：**`k_vh` Cookie（版本一致）优先** > `vh` 参数 > 环境默认；
+/// `vw` 只用参数/默认（Cookie 里没有宽度）。
+fn vp_of(s: &AppState, headers: &HeaderMap, vw: Option<i64>, vh: Option<i64>) -> Vp {
+    let vh = cookie_vh(headers).or(vh);
     Vp::resolve(vw, vh, (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize))
 }
 
@@ -1303,7 +1362,7 @@ async fn shelf(
     headers: HeaderMap,
     Query(q): Query<FsQ>,
 ) -> Response {
-    let vp = vp_of(&s, q.vw, q.vh);
+    let vp = vp_of(&s, &headers, q.vw, q.vh);
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let rows: Vec<BookshelfItem> = match sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
         .bind(None::<String>)
@@ -1423,7 +1482,7 @@ async fn toc(
     headers: HeaderMap,
     Query(q): Query<TocQ>,
 ) -> Response {
-    let vp = vp_of(&s, q.vw, q.vh);
+    let vp = vp_of(&s, &headers, q.vw, q.vh);
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let (_source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
@@ -1785,7 +1844,7 @@ async fn read(
     Query(q): Query<ReadQ>,
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
-    let vp = vp_of(&s, q.vw, q.vh);
+    let vp = vp_of(&s, &headers, q.vw, q.vh);
     let (source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
         Err(e) => return err_to_page(e),
@@ -2087,7 +2146,7 @@ async fn search(
     Query(q): Query<SearchQ>,
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
-    let vp = vp_of(&s, q.vw, q.vh);
+    let vp = vp_of(&s, &headers, q.vw, q.vh);
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
     let fs_url = format!("/k/search?fs={}&key={}", next_fs, qenc(&key));
@@ -2669,11 +2728,11 @@ mod tests {
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
         );
-        // 两个脚本：视口标定（head 内、按实测可见高）+ 自报探针（只上报不重载）
+        // 三个脚本：错误兜底（head 内、先于标定）+ 视口标定（head 内、按实测可见高）+ 自报探针
         assert_eq!(
             html.matches("<script").count(),
-            2,
-            "只允许视口标定脚本与自报探针"
+            3,
+            "只允许错误兜底、视口标定与自报探针"
         );
         assert!(
             html.contains("d.style.height=(V-12)+'px'"),
@@ -2711,12 +2770,29 @@ mod tests {
             "body_rect_bottom=",
             "lowest_el_bottom=",
             "scroll_evt=",
+            "stage=",
         ] {
             assert!(K_PROBE_JS.contains(f), "探针 v3/v4/v5 字段缺失：{f}");
         }
         assert!(
-            K_PROBE_JS.contains("addEventListener('scroll',sc,false)"),
+            K_PROBE_JS.contains("addEventListener('scroll',rs,false)"),
             "必须注册一次 scroll 事件补报滑动后的证据：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("var i=new Image()"),
+            "img 打点是主通道，不依赖 load/XHR：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("s('sync')"),
+            "必须在脚本执行后同步立即打一条：{K_PROBE_JS}"
+        );
+        assert!(
+            K_PROBE_JS.contains("i.onerror=function(){xh(u)}"),
+            "XHR 只能作为 img 失败时的可选回退：{K_PROBE_JS}"
+        );
+        assert!(
+            html.contains("window.__kerr") && html.contains("window.onerror"),
+            "必须在 calib 之前注册全局错误兜底"
         );
         assert!(
             K_PROBE_JS.contains("ck('k_ck')"),
@@ -2951,12 +3027,16 @@ mod tests {
             "标定值必须带算法版本号 k_vv（升级即失效重测）：{calib}"
         );
         assert!(
-            calib.contains("vv==2&&ock"),
-            "只有 k_vv 与当前版本一致、且 k_ck=1 才直通：{calib}"
+            calib.contains("vv==2){fin(V,-1,0)}"),
+            "版本一致即直通（服务端已按 Cookie 排版，不再强制重测）：{calib}"
         );
         assert!(
             calib.contains("document.cookie='k_vh=; path=/; max-age=0'"),
-            "版本不符/从未成功时必须删掉旧 k_vh 强制重测：{calib}"
+            "版本不符时必须删掉旧 k_vh 强制重测：{calib}"
+        );
+        assert!(
+            calib.contains("catch(E){try{window.__kerr"),
+            "整段包 try/catch，异常走 img 上报：{calib}"
         );
         assert!(
             calib.contains("k_vhfix2"),
@@ -3055,6 +3135,52 @@ mod tests {
             read_only_css().contains("z-index:12"),
             "顶栏须高于热区/底栏"
         );
+    }
+
+    /// 服务端直接读 `k_vh`：版本一致才生效，旧版本写的值一律不采用（v0.3.18 的教训）。
+    #[test]
+    fn cookie_vh_requires_current_version() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("k_vh=1224; k_vv=2"),
+        );
+        assert_eq!(cookie_vh(&h), Some(1224));
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("k_vh=1256; k_vv=1"),
+        );
+        assert_eq!(cookie_vh(&h), None, "旧版本写的 1256 必须作废");
+        h.insert(header::COOKIE, HeaderValue::from_static("k_vh=abc; k_vv=2"));
+        assert_eq!(cookie_vh(&h), None, "非数字不采用");
+        h.insert(header::COOKIE, HeaderValue::from_static("k_vh=1224"));
+        assert_eq!(cookie_vh(&h), None, "缺 k_vv 不采用");
+        h.insert(header::COOKIE, HeaderValue::from_static("k_fs=2"));
+        assert_eq!(cookie_vh(&h), None, "无标定 Cookie");
+    }
+
+    /// 兜底档位可一键切到 −48（常量开关），行预算随高度自动重算。
+    #[test]
+    fn calib_gap_switch_recomputes_budget() {
+        assert_eq!(calib_gap(), CALIB_FALLBACK_GAP);
+        let js = calib_js();
+        assert!(
+            js.contains(&format!("H-{}", calib_gap())),
+            "兜底算式必须用当前档位：{js}"
+        );
+        // 切到 −48 档时真机 H=1268 → V=1220，文档 1208：
+        // 正文可用高 996 → 四档行预算 21/19/16/27，末行仍不越过正文区下沿。
+        let hard = vps(1072, 1268 - CALIB_FALLBACK_GAP_SAFE);
+        let lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(hard, s.line)).collect();
+        assert_eq!(lines, vec![21, 19, 16, 27], "−48 档行预算");
+        for s in FS_SPECS.iter() {
+            let last_bottom = 56 + 36 + line_budget(hard, s.line) * s.line;
+            assert!(
+                last_bottom <= hard.layout_h() - BAR_H,
+                "{}px 末行越界：{last_bottom}",
+                s.line
+            );
+        }
     }
 
     /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。

@@ -517,6 +517,15 @@ pub struct ProbeLine {
     /// v5：是否为用户滑动后补报（1 = scroll 事件触发的那条）
     #[serde(default)]
     pub scroll_evt: Option<String>,
+    /// v6：打点通道（`sync`/`load`/`scroll`/`gerr`/`calib`/`probe`），确认脚本真的执行到了
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// v6：脚本异常信息（`stage=gerr|calib|probe` 时非空，截 60 字）
+    #[serde(default)]
+    pub err: Option<String>,
+    /// v6：异常行号（`window.onerror` 的 lineno；脚本内 try/catch 填 0）
+    #[serde(default)]
+    pub ln: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -558,6 +567,9 @@ pub struct ProbeQ {
     pub body_rect_bottom: Option<String>,
     pub lowest_el_bottom: Option<String>,
     pub scroll_evt: Option<String>,
+    pub stage: Option<String>,
+    pub err: Option<String>,
+    pub ln: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -565,6 +577,11 @@ pub struct ProbeQ {
 fn norm(v: Option<String>) -> Option<String> {
     v.map(|s| truncate(s.trim(), PROBE_LIMIT))
         .filter(|s| !s.is_empty())
+}
+
+/// 异常信息放宽到 60 字（`PROBE_LIMIT` 32 字会截掉关键报错后半段）
+fn norm60(v: Option<String>) -> Option<String> {
+    v.map(|s| truncate(s.trim(), 60)).filter(|s| !s.is_empty())
 }
 
 pub async fn probe(
@@ -613,6 +630,9 @@ pub async fn probe(
         body_rect_bottom: norm(q.body_rect_bottom),
         lowest_el_bottom: norm(q.lowest_el_bottom),
         scroll_evt: norm(q.scroll_evt),
+        stage: norm(q.stage),
+        err: norm60(q.err),
+        ln: norm(q.ln),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -904,6 +924,9 @@ mod tests {
             body_rect_bottom: Some("1168".into()),
             lowest_el_bottom: Some("1168".into()),
             scroll_evt: Some("0".into()),
+            stage: Some("sync".into()),
+            err: None,
+            ln: Some("0".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -940,6 +963,9 @@ mod tests {
             "body_rect_bottom",
             "lowest_el_bottom",
             "scroll_evt",
+            "stage",
+            "err",
+            "ln",
             "fs",
             "ua_class",
             "ua",
@@ -996,6 +1022,9 @@ mod tests {
             body_rect_bottom: Some(long.clone()),
             lowest_el_bottom: Some(long.clone()),
             scroll_evt: Some("1".into()),
+            stage: Some("gerr".into()),
+            err: Some(long.clone()),
+            ln: Some("42".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -1034,6 +1063,13 @@ mod tests {
                 "v4 字段同样 32 字符截断"
             );
         }
+        assert_eq!(norm(p.stage).as_deref(), Some("gerr"));
+        assert_eq!(norm(p.ln).as_deref(), Some("42"));
+        assert_eq!(
+            norm60(p.err).unwrap().chars().count(),
+            60,
+            "异常信息放宽到 60 字"
+        );
         assert_eq!(norm(Some("   ".into())), None);
     }
 }
