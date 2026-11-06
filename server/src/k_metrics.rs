@@ -526,6 +526,27 @@ pub struct ProbeLine {
     /// v6：异常行号（`window.onerror` 的 lineno；脚本内 try/catch 填 0）
     #[serde(default)]
     pub ln: Option<String>,
+    /// v7：`documentElement.scrollTop`（旧引擎 `pageYOffset` 恒 0，用这个判断真实滚动）
+    #[serde(default)]
+    pub doc_top: Option<String>,
+    /// v7：`body.scrollTop`（与 `doc_top` 分开上报，确认是谁在滚）
+    #[serde(default)]
+    pub scroll_top_body: Option<String>,
+    /// v7：`documentElement.scrollTop`
+    #[serde(default)]
+    pub scroll_top_doc: Option<String>,
+    /// v7：本页生命周期内观测到的最大位移（区分「滑一下又弹回」）
+    #[serde(default)]
+    pub max_seen: Option<String>,
+    /// v7：`visualViewport.pageTop`（不支持时为 `-`），判断是否为可视视口平移
+    #[serde(default)]
+    pub vv_off: Option<String>,
+    /// v7：底栏 `#k-bar` 的 `getBoundingClientRect().top`（滑动前后是否跟着动）
+    #[serde(default)]
+    pub bar_rect_top: Option<String>,
+    /// v7：`stage=move` 的来源（`touchmove`/`scroll`/`touchend`）
+    #[serde(default)]
+    pub move_src: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -570,6 +591,13 @@ pub struct ProbeQ {
     pub stage: Option<String>,
     pub err: Option<String>,
     pub ln: Option<String>,
+    pub doc_top: Option<String>,
+    pub scroll_top_body: Option<String>,
+    pub scroll_top_doc: Option<String>,
+    pub max_seen: Option<String>,
+    pub vv_off: Option<String>,
+    pub bar_rect_top: Option<String>,
+    pub move_src: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -633,6 +661,13 @@ pub async fn probe(
         stage: norm(q.stage),
         err: norm60(q.err),
         ln: norm(q.ln),
+        doc_top: norm(q.doc_top),
+        scroll_top_body: norm(q.scroll_top_body),
+        scroll_top_doc: norm(q.scroll_top_doc),
+        max_seen: norm(q.max_seen),
+        vv_off: norm(q.vv_off),
+        bar_rect_top: norm(q.bar_rect_top),
+        move_src: norm(q.move_src),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -924,9 +959,16 @@ mod tests {
             body_rect_bottom: Some("1168".into()),
             lowest_el_bottom: Some("1168".into()),
             scroll_evt: Some("0".into()),
-            stage: Some("sync".into()),
+            stage: Some("move".into()),
             err: None,
             ln: Some("0".into()),
+            doc_top: Some("0".into()),
+            scroll_top_body: Some("0".into()),
+            scroll_top_doc: Some("4".into()),
+            max_seen: Some("8".into()),
+            vv_off: Some("-".into()),
+            bar_rect_top: Some("1092".into()),
+            move_src: Some("touchmove".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -966,6 +1008,13 @@ mod tests {
             "stage",
             "err",
             "ln",
+            "doc_top",
+            "scroll_top_body",
+            "scroll_top_doc",
+            "max_seen",
+            "vv_off",
+            "bar_rect_top",
+            "move_src",
             "fs",
             "ua_class",
             "ua",
@@ -1025,6 +1074,13 @@ mod tests {
             stage: Some("gerr".into()),
             err: Some(long.clone()),
             ln: Some("42".into()),
+            doc_top: Some(" 4 ".into()),
+            scroll_top_body: Some(long.clone()),
+            scroll_top_doc: Some("0".into()),
+            max_seen: Some("8".into()),
+            vv_off: Some("-".into()),
+            bar_rect_top: Some("1092".into()),
+            move_src: Some("touchend".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -1065,6 +1121,15 @@ mod tests {
         }
         assert_eq!(norm(p.stage).as_deref(), Some("gerr"));
         assert_eq!(norm(p.ln).as_deref(), Some("42"));
+        assert_eq!(norm(p.doc_top).as_deref(), Some("4"));
+        assert_eq!(norm(p.scroll_top_doc).as_deref(), Some("0"));
+        assert_eq!(norm(p.max_seen).as_deref(), Some("8"));
+        assert_eq!(norm(p.vv_off).as_deref(), Some("-"));
+        assert_eq!(norm(p.move_src).as_deref(), Some("touchend"));
+        assert_eq!(
+            norm(p.scroll_top_body).unwrap().chars().count(),
+            PROBE_LIMIT
+        );
         assert_eq!(
             norm60(p.err).unwrap().chars().count(),
             60,
