@@ -66,10 +66,15 @@ const BAR_H: usize = 64;
 /// 实测可见高 `visibleH`（见 `calib_js`）：文档高锁成 `visibleH − 12`，**严格小于**
 /// 可见高，既不出滚动条，也不会让贴底元素溢到第二屏。
 const SAFE_BOTTOM: usize = 12;
-/// 标定失败时的兜底差额：`visibleH = clientHeight − 24`（真机 `clientHeight=1268` 时
-/// 得 1244，与实测可见高一致），再减去 `SAFE_BOTTOM`，最终文档高 = `clientHeight − 36`
-/// = 1232，比真实可见高再留 12px 硬余量，底栏底边 1232 仍在可见区内。
+/// 标定失败时的保守兜底：`visibleH = min(clientHeight − 24, outerHeight − 8, innerHeight)`
+/// （取不到的项忽略）。真机 `clientHeight=1268`、`outerHeight=1232` → `V=1224`，
+/// 再减 `SAFE_BOTTOM` 得文档 1212，相对真实可见 1244 留 32px 硬余量——宁可少排一行，
+/// 也不留可滑动余量（行预算会按新高度自动少算，属可接受代价）。
 const CALIB_FALLBACK_GAP: usize = 24;
+/// 标定算法版本（写 Cookie `k_vv`）。**任何会改变 `visibleH`/兜底值的改动都必须 +1**：
+/// 旧版本写的 `k_vh` 一律作废并强制重测一次，避免升级后继续沿用旧值（v0.3.17 的教训）。
+/// 同时用于 `sessionStorage` 去环键，版本升级后旧闩锁自动失效。
+const CALIB_VER: usize = 2;
 /// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，
 /// 四档字号只各让出 1–2 行；顶栏固定贴视口顶，正文区从它下沿开始。
 const READ_NAV_H: usize = 56;
@@ -220,12 +225,16 @@ const K_FS_COOKIE: &str = "k_fs";
 ///   4. 复原高度、`scrollTo(0, 0)`、`overflow` 与 `visibility`（测量期间整页 `hidden`，
 ///      避免 e-ink 上出现“撑高再回弹”的残影）；
 ///   5. 守卫：`y <= 0` 或 `visibleH = (H + 2000) − y` 不在 `[200, H]` 内 → 标定失败，
-///      回退 `H − CALIB_FALLBACK_GAP`（24）。
+///      回退保守值 `F = min(H − 24, outerHeight − 8, innerHeight)`（取不到的项忽略；
+///      真机 `outerHeight=1232` → `F=1224`，文档 1212，宁可少排一行也不留可滑动余量）。
 ///
-/// 结果写 Cookie `k_vh`（Path=/，30 天）；**后续页面优先读它、不再重复标定**。
+/// 结果写 Cookie `k_vh`（Path=/，30 天）、`k_vv`（标定算法版本 `CALIB_VER`）与
+/// `k_ck`/`k_my`（成功/失败、实测滚动量，会话级）。**只有 `k_vv` 与当前版本一致、
+/// 且 `k_ck=1`（曾成功实测）才直通**；版本不符或从未成功 → 删 `k_vh` 强制重测，
+/// 保证升级后不会继续用旧版本写下的值。
 /// 参数 `vh` 与 `visibleH` 不一致时用 `location.replace` 带 `vh=visibleH` 重载，
-/// 让服务端按真实可见高重算行预算与全部像素几何；**不再写 `kfix` 永久闩锁**，
-/// 去环只靠 `sessionStorage.k_vhfix`（只挡连续两次，`vh` 对上后即清除）。
+/// 让服务端按真实可见高重算行预算与全部像素几何；**不写 `kfix` 永久闩锁**，
+/// 去环只靠版本化的 `sessionStorage.k_vhfix{CALIB_VER}`（只挡连续两次，`vh` 对上后清除）。
 /// 文档高统一锁成 `visibleH − SAFE_BOTTOM`，**严格小于**可见高。
 fn calib_js() -> String {
     format!(
@@ -235,19 +244,24 @@ for(var i=0;i<p.length;i++){{var k=p[i].split('=')[0];\
 if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k!='kfix'&&p[i])o.push(p[i]);}}\
 function ck(n){{var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):-1}}\
 function sy(){{return window.scrollY||window.pageYOffset||0}}\
+function mn(a,b){{if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}}\
+var F=mn(mn(H-{gap},(window.outerHeight||0)-8),innerHeight);if(!(F>200))F=H-{gap};\
 function rep(V){{if(!W||!V)return;\
-if(vw==W&&vh==V){{try{{sessionStorage.removeItem('k_vhfix')}}catch(e){{}}return}}\
-var once=0;try{{once=sessionStorage.getItem('k_vhfix')=='1'}}catch(e){{}}\
-if(once)return;try{{sessionStorage.setItem('k_vhfix','1')}}catch(e){{}}\
+if(vw==W&&vh==V){{try{{sessionStorage.removeItem('k_vhfix{ver}')}}catch(e){{}}return}}\
+var once=0;try{{once=sessionStorage.getItem('k_vhfix{ver}')=='1'}}catch(e){{}}\
+if(once)return;try{{sessionStorage.setItem('k_vhfix{ver}','1')}}catch(e){{}}\
 o.push('vw='+W,'vh='+V);location.replace(location.pathname+'?'+o.join('&'))}}\
 function fin(V,y,meas){{if(done)return;done=1;try{{d.style.visibility=dV}}catch(e){{}}\
-var okv=(V>200&&V<=H)?1:0;if(!okv)V=H-{gap};\
+var okv=(V>200&&V<=H)?1:0;if(!okv)V=F;\
 if(meas){{try{{document.cookie='k_ck='+okv+'; path=/';\
 document.cookie='k_my='+y+'; path=/'}}catch(e){{}}}}\
+try{{document.cookie='k_vv={ver}; path=/; max-age=2592000'}}catch(e){{}}\
 try{{document.cookie='k_vh='+V+'; path=/; max-age=2592000'}}catch(e){{}}\
 try{{if(V>{min})d.style.height=(V-{safe})+'px'}}catch(e){{}}\
 rep(V)}}\
-var V=ck('k_vh');if(V>200&&V<=H){{fin(V,-1,0)}}else{{\
+var V=ck('k_vh'),vv=ck('k_vv'),ock=(ck('k_ck')==1);\
+if(V>200&&V<=H&&vv=={ver}&&ock){{fin(V,-1,0)}}else{{\
+if(!(vv=={ver}&&ock)){{try{{document.cookie='k_vh=; path=/; max-age=0'}}catch(e){{}}}}\
 var oldH=d.style.height,oldO=d.style.overflow,y1=0,y2=0,ok=0;\
 dV=d.style.visibility;d.style.visibility='hidden';\
 try{{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);ok=1}}\
@@ -258,6 +272,7 @@ try{{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO}}catch(e){{}
 fin((H+2000)-y,y,1)}},50)}},50)}}}}}})()",
         safe = SAFE_BOTTOM,
         gap = CALIB_FALLBACK_GAP,
+        ver = CALIB_VER,
         min = 400
     )
 }
@@ -274,13 +289,19 @@ fin((H+2000)-y,y,1)}},50)}},50)}}}}}})()",
 /// v4 追加 `calib`（`ok`/`fail`，来自标定脚本写的 `k_ck`）、`meas_y`（实测最大滚动量，
 /// 失败时也会上报，不再静默回退）、`bar_bottom`（底栏底边）、`page_y`（当前 `pageYOffset`，
 /// 区分「浏览器平移」与「文档真溢出」）、`body_scroll_h` 与 `kfix`（URL 上是否带旧闩锁）。
+/// v5 追加 `body_rect_bottom`、`lowest_el_bottom`（`body` 直接子元素 `top+height` 的最大值），
+/// 并注册一次 `scroll` 事件再报一条（带滑动后的 `page_y` 与 `#k-bar` 的 `top`），
+/// 用于区分「body 真实溢出」与「老 WebKit 钳制/可视视口平移」。
 const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
 function ck(n){var m=new RegExp('(?:^|; )'+n+'=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
 function bar(){return document.getElementById('k-bar')}\
 function bt(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().top)}catch(e){return b.offsetTop}}\
 function bb(){var b=bar();if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return b.offsetTop+b.offsetHeight}}\
-function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
+function bre(){var b=document.body;if(!b)return '-';try{return Math.round(b.getBoundingClientRect().bottom)}catch(e){return '-'}}\
+function lb(){var b=document.body;if(!b||!b.children)return '-';var m=-1;try{for(var i=0;i<b.children.length;i++){{\
+var r=b.children[i].getBoundingClientRect(),x=r.top+(r.height||(r.bottom-r.top));if(x>m)m=x}}catch(e){return '-'}return m>=0?Math.round(m):'-'}\
+function s(ev){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
 st=document.getElementById('k-stage'),ock=ck('k_ck');\
 var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
 '&client_w='+d.clientWidth+'&client_h='+d.clientHeight+'&scroll_w='+d.scrollWidth+'&scroll_h='+d.scrollHeight+\
@@ -290,10 +311,14 @@ var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h=
 '&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight)+\
 '&visible_h='+ck('k_vh')+'&bar_top='+bt()+'&bar_bottom='+bb()+\
 '&page_y='+v(window.pageYOffset||0)+'&body_scroll_h='+v(b&&b.scrollHeight)+\
+'&body_rect_bottom='+bre()+'&lowest_el_bottom='+lb()+'&scroll_evt='+(ev?1:0)+\
 '&calib='+(ock=='1'?'ok':(ock=='0'?'fail':'-'))+'&meas_y='+ck('k_my')+'&kfix='+p('kfix');\
 var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
-if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
-else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
+var fired=0;function sc(){if(fired)return;fired=1;s(1)}\
+if(window.addEventListener){window.addEventListener('load',function(){setTimeout(function(){s(0)},200)},false);\
+window.addEventListener('scroll',sc,false)}\
+else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(function(){s(0)},200)});\
+window.attachEvent('onscroll',sc)}})()";
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
@@ -2669,9 +2694,16 @@ mod tests {
             "calib=",
             "meas_y=",
             "kfix=",
+            "body_rect_bottom=",
+            "lowest_el_bottom=",
+            "scroll_evt=",
         ] {
-            assert!(K_PROBE_JS.contains(f), "探针 v3/v4 字段缺失：{f}");
+            assert!(K_PROBE_JS.contains(f), "探针 v3/v4/v5 字段缺失：{f}");
         }
+        assert!(
+            K_PROBE_JS.contains("addEventListener('scroll',sc,false)"),
+            "必须注册一次 scroll 事件补报滑动后的证据：{K_PROBE_JS}"
+        );
         assert!(
             K_PROBE_JS.contains("ck('k_ck')"),
             "calib 必须来自标定脚本写的 k_ck Cookie"
@@ -2788,6 +2820,25 @@ mod tests {
         for s in FS_SPECS.iter() {
             assert!(line_budget(small, s.line) * s.line <= small.text_h());
         }
+        // 兜底收紧后的真机值（V = 1224 → 文档 1212）：四档行预算自动少算一行，
+        // 且「顶栏 56 + 上留白 36 + 行数×行高」不越过正文区下沿（1212 − 76 = 1136）。
+        let fb = vps(1072, 1224);
+        let fb_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(fb, s.line)).collect();
+        assert_eq!(
+            fb_lines,
+            vec![21, 19, 16, 27],
+            "1224 行预算应按新可见高重算"
+        );
+        for s in FS_SPECS.iter() {
+            let last_bottom = 56 + 36 + line_budget(fb, s.line) * s.line;
+            assert!(
+                last_bottom <= fb.layout_h() - BAR_H,
+                "{}px 末行越界：{last_bottom} > {}",
+                s.line,
+                fb.layout_h() - BAR_H
+            );
+            assert!(line_budget(fb, s.line) * s.line <= fb.text_h());
+        }
     }
 
     /// 列表页（书架/目录/搜索）每页条数按「页面高 − 顶栏 − 分页条 − 安全余量」实算：
@@ -2874,8 +2925,28 @@ mod tests {
             "标定失败必须回退而不是写坏值：{calib}"
         );
         assert!(
-            calib.contains("if(!okv)V=H-24"),
-            "回退值 = clientHeight − 24：{calib}"
+            calib.contains("if(!okv)V=F"),
+            "标定失败只能回退保守值 F：{calib}"
+        );
+        assert!(
+            calib.contains("mn(mn(H-24,(window.outerHeight||0)-8),innerHeight)"),
+            "F = min(clientHeight − 24, outerHeight − 8, innerHeight)：{calib}"
+        );
+        assert!(
+            calib.contains("k_vv=2; path=/"),
+            "标定值必须带算法版本号 k_vv（升级即失效重测）：{calib}"
+        );
+        assert!(
+            calib.contains("vv==2&&ock"),
+            "只有 k_vv 与当前版本一致、且 k_ck=1 才直通：{calib}"
+        );
+        assert!(
+            calib.contains("document.cookie='k_vh=; path=/; max-age=0'"),
+            "版本不符/从未成功时必须删掉旧 k_vh 强制重测：{calib}"
+        );
+        assert!(
+            calib.contains("k_vhfix2"),
+            "去环键必须随算法版本变化（k_vhfix2），否则旧闩锁会让 vh 永远同步不到：{calib}"
         );
         assert!(
             calib.contains("k_vh="),
