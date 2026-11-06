@@ -4,16 +4,15 @@
 //! - `innerWidth×innerHeight = 1072×1268`，且 `innerWidth == screen.width`：
 //!   浏览器没有按 DPR 1.7964 缩放，**1 CSS px ≈ 1 物理 px**，字号必须按 px 直接给。
 //! - 版心 1000px（左右各留 36px）；顶栏 73px（72 内容 + 1px 线）。
-//! - 文档高不再取 `100%`/`vh`：`K_FIT_JS` 在 `<head>` 里按实测
-//!   `documentElement.clientHeight − SAFE_BOTTOM(24)` 写死（1268 → 1244）。
-//!   这样即使老引擎在「文档高 == 视口高」时也画滚动条、或 URL 里的 `vh` 比真实
-//!   布局视口大，文档也永远比视口矮 24px，不会出现第二屏；底栏
-//!   `position:fixed;bottom:0`（总高 88 = 64 内容 + 24 安全区）压在这 24px 上，
-//!   视觉与原来一致。正文区仍然由 `#k-stage` 的 `top/bottom` 贴视口，不读任何参数。
+//! - **版面基准是「真实可见高」`visibleH`**，不是 `clientHeight`（1268）：Silk 的
+//!   布局视口比可见区高，`bottom:0` 会把它底栏顶到可见区之外。`calib_js` 在 `<head>`
+//!   用「文档撑高 → 滚到底 → 文档高−最大滚动量」标定 `visibleH`，写 Cookie `k_vh`，
+//!   再把 `html` 高度锁成 `visibleH − SAFE_BOTTOM(12)`（严格小于可见高）。
 //! - 只使用 table / block / inline-block + 服务端算好的像素；不用 flex/grid/vw/vh/calc/rem/CSS 变量，
-//!   不用 `border-radius`；底栏用 `position:fixed`，不用 transform/transition。
-//! - 三个内联脚本：文档高兜底（`K_FIT_JS`，不重载）、视口补参（`K_VP_FIX_JS`，ES5、
-//!   最多重载一次）、自报探针（`K_PROBE_JS`，不重载）；其余翻页/切换字号全部是真实链接或原生 form。
+//!   不用 `border-radius`；底栏与贴底元素用 `position:absolute`（相对 `body`，`body` 为
+//!   `position:relative` 且高 = `visibleH − 12`），不用 transform/transition。
+//! - 两个内联脚本：视口标定（`calib_js`，ES5、`kfix` 最多重载一次）、自报探针
+//!   （`K_PROBE_JS`，不重载）；其余翻页/切换字号全部是真实链接。
 //! - 分页按字符切（`char_indices`），同一章同一档字号的页码恒定，与渲染无关。
 //! - 登录：两个字段的 table 表单 + HttpOnly Cookie（`k_session`，30 天）；字号存 `k_fs` Cookie。
 
@@ -60,10 +59,12 @@ const K_H: usize = 1268;
 const NAV_H: usize = 72;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
-/// 底部安全余量：真机浏览器底栏/滚动条会占掉几到十几像素。
-/// 页面按 `vh` 精确填满会顶出纵向滚动条、把贴底栏裁掉，这里统一预留 24px。
-/// 代价是 1072×1268 下小档/标准档各少 1 行（24→23、21→20），大档/超小档行数不变。
-const SAFE_BOTTOM: usize = 24;
+/// 底部安全余量 = 文档相对**真实可见高**的留白（12px，落在 8–16 区间）。
+/// 真机现象：Silk 的布局视口高（`clientHeight`）比真实可见高（被系统栏/浏览器栏盖住）
+/// 大，任何 `bottom:0` 都锚在布局视口底 → 底栏掉到可见区外。这里改为整页基于
+/// 实测可见高 `visibleH`（见 `calib_js`）：文档高锁成 `visibleH − 12`，**严格小于**
+/// 可见高，既不出滚动条，也不会让贴底元素溢到第二屏。
+const SAFE_BOTTOM: usize = 12;
 /// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，
 /// 四档字号只各让出 1–2 行；顶栏固定贴视口顶，正文区从它下沿开始。
 const READ_NAV_H: usize = 56;
@@ -105,25 +106,25 @@ impl Vp {
     fn content_w(self) -> usize {
         self.w.saturating_sub(SIDE_PAD * 4)
     }
-    /// 页面实际高度 = 视口高 − 底部安全余量（1268 → 1244）。
-    /// 真机浏览器会留底栏/滚动条等几到十几像素，按 vh 精确填满必然顶出滚动条。
+    /// 文档高 = 可见高 − 底部余量（1268 → 1256）。真机可见高由 `calib_js` 标定后
+    /// 以 `vh` 参数传回，所以这里的 `h` 就是真实可见高，余量 12px（8–16 区间）。
     fn layout_h(self) -> usize {
         self.h.saturating_sub(SAFE_BOTTOM)
     }
-    /// 阅读页正文容器高 = 页面高 − 底栏（1268 → 1180）
+    /// 阅读页正文容器高 = 文档高 − 底栏（1268 → 1192）
     fn body_h(self) -> usize {
         self.layout_h().saturating_sub(BAR_H)
     }
-    /// 带顶栏页面的正文区高 = 页面高 − 顶栏 − 1（1268 → 1171）
+    /// 带顶栏页面的正文区高 = 文档高 − 顶栏 − 1（1268 → 1183）
     fn nav_h(self) -> usize {
         self.layout_h().saturating_sub(NAV_H + 1)
     }
-    /// 小说正文可用高 = 正文容器 − 顶栏 − 顶部留白 − 页码行（1268 → 1032）
+    /// 小说正文可用高 = 正文容器 − 顶栏 − 顶部留白 − 页码行（1268 → 1044）
     fn text_h(self) -> usize {
         self.body_h()
             .saturating_sub(READ_NAV_H + READ_PAD_TOP + READ_PAGENO_H)
     }
-    /// 漫画整图/单片可用高 = 页面高 − 底栏 − 8（1268 → 1172，即切片可用高 vh）
+    /// 漫画整图/单片可用高 = 文档高 − 底栏 − 8（1268 → 1184，即切片可用高 vh）
     fn content_h(self) -> usize {
         self.layout_h().saturating_sub(BAR_H + 8)
     }
@@ -197,19 +198,47 @@ const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 const K_FS_COOKIE: &str = "k_fs";
 
-/// 视口补参脚本（ES5，≤420 字节）：URL 缺 `vw`/`vh` 或与真实布局视口不符时，
-/// 用 `location.replace` 补参并重载一次；`kfix=1` 是防循环标记，最多重载一次。
-/// 高一律取 `documentElement.clientHeight`（真正参与排版、决定滚动存不存在的布局视口高；
-/// Kindle Silk 的 `innerHeight` 可能报整屏高，比布局视口大，不能作为排版依据），取不到才退回 `innerHeight`。
-/// 宽仍用 `innerWidth`（含滚动条占位），避免横滚条把宽度算窄后反复补参。
-/// 服务端渲染的翻页/换章链接已带参，正常翻页不会触发重载。
-const K_VP_FIX_JS: &str = "(function(){var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
-for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
-if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}\
-var d=document.documentElement,H=innerHeight;\
-if(d&&d.clientHeight>0)H=d.clientHeight;\
-if(!f&&innerWidth>0&&H>0&&(vw!=innerWidth||vh!=H)){o.push('vw='+innerWidth,'vh='+H,'kfix=1');\
-location.replace(location.pathname+'?'+o.join('&'));}})()";
+/// 可见高标定脚本（ES5，注入 `<head>`，首帧前生效，最多重载一次）。
+///
+/// 真机根因：Silk 的布局视口高 `clientHeight`（1268）比**真实可见高**（约 1180，
+/// 被系统栏/浏览器工具栏盖住）大，`position:fixed;bottom:0` 与一切 `bottom` 定位都锚在
+/// 布局视口底，于是底栏落在可见区外，必须向下滑才能看到。光“留 24px 余量”治不了，
+/// 因为差距是可见高与布局视口高的差，不是滚动条厚度。
+///
+/// 标定办法（纯 ES5，不依赖任何新 API）：
+///   1. 记下 `H = documentElement.clientHeight`；
+///   2. 临时把 `html` 撑到 `H + 2000`，并临时把 `html` 的 `overflow` 改成 `visible`
+///      （页面 CSS 里根元素是 `overflow:hidden`，会传播到视口、让 `scrollTo` 完全无效），
+///      再 `scrollTo(0, 3000)` 滚到底；
+///   3. 读 `scrollY`（最大滚动量），则 `visibleH = (H + 2000) − scrollY`；
+///   4. 先复原高度、`scrollTo(0, 0)`，再复原 `overflow`（放在 `finally` 里，异常也不留后患）；
+///   5. 守卫：`scrollY <= 0` 或 `visibleH` 不在 `[200, H]` 内 → 标定失败，回退 `H − 12`。
+///
+/// 结果写 Cookie `k_vh`（Path=/，30 天）；**后续页面优先读它、不再重复标定**。
+/// 参数 `vh` 与 `visibleH` 不一致时用 `location.replace` 带 `vh=visibleH` 重载一次
+/// （`kfix=1` 防循环），让服务端按真实可见高重算行预算与全部像素几何。
+/// 文档高统一锁成 `visibleH − SAFE_BOTTOM`，**严格小于**可见高。
+fn calib_js() -> String {
+    format!(
+        "(function(){{var d=document.documentElement,W=innerWidth,H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight;\
+var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],vw=null,vh=null,f=0;\
+for(var i=0;i<p.length;i++){{var k=p[i].split('=')[0];\
+if(k=='vw')vw=p[i].substring(3);else if(k=='vh')vh=p[i].substring(3);else if(k=='kfix')f=1;else if(p[i])o.push(p[i]);}}\
+function ck(){{var m=new RegExp('(?:^|; )k_vh=([^;]*)').exec(document.cookie);return m?parseFloat(m[1]):0}}\
+function meas(){{try{{var oldH=d.style.height,oldO=d.style.overflow,y=0;\
+try{{d.style.height=(H+2000)+'px';d.style.overflow='visible';window.scrollTo(0,3000);\
+y=window.scrollY||window.pageYOffset||0;}}finally{{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO;}}\
+var v=(H+2000)-y;if(y>0&&v>200&&v<=H)return Math.round(v);}}catch(e){{}}return 0}}\
+var V=ck();if(!(V>200&&V<=H))V=meas();\
+if(!V)V=H-{safe};\
+try{{document.cookie='k_vh='+V+'; path=/; max-age=2592000';}}catch(e){{}}\
+try{{if(V>{min})d.style.height=(V-{safe})+'px';}}catch(e){{}}\
+if(!f&&W>0&&V>0&&(vw!=W||vh!=V)){{o.push('vw='+W,'vh='+V,'kfix=1');\
+location.replace(location.pathname+'?'+o.join('&'));}}}})()",
+        safe = SAFE_BOTTOM,
+        min = 400
+    )
+}
 
 /// 自报探针（ES5，零依赖，不重载页面）：`load` 后 200ms 用 `XMLHttpRequest`
 /// 把「URL 参数视口 + 真实量到的视口/文档尺寸」回传 `/api/k/probe`。
@@ -218,8 +247,12 @@ location.replace(location.pathname+'?'+o.join('&'));}})()";
 /// v2 追加 `screen_w/screen_h/avail_h/outer_w/outer_h/body_h/stage_h`：
 /// 若 `screen_h`/`avail_h` 明显大于 `client_h`，说明 Silk 的可视视口被系统栏或工具栏
 /// 遮住了一部分（此时即使文档高 = `clientHeight` 仍会露滚动条），量不到的数一律填 `-`。
+/// v3 追加 `visible_h`（`k_vh` 标定值）与 `bar_top`（底栏实际 top），用于真机自证
+/// 「标定出的可见高」与「底栏是否落在可见区内」。
 const K_PROBE_JS: &str = "(function(){function p(n){var m=new RegExp('[?&]'+n+'=([^&]*)').exec(location.search);return m?m[1]:''}\
 function v(x){return typeof x=='number'?x:'-'}\
+function ck(){var m=new RegExp('(?:^|; )k_vh=([^;]*)').exec(document.cookie);return m?m[1]:'-'}\
+function bt(){var b=document.getElementById('k-bar');if(!b)return '-';try{var r=b.getBoundingClientRect();return Math.round(r.top)}catch(e){return b.offsetTop}}\
 function s(){try{var d=document.documentElement,dpr=window.devicePixelRatio||1,sn=window.screen||{},b=document.body,\
 st=document.getElementById('k-stage');\
 var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h='+innerHeight+\
@@ -227,26 +260,11 @@ var q='vw_param='+p('vw')+'&vh_param='+p('vh')+'&inner_w='+innerWidth+'&inner_h=
 '&dpr='+dpr+'&fs='+p('fs')+'&path='+encodeURIComponent(location.pathname)+\
 '&screen_w='+v(sn.width)+'&screen_h='+v(sn.height)+'&avail_h='+v(sn.availHeight)+\
 '&outer_w='+v(window.outerWidth)+'&outer_h='+v(window.outerHeight)+\
-'&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight);\
+'&body_h='+v(b&&b.clientHeight)+'&stage_h='+v(st&&st.clientHeight)+\
+'&visible_h='+ck()+'&bar_top='+bt();\
 var x=new XMLHttpRequest();x.open('GET','/api/k/probe?'+q,true);x.send(null)}catch(e){}}\
 if(window.addEventListener){window.addEventListener('load',function(){setTimeout(s,200)},false)}\
 else if(window.attachEvent){window.attachEvent('onload',function(){setTimeout(s,200)})}})()";
-
-/// 文档高兜底脚本（ES5，零依赖，不重载，注入 `<head>` 保证首帧生效）：
-/// 把 `html` 的实测高度固定为 `documentElement.clientHeight − SAFE_BOTTOM`。
-/// 真机问题是「文档高恰好等于布局视口高」时 Silk 仍绘制滚动条，以及 URL 里的 `vh`
-/// 可能比真实布局视口大；这里以浏览器实测值为准、并主动让文档比视口矮 24px，
-/// 于是无论参数是否准确，文档都不可能产生第二屏。取不到 `clientHeight` 时不改，
-/// 退回 CSS 的 `height:100%`。
-fn fit_js() -> String {
-    format!(
-        "(function(){{function f(){{try{{var d=document.documentElement,H=d.clientHeight||innerHeight;\
-if(H>{min}){{d.style.height=(H-{safe})+'px'}}}}catch(e){{}}}}f();\
-if(window.addEventListener){{window.addEventListener('load',f,false)}}}})()",
-        min = 400,
-        safe = SAFE_BOTTOM
-    )
-}
 
 /// 四档字号。每页行数由 `line_budget(vp, line)` 按视口高动态算出。
 struct FsSpec {
@@ -439,14 +457,14 @@ fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) ->
 html{{-webkit-text-size-adjust:none;height:100%;overflow:hidden}}\
 html,body{{margin:0;padding:0;width:100%;background:#fff;color:#000}}\
 html::-webkit-scrollbar,body::-webkit-scrollbar,#k-stage::-webkit-scrollbar{{width:0;height:0;display:none}}\
-body{{height:100%;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
+body{{position:relative;height:100%;overflow:hidden;font-family:serif;font-size:{size}px;line-height:{line}px}}\
 *{{box-sizing:border-box}}\
 a{{color:#000;text-decoration:none}}\
 h1,h2,h3,p{{margin:0}}\
 table{{border-collapse:collapse}}\
 .wrap{{width:{pw}px;margin-left:{pad}px}}\
 {extra}\
-</style><script>{fit}</script></head><body><div class=\"wrap\">{body}</div><script>{js}</script><script>{probe}</script></body></html>",
+</style><script>{calib}</script></head><body><div class=\"wrap\">{body}</div><script>{probe}</script></body></html>",
         viewport = viewport,
         title = esc(title),
         size = spec.size,
@@ -455,8 +473,7 @@ table{{border-collapse:collapse}}\
         pad = SIDE_PAD,
         extra = extra_css,
         body = body,
-        fit = fit_js(),
-        js = K_VP_FIX_JS,
+        calib = calib_js(),
         probe = K_PROBE_JS
     )
 }
@@ -506,12 +523,15 @@ fn nav_link(href: &str, label: &str) -> String {
     )
 }
 
-/// 贴视口底部的固定栏（仅阅读页）：`left:0;right:0;bottom:0`，总高 88 =
-/// 上 64 内容（4 格各 250px）+ 下 24 安全区（`padding-bottom`，避免被系统栏/滚动条遮住）。
-/// 不再用 `bottom:24px` + 视口宽像素：页面高由 100% 决定，底栏必须贴住真实视口底。
+/// 阅读页底栏：形如贴视口底，但用 `position:absolute;bottom:0`，因为它的包含块
+/// （`body{position:relative}`）高度 = `visibleH − SAFE_BOTTOM`，与真实可见区一致。
+/// **不能用 `position:fixed`**：老 Silk 把 fixed 元素锚在布局视口（1268）而不是真实可见区，
+/// `bottom:0` 会掉到可见区外（真机"要下滑才看到底栏"的根因）；absolute + top/bottom
+/// 相对 body 则在所有 WebKit 版本上一致。
+/// 总高 76 = 64 内容（4 格各 250px）+ 12 安全区（`padding-bottom`）。
 fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
-        "<div id=\"k-bar\" style=\"position:fixed;left:0;right:0;bottom:0;height:{h}px;padding-bottom:{safe}px;background:#fff;z-index:10\">\
+        "<div id=\"k-bar\" style=\"position:absolute;left:0;right:0;bottom:0;height:{h}px;padding-bottom:{safe}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
         h = BAR_H + SAFE_BOTTOM,
         safe = SAFE_BOTTOM,
@@ -1516,7 +1536,7 @@ struct ComicPage {
     height: usize,
 }
 
-/// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ 漫画可用高（`vp.content_h()`，1268 → 1172）。
+/// 由图片列表与原始宽高构建页表，保证每页显示高 ≤ 漫画可用高（`vp.content_h()`，1268 → 1184）。
 /// - 长条页（切片开关开启且 `slice_count_window` > 1）：一图拆 `layers` 页，
 ///   非末片按可用高、末片取剩余；
 /// - 一屏内：整图按版心 928 宽，显示高超过可用高时按高度等比缩小；
@@ -1553,7 +1573,7 @@ fn comic_pages(
             1
         };
         if n > 1 {
-            // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1172/620），
+            // 切片的真实高度由服务端按近白行落点决定（实测 1150/667，窗口预判只有 1184/620），
             // 写死 height 会把图拉扁；这里只给宽度，页面高度由 `vh−24` 的 stage 兜住
             // （漫画页保留像素高：切片高度按 `sp.vh` 生成，改成拉伸填满会丢图）。
             for k in 0..n {
@@ -1918,7 +1938,7 @@ async fn comic_read(
         }
     }
     // 切片参数按请求视口推导：版心宽 = vw − 144（1072 → 928），
-    // 可用高 = 页面高 − 底栏 − 8 − 顶栏（1268 → 1172 − 56 = 1116），
+    // 可用高 = 文档高 − 底栏 − 8 − 顶栏（1268 → 1184 − 56 = 1128），
     // 少切这一刀，整图/切片才不会被新顶栏压掉最后 56px
     let sp = image::SliceParams::from_config(
         &s.cfg,
@@ -2507,15 +2527,15 @@ mod tests {
         assert!(!t.contains('<'));
     }
 
-    /// 阅读页页面高 1244（=1268−24 安全余量）、可用 1172；四档行预算按
-    /// 「正文可用高 − 56 顶栏 ÷ 行高」动态算出。
+    /// 阅读页文档高 1256（=1268−12 余量）、正文可用 1044；四档行预算按
+    /// 「正文可用高 − 56 顶栏 − 36 上留白 − 56 页码」动态算出。
     #[test]
     fn font_specs_fit_read_stage() {
         assert_eq!(vp().h, 1268);
-        assert_eq!(vp().layout_h(), 1244);
-        assert_eq!(vp().content_h(), 1172);
-        // 1072×1268 下表：1032/46=22、1032/52=19、1032/62=16、1032/36=28（已扣 56px 顶栏）
-        let expect = [(28, 46, 22), (32, 52, 19), (38, 62, 16), (20, 36, 28)];
+        assert_eq!(vp().layout_h(), 1256);
+        assert_eq!(vp().content_h(), 1184);
+        // 1072×1268 下表：1044/46=22、1044/52=20、1044/62=16、1044/36=29（已扣 56px 顶栏）
+        let expect = [(28, 46, 22), (32, 52, 20), (38, 62, 16), (20, 36, 29)];
         assert_eq!(FS_SPECS.len(), 4, "应有四档字号");
         for (spec, (size, line, lines)) in FS_SPECS.iter().zip(expect) {
             assert_eq!((spec.size, spec.line), (size, line));
@@ -2581,22 +2601,21 @@ mod tests {
             html_naked.contains("content=\"width=device-width,initial-scale=1"),
             "{html_naked}"
         );
-        // 三个脚本：文档高兜底（head 内、按实测 clientHeight）+ 视口补参（带 kfix
-        // 防循环标记）+ 自报探针（只上报不重载）
+        // 两个脚本：视口标定（head 内、按实测可见高）+ 自报探针（只上报不重载）
         assert_eq!(
             html.matches("<script").count(),
-            3,
-            "只允许文档高兜底、补参脚本与自报探针"
+            2,
+            "只允许视口标定脚本与自报探针"
         );
         assert!(
-            html.contains("d.style.height=(H-24)+'px'"),
-            "文档高必须按实测 clientHeight 减 24px：{html}"
+            html.contains("d.style.height=(V-12)+'px'"),
+            "文档高必须锁成 visibleH − 12：{html}"
         );
         assert!(
             html.contains("</style><script>(function(){"),
-            "文档高兜底脚本必须进 head，首帧就生效"
+            "视口标定脚本必须进 head，首帧就生效"
         );
-        assert!(html.contains("kfix=1"), "补参脚本必须带防循环标记");
+        assert!(html.contains("kfix=1"), "标定脚本必须带防循环标记");
         assert!(
             html.contains("/api/k/probe?"),
             "探针必须上报到 /api/k/probe"
@@ -2609,8 +2628,10 @@ mod tests {
             "outer_h=",
             "body_h=",
             "stage_h=",
+            "visible_h=",
+            "bar_top=",
         ] {
-            assert!(K_PROBE_JS.contains(f), "探针 v2 字段缺失：{f}");
+            assert!(K_PROBE_JS.contains(f), "探针 v3 字段缺失：{f}");
         }
         assert!(
             K_PROBE_JS.contains("getElementById('k-stage')"),
@@ -2691,7 +2712,7 @@ mod tests {
     }
 
     /// 四档行预算全部由视口高动态算出（已扣 56px 顶栏）：
-    /// 1072×1268 → 22/19/16/28，1024×1200 同档位按更低可用高再算一遍（20/18/15/26），
+    /// 1072×1268 → 22/20/16/29，1024×1200 同档位按更低可用高再算一遍（21/18/15/27），
     /// 且总高始终 ≤ 可用高。
     #[test]
     fn read_line_budget_matches_reference() {
@@ -2700,7 +2721,7 @@ mod tests {
                 .iter()
                 .map(|s| line_budget(vp(), s.line))
                 .collect::<Vec<_>>(),
-            vec![22, 19, 16, 28]
+            vec![22, 20, 16, 29]
         );
         for s in FS_SPECS.iter() {
             assert!(budget(s) * s.line <= vp().text_h(), "{}px 行高溢出", s.line);
@@ -2714,7 +2735,7 @@ mod tests {
             .collect();
         assert_eq!(
             small_lines,
-            vec![20, 18, 15, 26],
+            vec![21, 18, 15, 27],
             "1024×1200 行预算应按可用高重算"
         );
         for s in FS_SPECS.iter() {
@@ -2726,13 +2747,13 @@ mod tests {
     /// 1072×1268 与 1024×1200 两档都必须装得下，也不允许多留一整行。
     #[test]
     fn list_pages_fit_inside_stage_at_reference_viewports() {
-        // 1268：正文区 1171；书架 10×110+64=1164、目录 15×72+64=1144、搜索 9×112+152=1160
+        // 1268：正文区 1183；书架 10×111+64=1174、目录 15×72+64=1144、搜索 9×112+152=1160
         let v = vp();
-        assert_eq!((v.nav_h(), v.shelf_layout()), (1171, (10, 110)));
+        assert_eq!((v.nav_h(), v.shelf_layout()), (1183, (10, 111)));
         assert_eq!(toc_page_size(v), 30);
         assert_eq!(search_page_size(v, false), 9);
         let s = vps(1024, 1200);
-        assert_eq!((s.nav_h(), s.shelf_layout()), (1103, (10, 103)));
+        assert_eq!((s.nav_h(), s.shelf_layout()), (1115, (10, 105)));
         assert_eq!(toc_page_size(s), 28);
         assert_eq!(search_page_size(s, false), 8);
         for vp in [v, s] {
@@ -2753,9 +2774,9 @@ mod tests {
         assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
     }
 
-    /// 一屏一页（不依赖参数视口是否准确）：`#k-stage` 绝对定位填满「视口 − 88」，
-    /// 底栏贴 `bottom:0` 且内置 24px 安全区；文档高由 `fit_js()` 按实测
-    /// `clientHeight − 24` 写死，永远比视口矮，不会出现第二屏/滚动条。
+    /// 一屏一页（不依赖参数视口是否准确）：`#k-stage` 绝对定位填满「可见区 − 76」，
+    /// 底栏 `absolute;bottom:0` 相对 `body`（`body` 高 = `visibleH − 12`）贴可见区底；
+    /// 文档高由 `calib_js()` 按**标定出的真实可见高**锁成 `visibleH − 12`，永远比可见高矮。
     #[test]
     fn read_page_locks_one_screen_and_hides_overflow() {
         let css = read_only_css();
@@ -2769,17 +2790,53 @@ mod tests {
             html_css.contains("#k-stage::-webkit-scrollbar{width:0;height:0;display:none}"),
             "必须显式关闭滚动条绘制：{html_css}"
         );
-        // 兜底脚本以实测 clientHeight 为准，且不依赖 URL 参数、不重载
-        let fit = fit_js();
-        assert!(fit.contains("d.clientHeight||innerHeight"), "{fit}");
-        assert!(fit.contains("(H-24)+'px'"), "{fit}");
+        // 标定脚本：以「文档高 − 最大滚动量」量出真实可见高，写 Cookie 并带参重载一次
+        let calib = calib_js();
         assert!(
-            !fit.contains("location") && !fit.contains("replace"),
-            "文档高兜底不得改写 location：{fit}"
+            calib.contains("H=(d&&d.clientHeight>0)?d.clientHeight:innerHeight"),
+            "{calib}"
+        );
+        assert!(calib.contains("d.style.height=(H+2000)+'px'"), "{calib}");
+        assert!(
+            calib.contains("d.style.overflow='visible'"),
+            "根元素是 overflow:hidden，测量前必须临时放开，否则 scrollTo 无效：{calib}"
         );
         assert!(
-            css.contains("#k-stage{position:absolute;top:56px;left:36px;right:36px;bottom:88px;padding:36px 36px 0;overflow:hidden}"),
-            "正文区必须从 56px 顶栏下沿开始：{css}"
+            calib.contains(
+                "finally{d.style.height=oldH;window.scrollTo(0,0);d.style.overflow=oldO;}"
+            ),
+            "高度与 overflow 必须无条件复原（异常也不留后患）：{calib}"
+        );
+        assert!(calib.contains("window.scrollTo(0,3000)"), "{calib}");
+        assert!(
+            calib.contains("v=(H+2000)-y"),
+            "可见高 = 文档高 − 最大滚动量：{calib}"
+        );
+        assert!(
+            calib.contains("y>0&&v>200&&v<=H"),
+            "标定失败必须回退而不是写坏值：{calib}"
+        );
+        assert!(
+            calib.contains("V=H-12"),
+            "回退值 = clientHeight − 12：{calib}"
+        );
+        assert!(
+            calib.contains("k_vh="),
+            "标定值必须落到 k_vh Cookie：{calib}"
+        );
+        assert!(calib.contains("path=/"), "Cookie 必须对全站生效：{calib}");
+        assert!(
+            calib.contains("location.replace"),
+            "参数不符时要重载一次：{calib}"
+        );
+        assert!(calib.contains("kfix=1"), "必须有防循环标记：{calib}");
+        assert!(
+            calib.contains("d.style.height=(V-12)+'px'"),
+            "文档高锁成 visibleH − 12（严格小于可见高）：{calib}"
+        );
+        assert!(
+            css.contains("#k-stage{position:absolute;top:56px;left:36px;right:36px;bottom:76px;padding:36px 36px 0;overflow:hidden}"),
+            "正文区必须从 56px 顶栏下沿开始、底边让出 76：{css}"
         );
         assert!(
             css.contains("#k-read-nav{position:fixed;top:0;left:0;right:0;height:56px;padding:0 36px;background:#fff;border-bottom:1px solid #000;z-index:12}"),
@@ -2796,14 +2853,18 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("body{height:100%;overflow:hidden;"),
-            "body 也必须撑满视口：{html}"
+            html.contains("body{position:relative;height:100%;overflow:hidden;"),
+            "body 必须是 absolute 子元素的包含块：{html}"
         );
+        // 底栏不能再用 fixed（老 Silk 会把 fixed 锚在布局视口，掉到可见区外）
         let bar = fixed_bar("", vp());
         assert!(
-            bar.contains("position:fixed;left:0;right:0;bottom:0;height:88px;padding-bottom:24px"),
-            "底栏必须贴视口底并内置 {SAFE_BOTTOM}px 安全区：{bar}"
+            bar.contains(
+                "position:absolute;left:0;right:0;bottom:0;height:76px;padding-bottom:12px"
+            ),
+            "底栏必须相对 body 贴底并内置 12px 安全区：{bar}"
         );
+        assert!(!bar.contains("position:fixed"), "底栏不得用 fixed：{bar}");
         assert!(!bar.contains("width:1072px"), "底栏宽度不得写死像素：{bar}");
     }
 
@@ -2856,7 +2917,7 @@ mod tests {
     fn empty_shelf_is_outlined_and_centered() {
         let html = empty_shelf(2, vp());
         assert!(html.contains("border:1px solid #000"), "{html}");
-        assert!(html.contains("width=\"1000\" height=\"1171\""), "{html}");
+        assert!(html.contains("width=\"1000\" height=\"1183\""), "{html}");
         assert!(
             html.contains("align=\"center\" valign=\"middle\""),
             "{html}"
@@ -3069,15 +3130,15 @@ mod tests {
             &sp0,
         );
         assert!(!html.contains("slice=1"), "整图页不得带切片参数");
-        // 1024×1200 缩到 928 宽 → 高 1088（≤1172 漫画可用高），显式宽高防抖动
+        // 1024×1200 缩到 928 宽 → 高 1088（≤1184 漫画可用高），显式宽高防抖动
         assert!(html.contains("width=\"928\" height=\"1088\""), "{html}");
         assert!(html.contains("max-width:100%"), "禁止横向溢出");
-        // 漫画页保留像素高（1244 − 56 顶栏 = 1188），并整体下移到顶栏下沿
-        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1188px"));
+        // 漫画页保留像素高（1256 − 56 顶栏 = 1200），并整体下移到顶栏下沿
+        assert!(html.contains("id=\"k-stage\"") && html.contains("height:1200px"));
         // 漫画页同样清零 read_only_css 的绝对定位偏移，否则整页会被 right 挤向右
         assert!(
             html.contains(
-                "position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:56px;height:1188px"
+                "position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:56px;height:1200px"
             ),
             "{html}"
         );
@@ -3117,8 +3178,8 @@ mod tests {
             &sp0,
         );
         assert!(s2.contains("slice=1&i=1"), "{s2}");
-        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离（vh 取漫画可用高 1172）
-        assert!(s2.contains("dw=928") && s2.contains("vh=1172"), "{s2}");
+        // 切片 URL 必须带 dw/vh：缓存 key 按尺寸天然隔离（vh 取漫画可用高 1184）
+        assert!(s2.contains("dw=928") && s2.contains("vh=1184"), "{s2}");
         assert!(s2.contains("width=\"928\""), "{s2}");
         assert!(
             !s2.contains("height=\""),

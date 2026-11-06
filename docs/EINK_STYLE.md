@@ -54,7 +54,7 @@
 | 阴影 | 无 | **无阴影** |
 | 过渡 | 无 | **无 transition / animation** |
 
-版心固定：总宽 `1072`，左右 `36` 边距，内容 `1000`；阅读页 stage 高 `1268`，可用 `1196`；底栏高 `64`（4 格等分，各 250）。
+版心固定：总宽 `1072`，左右 `36` 边距，内容 `1000`；阅读页文档高 = **标定出的真实可见高 − 12**（首次进入由 `<head>` 内联 ES5 用「文档撑高 → 滚到底 → 文档高 − 最大滚动量」标定，写 Cookie `k_vh`，之后带 `?vh=` 重渲染；1268 下为 `1256`），正文可用高 `1044`（四档行预算 22/20/16/29）；底栏高 `76`（`64` 内容 + `12` 安全区，4 格等分，各 `250`）。
 
 ## 3. 允许清单（`/k` 内唯一可用写法）
 
@@ -68,7 +68,7 @@
 | `border` / `border-collapse` / `border-spacing` | 1px |
 | `font-family` / `font-size` / `font-weight` / `line-height` / `letter-spacing` / `text-align` / `text-indent` | 排版 |
 | `color` / `background`（纯色） | 仅第 2.1 节灰阶 |
-| `position: fixed` | **仅限阅读页底栏**（`routes/kindle.rs` 已实际使用 `position:fixed;bottom:0`；真机回读可用） |
+| `position: absolute` + `body{position:relative}` | **仅限阅读页贴底元素**（底栏、翻页热区、列表页 stage）。老 Silk 把 `position:fixed` 锚在**布局视口**，而布局视口比真实可见高更大，底栏会掉到可见区外；`absolute` 锚在 `body`，`body` 高又被标定脚本锁成「可见高 − 12」，因此一定在可见区内。`<head>` 也有只读的 `fixed` 顶栏（`#k-read-nav` 贴顶 56px），贴顶不受此问题影响 |
 | `overflow: hidden` / `overflow-x: hidden` | 防横向溢出 |
 | `-webkit-text-size-adjust: none` | 防老引擎自动放大 |
 
