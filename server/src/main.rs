@@ -1,33 +1,10 @@
-mod auth;
-mod config;
-mod crypto;
-mod db;
-mod db_guard;
-mod entities;
-mod error;
-mod image_cache;
-mod k_metrics;
-mod models;
-mod req;
-mod routes;
-mod rule_engine;
-// search_rank 的排序/配额/停止策略目前由单测与基准覆盖，生产路由尚未接入；
-// 模块级放行 dead_code，避免 20+ 条逐项 allow 淹没真实告警。
-#[allow(dead_code)]
-mod search_rank;
-mod serde_util;
-mod source_bench;
-mod source_health;
-mod source_ledger;
-mod source_quality;
-mod web_book;
+use boranlib::config::{self, Config};
+use boranlib::{auth, db, db_guard, image_cache, req, routes, rule_engine};
 
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
-
-use crate::config::Config;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

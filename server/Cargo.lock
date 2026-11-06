@@ -410,6 +410,7 @@ dependencies = [
  "sxd-document",
  "sxd-xpath",
  "tokio",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
