@@ -602,11 +602,45 @@ mod tests {
             .unwrap();
         assert_eq!(stored, "alice", "落库用户名必须已 trim");
     }
+
+    // 生产首次启动：必须显式提供足够强的 ADMIN_PASS；开发允许缺省 __INITIAL_ADMIN_PASS__。
+    #[test]
+    fn production_bootstrap_requires_strong_password() {
+        assert_eq!(resolve_bootstrap_pass(false, None).unwrap(), "__INITIAL_ADMIN_PASS__");
+        assert!(resolve_bootstrap_pass(false, Some("x".into())).is_ok());
+        assert!(resolve_bootstrap_pass(true, None).is_err());
+        assert!(resolve_bootstrap_pass(true, Some("__INITIAL_ADMIN_PASS__".into())).is_err());
+        assert!(resolve_bootstrap_pass(true, Some("short".into())).is_err());
+        assert_eq!(
+            resolve_bootstrap_pass(true, Some("correct-horse".into())).unwrap(),
+            "correct-horse"
+        );
+    }
+}
+
+/// 生产环境管理员口令最小长度（字节）。
+const MIN_ADMIN_PASS_LEN: usize = 8;
+
+/// 解析首次启动口令：生产环境必须显式设置且足够强；开发环境允许缺省 __INITIAL_ADMIN_PASS__。
+fn resolve_bootstrap_pass(production: bool, pass: Option<String>) -> AppResult<String> {
+    match pass {
+        Some(pass) if production && (pass.len() < MIN_ADMIN_PASS_LEN || pass == "__INITIAL_ADMIN_PASS__") => {
+            Err(AppError::Internal(format!(
+                "生产环境 ADMIN_PASS 至少 {MIN_ADMIN_PASS_LEN} 字节，且不能使用默认口令 __INITIAL_ADMIN_PASS__"
+            )))
+        }
+        Some(pass) => Ok(pass),
+        None if production => Err(AppError::Internal(format!(
+            "生产环境首次启动必须设置 ADMIN_PASS（BORANLIB_ADMIN_PASS 或 LEGADO_ADMIN_PASS，至少 {MIN_ADMIN_PASS_LEN} 字节，且不能是 __INITIAL_ADMIN_PASS__）"
+        ))),
+        None => Ok("__INITIAL_ADMIN_PASS__".into()),
+    }
 }
 
 /// 首次启动引导：若 users 表为空，则创建管理员账号。
-/// 凭据来自环境变量 ADMIN_USER / ADMIN_PASS，缺省 admin / __INITIAL_ADMIN_PASS__（仅用于首次，请尽快修改）。
-pub async fn bootstrap_admin(pool: &SqlitePool) -> AppResult<()> {
+/// 用户名来自 `ADMIN_USER`（缺省 admin）；口令来自 `ADMIN_PASS`。
+/// 生产环境必须显式设置 `ADMIN_PASS`（至少 8 字节且不能是 __INITIAL_ADMIN_PASS__），否则拒绝创建。
+pub async fn bootstrap_admin(pool: &SqlitePool, cfg: &crate::config::Config) -> AppResult<()> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(pool)
         .await?;
@@ -614,13 +648,17 @@ pub async fn bootstrap_admin(pool: &SqlitePool) -> AppResult<()> {
         return Ok(());
     }
     let user = crate::config::env_prefixed("ADMIN_USER").unwrap_or_else(|| "admin".into());
-    let pass = crate::config::env_prefixed("ADMIN_PASS").unwrap_or_else(|| "__INITIAL_ADMIN_PASS__".into());
+    let pass = resolve_bootstrap_pass(cfg.production, crate::config::env_prefixed("ADMIN_PASS"))?;
     let pw = hash(&pass, DEFAULT_COST).map_err(AppError::Bcrypt)?;
     sqlx::query("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')")
         .bind(&user)
         .bind(&pw)
         .execute(pool)
         .await?;
-    tracing::warn!("bootstrap: created default admin '{user}' / '{pass}' — please change it");
+    if cfg.production {
+        tracing::warn!(%user, "bootstrap: created admin from BORANLIB_ADMIN_PASS");
+    } else {
+        tracing::warn!(%user, "bootstrap: created default admin — please change the password");
+    }
     Ok(())
 }

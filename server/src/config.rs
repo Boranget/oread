@@ -3,6 +3,71 @@ use std::env;
 /// 环境变量前缀：新品牌优先，旧前缀仅作兼容（两者都缺才用默认值）。
 const ENV_PREFIXES: [&str; 2] = ["BORANLIB_", "LEGADO_"];
 
+/// 缺省 JWT secret：只允许开发环境使用。
+pub const DEFAULT_JWT_SECRET: &str = "change-me-in-prod";
+/// 生产环境 JWT secret 最小长度（字节）。
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// 逗号分隔的来源列表：去空白、去尾部 `/`、去重；空串忽略。
+fn parse_origin_list(raw: Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.unwrap_or_default().split(',') {
+        let origin = part.trim().trim_end_matches('/');
+        if origin.is_empty() || out.iter().any(|v| v == origin) {
+            continue;
+        }
+        out.push(origin.to_string());
+    }
+    out
+}
+
+/// 只接受精确的 `scheme://host[:port]`；拒绝通配符、路径、查询串和片段。
+fn validate_cors_origins(origins: &[String]) -> Result<(), String> {
+    for origin in origins {
+        if origin == "*" {
+            return Err("CORS_ORIGINS 不允许 `*`；请列出精确来源".into());
+        }
+        let parsed = url::Url::parse(origin)
+            .map_err(|e| format!("CORS_ORIGINS 中的来源不合法 `{origin}`: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!("CORS_ORIGINS 只支持 http/https: {origin}"));
+        }
+        if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(format!(
+                "CORS_ORIGINS 只接受 origin，不能带路径/查询/片段: {origin}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 生产环境：拒绝默认 secret 和过短 secret；开发环境只告警。
+fn validate_production_secret(production: bool, secret: &str) -> Result<(), String> {
+    if !production {
+        return Ok(());
+    }
+    if secret == DEFAULT_JWT_SECRET {
+        return Err("生产环境必须设置 BORANLIB_JWT_SECRET（当前仍是 change-me-in-prod）".into());
+    }
+    if secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(format!(
+            "生产环境 BORANLIB_JWT_SECRET 至少 {MIN_JWT_SECRET_LEN} 字节（当前 {} 字节）",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
+/// 显式 `BORANLIB_ENV`：dev/development/test 视为开发，prod/production/release 视为生产；
+/// 未设置或无法识别时跟随构建档位（debug=开发，release=生产），避免拼错值意外放宽生产校验。
+fn resolve_production(raw: Option<String>) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "dev" | "development" | "test") => false,
+        Some(v) if matches!(v.as_str(), "prod" | "production" | "release") => true,
+        _ => !cfg!(debug_assertions),
+    }
+}
+
 /// 按前缀顺序查找；空串/纯空白视为未设置，继续找下一个前缀。
 fn lookup_prefixed(key: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
     ENV_PREFIXES
@@ -131,6 +196,10 @@ pub struct Config {
     /// 数据根目录，下面会生成 shared.db 与 users/{uid}.db
     pub data_dir: String,
     pub jwt_secret: String,
+    /// 是否生产环境：显式 `BORANLIB_ENV=production`，未设置时 release 视为生产、debug 视为开发。
+    pub production: bool,
+    /// CORS 白名单（精确 origin）；为空表示不添加 CORS 层（同源部署）。
+    pub cors_origins: Vec<String>,
 
     // ---- 低资源预算（474 MiB 可用内存的 OpenStick）----
     /// 正文缓存落库总量上限（MiB）
@@ -248,6 +317,8 @@ impl Config {
                 env_u64_opt("SEARCH_ALL_BUDGET_SECS"),
             );
         let http_concurrency_raw = env_u64_opt("HTTP_CONCURRENCY");
+        let production = resolve_production(env_prefixed("ENV"));
+        let cors_origins = parse_origin_list(env_prefixed("CORS_ORIGINS"));
         // 切片参数有跨字段约束：overlap 不得超过可用高的 1/4（与 SliceParams 的夹取一致）。
         let comic_slice_vh = env_u64("COMIC_SLICE_VH", 1196).clamp(320, 2000) as u32;
         let comic_slice_ov =
@@ -258,7 +329,9 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8080),
             data_dir: env_prefixed("DATA_DIR").unwrap_or_else(|| "data".into()),
-            jwt_secret: env_prefixed("JWT_SECRET").unwrap_or_else(|| "change-me-in-prod".into()),
+            jwt_secret: env_prefixed("JWT_SECRET").unwrap_or_else(|| DEFAULT_JWT_SECRET.into()),
+            production,
+            cors_origins,
 
             cache_limit_mb: env_u64("CACHE_LIMIT_MB", 50).clamp(4, 512),
             // 并发默认 16：扫参照显示同预算下 8→16 命中源 +3.3pt、首屏不变；上限 16。
@@ -326,6 +399,12 @@ impl Config {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "web/dist".into()),
         }
+    }
+
+    /// 启动前校验：生产环境拒绝弱 JWT secret，CORS 只接受精确来源。
+    pub fn validate(&self) -> Result<(), String> {
+        validate_production_secret(self.production, &self.jwt_secret)?;
+        validate_cors_origins(&self.cors_origins)
     }
 
     pub fn cache_limit_bytes(&self) -> i64 {
@@ -525,5 +604,63 @@ mod tests {
         assert_eq!(resolve_js_timeout_ms(Some(5000)), 5000);
         assert_eq!(resolve_js_timeout_ms(Some(5001)), 5000);
         assert_eq!(resolve_js_timeout_ms(Some(u64::MAX)), 5000);
+    }
+
+    // 生产判定：显式值优先；未设置时 debug=开发、release=生产。
+    #[test]
+    fn production_is_resolved_from_env_or_build_profile() {
+        assert!(resolve_production(Some("production".into())));
+        assert!(resolve_production(Some(" PROD ".into())));
+        assert!(resolve_production(Some("release".into())));
+        assert!(!resolve_production(Some("dev".into())));
+        assert!(!resolve_production(Some("development".into())));
+        assert!(!resolve_production(Some("test".into())));
+        // 无法识别的值跟随构建档位，避免拼错后意外放宽生产校验。
+        assert_eq!(
+            resolve_production(Some("staging".into())),
+            !cfg!(debug_assertions)
+        );
+        assert_eq!(resolve_production(None), !cfg!(debug_assertions));
+        assert_eq!(
+            resolve_production(Some("   ".into())),
+            !cfg!(debug_assertions)
+        );
+    }
+
+    // 生产拒绝默认 / 过短 secret；开发环境允许默认值（只告警）。
+    #[test]
+    fn production_secret_validation() {
+        assert!(validate_production_secret(false, DEFAULT_JWT_SECRET).is_ok());
+        assert!(validate_production_secret(false, "short").is_ok());
+        assert!(validate_production_secret(true, DEFAULT_JWT_SECRET).is_err());
+        assert!(validate_production_secret(true, "short").is_err());
+        assert!(validate_production_secret(true, &"a".repeat(MIN_JWT_SECRET_LEN - 1)).is_err());
+        assert!(validate_production_secret(true, &"a".repeat(MIN_JWT_SECRET_LEN)).is_ok());
+    }
+
+    // CORS 列表：逗号分隔、去空白、去尾部斜杠、去重、忽略空项。
+    #[test]
+    fn cors_origin_list_is_normalized() {
+        assert!(parse_origin_list(None).is_empty());
+        assert!(parse_origin_list(Some("  ".into())).is_empty());
+        assert_eq!(
+            parse_origin_list(Some(
+                " https://a.example , http://b.example:8080/,https://a.example ".into()
+            )),
+            vec!["https://a.example", "http://b.example:8080"]
+        );
+    }
+
+    // CORS 校验：只接受精确 http(s) origin，拒绝 *、路径、查询串和非 http(s)。
+    #[test]
+    fn cors_origins_reject_wildcard_and_paths() {
+        assert!(validate_cors_origins(&[]).is_ok());
+        assert!(validate_cors_origins(&["https://a.example".into()]).is_ok());
+        assert!(validate_cors_origins(&["http://127.0.0.1:5173".into()]).is_ok());
+        assert!(validate_cors_origins(&["*".into()]).is_err());
+        assert!(validate_cors_origins(&["https://a.example/app".into()]).is_err());
+        assert!(validate_cors_origins(&["https://a.example?x=1".into()]).is_err());
+        assert!(validate_cors_origins(&["ftp://a.example".into()]).is_err());
+        assert!(validate_cors_origins(&["not a url".into()]).is_err());
     }
 }
