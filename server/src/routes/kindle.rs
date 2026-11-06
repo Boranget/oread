@@ -22,7 +22,7 @@ use axum::{
     extract::{Query, Request, State},
     http::{header::SET_COOKIE, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
-    routing::{get, post},
+    routing::get,
     Form, Router,
 };
 
@@ -42,7 +42,7 @@ use crate::routes::books::{
     load_book_meta, load_cached_chapters, load_cached_content, save_book_meta, save_chapters,
     save_content_cached,
 };
-use crate::routes::bookshelf::SHELF_LIST_SQL;
+use crate::routes::bookshelf::{record_progress, SHELF_LIST_SQL};
 use crate::routes::image;
 use crate::routes::replace;
 use crate::routes::sources::{load_source, load_sources};
@@ -287,7 +287,6 @@ pub fn routes() -> Router<AppState> {
         .route("/k/toc", get(toc))
         .route("/k/read", get(read))
         .route("/k/search", get(search))
-        .route("/k/progress", post(progress))
         .route("/k/_selftest", get(selftest))
         .route("/k/login", get(login_form).post(login_post))
         .route("/k/logout", get(logout))
@@ -508,7 +507,7 @@ fn nav_link(href: &str, label: &str) -> String {
 }
 
 /// 贴视口底部的固定栏（仅阅读页）：`left:0;right:0;bottom:0`，总高 88 =
-/// 上 64 内容（5 格各 200px）+ 下 24 安全区（`padding-bottom`，避免被系统栏/滚动条遮住）。
+/// 上 64 内容（4 格各 250px）+ 下 24 安全区（`padding-bottom`，避免被系统栏/滚动条遮住）。
 /// 不再用 `bottom:24px` + 视口宽像素：页面高由 100% 决定，底栏必须贴住真实视口底。
 fn fixed_bar(row: &str, vp: Vp) -> String {
     format!(
@@ -534,7 +533,7 @@ fn bar_inner(icon: &str, label: &str) -> String {
 
 fn bar_cell(href: &str, icon: &str, label: &str) -> String {
     format!(
-        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+        "<td width=\"25%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
          <a href=\"{href}\" style=\"display:block;height:63px;padding-top:6px\">{inner}</a></td>",
         href = href,
         inner = bar_inner(icon, label)
@@ -544,7 +543,7 @@ fn bar_cell(href: &str, icon: &str, label: &str) -> String {
 /// 底栏格：禁用态（弱灰、不可点），用于全书末页的「下一页」
 fn bar_cell_off(icon: &str, label: &str) -> String {
     format!(
-        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+        "<td width=\"25%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
          <span style=\"display:block;height:63px;padding-top:6px;color:#555\">{inner}</span></td>",
         inner = bar_inner(icon, label)
     )
@@ -745,34 +744,6 @@ fn bar_cell_next(next: Option<&(String, &'static str)>) -> String {
         Some((href, label)) => bar_cell(href, "后", label),
         None => bar_cell_off("后", "下一页"),
     }
-}
-
-/// 进度提交：零 JS 的原生 form（底栏第 5 格），整格是 `<button>`，与其它格同构
-fn progress_form(q: &ReadQ, ch: i64, p: i64, n: i64, total: usize, fs: usize, vp: Vp) -> String {
-    format!(
-        "<td width=\"20%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
-         <form method=\"post\" action=\"/k/progress\" style=\"margin:0\">\
-         <input type=\"hidden\" name=\"book\" value=\"{book}\">\
-         <input type=\"hidden\" name=\"source\" value=\"{source}\">\
-         <input type=\"hidden\" name=\"ch\" value=\"{ch}\">\
-         <input type=\"hidden\" name=\"p\" value=\"{p}\">\
-         <input type=\"hidden\" name=\"n\" value=\"{n}\">\
-         <input type=\"hidden\" name=\"total\" value=\"{total}\">\
-         <input type=\"hidden\" name=\"fs\" value=\"{fs}\">\
-         <input type=\"hidden\" name=\"vw\" value=\"{vw}\">\
-         <input type=\"hidden\" name=\"vh\" value=\"{vh}\">\
-         <button type=\"submit\" style=\"width:100%;height:63px;border:0;padding:0;background:#fff;color:#000;font-family:serif;-webkit-appearance:none;appearance:none\">{inner}</button></form></td>",
-        book = esc(&q.book),
-        source = esc(&q.source),
-        ch = ch,
-        p = p,
-        n = n,
-        total = total,
-        fs = fs,
-        vw = vp.w,
-        vh = vp.h,
-        inner = bar_inner("记", "记录")
-    )
 }
 
 /// 描边按钮（只描边不填充、圆角 0、无阴影/渐变/过渡），240×72
@@ -1123,18 +1094,6 @@ pub struct FsQ {
 pub struct LoginQ {
     username: String,
     password: String,
-}
-#[derive(Deserialize)]
-pub struct ProgressQ {
-    book: String,
-    source: Option<String>,
-    ch: i64,
-    p: i64,
-    n: i64,
-    fs: Option<i64>,
-    total: Option<i64>,
-    vw: Option<i64>,
-    vh: Option<i64>,
 }
 
 // ---------------- 数据辅助 ----------------
@@ -1821,6 +1780,15 @@ async fn read(
     let blocks = plan.chunks.len();
 
     let ch_title = title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
+    // 打开阅读页即落库：进度在服务端渲染路径自动 upsert（幂等，重复渲染不写脏）
+    let _ = record_progress(
+        &db.0,
+        &q.book,
+        ch,
+        p as f64 / n as f64,
+        Some(chapters.len() as i64),
+    )
+    .await;
     let toc_url = toc_link(&q, fs, ch, vp);
     let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
     let mut meta = if blocks > 1 {
@@ -1833,8 +1801,7 @@ async fn read(
     if truncated {
         meta.push_str("·已截断");
     }
-    // 进度提交：零 JS 的原生 form，放在底栏第 5 格（阅读页无顶栏）
-    let progress_cell = progress_form(&q, ch, p, n, chapters.len(), fs, vp);
+    // 进度提交已自动化（打开页面即写库），底栏不再有「记录」格
     let next_fs = cycle_fs(fs);
     let fs_href = read_link(&q, next_fs, ch, p, vp);
 
@@ -1862,15 +1829,14 @@ async fn read(
         paras = paras,
         meta = esc(&meta)
     );
-    // 贴底固定栏 5 格（各 200px）：上一页 / 下一页 / 目录 / 字号 / 记录
+    // 贴底固定栏 4 格（各 250px）：上一页 / 下一页 / 目录 / 字号
     let bottom = fixed_bar(
         &format!(
-            "{prev}{next}{toc}{fs}{progress}",
+            "{prev}{next}{toc}{fs}",
             prev = bar_cell_prev(prev.as_ref()),
             next = bar_cell_next(next.as_ref()),
             toc = bar_cell(&toc_url, "目", "目录"),
             fs = bar_cell(&fs_href, "字", "字号"),
-            progress = progress_cell
         ),
         vp,
     );
@@ -1969,9 +1935,17 @@ async fn comic_read(
     let pg = &pages[(p - 1) as usize];
 
     let toc_url = toc_link(q, fs, ch, vp);
+    // 打开漫画页即落库（与小说页一致，幂等）
+    let _ = record_progress(
+        pool,
+        &q.book,
+        ch,
+        p as f64 / n as f64,
+        Some(chapters.len() as i64),
+    )
+    .await;
     let (prev, next) = read_nav(q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
     let meta = format!("{p}/{n}");
-    let progress_cell = progress_form(q, ch, p, n, chapters.len(), fs, vp);
     let next_fs = cycle_fs(fs);
     let fs_href = read_link(q, next_fs, ch, p, vp);
 
@@ -1987,12 +1961,11 @@ async fn comic_read(
     );
     let bottom = fixed_bar(
         &format!(
-            "{prev}{next}{toc}{fs}{progress}",
+            "{prev}{next}{toc}{fs}",
             prev = bar_cell_prev(prev.as_ref()),
             next = bar_cell_next(next.as_ref()),
             toc = bar_cell(&toc_url, "目", "目录"),
             fs = bar_cell(&fs_href, "字", "字号"),
-            progress = progress_cell
         ),
         vp,
     );
@@ -2026,87 +1999,6 @@ async fn comic_read(
     let mut res = page_css(&title, fs, &body, &read_only_css(), vp);
     if explicit {
         remember_fs(&mut res, fs);
-    }
-    res
-}
-
-// ---------------- 进度提交（零 JS form） ----------------
-
-async fn progress(
-    State(s): State<AppState>,
-    _u: AuthUser,
-    db: UserDb,
-    Form(q): Form<ProgressQ>,
-) -> Response {
-    let ch = q.ch.max(0);
-    let position = if q.n > 0 {
-        (q.p.max(1) as f64 / q.n as f64).min(1.0)
-    } else {
-        0.0
-    };
-    let _ = sqlx::query(
-        "INSERT INTO reading_progress (book_id, chapter_index, position) \
-         VALUES (?1,?2,?3) ON CONFLICT(book_id) DO UPDATE SET \
-         chapter_index=excluded.chapter_index, position=excluded.position, updated_at=datetime('now')",
-    )
-    .bind(&q.book)
-    .bind(ch)
-    .bind(position)
-    .execute(&db.0)
-    .await;
-
-    let total = match q.total {
-        Some(t) if t > 0 => t,
-        _ => sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(total_chapter_num,0) FROM book_meta WHERE book_url = ?",
-        )
-        .bind(&q.book)
-        .fetch_optional(&db.0)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0),
-    };
-    let name: Option<String> = sqlx::query_scalar("SELECT name FROM book_meta WHERE book_url = ?")
-        .bind(&q.book)
-        .fetch_optional(&db.0)
-        .await
-        .ok()
-        .flatten();
-    let _ = sqlx::query(
-        "INSERT INTO book_stats (book_id, name, total_chapters, read_chapters, last_read_at) \
-         VALUES (?1,?2,?3,?4, datetime('now')) ON CONFLICT(book_id) DO UPDATE SET \
-         name=COALESCE(excluded.name, book_stats.name), \
-         total_chapters=CASE WHEN excluded.total_chapters>0 THEN excluded.total_chapters ELSE book_stats.total_chapters END, \
-         read_chapters=MAX(book_stats.read_chapters, excluded.read_chapters), \
-         last_read_at=datetime('now')",
-    )
-    .bind(&q.book)
-    .bind(&name)
-    .bind(total)
-    .bind(ch + 1)
-    .execute(&db.0)
-    .await;
-
-    let fs = match q.fs {
-        Some(v) if (1..=4).contains(&v) => v as usize,
-        _ => 2,
-    };
-    let loc = qlink(
-        &format!(
-            "/k/read?book={}&source={}&ch={}&p={}",
-            qenc(&q.book),
-            qenc(q.source.as_deref().unwrap_or("")),
-            ch,
-            q.p.max(1)
-        ),
-        fs,
-        vp_of(&s, q.vw, q.vh),
-    );
-    let mut res = Response::new(axum::body::Body::empty());
-    *res.status_mut() = StatusCode::SEE_OTHER;
-    if let Ok(v) = HeaderValue::from_str(&loc) {
-        res.headers_mut().insert(axum::http::header::LOCATION, v);
     }
     res
 }
@@ -2973,37 +2865,21 @@ mod tests {
         assert!(html.contains("width:240px;height:72px;line-height:70px;border:1px solid #000"));
     }
 
-    /// 底栏 5 格等宽（各 200 = 20%）、64 高、图标 28 + 文字 20，禁用态用 #555 且不可点。
+    /// 底栏 4 格等宽（各 250 = 25%）、64 高、图标 28 + 文字 20，禁用态用 #555 且不可点。
+    /// 「记录」已删除：进度改为打开页面即自动写入。
     #[test]
-    fn bottom_bar_has_five_equal_cells() {
+    fn bottom_bar_has_four_equal_cells() {
         let row = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}",
             bar_cell("/k?a", "前", "上一页"),
             bar_cell_off("后", "下一页"),
             bar_cell("/k?b", "目", "目录"),
             bar_cell("/k?c", "字", "字号"),
-            progress_form(
-                &ReadQ {
-                    book: "b".into(),
-                    source: "s".into(),
-                    ch: None,
-                    p: None,
-                    fs: None,
-                    vw: None,
-                    vh: None,
-                },
-                0,
-                1,
-                1,
-                1,
-                2,
-                vp()
-            )
         );
         let bar = fixed_bar(&row, vp());
-        assert_eq!(bar.matches("<td ").count(), 5, "{bar}");
-        assert_eq!(bar.matches("width=\"20%\"").count(), 5, "{bar}");
-        assert_eq!(bar.matches("height=\"64\"").count(), 5, "{bar}");
+        assert_eq!(bar.matches("<td ").count(), 4, "{bar}");
+        assert_eq!(bar.matches("width=\"25%\"").count(), 4, "{bar}");
+        assert_eq!(bar.matches("height=\"64\"").count(), 4, "{bar}");
         assert!(bar.contains("width:28px;height:28px"));
         assert!(
             bar.contains("font-size:28px;line-height:28px;font-weight:700"),
@@ -3011,10 +2887,11 @@ mod tests {
         );
         assert!(!bar.contains("border:1px solid #000"), "字符不得再套方框");
         assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
-        assert_eq!(
-            bar.matches("<a ").count(),
-            3,
-            "上/下/目录/字号里只有 3 个 <a>，记录是 form"
+        assert_eq!(bar.matches("<a ").count(), 3, "只有目录/字号/上一页是链接");
+        assert!(!bar.contains("<form"), "记录表单已删除");
+        assert!(
+            !bar.contains(">记<") && !bar.contains("记录"),
+            "不再有记录格"
         );
         assert!(bar.contains("color:#555"), "禁用态用弱灰 #555");
         assert!(!bar.contains("background:#e6e6e6"));
