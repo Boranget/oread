@@ -1,0 +1,187 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-11-06T22:55:17.623Z",
+  "git": {
+    "branch": "main",
+    "commit": "8c6baa5",
+    "subject": "docs: 更新优化方案基线与构建/磁盘策略",
+    "dirty": 3,
+    "trackedFiles": 174,
+    "objects": "count: 4\nsize: 10.48 KiB\nin-pack: 1684\npacks: 1\nsize-pack: 3.17 MiB\nprune-packable: 0\ngarbage: 0\nsize-garbage: 0 bytes",
+    "sizeBytes": 3408863
+  },
+  "code": {
+    "rust": {
+      "files": 33,
+      "lines": 44037,
+      "top": [
+        {
+          "path": "server\\src\\rule_engine.rs",
+          "lines": 8814
+        },
+        {
+          "path": "server\\src\\routes\\books.rs",
+          "lines": 4091
+        },
+        {
+          "path": "server\\src\\routes\\kindle.rs",
+          "lines": 3443
+        },
+        {
+          "path": "server\\src\\web_book.rs",
+          "lines": 3165
+        },
+        {
+          "path": "server\\src\\routes\\image.rs",
+          "lines": 3152
+        },
+        {
+          "path": "server\\src\\source_bench.rs",
+          "lines": 2863
+        },
+        {
+          "path": "server\\src\\routes\\sources.rs",
+          "lines": 2547
+        },
+        {
+          "path": "server\\src\\req.rs",
+          "lines": 2284
+        }
+      ]
+    },
+    "svelte": {
+      "files": 13,
+      "lines": 9517,
+      "top": [
+        {
+          "path": "server\\web\\src\\pages\\Reader.svelte",
+          "lines": 2534
+        },
+        {
+          "path": "server\\web\\src\\pages\\Discover.svelte",
+          "lines": 1220
+        },
+        {
+          "path": "server\\web\\src\\pages\\Sources.svelte",
+          "lines": 1084
+        },
+        {
+          "path": "server\\web\\src\\lib\\SourceRulesEditor.svelte",
+          "lines": 917
+        },
+        {
+          "path": "server\\web\\src\\pages\\Bookshelf.svelte",
+          "lines": 787
+        },
+        {
+          "path": "server\\web\\src\\pages\\Settings.svelte",
+          "lines": 751
+        },
+        {
+          "path": "server\\web\\src\\pages\\ComicReader.svelte",
+          "lines": 646
+        },
+        {
+          "path": "server\\web\\src\\pages\\ReplaceRules.svelte",
+          "lines": 502
+        }
+      ]
+    },
+    "js": {
+      "files": 7,
+      "lines": 1041,
+      "top": [
+        {
+          "path": "server\\web\\src\\lib\\api.js",
+          "lines": 603
+        },
+        {
+          "path": "server\\web\\src\\lib\\readingPrefs.js",
+          "lines": 143
+        },
+        {
+          "path": "server\\web\\src\\lib\\zhconvert.js",
+          "lines": 123
+        },
+        {
+          "path": "server\\web\\src\\lib\\theme.js",
+          "lines": 106
+        },
+        {
+          "path": "server\\web\\src\\lib\\readerContent.js",
+          "lines": 27
+        },
+        {
+          "path": "server\\web\\src\\lib\\readerContent.test.js",
+          "lines": 27
+        },
+        {
+          "path": "server\\web\\src\\main.js",
+          "lines": 12
+        }
+      ]
+    }
+  },
+  "tests": {
+    "rustTests": 487,
+    "rustFilesWithTests": 29,
+    "top": [
+      {
+        "path": "server\\src\\rule_engine.rs",
+        "tests": 139
+      },
+      {
+        "path": "server\\src\\web_book.rs",
+        "tests": 41
+      },
+      {
+        "path": "server\\src\\req.rs",
+        "tests": 36
+      },
+      {
+        "path": "server\\src\\routes\\books.rs",
+        "tests": 34
+      },
+      {
+        "path": "server\\src\\routes\\kindle.rs",
+        "tests": 30
+      },
+      {
+        "path": "server\\src\\routes\\image.rs",
+        "tests": 27
+      },
+      {
+        "path": "server\\src\\source_bench.rs",
+        "tests": 22
+      },
+      {
+        "path": "server\\src\\search_rank.rs",
+        "tests": 17
+      }
+    ],
+    "integrationTestFiles": [
+      "server\\tests\\migrations_lf.rs"
+    ],
+    "frontendTestFiles": [
+      "server\\web\\src\\lib\\readerContent.test.js"
+    ]
+  },
+  "frontend": {
+    "entryJsGzipKb": 75.146484375,
+    "cssGzipKb": 6.244140625,
+    "chunks": [
+      "assets/index-BsvAo8Sc.js"
+    ],
+    "css": [
+      "./assets/index-BnnTxVKO.css"
+    ],
+    "buildSeconds": 7.2697403
+  },
+  "binaries": {},
+  "build": null,
+  "runtime": null,
+  "disk": {
+    "freeBytes": 46947442688,
+    "totalBytes": 167772155904
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "baseUrl": "http://127.0.0.1:18080",
+  "capturedAt": "2026-11-06T22:56:18.466Z",
+  "endpoints": [
+    {
+      "path": "/healthz",
+      "status": 200,
+      "file": "healthz.json"
+    },
+    {
+      "path": "/api/healthz",
+      "status": 200,
+      "file": "api_healthz.json"
+    },
+    {
+      "path": "/api/sources",
+      "status": 200,
+      "file": "api_sources.json"
+    },
+    {
+      "path": "/api/sources/health",
+      "status": 200,
+      "file": "api_sources_health.json"
+    },
+    {
+      "path": "/api/bookshelf",
+      "status": 200,
+      "file": "api_bookshelf.json"
+    },
+    {
+      "path": "/api/settings",
+      "status": 200,
+      "file": "api_settings.json"
+    },
+    {
+      "path": "/api/stats/overview",
+      "status": 200,
+      "file": "api_stats_overview.json"
+    },
+    {
+      "path": "/api/replace-rules",
+      "status": 200,
+      "file": "api_replace-rules.json"
+    },
+    {
+      "path": "/api/bookmarks",
+      "status": 200,
+      "file": "api_bookmarks.json"
+    },
+    {
+      "path": "/api/admin/users",
+      "status": 200,
+      "file": "api_admin_users.json"
+    }
+  ]
+}

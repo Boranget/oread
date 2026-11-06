@@ -1,0 +1,43 @@
+{
+  "status": 200,
+  "contentType": "application/json",
+  "body": {
+    "cache_limit_mb": 50,
+    "http": {
+      "concurrency": 16,
+      "max_body_mb": 5,
+      "timeout_secs": 15
+    },
+    "image_cache": {
+      "bytes": "<volatile>",
+      "items": "<volatile>",
+      "limit_mb": 64,
+      "mb": 0
+    },
+    "js": {
+      "budget_ms": 3000,
+      "enabled": true,
+      "last_ms": "<volatile>",
+      "max_ms": "<volatile>"
+    },
+    "ok": true,
+    "open_user_dbs": "<volatile>",
+    "rss_bytes": "<volatile>",
+    "rss_mb": "<volatile>",
+    "search": {
+      "all_source_slots": 16,
+      "comic_slots": 4,
+      "comic_slots_all": 4,
+      "per_source_ms": 8000,
+      "per_source_secs": 8,
+      "source_concurrency_default": 8,
+      "source_concurrency_max": 8,
+      "source_concurrency_min": 1,
+      "source_limit_wait_ms": "<volatile>",
+      "source_limit_waits": "<volatile>",
+      "source_slots": 16,
+      "total_all_secs": 10,
+      "total_curated_secs": 6
+    }
+  }
+}

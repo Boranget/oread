@@ -1,0 +1,15 @@
+{
+  "status": 200,
+  "contentType": "application/json",
+  "body": {
+    "books": [],
+    "daily": [],
+    "days": 7,
+    "longest_streak_days": 0,
+    "streak_days": 0,
+    "today_seconds": 0,
+    "total_chars": 0,
+    "total_seconds": 0,
+    "weekly": []
+  }
+}

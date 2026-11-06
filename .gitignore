@@ -32,3 +32,6 @@
 /decompiled/
 /base.apk
 
+# Phase 0 golden 快照：baseline 入库，current 仅本地 diff
+/scripts/golden/current/
+

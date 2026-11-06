@@ -1,0 +1,306 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-11-06T22:55:55.863Z",
+  "git": {
+    "branch": "main",
+    "commit": "8c6baa5",
+    "subject": "docs: 更新优化方案基线与构建/磁盘策略",
+    "dirty": 5,
+    "trackedFiles": 174,
+    "objects": "count: 4\nsize: 10.48 KiB\nin-pack: 1684\npacks: 1\nsize-pack: 3.17 MiB\nprune-packable: 0\ngarbage: 0\nsize-garbage: 0 bytes",
+    "sizeBytes": 3408863
+  },
+  "code": {
+    "rust": {
+      "files": 33,
+      "lines": 44037,
+      "top": [
+        {
+          "path": "server\\src\\rule_engine.rs",
+          "lines": 8814
+        },
+        {
+          "path": "server\\src\\routes\\books.rs",
+          "lines": 4091
+        },
+        {
+          "path": "server\\src\\routes\\kindle.rs",
+          "lines": 3443
+        },
+        {
+          "path": "server\\src\\web_book.rs",
+          "lines": 3165
+        },
+        {
+          "path": "server\\src\\routes\\image.rs",
+          "lines": 3152
+        },
+        {
+          "path": "server\\src\\source_bench.rs",
+          "lines": 2863
+        },
+        {
+          "path": "server\\src\\routes\\sources.rs",
+          "lines": 2547
+        },
+        {
+          "path": "server\\src\\req.rs",
+          "lines": 2284
+        }
+      ]
+    },
+    "svelte": {
+      "files": 13,
+      "lines": 9517,
+      "top": [
+        {
+          "path": "server\\web\\src\\pages\\Reader.svelte",
+          "lines": 2534
+        },
+        {
+          "path": "server\\web\\src\\pages\\Discover.svelte",
+          "lines": 1220
+        },
+        {
+          "path": "server\\web\\src\\pages\\Sources.svelte",
+          "lines": 1084
+        },
+        {
+          "path": "server\\web\\src\\lib\\SourceRulesEditor.svelte",
+          "lines": 917
+        },
+        {
+          "path": "server\\web\\src\\pages\\Bookshelf.svelte",
+          "lines": 787
+        },
+        {
+          "path": "server\\web\\src\\pages\\Settings.svelte",
+          "lines": 751
+        },
+        {
+          "path": "server\\web\\src\\pages\\ComicReader.svelte",
+          "lines": 646
+        },
+        {
+          "path": "server\\web\\src\\pages\\ReplaceRules.svelte",
+          "lines": 502
+        }
+      ]
+    },
+    "js": {
+      "files": 7,
+      "lines": 1041,
+      "top": [
+        {
+          "path": "server\\web\\src\\lib\\api.js",
+          "lines": 603
+        },
+        {
+          "path": "server\\web\\src\\lib\\readingPrefs.js",
+          "lines": 143
+        },
+        {
+          "path": "server\\web\\src\\lib\\zhconvert.js",
+          "lines": 123
+        },
+        {
+          "path": "server\\web\\src\\lib\\theme.js",
+          "lines": 106
+        },
+        {
+          "path": "server\\web\\src\\lib\\readerContent.js",
+          "lines": 27
+        },
+        {
+          "path": "server\\web\\src\\lib\\readerContent.test.js",
+          "lines": 27
+        },
+        {
+          "path": "server\\web\\src\\main.js",
+          "lines": 12
+        }
+      ]
+    }
+  },
+  "tests": {
+    "rustTests": 487,
+    "rustFilesWithTests": 29,
+    "top": [
+      {
+        "path": "server\\src\\rule_engine.rs",
+        "tests": 139
+      },
+      {
+        "path": "server\\src\\web_book.rs",
+        "tests": 41
+      },
+      {
+        "path": "server\\src\\req.rs",
+        "tests": 36
+      },
+      {
+        "path": "server\\src\\routes\\books.rs",
+        "tests": 34
+      },
+      {
+        "path": "server\\src\\routes\\kindle.rs",
+        "tests": 30
+      },
+      {
+        "path": "server\\src\\routes\\image.rs",
+        "tests": 27
+      },
+      {
+        "path": "server\\src\\source_bench.rs",
+        "tests": 22
+      },
+      {
+        "path": "server\\src\\search_rank.rs",
+        "tests": 17
+      }
+    ],
+    "integrationTestFiles": [
+      "server\\tests\\migrations_lf.rs"
+    ],
+    "frontendTestFiles": [
+      "server\\web\\src\\lib\\readerContent.test.js"
+    ]
+  },
+  "frontend": {
+    "entryJsGzipKb": 75.146484375,
+    "cssGzipKb": 6.244140625,
+    "chunks": [
+      "assets/index-BsvAo8Sc.js"
+    ],
+    "css": [
+      "./assets/index-BnnTxVKO.css"
+    ]
+  },
+  "binaries": {},
+  "build": null,
+  "runtime": {
+    "baseUrl": "http://127.0.0.1:18080",
+    "endpoints": {
+      "/healthz": {
+        "status": 200,
+        "p50Ms": 1.5420999999998912,
+        "p95Ms": 3.3086000000000695,
+        "minMs": 1.3334999999999582,
+        "maxMs": 3.3086000000000695
+      },
+      "/api/healthz": {
+        "status": 200,
+        "p50Ms": 2.53430000000003,
+        "p95Ms": 3.8572999999998956,
+        "minMs": 1.7946999999999207,
+        "maxMs": 3.8572999999998956
+      },
+      "/api/sources": {
+        "status": 200,
+        "p50Ms": 1.8478000000000065,
+        "p95Ms": 5.11220000000003,
+        "minMs": 1.2601999999999407,
+        "maxMs": 5.11220000000003
+      },
+      "/api/sources/health": {
+        "status": 200,
+        "p50Ms": 1.408200000000079,
+        "p95Ms": 3.975300000000061,
+        "minMs": 1.134800000000041,
+        "maxMs": 3.975300000000061
+      },
+      "/api/bookshelf": {
+        "status": 200,
+        "p50Ms": 1.4973999999999705,
+        "p95Ms": 4.477499999999964,
+        "minMs": 1.2384999999999309,
+        "maxMs": 4.477499999999964
+      },
+      "/api/settings": {
+        "status": 200,
+        "p50Ms": 1.2372000000000298,
+        "p95Ms": 1.457700000000159,
+        "minMs": 1.0944999999999254,
+        "maxMs": 1.457700000000159
+      },
+      "/api/stats/overview": {
+        "status": 200,
+        "p50Ms": 1.7690000000000055,
+        "p95Ms": 5.955600000000004,
+        "minMs": 1.1235999999998967,
+        "maxMs": 5.955600000000004
+      },
+      "/api/replace-rules": {
+        "status": 200,
+        "p50Ms": 1.0792999999998756,
+        "p95Ms": 1.7228000000000065,
+        "minMs": 0.8768999999999778,
+        "maxMs": 1.7228000000000065
+      },
+      "/api/bookmarks": {
+        "status": 200,
+        "p50Ms": 0.9827000000000226,
+        "p95Ms": 1.8986999999999625,
+        "minMs": 0.8891000000000986,
+        "maxMs": 1.8986999999999625
+      },
+      "/api/admin/users": {
+        "status": 200,
+        "p50Ms": 0.9970000000000709,
+        "p95Ms": 1.718900000000076,
+        "minMs": 0.7854999999999563,
+        "maxMs": 1.718900000000076
+      }
+    },
+    "health": {
+      "cache": {
+        "bytes": 0,
+        "image_cache_bytes": 0,
+        "mb": 0,
+        "rows": 0,
+        "total_bytes": 0
+      },
+      "cache_limit_mb": 50,
+      "http": {
+        "concurrency": 16,
+        "max_body_mb": 5,
+        "timeout_secs": 15
+      },
+      "image_cache": {
+        "bytes": 0,
+        "items": 0,
+        "limit_mb": 64,
+        "mb": 0
+      },
+      "js": {
+        "budget_ms": 3000,
+        "enabled": true,
+        "last_ms": 0,
+        "max_ms": 0
+      },
+      "ok": true,
+      "open_user_dbs": 1,
+      "rss_bytes": 18063360,
+      "rss_mb": 17.23,
+      "search": {
+        "all_source_slots": 16,
+        "comic_slots": 4,
+        "comic_slots_all": 4,
+        "per_source_ms": 8000,
+        "per_source_secs": 8,
+        "source_concurrency_default": 8,
+        "source_concurrency_max": 8,
+        "source_concurrency_min": 1,
+        "source_limit_wait_ms": 0,
+        "source_limit_waits": 0,
+        "source_slots": 16,
+        "total_all_secs": 10,
+        "total_curated_secs": 6
+      }
+    }
+  },
+  "disk": {
+    "freeBytes": 46946492416,
+    "totalBytes": 167772155904
+  }
+}

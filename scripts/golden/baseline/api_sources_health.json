@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "contentType": "application/json",
+  "body": {
+    "active": 0,
+    "cooldown_secs": 86400,
+    "cooling": 0,
+    "detail": false,
+    "distinct_hosts": 0,
+    "fail": 0,
+    "fail_threshold": 3,
+    "never": 0,
+    "now": "<volatile>",
+    "ok": 0,
+    "partial": 0,
+    "quarantined": 0,
+    "rule_anomaly_sources": 0,
+    "sources": null,
+    "total": 0
+  }
+}

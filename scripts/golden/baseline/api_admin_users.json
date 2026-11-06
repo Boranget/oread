@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "contentType": "application/json",
+  "body": {
+    "ok": true,
+    "users": [
+      {
+        "created_at": "<volatile>",
+        "disabled": false,
+        "id": 1,
+        "last_login_at": "<volatile>",
+        "role": "admin",
+        "username": "admin"
+      }
+    ]
+  }
+}

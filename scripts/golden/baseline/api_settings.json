@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "contentType": "application/json",
+  "body": {
+    "auto_refresh": true,
+    "builtin_clean": false,
+    "cache_limit_mb": 50,
+    "font_family": "serif",
+    "font_size": 18,
+    "image_style": 0,
+    "line_height": 1.75,
+    "page_width": 800,
+    "read_mode": "scroll",
+    "theme": "light",
+    "use_replace_rule": true
+  }
+}
