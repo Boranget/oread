@@ -490,6 +490,24 @@ pub struct ProbeLine {
     /// v3：底栏 `#k-bar` 实际 top（`getBoundingClientRect().top`）
     #[serde(default)]
     pub bar_top: Option<String>,
+    /// v4：标定结果（`ok`/`fail`，失败时不再静默回退）
+    #[serde(default)]
+    pub calib: Option<String>,
+    /// v4：实测最大滚动量（`scrollTo` 后两次采样的较大值；未测量为 `-`）
+    #[serde(default)]
+    pub meas_y: Option<String>,
+    /// v4：底栏实际 bottom（`getBoundingClientRect().bottom`），用于判断是否被可见区裁掉
+    #[serde(default)]
+    pub bar_bottom: Option<String>,
+    /// v4：上报时的 `window.pageYOffset`，非 0 表示浏览器真的平移了文档
+    #[serde(default)]
+    pub page_y: Option<String>,
+    /// v4：`body.scrollHeight`，与 `client_h` 对比可区分「文档真溢出」与「浏览器平移」
+    #[serde(default)]
+    pub body_scroll_h: Option<String>,
+    /// v4：URL 上是否还带旧版 `kfix` 闩锁（1/0/空）
+    #[serde(default)]
+    pub kfix: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -522,6 +540,12 @@ pub struct ProbeQ {
     pub stage_h: Option<String>,
     pub visible_h: Option<String>,
     pub bar_top: Option<String>,
+    pub calib: Option<String>,
+    pub meas_y: Option<String>,
+    pub bar_bottom: Option<String>,
+    pub page_y: Option<String>,
+    pub body_scroll_h: Option<String>,
+    pub kfix: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -568,6 +592,12 @@ pub async fn probe(
         stage_h: norm(q.stage_h),
         visible_h: norm(q.visible_h),
         bar_top: norm(q.bar_top),
+        calib: norm(q.calib),
+        meas_y: norm(q.meas_y),
+        bar_bottom: norm(q.bar_bottom),
+        page_y: norm(q.page_y),
+        body_scroll_h: norm(q.body_scroll_h),
+        kfix: norm(q.kfix),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -850,6 +880,12 @@ mod tests {
             stage_h: Some("1056".into()),
             visible_h: Some("1180".into()),
             bar_top: Some("1092".into()),
+            calib: Some("ok".into()),
+            meas_y: Some("2088".into()),
+            bar_bottom: Some("1168".into()),
+            page_y: Some("0".into()),
+            body_scroll_h: Some("1168".into()),
+            kfix: Some("0".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -877,6 +913,12 @@ mod tests {
             "stage_h",
             "visible_h",
             "bar_top",
+            "calib",
+            "meas_y",
+            "bar_bottom",
+            "page_y",
+            "body_scroll_h",
+            "kfix",
             "fs",
             "ua_class",
             "ua",
@@ -924,6 +966,12 @@ mod tests {
             stage_h: Some("-".into()),
             visible_h: Some("1180".into()),
             bar_top: Some("1092".into()),
+            calib: Some("fail".into()),
+            meas_y: Some("0".into()),
+            bar_bottom: Some(long.clone()),
+            page_y: Some(" 12 ".into()),
+            body_scroll_h: Some(long.clone()),
+            kfix: Some("1".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -945,6 +993,17 @@ mod tests {
         assert_eq!(norm(p.screen_h).as_deref(), Some("1268"));
         assert_eq!(norm(p.stage_h).as_deref(), Some("-"));
         assert_eq!(norm(p.visible_h).as_deref(), Some("1180"));
+        assert_eq!(norm(p.calib).as_deref(), Some("fail"));
+        assert_eq!(norm(p.meas_y).as_deref(), Some("0"));
+        assert_eq!(norm(p.page_y).as_deref(), Some("12"));
+        assert_eq!(norm(p.kfix).as_deref(), Some("1"));
+        for v in [norm(p.bar_bottom), norm(p.body_scroll_h)] {
+            assert_eq!(
+                v.unwrap().chars().count(),
+                PROBE_LIMIT,
+                "v4 字段同样 32 字符截断"
+            );
+        }
         assert_eq!(norm(Some("   ".into())), None);
     }
 }
