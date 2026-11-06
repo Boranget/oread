@@ -624,30 +624,27 @@ table{{border-collapse:collapse}}\
     )
 }
 
-fn page(title: &str, fs: usize, body: &str, vp: Vp, vmh: Option<usize>) -> Response {
+fn page(title: &str, fs: usize, body: &str, vp: Vp, vmh: VmhSel) -> Response {
     page_css(title, fs, body, "", vp, vmh)
 }
 
-fn page_css(
-    title: &str,
-    fs: usize,
-    body: &str,
-    extra_css: &str,
-    vp: Vp,
-    vmh: Option<usize>,
-) -> Response {
-    let html = page_html_css(title, fs, body, extra_css, vp, vmh);
+fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp, vmh: VmhSel) -> Response {
+    let html = page_html_css(title, fs, body, extra_css, vp, vmh.meta());
     let mut res = axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
         .body(axum::body::Body::from(html))
         .expect("html response");
-    if let Some(h) = vmh {
-        // 记住试验开关，下次不带 `?vmh=` 也沿用（删除 Cookie 即恢复默认）
+    // 先解析参数再决定写/删：`vmh=0`/`off` 删除 Cookie，本次不输出 height。
+    let cookie = match vmh {
+        VmhSel::Set(h) => Some(format!("k_vmh={h}; path=/; max-age=2592000")),
+        VmhSel::Off => Some("k_vmh=; path=/; max-age=0".to_string()),
+        VmhSel::Unset => None,
+    };
+    if let Some(c) = cookie {
         res.headers_mut().insert(
             axum::http::header::SET_COOKIE,
-            axum::http::HeaderValue::from_str(&format!("k_vmh={h}; path=/; max-age=2592000"))
-                .expect("cookie header"),
+            axum::http::HeaderValue::from_str(&c).expect("cookie header"),
         );
     }
     res
@@ -985,7 +982,7 @@ fn err_page(msg: &str) -> Response {
         2,
         &notice_page("出错了", msg, "/k", "返回书架"),
         Vp::default(),
-        None,
+        VmhSel::Unset,
     )
 }
 
@@ -1004,7 +1001,7 @@ fn visible_chapters(chapters: &[BookChapter]) -> Vec<&BookChapter> {
 }
 
 /// 直接访问分卷行时返回的友好提示页（沿用现有版心，不新增版式）。
-fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp, vmh: Option<usize>) -> Response {
+fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp, vmh: VmhSel) -> Response {
     let back = qlink(
         &format!("/k/toc?book={}&source={}", qenc(&q.book), qenc(&q.source)),
         fs,
@@ -1239,8 +1236,8 @@ pub struct TocQ {
     /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px），缺省不输出
-    vmh: Option<i64>,
+    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
+    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct ReadQ {
@@ -1252,8 +1249,8 @@ pub struct ReadQ {
     /// 视口宽/高（CSS px）：请求参数优先，缺参回落环境默认
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px），缺省不输出
-    vmh: Option<i64>,
+    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
+    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct SearchQ {
@@ -1267,8 +1264,8 @@ pub struct SearchQ {
     include_cooled: Option<String>,
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px），缺省不输出
-    vmh: Option<i64>,
+    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
+    vmh: Option<String>,
 }
 
 /// `/k` 的 scope 解析：只有显式 `all`/`expanded` 走全量，其余（含缺省、未知值）一律 curated。
@@ -1284,8 +1281,8 @@ pub struct FsQ {
     sp: Option<i64>,
     vw: Option<i64>,
     vh: Option<i64>,
-    /// 试验开关：viewport meta 的 `height`（px），缺省不输出
-    vmh: Option<i64>,
+    /// 试验开关：viewport meta 的 `height`（px）；`0`/`off` 清除 Cookie
+    vmh: Option<String>,
 }
 #[derive(Deserialize)]
 pub struct LoginQ {
@@ -1323,24 +1320,60 @@ fn vp_of(s: &AppState, headers: &HeaderMap, vw: Option<i64>, vh: Option<i64>) ->
     Vp::resolve(vw, vh, (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize))
 }
 
-/// 试验开关：`?vmh=<px>` 优先，否则沿用 Cookie `k_vmh`；合法区间 400..=2400。
-/// 有值时 output `<meta name="viewport" content="width=…,height=…">`，用于验证
-/// 老引擎是否支持 meta height（把布局视口变矮）。
-fn vmh_of(headers: &HeaderMap, q: Option<i64>) -> Option<usize> {
-    let v = q.or_else(|| {
-        let raw = headers
-            .get_all(axum::http::header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect::<Vec<_>>()
-            .join("; ");
-        raw.split(';').find_map(|part| {
+/// 试验开关的三态：未设置、清除（`vmh=0`/`off`）、设置（400..=2400）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmhSel {
+    Unset,
+    Off,
+    Set(usize),
+}
+
+impl VmhSel {
+    /// 渲染用的 meta height：只有 `Set` 才输出。
+    fn meta(self) -> Option<usize> {
+        match self {
+            VmhSel::Set(h) => Some(h),
+            VmhSel::Unset | VmhSel::Off => None,
+        }
+    }
+}
+
+fn vmh_cookie(headers: &HeaderMap) -> Option<usize> {
+    let raw = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
+    raw.split(';')
+        .find_map(|part| {
             part.trim()
                 .strip_prefix("k_vmh=")
                 .and_then(|v| v.trim().parse::<i64>().ok())
         })
-    })?;
-    (400..=2400).contains(&v).then_some(v as usize)
+        .filter(|v| (400..=2400).contains(v))
+        .map(|v| v as usize)
+}
+
+/// 试验开关：**先解析参数、再决定写/删/沿用**——
+/// `vmh=0`/`off` 清除（不输出 height，也不看旧 Cookie）；合法值 `400..=2400` 写入；
+/// 其他非法值忽略参数、沿用 Cookie（不清除）；无参数时沿用 Cookie。
+fn vmh_sel(headers: &HeaderMap, q: Option<&str>) -> VmhSel {
+    if let Some(raw) = q {
+        let t = raw.trim().to_ascii_lowercase();
+        if t == "0" || t == "off" {
+            return VmhSel::Off;
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            if (400..=2400).contains(&v) {
+                return VmhSel::Set(v as usize);
+            }
+        }
+    }
+    match vmh_cookie(headers) {
+        Some(h) => VmhSel::Set(h),
+        None => VmhSel::Unset,
+    }
 }
 
 /// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
@@ -1398,7 +1431,7 @@ async fn login_form(Query(q): Query<std::collections::HashMap<String, String>>) 
             err = err
         ),
         Vp::default(),
-        None,
+        VmhSel::Unset,
     )
 }
 
@@ -1471,7 +1504,7 @@ async fn shelf(
     Query(q): Query<FsQ>,
 ) -> Response {
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_of(&headers, q.vmh);
+    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let rows: Vec<BookshelfItem> = match sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
         .bind(None::<String>)
@@ -1592,7 +1625,7 @@ async fn toc(
     Query(q): Query<TocQ>,
 ) -> Response {
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_of(&headers, q.vmh);
+    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let (_source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
@@ -1955,7 +1988,7 @@ async fn read(
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_of(&headers, q.vmh);
+    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let (source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
         Err(e) => return err_to_page(e),
@@ -2122,7 +2155,7 @@ async fn comic_read(
     fs: usize,
     explicit: bool,
     vp: Vp,
-    vmh: Option<usize>,
+    vmh: VmhSel,
 ) -> Response {
     let chapter = &chapters[ch as usize];
     let images = match load_comic_images(s, pool, source, chapter, &q.book).await {
@@ -2259,7 +2292,7 @@ async fn search(
 ) -> Response {
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let vp = vp_of(&s, &headers, q.vw, q.vh);
-    let vmh = vmh_of(&headers, q.vmh);
+    let vmh = vmh_sel(&headers, q.vmh.as_deref());
     let key = q.key.unwrap_or_default().trim().to_string();
     let next_fs = cycle_fs(fs);
     let fs_url = format!("/k/search?fs={}&key={}", next_fs, qenc(&key));
@@ -2504,7 +2537,7 @@ async fn selftest(_u: AuthUser) -> Response {
          KPW3 视觉自测 · <a href=\"/k\">返回书架</a></div>\
          <table width=\"1000\" cellpadding=\"0\" cellspacing=\"0\">{rows}</table>"
     );
-    page("KPW3 视觉自测", 2, &body, Vp::default(), None)
+    page("KPW3 视觉自测", 2, &body, Vp::default(), VmhSel::Unset)
 }
 
 #[cfg(test)]
@@ -3295,29 +3328,61 @@ mod tests {
         assert_eq!(cookie_vh(&h), None, "无标定 Cookie");
     }
 
-    /// `?vmh=` 试验开关：有值才输出 viewport meta 的 `height`，并落到 `k_vmh` Cookie；
-    /// 参数优先于 Cookie；非法值忽略。
+    /// `?vmh=` 三态：写入（1100）、清除（0/off）、非法（300 忽略）。
+    /// 规则是「先解析参数、再决定写/删/沿用」，清除指令优先于旧 Cookie。
     #[test]
     fn viewport_meta_height_switch() {
         let v = vp();
-        let off = page_html_css("测试", 2, "", "", v, None);
-        assert!(
-            off.contains("name=\"viewport\"")
-                && off.contains("content=\"width=1072,initial-scale=1"),
-            "默认不得输出 height：{off}"
-        );
-        let on = page_html_css("测试", 2, "", "", v, Some(1200));
-        assert!(
-            on.contains("content=\"width=1072,height=1200,initial-scale=1"),
-            "?vmh=1200 必须输出 meta height：{on}"
-        );
         let mut h = HeaderMap::new();
-        assert_eq!(vmh_of(&h, Some(1200)), Some(1200));
-        assert_eq!(vmh_of(&h, Some(399)), None, "过小忽略");
-        assert_eq!(vmh_of(&h, Some(2401)), None, "过大忽略");
+
+        // 写入：输出 meta height + 30 天 Cookie
+        assert_eq!(vmh_sel(&h, Some("1100")), VmhSel::Set(1100));
+        let on = page_html_css("测试", 2, "", "", v, Some(1100));
+        assert!(
+            on.contains("content=\"width=1072,height=1100,initial-scale=1"),
+            "?vmh=1100 必须输出 meta height：{on}"
+        );
+        let res = page_css("测试", 2, "", "", v, VmhSel::Set(1100));
+        assert_eq!(
+            res.headers()
+                .get(header::SET_COOKIE)
+                .and_then(|v| v.to_str().ok()),
+            Some("k_vmh=1100; path=/; max-age=2592000")
+        );
+
+        // 清除：0/off 等价；旧 Cookie 存在时也先按参数清除，不沿用旧值
         h.insert(header::COOKIE, HeaderValue::from_static("k_vmh=1100"));
-        assert_eq!(vmh_of(&h, None), Some(1100), "无参数时沿用 Cookie");
-        assert_eq!(vmh_of(&h, Some(1200)), Some(1200), "参数优先于 Cookie");
+        assert_eq!(vmh_sel(&h, Some("0")), VmhSel::Off);
+        assert_eq!(vmh_sel(&h, Some("off")), VmhSel::Off);
+        assert_eq!(vmh_sel(&h, Some("OFF")), VmhSel::Off);
+        let off = page_html_css("测试", 2, "", "", v, VmhSel::Off.meta());
+        assert!(
+            off.contains("content=\"width=1072,initial-scale=1"),
+            "清除后 meta 不得带 height：{off}"
+        );
+        let res = page_css("测试", 2, "", "", v, VmhSel::Off);
+        assert_eq!(
+            res.headers()
+                .get(header::SET_COOKIE)
+                .and_then(|v| v.to_str().ok()),
+            Some("k_vmh=; path=/; max-age=0")
+        );
+
+        // 非法：忽略参数、沿用 Cookie、不写也不删
+        let empty = HeaderMap::new();
+        assert_eq!(vmh_sel(&empty, Some("300")), VmhSel::Unset, "非法值忽略");
+        assert_eq!(
+            vmh_sel(&h, Some("300")),
+            VmhSel::Set(1100),
+            "非法值不覆盖 Cookie"
+        );
+        let res = page_css("测试", 2, "", "", v, VmhSel::Unset);
+        assert!(
+            res.headers().get(header::SET_COOKIE).is_none(),
+            "无指令不写 Cookie"
+        );
+        assert_eq!(vmh_sel(&h, Some("2401")), VmhSel::Set(1100), "过大同样忽略");
+        assert_eq!(vmh_sel(&h, None), VmhSel::Set(1100), "无参数沿用 Cookie");
     }
 
     /// 兜底档位可一键切到 −48（常量开关），行预算随高度自动重算。
