@@ -1,0 +1,7 @@
+{
+  "description": "tag. 前缀 + 正向下标",
+  "mode": "string",
+  "rule": "tag.li.1@text",
+  "is_url": false,
+  "base_url": ""
+}

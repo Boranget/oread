@@ -1,0 +1,7 @@
+{
+  "description": "|| 首选规则为空时回退",
+  "mode": "string",
+  "rule": "class.a@text||class.b@text",
+  "is_url": false,
+  "base_url": ""
+}

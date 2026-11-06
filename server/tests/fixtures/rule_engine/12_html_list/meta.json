@@ -1,0 +1,7 @@
+{
+  "description": "列表规则返回同构元素文本",
+  "mode": "list",
+  "rule": "class.item@text",
+  "is_url": false,
+  "base_url": ""
+}

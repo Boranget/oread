@@ -1,0 +1,7 @@
+{
+  "description": "!0:1 排除指定下标后返回列表",
+  "mode": "list",
+  "rule": "tag.li!0:1@text",
+  "is_url": false,
+  "base_url": ""
+}

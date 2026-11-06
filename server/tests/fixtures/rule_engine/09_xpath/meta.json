@@ -1,0 +1,7 @@
+{
+  "description": "XPath 显式前缀",
+  "mode": "string",
+  "rule": "@XPath:/root/book/name/text()",
+  "is_url": false,
+  "base_url": ""
+}

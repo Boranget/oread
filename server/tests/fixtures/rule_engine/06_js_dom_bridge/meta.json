@@ -1,0 +1,7 @@
+{
+  "description": "@js: 内使用 org.jsoup 解析当前 HTML",
+  "mode": "string",
+  "rule": "@js:org.jsoup.Jsoup.parse(result).select('.title').text()",
+  "is_url": false,
+  "base_url": ""
+}

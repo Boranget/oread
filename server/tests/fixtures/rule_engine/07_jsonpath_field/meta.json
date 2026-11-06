@@ -1,0 +1,7 @@
+{
+  "description": "JsonPath 取嵌套字段",
+  "mode": "string",
+  "rule": "$.data.book.name",
+  "is_url": false,
+  "base_url": ""
+}

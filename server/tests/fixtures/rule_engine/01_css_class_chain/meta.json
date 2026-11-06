@@ -1,0 +1,7 @@
+{
+  "description": "class 前缀 + 子元素 + @text",
+  "mode": "string",
+  "rule": "class.item@span@text",
+  "is_url": false,
+  "base_url": ""
+}

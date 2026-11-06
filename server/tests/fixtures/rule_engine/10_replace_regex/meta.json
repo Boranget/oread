@@ -1,0 +1,7 @@
+{
+  "description": "## 正则替换与 $1 分组",
+  "mode": "string",
+  "rule": "class.n@text##第\\s*(\\d+)\\s*章##$1",
+  "is_url": false,
+  "base_url": ""
+}

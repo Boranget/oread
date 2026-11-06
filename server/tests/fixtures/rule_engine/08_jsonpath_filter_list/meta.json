@@ -1,0 +1,7 @@
+{
+  "description": "JsonPath 过滤表达式返回列表",
+  "mode": "list",
+  "rule": "$.data.list[?(@.score>=8)].title",
+  "is_url": false,
+  "base_url": ""
+}

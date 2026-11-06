@@ -1,0 +1,7 @@
+{
+  "description": "@js: 前缀使用 result",
+  "mode": "string",
+  "rule": "@js:result.trim().toUpperCase()",
+  "is_url": false,
+  "base_url": ""
+}

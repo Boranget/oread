@@ -1,0 +1,7 @@
+{
+  "description": "多行规则：先取列表，再对每项执行 JS",
+  "mode": "list",
+  "rule": "a\n@js:Array.from(result).map(x=>org.jsoup.Jsoup.parse(x).select('a')[0].attr('href'))",
+  "is_url": false,
+  "base_url": ""
+}
