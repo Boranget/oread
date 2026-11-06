@@ -1168,6 +1168,22 @@ pub async fn chapter_list_book(
             }
         }
     }
+    // Legado TocRule.formatJs：逐章执行，返回字符串替换章节标题；
+    // 单章执行失败只跳过该章，不影响整份目录。
+    if let Some(js) = rule.format_js.as_deref().filter(|s| !s.trim().is_empty()) {
+        for (i, ch) in chaps.iter_mut().enumerate() {
+            ar.set_var("index", (i + 1).to_string());
+            ar.set_var("title", ch.title.clone().unwrap_or_default());
+            match ar.eval_script(js, "", &ch.url) {
+                Ok(v) if !v.trim().is_empty() => ch.title = Some(v),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    source = source.book_source_url.as_str(),
+                    "formatJs 执行失败：{e}"
+                ),
+            }
+        }
+    }
     record_ar(&ar, store);
     Ok(chaps)
 }

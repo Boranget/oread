@@ -387,6 +387,7 @@ fn new_js_context(conf: JsConf) -> boa_engine::Context {
         ("__nativeCookieClear", native_cookie_clear as JsNativeFn),
         ("__nativeSourceVarGet", native_source_var_get as JsNativeFn),
         ("__nativeSourceVarPut", native_source_var_put as JsNativeFn),
+        ("__nativeHead", native_head as JsNativeFn),
         ("__nativeCacheFileGet", native_cache_file_get as JsNativeFn),
         ("__nativeCacheFilePut", native_cache_file_put as JsNativeFn),
     ] {
@@ -616,6 +617,52 @@ fn native_ajax(
     match res {
         Ok(s) => Ok(boa_engine::JsValue::from(boa_engine::JsString::from(s))),
         Err(e) => Err(ajax_error(&format!("java.ajax 请求失败：{e}"))),
+    }
+}
+
+/// `java.head(url[, headersJson])` 的原生实现：不读正文，返回
+/// `{status, url, headers}` 供 JS 构造与 Legado StrResponse 同形的响应对象。
+fn native_head(
+    _this: &boa_engine::JsValue,
+    args: &[boa_engine::JsValue],
+    _ctx: &mut boa_engine::Context,
+) -> boa_engine::JsResult<boa_engine::JsValue> {
+    let text_arg = |i: usize| -> Option<String> {
+        args.get(i)
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+    };
+    let url = text_arg(0).unwrap_or_default();
+    if url.trim().is_empty() {
+        return Err(ajax_error("java.head 缺少 url 参数"));
+    }
+    let headers: HashMap<String, String> = args
+        .get(1)
+        .and_then(|v| v.as_string())
+        .and_then(|s| serde_json::from_str(&s.to_std_string_escaped()).ok())
+        .unwrap_or_default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ajax_error(&format!("java.head 初始化运行时失败：{e}")))?;
+    let res = rt.block_on(crate::req::head(&url, &headers));
+    match res {
+        Ok(h) => {
+            let headers: serde_json::Map<String, serde_json::Value> = h
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            let payload = serde_json::json!({
+                "status": h.status,
+                "url": h.url,
+                "headers": headers,
+            });
+            Ok(boa_engine::JsValue::from(boa_engine::JsString::from(
+                payload.to_string(),
+            )))
+        }
+        Err(e) => Err(ajax_error(&format!("java.head 请求失败：{e}"))),
     }
 }
 
@@ -863,12 +910,10 @@ fn jsoup_plan(text: &str) -> Result<JsoupPlan, String> {
     if s.is_empty() {
         return Err("空选择器".to_string());
     }
-    for ext in [":matches(", ":matchesOwn(", ":nth("] {
-        if s.contains(ext) {
-            return Err(format!(
-                "选择器使用了 jsoup 专有扩展伪类 {ext}…，当前后端(scraper)不支持：{s}"
-            ));
-        }
+    if s.contains(":nth(") {
+        return Err(format!(
+            "选择器使用了 jsoup 专有扩展伪类 :nth(…，当前后端(scraper)不支持：{s}"
+        ));
     }
     let (base, filters) = split_jquery_filters(s);
     let base = if base.is_empty() {
@@ -1561,6 +1606,31 @@ var cookie = {
   },
   clear: function(){ __nativeCookieClear(__sourceKey); return ""; }
 };
+// Legado `java.connect` / `java.startBrowserAwait` 返回 StrResponse。服务端没有 WebView/人工验证，
+// 这里用与 java.ajax 相同的原生抓取层发请求，并返回同形状的响应对象（body/url/code/header）。
+// 抓取失败按 Legado 的容错方式把错误写进 body（调用方 `.body().includes(...)` 不会抛异常）。
+function __httpResponse(url, header){
+  var u = String(url == null ? "" : url);
+  var h = header == null ? "" : (typeof header === "string" ? header : JSON.stringify(header));
+  var body = "", code = 200;
+  try {
+    body = __nativeAjax(u, "GET", "", h);
+  } catch (e) {
+    body = "connect(" + u + ") error\n" + String(e && e.message ? e.message : e);
+    code = 0;
+  }
+  return {
+    body: function(){ return body; },
+    getBody: function(){ return body; },
+    url: function(){ return u; },
+    getUrl: function(){ return u; },
+    code: function(){ return code; },
+    getCode: function(){ return code; },
+    header: function(){ return ""; },
+    headers: function(){ return ""; },
+    toString: function(){ return body; }
+  };
+}
 var java = {
   toNumChapter: function(s){ return s==null ? "" : cn2num(String(s)); },
   md5Encode: function(s){ return __md5(s == null ? "" : String(s)); },
@@ -1665,11 +1735,31 @@ var java = {
   importScript: function(path){
     return String(__nativeImportScript(path == null ? "" : String(path)));
   },
-  // Legado `java.head(url)` 返回响应对象（header/code/body 等）。本服务抓取层只回正文文本、
-  // 不保留响应头，这里显式报未支持：依赖 etag 的 jsLib（如哔哩哔哩漫画 Reload）在自己的
-  // try/catch 里会降级为“无缓存直接下载”，不会把错误抛给规则作者。
-  head: function(){ throw new Error("UNSUPPORTED_JS_API:java.head（抓取层不暴露响应头/状态码）"); },
-  connect: function(){ throw new Error("UNSUPPORTED_JS_API:java.connect（本服务无 socket 桥接）"); },
+  // Legado `java.connect(url[, header])`：返回 StrResponse（body/url/code/header）。
+  connect: function(url, header){ return __httpResponse(url, header); },
+  // Legado `java.head(url[, header])`：HEAD 请求，返回带响应头的 StrResponse（不读正文）。
+  // 书源 jsLib（如哔哩漫画 Reload）常用 `.header('etag')` 拿缓存指纹。
+  head: function(url, header){
+    var u = String(url == null ? "" : url);
+    var h = header == null ? "" : (typeof header === "string" ? header : JSON.stringify(header));
+    var r = JSON.parse(__nativeHead(u, h));
+    var hs = r.headers || {};
+    return {
+      body: function(){ return ""; },
+      getBody: function(){ return ""; },
+      url: function(){ return r.url || u; },
+      getUrl: function(){ return r.url || u; },
+      code: function(){ return r.status || 0; },
+      getCode: function(){ return r.status || 0; },
+      header: function(n){
+        var k = String(n == null ? "" : n).toLowerCase();
+        for (var x in hs) { if (x.toLowerCase() === k) return String(hs[x]); }
+        return "";
+      },
+      headers: function(){ return hs; },
+      toString: function(){ return ""; }
+    };
+  },
   // DOM 桥：`java.setContent(html)` 之后按需在“当前文档”上求值（Rust 原生解析，
   // 不再依赖预抽取的只读表）；未 setContent 时仍用 Phase 1 的字面量选择器快路。
   setContent: function(html){ __content = (html == null) ? "" : String(html); },
@@ -1764,9 +1854,26 @@ var java = {
   refreshTocUrl: function(){ __refreshToc = true; },
   getCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.getCookie（本服务无 Cookie 桥接）"); },
   setCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.setCookie（本服务无 Cookie 桥接）"); },
-  webView: function(){ throw new Error("UNSUPPORTED_JS_API:java.webView（本服务无 WebView）"); },
+  // Legado `java.startBrowserAwait(url, title[, refetchAfterSuccess])`：内置浏览器人工过验证后返回页面。
+  // 服务端没有人机交互界面，这里直接抓取目标页并返回 StrResponse；遇到站点质询页时 body 就是质询页，
+  // 由书源规则自行判断，行为与“验证失败但拿到了响应”一致。
+  startBrowserAwait: function(url){ return __httpResponse(url, null); },
+  // Legado `java.startBrowser(url, title)`：只打开内置浏览器，无返回值。服务端无 UI，等价空操作。
+  startBrowser: function(){ return ""; },
+  // Legado `java.webView(html, url, js)`：无 WebView 时只覆盖“取整页源码”的形态——
+  // html 非空直接返回 html；否则抓取 url；传入 js 需要页面内 DOM 执行，显式报未支持。
+  webView: function(html, url, js){
+    if (js != null && String(js).trim() !== "") {
+      throw new Error("UNSUPPORTED_JS_API:java.webView(js)（本服务无 WebView，无法执行页面内脚本）");
+    }
+    if (url != null && String(url).trim() !== "") {
+      try { return __nativeAjax(String(url), "GET", "", ""); } catch(e) { return ""; }
+    }
+    return html == null ? "" : String(html);
+  },
+  // 这两个 API 依赖 WebView 观察最终资源地址/跳转地址，抓取层拿不到等价信号，保持显式未支持。
   webViewGetSource: function(){ throw new Error("UNSUPPORTED_JS_API:java.webViewGetSource（本服务无 WebView）"); },
-  webViewGetOverrideUrl: function(){ throw new Error("UNSUPPORTED_JS_API:java.webViewGetOverrideUrl（本服务无 WebView）"); }
+  webViewGetOverrideUrl: function(){ throw new Error("UNSUPPORTED_JS_API:java.webViewGetOverrideUrl（本服务无 WebView）"); },
 };
 
 // ===== org.jsoup（按 147 源实际调用面实现）=====
@@ -4734,12 +4841,20 @@ fn shorthand_segment(name: &str) -> &str {
 enum JqFilter {
     First,
     Last,
+    /// jsoup `:eq(n)`：比较元素在父节点下的**元素序号**（`elementSiblingIndex()`），
+    /// 不是结果集下标，也不支持负数从尾取。
     Eq(i64),
+    /// jsoup `:lt(n)`：元素序号 < n（排除根元素，负数无匹配）。
     Lt(i64),
+    /// jsoup `:gt(n)`：元素序号 > n（排除根元素，负数匹配全部非根元素）。
     Gt(i64),
     Contains(String),
     /// jsoup `:containsOwn(text)`：只看元素自身直接文本（不含子元素文本）。
     ContainsOwn(String),
+    /// jsoup `:matches(regex)`：`Element.text()`（空白归一）按 Java 正则 `find`。
+    Matches(String),
+    /// jsoup `:matchesOwn(regex)`：`ownText()` 按 Java 正则 `find`。
+    MatchesOwn(String),
     /// jsoup `:has(selector)`：存在匹配的后代元素。
     Has(String),
 }
@@ -4764,7 +4879,7 @@ fn find_close_paren(cs: &[char], open: usize) -> Option<usize> {
             '"' | '\'' => quote = Some(c),
             '(' => depth += 1,
             ')' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return Some(i);
                 }
@@ -4876,6 +4991,26 @@ fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
                         base.push(c);
                         i += 1;
                     }
+                } else if starts_at(&cs, i, ":matchesOwn(") {
+                    let open = i + 11;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::MatchesOwn(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
+                } else if starts_at(&cs, i, ":matches(") {
+                    let open = i + 8;
+                    if let Some(close) = find_close_paren(&cs, open) {
+                        let arg: String = cs[open + 1..close].iter().collect();
+                        filters.push(JqFilter::Matches(unquote_arg(&arg)));
+                        i = close + 1;
+                    } else {
+                        base.push(c);
+                        i += 1;
+                    }
                 } else if starts_at(&cs, i, ":has(") {
                     let open = i + 4;
                     if let Some(close) = find_close_paren(&cs, open) {
@@ -4900,14 +5035,34 @@ fn split_jquery_filters(selector: &str) -> (String, Vec<JqFilter>) {
     (base.trim().to_string(), filters)
 }
 
-/// jQuery 负下标：`-1` 表示最后一个，越界返回 None。
-fn jq_index(n: i64, len: usize) -> Option<usize> {
-    let idx = if n < 0 { len as i64 + n } else { n };
-    if idx >= 0 && (idx as usize) < len {
-        Some(idx as usize)
-    } else {
-        None
-    }
+/// jsoup `Element.text()` 的空白归一（与 `normaliseWhitespace` 一致：连续空白折叠为单空格并裁边）。
+fn normalized_text(el: &scraper::ElementRef) -> String {
+    el.text()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// jsoup `Element.ownText()` 的空白归一（只保留元素自身直接文本节点）。
+fn normalized_own_text(el: &scraper::ElementRef) -> String {
+    text_nodes(el)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// jsoup `Element.elementSiblingIndex()`：父节点下、当前元素之前有多少个元素兄弟。
+/// 返回 None 表示没有元素父节点（根元素），jsoup 的 `:eq/:lt/:gt` 会排除根元素。
+fn jsoup_sibling_index(el: &scraper::ElementRef) -> Option<usize> {
+    let parent = el.parent().and_then(scraper::ElementRef::wrap)?;
+    Some(
+        parent
+            .children()
+            .filter(|n| n.value().as_element().is_some())
+            .take_while(|n| n.id() != el.id())
+            .count(),
+    )
 }
 
 /// 按出现顺序依次套用 jQuery 过滤（与 jQuery 对结果集链式过滤的语义一致）。
@@ -4916,46 +5071,51 @@ fn apply_jq_filters<'a>(
     filters: &[JqFilter],
 ) -> Vec<scraper::ElementRef<'a>> {
     for f in filters {
-        let len = els.len();
         els = match f {
             JqFilter::First => els.into_iter().take(1).collect(),
             JqFilter::Last => els.pop().into_iter().collect(),
-            JqFilter::Eq(n) => match jq_index(*n, len) {
-                Some(i) => els.into_iter().skip(i).take(1).collect(),
-                None => Vec::new(),
-            },
-            JqFilter::Lt(n) => {
-                let bound = if *n < 0 { len as i64 + *n } else { *n };
-                let take = bound.max(0) as usize;
-                els.into_iter().take(take).collect()
-            }
-            JqFilter::Gt(n) => {
-                let bound = if *n < 0 { len as i64 + *n } else { *n };
-                if bound < 0 {
-                    els
-                } else {
-                    els.into_iter().skip((bound + 1) as usize).collect()
-                }
-            }
+            // jsoup 的 :eq/:lt/:gt 比较 `elementSiblingIndex()`（父节点下元素序号），
+            // 不是结果集下标；没有从尾取负数的语义，负值按普通数值比较。
+            JqFilter::Eq(n) => els
+                .into_iter()
+                .filter(|e| *n >= 0 && jsoup_sibling_index(e).is_some_and(|idx| idx as i64 == *n))
+                .collect(),
+            JqFilter::Lt(n) => els
+                .into_iter()
+                .filter(|e| jsoup_sibling_index(e).is_some_and(|idx| (idx as i64) < *n))
+                .collect(),
+            JqFilter::Gt(n) => els
+                .into_iter()
+                .filter(|e| jsoup_sibling_index(e).is_some_and(|idx| (idx as i64) > *n))
+                .collect(),
             JqFilter::Contains(text) => {
                 // jsoup 语义：`Element.text()` 包含匹配，**不区分大小写**
                 let needle = text.to_lowercase();
                 els.into_iter()
-                    .filter(|e| {
-                        e.text()
-                            .collect::<String>()
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .to_lowercase()
-                            .contains(&needle)
-                    })
+                    .filter(|e| normalized_text(e).to_lowercase().contains(&needle))
                     .collect()
             }
             JqFilter::ContainsOwn(text) => {
                 let needle = text.to_lowercase();
                 els.into_iter()
                     .filter(|e| own_text_contains(e, &needle))
+                    .collect()
+            }
+            JqFilter::Matches(pattern) => {
+                // 上游用 Java Pattern.find()，这里用 regex crate 做同样的“部分匹配”。
+                // 非法正则上游会抛 SelectorParseException；本引擎在过滤链里降级为不匹配。
+                let re = regex::Regex::new(pattern).ok();
+                els.into_iter()
+                    .filter(|e| re.as_ref().is_some_and(|r| r.is_match(&normalized_text(e))))
+                    .collect()
+            }
+            JqFilter::MatchesOwn(pattern) => {
+                let re = regex::Regex::new(pattern).ok();
+                els.into_iter()
+                    .filter(|e| {
+                        re.as_ref()
+                            .is_some_and(|r| r.is_match(&normalized_own_text(e)))
+                    })
                     .collect()
             }
             JqFilter::Has(sel) => {
@@ -5984,9 +6144,14 @@ mod tests {
     fn unsupported_js_api_reports_feature_name() {
         // 垫片抛出的未支持 API 必须带出具体名称，而不是只显示 JsError/Opaque
         let ar = AnalyzeRule::new();
-        // java.ajax 已接入原生网络桥，这里改用仍未支持的 WebView 桥验证文案
+        // java.webView 现在覆盖“取整页源码”形态；带 js 参数仍需 WebView DOM，保持显式未支持
         let err = ar
-            .get_string("", "<js>java.webView('http://x')</js>", false, "")
+            .get_string(
+                "",
+                "<js>java.webView('', '', 'return document.title')</js>",
+                false,
+                "",
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -5994,6 +6159,39 @@ mod tests {
             "错误文案应给出可读提示，实际: {err}"
         );
         assert!(err.contains("webView"), "应点名缺失的 API，实际: {err}");
+    }
+
+    #[test]
+    fn browser_apis_return_str_response_without_network() {
+        let ar = AnalyzeRule::new();
+        // 空 URL 不联网：connect 失败时按 Legado 的容错写成 body，code 为 0
+        let v = ar
+            .get_string("", "<js>java.connect('').code()</js>", false, "")
+            .unwrap();
+        assert_eq!(v, "0");
+        let v = ar
+            .get_string("", "<js>typeof java.connect('').body</js>", false, "")
+            .unwrap();
+        assert_eq!(v, "function");
+        let v = ar
+            .get_string(
+                "",
+                "<js>java.startBrowserAwait('').body().indexOf('error') >= 0</js>",
+                false,
+                "",
+            )
+            .unwrap();
+        assert_eq!(v, "true");
+        // webView 没有 url 时直接返回 html，不触发网络
+        let v = ar
+            .get_string("", "<js>java.webView('<p>x</p>', '', '')</js>", false, "")
+            .unwrap();
+        assert_eq!(v, "<p>x</p>");
+        // startBrowser 无 UI，空操作且不报错
+        let v = ar
+            .get_string("", "<js>java.startBrowser('http://x','t')</js>", false, "")
+            .unwrap();
+        assert_eq!(v, "");
     }
 
     // ---- jsLib / java.importScript（哔哩哔哩漫画整源依赖 Reload）----
@@ -6060,16 +6258,15 @@ mod tests {
     }
 
     #[test]
-    fn java_head_reports_explicit_unsupported() {
-        // 抓取层不保留响应头，`java.head(...).header('etag')` 显式报未支持；
-        // jsLib 的 Reload 用 try/catch 包住这段，因此只降级不致命。
+    fn java_head_requires_url() {
+        // head 已接抓取层；空 url 显式报错、不发起网络请求。
         let ar = AnalyzeRule::new();
         let err = ar
-            .get_string("", "<js>java.head('https://x.com/a')</js>", false, "")
+            .get_string("", "<js>java.head('')</js>", false, "")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
-        assert!(err.contains("head"), "应点名 API，实际: {err}");
+        assert!(err.contains("java.head"), "应点名 API，实际: {err}");
+        assert!(err.contains("缺少 url"), "实际: {err}");
     }
 
     #[test]
@@ -6102,6 +6299,70 @@ function Reload(e){
             .unwrap(),
             "sub-rule-ok"
         );
+    }
+
+    #[test]
+    fn real_source_js_lib_edge_functions_evaluate() {
+        // 直接用源包里的真实 jsLib（三份内联脚本），不走网络：验证 Reload/Get 之外的
+        // bhost / base64 解码 / formatDate / buildQueryParams / getLanguage 在共享作用域可调用。
+        let pack: Value = serde_json::from_str(include_str!(
+            "../../sources/pack-20261106/boranlib-sources.json"
+        ))
+        .unwrap();
+        let libs: Vec<(String, String)> = pack
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| {
+                let name = s["bookSourceName"].as_str().unwrap_or("").to_string();
+                let lib = s["jsLib"].as_str().unwrap_or("").trim().to_string();
+                // 只取内联脚本；`{...}` 形态是 {库名: URL} map，需要联网下载。
+                if lib.is_empty() || lib.starts_with('{') {
+                    None
+                } else {
+                    Some((name, lib))
+                }
+            })
+            .collect();
+        assert_eq!(libs.len(), 3, "源包里应有 3 份内联 jsLib，实际: {libs:?}");
+        let ar = AnalyzeRule::new();
+
+        // 包子漫画 bhost()：走 `this.source.getVariable()`，无变量时回落到站点主域。
+        let (name, lib) = libs.iter().find(|(n, _)| n.contains("包子")).unwrap();
+        let js = format!(
+            "<js>{lib}\nvar t = {{source: {{getVariable: function(){{ return ''; }}}}}}; bhost.call(t)</js>"
+        );
+        assert_eq!(
+            ar.get_string("", &js, false, "").unwrap(),
+            "https://manhuafree.com",
+            "jsLib 来源: {name}"
+        );
+
+        // 如漫画网 _0x1c72dc()：站点内联的 base64 解码器。
+        let (name, lib) = libs.iter().find(|(n, _)| n.contains("如漫画")).unwrap();
+        let js = format!("<js>{lib}\n_0x1c72dc.call(null, 'aGVsbG8=')</js>");
+        assert_eq!(
+            ar.get_string("", &js, false, "").unwrap(),
+            "hello",
+            "jsLib 来源: {name}"
+        );
+
+        // 曼哈漫画 getLanguage / buildQueryParams：解构 this.source + 读取源变量。
+        let (name, lib) = libs.iter().find(|(n, _)| n.contains("曼哈漫画")).unwrap();
+        let js = String::from("<js>")
+            + lib
+            + "\nvar T = {source: {getVariable: function(){ return '{\"contentRating\":[\"safe\"],\"Language\":\"en-us\",\"sort\":\"rating,desc\"}'; }}};"
+            + "\ngetLanguage('en-us') + '|' + buildQueryParams.call(T, '搜索') + '|' + (formatDate('2020-01-02T03:04:05').length > 0)"
+            + "</js>";
+        let out = ar.get_string("", &js, false, "").unwrap();
+        assert!(
+            out.starts_with("英语（美国）|"),
+            "jsLib 来源: {name}，实际: {out}"
+        );
+        assert!(out.contains("contentRating[]=safe"), "实际: {out}");
+        assert!(out.contains("originalLanguage[]=en-us"), "实际: {out}");
+        assert!(out.contains("order[rating]=desc"), "实际: {out}");
+        assert!(out.ends_with("|true"), "实际: {out}");
     }
 
     /// 奇怪小说的真实 toc 规则（节选自 yetianlian 页面结构）：
@@ -6231,7 +6492,7 @@ href+"|"+rev"#,
 
     #[test]
     fn jsoup_extended_selector_reports_unsupported() {
-        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:matches(第一)")"#)
+        let err = run_js(r#"@js:org.jsoup.Jsoup.parse(result).select("a:nth(1)")"#)
             .unwrap_err()
             .to_string();
         assert!(err.contains("未支持的 JS 特性"), "实际: {err}");
@@ -6241,11 +6502,13 @@ href+"|"+rev"#,
     // jsoup 扩展伪类走 select 结果集过滤（与 Legado/jsoup 语义一致），不再整体抛未支持。
     #[test]
     fn jsoup_pseudo_classes_select() {
+        // li:matches 用合并文本（2 个 li 命中），li:matchesOwn 只用自身文本（li 内只有子元素 → 0），
+        // a:matchesOwn 命中 2 个标题。
         let out = run_js(
-            r#"@js:var d=org.jsoup.Jsoup.parse(result);d.select("li:has(span)").size()+"|"+d.select("li:contains(第二章)").size()+"|"+d.select("li:containsOwn(第二章)").size()"#,
+            r#"@js:var d=org.jsoup.Jsoup.parse(result);d.select("li:has(span)").size()+"|"+d.select("li:contains(第二章)").size()+"|"+d.select("li:containsOwn(第二章)").size()+"|"+d.select("li:matches(第.章)").size()+"|"+d.select("li:matchesOwn(第.章)").size()+"|"+d.select("a:matchesOwn(第.章)").size()"#,
         )
         .unwrap();
-        assert_eq!(out, "1|1|0");
+        assert_eq!(out, "1|1|0|2|0|2");
     }
 
     // ---- AES / 字节桥（哔哩漫画解图链路的基础）----
@@ -7805,11 +8068,11 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
                 .unwrap(),
             "第二章"
         );
-        // jQuery 负下标：-1 为最后一个
+        // 上游 elementSiblingIndex 语义不是 jQuery：负下标不从尾取
         assert_eq!(
             ar.get_string(NEWS_HTML, "li:eq(-1)@a@text", false, "")
                 .unwrap(),
-            "第四章"
+            ""
         );
     }
 
@@ -7867,11 +8130,46 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
             "正文"
         );
         assert_eq!(ar.get_string(has, "div.b:has(p)", false, "").unwrap(), "");
-        // :eq 负数从尾部取
+        // :eq 是 elementSiblingIndex 语义，不支持负数从尾取
         assert_eq!(
             ar.get_string(NEWS_HTML, "li:eq(-2)@a@text", false, "")
                 .unwrap(),
-            "第三章"
+            ""
+        );
+    }
+
+    // 上游 jsoup 的 :eq/:lt/:gt 比较 elementSiblingIndex（父节点下元素序号），
+    // 不是结果集下标、也不支持负数从尾取。用混合子节点验证与 jQuery 语义的差异。
+    #[test]
+    fn jsoup_index_pseudos_use_element_sibling_index() {
+        let ar = AnalyzeRule::new();
+        // ul 下元素顺序：li(0) span(1) li(2) li(3)
+        let html = r#"<ul><li>a</li><span>b</span><li>c</li><li>d</li></ul>"#;
+        // jQuery 结果集下标 :eq(2) 会取到 d；jsoup 取元素序号为 2 的 c
+        assert_eq!(
+            ar.get_string(html, "li:eq(2)@text", false, "").unwrap(),
+            "c"
+        );
+        // 越界序号无匹配
+        assert_eq!(ar.get_string(html, "li:eq(9)@text", false, "").unwrap(), "");
+        // 负值不从尾取：eq/lt 无匹配，gt 匹配全部非根元素
+        assert_eq!(
+            ar.get_string(html, "li:eq(-1)@text", false, "").unwrap(),
+            ""
+        );
+        assert_eq!(
+            ar.get_string(html, "li:lt(-1)@text", false, "").unwrap(),
+            ""
+        );
+        let gt = ar.get_string_list(html, "li:gt(-1)").unwrap();
+        assert_eq!(gt.len(), 3, "实际: {gt:?}");
+        // :lt(2) 只保留元素序号 0 的 a（jQuery 会取前两个结果 a、c）；
+        // get_string_list 的 CSS 模式返回元素 HTML（既有契约），故按 HTML 断言。
+        let lt = ar.get_string_list(html, "li:lt(2)@text").unwrap();
+        assert_eq!(
+            lt,
+            vec!["<li>a</li>".to_string()],
+            "实际: {lt:?} (元素序号 2 的 c 不满足 <2)"
         );
     }
 

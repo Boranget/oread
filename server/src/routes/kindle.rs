@@ -25,10 +25,7 @@
 use axum::{
     body::Body,
     extract::{Query, Request, State},
-    http::{
-        header::SET_COOKIE,
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::SET_COOKIE, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     routing::get,
     Form, Router,
@@ -223,16 +220,13 @@ const K_FS_COOKIE: &str = "k_fs";
 /// 运行时视口高脚本（ES5，注入 `<head>`，首帧前生效；不落 Cookie、不写 sessionStorage）。
 ///
 /// 每次进页面现算可用高，再把 `vh=<算出值>` 带回 URL：
+///
 ///   1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）；
 ///   2. `screen.availHeight` 做上限保护；
 ///   3. 两者都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
+///
 /// 首次进入（链接没带 `vh`）用默认值渲染一次，脚本在 `<head>` 里立刻 `location.replace`；
 /// `load` 后把同一 `vh` 补到页内所有链接，翻页不再二次重载。同机型反复进入结果一致。
-
-
-
-///
-
 const K_VP_JS: &str = "(function(){try{\
 var d=document.documentElement,ih=window.innerHeight||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
@@ -758,11 +752,6 @@ fn read_only_css(vp: Vp) -> String {
     )
 }
 
-
-
-
-
-
 /// 阅读页内部链接：始终带目标档位的 `fs`，切档后不会被当前档位拼成重复参数。
 fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
     qlink(
@@ -1202,7 +1191,6 @@ fn vp_of(s: &AppState, _headers: &HeaderMap, vw: Option<i64>, vh: Option<i64>) -
     Vp::resolve(vw, vh, (s.cfg.kindle_vw as usize, s.cfg.kindle_vh as usize))
 }
 
-
 /// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
 async fn ensure_chapters(
     s: &AppState,
@@ -1501,14 +1489,15 @@ async fn toc(
         fs,
         vp,
     );
+    let back = format!(
+        "<a href=\"{}\" style=\"display:inline-block;min-width:80px;text-align:center;font-size:34px;line-height:72px;font-weight:400\">&#10005;</a>",
+        read_back
+    );
     let nav = format!(
         "{}{}{}",
         nav_link(&qlink("/k", fs, vp), "书架"),
         nav_link(&fs_href, FS_SPECS[next_fs - 1].label),
-        format!(
-            "<a href=\"{}\" style=\"display:inline-block;min-width:80px;text-align:center;font-size:34px;line-height:72px;font-weight:400\">&#10005;</a>",
-            read_back
-        ),
+        back
     );
     let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
@@ -3013,7 +3002,10 @@ mod tests {
             css.contains("html,body{position:relative;top:0;left:0;width:100%;height:1201px;overflow:hidden}"),
             "文档高必须等于运行时可用高：{css}"
         );
-        assert!(!css.contains("position:fixed"), "不得用 fixed 锚布局视口：{css}");
+        assert!(
+            !css.contains("position:fixed"),
+            "不得用 fixed 锚布局视口：{css}"
+        );
         assert!(!css.contains("103%"), "不得再有 body 103% hack：{css}");
         assert!(!css.contains("k-scroll"), "不得再有嵌套滚动容器：{css}");
         assert!(
@@ -3051,7 +3043,11 @@ mod tests {
             "底栏高度必须派生：{bar}"
         );
         assert!(!bar.contains("position:fixed"), "{bar}");
-        assert_ne!(vp().bar_h(), vps(1072, 1000).bar_h(), "不同可用高应得不同底栏高");
+        assert_ne!(
+            vp().bar_h(),
+            vps(1072, 1000).bar_h(),
+            "不同可用高应得不同底栏高"
+        );
     }
 
     /// 阅读页顶栏：左「← 书架」回 `/k`、右「目录」回目录页，两者都透传当前 fs/vw/vh；
@@ -3092,7 +3088,11 @@ mod tests {
         let d = (1072, 1201);
         assert_eq!(Vp::resolve(None, Some(1201), d).layout_h(), 1201);
         assert_eq!(Vp::resolve(None, None, d).layout_h(), 1201, "缺参用默认");
-        assert_eq!(Vp::resolve(None, Some(999), d).layout_h(), 999, "按参数原样排版");
+        assert_eq!(
+            Vp::resolve(None, Some(999), d).layout_h(),
+            999,
+            "按参数原样排版"
+        );
         let g = vps(1072, 1201).content_h();
         assert!(g < 1201 && g > 0, "版面必须比可用高矮（给底栏让位）");
     }
@@ -3106,10 +3106,13 @@ mod tests {
             html.contains("content=\"width=1072,initial-scale=1"),
             "viewport 只声明宽度：{html}"
         );
-        assert!(!html.contains("height=1224") && !html.contains(",height="), "不得输出 meta height");
+        assert!(
+            !html.contains("height=1224") && !html.contains(",height="),
+            "不得输出 meta height"
+        );
         let res = page_css("测试", 2, "", "", v);
         assert!(
-            res.headers().get(header::SET_COOKIE).is_none(),
+            res.headers().get(SET_COOKIE).is_none(),
             "页面不再写高度 Cookie"
         );
     }
@@ -3119,13 +3122,23 @@ mod tests {
     fn line_budget_tracks_runtime_height() {
         let small = vps(1072, 1100);
         let big = vps(1072, 1280);
-        let s_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(small, s.line)).collect();
+        let s_lines: Vec<usize> = FS_SPECS
+            .iter()
+            .map(|s| line_budget(small, s.line))
+            .collect();
         let b_lines: Vec<usize> = FS_SPECS.iter().map(|s| line_budget(big, s.line)).collect();
-        assert!(s_lines.iter().zip(b_lines.iter()).all(|(a, b)| a < b), "高越大行越多");
+        assert!(
+            s_lines.iter().zip(b_lines.iter()).all(|(a, b)| a < b),
+            "高越大行越多"
+        );
         for v in [small, big] {
             for s in FS_SPECS.iter() {
                 let last_bottom = READ_NAV_H + READ_PAD_TOP + line_budget(v, s.line) * s.line;
-                assert!(last_bottom <= v.layout_h() - v.bar_h(), "{}px 末行越界", s.line);
+                assert!(
+                    last_bottom <= v.layout_h() - v.bar_h(),
+                    "{}px 末行越界",
+                    s.line
+                );
             }
         }
     }
@@ -3170,17 +3183,16 @@ mod tests {
         let ch = vp().bar_content_h().saturating_sub(1);
         assert_eq!(bar.matches("<td ").count(), 3, "{bar}");
         assert_eq!(bar.matches("width=\"33.33%\"").count(), 3, "{bar}");
-        assert_eq!(
-            bar.matches(&format!("height=\"{ch}\"")).count(),
-            3,
-            "{bar}"
-        );
+        assert_eq!(bar.matches(&format!("height=\"{ch}\"")).count(), 3, "{bar}");
         assert!(bar.contains("font-size:34px"), "{bar}");
         assert!(!bar.contains("border:1px solid #000"), "格子不得再套方框");
         assert!(bar.contains("<a href=\"/k?a\""), "上一页必须是链接");
         assert_eq!(bar.matches("<a ").count(), 2, "前/字号两格是链接");
         assert!(!bar.contains("<form"), "记录表单已删除");
-        assert!(!bar.contains("目录") && !bar.contains(">目<"), "目录格已删除");
+        assert!(
+            !bar.contains("目录") && !bar.contains(">目<"),
+            "目录格已删除"
+        );
         assert!(
             !bar.contains("上一页") && !bar.contains("下一页") && !bar.contains("上一章"),
             "不再有下方小字"

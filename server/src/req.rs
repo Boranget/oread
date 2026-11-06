@@ -494,6 +494,7 @@ fn build_request(
     let budget = timeout.unwrap_or_else(|| Duration::from_secs(conf().timeout_secs));
     let mut rb = match method.to_uppercase().as_str() {
         "POST" => client.post(url),
+        "HEAD" => client.head(url),
         _ => client.get(url),
     }
     .timeout(budget);
@@ -1132,6 +1133,36 @@ pub async fn fetch(
         SourceLimit::concurrency_only(0),
     )
     .await
+}
+
+/// HEAD 响应：只保留状态码、最终 URL 与响应头（供 `java.head` / jsLib `Reload` 读 etag）。
+pub struct HeadResponse {
+    pub status: u16,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// `java.head(url[, headers])` 的原生实现：不跟随重定向、不读正文，与上游 okhttp 的
+/// `followRedirects(false)` 一致。与 `java.ajax` 同源，不注入书源 Cookie 桶。
+pub async fn head(url: &str, headers: &HashMap<String, String>) -> anyhow::Result<HeadResponse> {
+    let _permit = acquire_permit().await?;
+    let parsed = Url::parse(url).map_err(|e| anyhow!("URL 解析失败: {e}"))?;
+    ensure_public_url(&parsed, false).await?;
+    let resp = build_request(client(), "HEAD", url, headers, None, None)
+        .send()
+        .await
+        .map_err(|e| anyhow!("HEAD 请求失败: {e}"))?;
+    let mut out = Vec::new();
+    for (k, v) in resp.headers() {
+        if let Ok(s) = v.to_str() {
+            out.push((k.to_string(), s.to_string()));
+        }
+    }
+    Ok(HeadResponse {
+        status: resp.status().as_u16(),
+        url: resp.url().to_string(),
+        headers: out,
+    })
 }
 
 /// 按书源发起请求：Cookie 按 `bookSourceUrl` 分桶，其余与 `fetch` 一致。
