@@ -820,6 +820,16 @@ async fn backup_or_fail(cfg: &Config, scope: Scope) -> Result<PathBuf, FatalStar
     }
 }
 
+/// 迁移过程中的暂时性 SQLite 错误：`10=IOERR`（网络盘抖动/坏块重试）、
+/// `5/6=BUSY/LOCKED`（旧连接尚未释放）。磁盘满（13）、只读（8）、语法（1）
+/// 重试也不会好转，直接失败并给出可执行建议。
+fn is_transient_migration_error(err: &MigrateError) -> bool {
+    let MigrateError::Execute(inner) = err else {
+        return false;
+    };
+    matches!(sqlite_parts(inner).0, Some(5) | Some(6) | Some(10))
+}
+
 /// 迁移入口：探测状态 → 必要时备份 → 执行迁移 → 失败时给出人话错误。
 ///
 /// `scope=Shared` 时的失败会额外写启动失败标记，供下次启动退避。
@@ -905,7 +915,27 @@ pub async fn migrate_bucket(
         RepairReport::default()
     };
 
-    match migrator.run(pool).await {
+    // 暂时性 I/O/BUSY 错误最多重试 3 次（约 0.5s、1s 退避）；磁盘满/只读等直接失败。
+    let mut retries = 0u32;
+    let run_result = loop {
+        match migrator.run(pool).await {
+            Ok(()) => break Ok(()),
+            Err(err) if retries < 2 && is_transient_migration_error(&err) => {
+                retries += 1;
+                let delay = Duration::from_millis(250u64 << retries);
+                tracing::warn!(
+                    attempt = retries,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "数据库迁移遇到暂时性错误，退避后重试"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => break Err(err),
+        }
+    };
+
+    match run_result {
         Ok(()) => {
             if !repair.normalized.is_empty() {
                 tracing::info!(

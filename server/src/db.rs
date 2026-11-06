@@ -62,13 +62,39 @@ pub async fn reclaim_pages(pool: &SqlitePool, pages: u32) -> AppResult<()> {
     Ok(())
 }
 
-/// 初始化共享桶：建目录 + 建库 + 执行 shared 迁移。
+/// 启动时对数据库目录做一次可写探测。
+///
+/// 只创建一个临时探测文件并立即删除，不触碰现有库。失败时把“磁盘满 / 权限 /
+/// 只读挂载 / 杀软拦截”这些最常见原因写进错误，避免只抛裸 OS 错误码。
+fn probe_writable_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let probe = dir.join(format!(".boranlib-write-probe-{}", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&probe)?;
+        f.write_all(b"ok")?;
+        f.sync_all()
+    })();
+    let _ = std::fs::remove_file(&probe);
+    written.map_err(|e| {
+        anyhow::anyhow!(
+            "数据库目录不可写：{}\n  原因：{e}\n  \
+             下一步：检查磁盘剩余空间、DATA_DIR 权限，以及只读挂载/杀毒软件是否拦截写入；处理后重启。",
+            dir.display()
+        )
+    })
+}
+
+/// 初始化共享桶：建目录 + 可写探测 + 建库 + 执行 shared 迁移。
 ///
 /// 返回 `anyhow::Result`：迁移阶段的错误由 [`crate::db_guard`] 翻译成可读说明
 /// （含版本号、备份路径与下一步），`main` 直接打印并保持非 0 退出码。
 pub async fn init_shared(cfg: &Config) -> anyhow::Result<SqlitePool> {
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    std::fs::create_dir_all(format!("{}/users", cfg.data_dir))?;
+    let data_dir = std::path::Path::new(&cfg.data_dir);
+    let users_dir = data_dir.join("users");
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::create_dir_all(&users_dir)?;
+    probe_writable_dir(data_dir)?;
+    probe_writable_dir(&users_dir)?;
 
     let opts = SqliteConnectOptions::from_str(&cfg.shared_db_url())?.create_if_missing(true);
     let pool = SqlitePoolOptions::new()
@@ -122,9 +148,37 @@ pub async fn user_pool(cfg: &Config, uid: i64) -> AppResult<SqlitePool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pragma, reclaim_pages};
+    use super::{apply_pragma, probe_writable_dir, reclaim_pages};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+
+    /// 可写目录探测成功且不残留文件；不可写路径要给出可执行的原因与建议。
+    #[test]
+    fn writable_probe_cleans_up_and_explains_failure() {
+        let stem = format!(
+            "oread-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(&stem);
+        std::fs::create_dir_all(&dir).unwrap();
+        probe_writable_dir(&dir).unwrap();
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 0, "探测文件应被删除");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 用一个普通文件冒充目录，稳定复现“不可写”。
+        let file = std::env::temp_dir().join(format!("{stem}.file"));
+        std::fs::write(&file, b"x").unwrap();
+        let err = probe_writable_dir(&file).unwrap_err().to_string();
+        assert!(err.contains("数据库目录不可写"));
+        assert!(err.contains("DATA_DIR"));
+        assert!(err.contains("磁盘剩余空间"));
+        let _ = std::fs::remove_file(&file);
+    }
 
     /// 新库在增量模式下，删行后用 `incremental_vacuum` 能把空闲页归还。
     #[tokio::test]
