@@ -409,6 +409,10 @@ pub struct BookContent {
     pub book_url: String,
     #[serde(default)]
     pub url: String,
+    /// 来源书源 URL（缓存键的一部分）；旧缓存行为空串。
+    #[sqlx(default)]
+    #[serde(default, skip)]
+    pub origin: String,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]

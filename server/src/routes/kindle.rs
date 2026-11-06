@@ -1204,6 +1204,9 @@ async fn ensure_chapters(
     }
     let mut book = Book {
         book_url: book_url.to_string(),
+        origin: Some(source.book_source_url.clone()),
+        origin_name: Some(source.book_source_name.clone()),
+        book_source_type: source.book_source_type,
         ..Default::default()
     };
     if let Some(m) = load_book_meta(db, book_url).await? {
@@ -1767,8 +1770,13 @@ async fn load_comic_images(
     chapter: &BookChapter,
     book_url: &str,
 ) -> Result<Vec<BookImage>, String> {
-    if let Ok(Some(c)) =
-        crate::routes::comic::load_cached_images(pool, &chapter.url, s.cfg.content_ttl_secs).await
+    if let Ok(Some(c)) = crate::routes::comic::load_cached_images(
+        pool,
+        &chapter.url,
+        &source.book_source_url,
+        s.cfg.content_ttl_secs,
+    )
+    .await
     {
         if c.content_type == "image" {
             let (v, _) = crate::routes::comic::decode_images(c.images_json.as_deref());
@@ -1791,6 +1799,7 @@ async fn load_comic_images(
     .unwrap_or_default();
     let c = BookContent {
         url: chapter.url.clone(),
+        origin: source.book_source_url.clone(),
         book_url: book_url.to_string(),
         title: chapter.title.clone(),
         content: Some(String::new()),
@@ -1838,22 +1847,29 @@ async fn read(
         return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp).await;
     }
 
-    let mut c: BookContent =
-        match load_cached_content(&db.0, &chapter.url, s.cfg.content_ttl_secs).await {
-            Ok(Some(c)) => c,
-            _ => {
-                let fetched = match web_book::chapter_content(&source, chapter).await {
-                    Ok(c) => c,
-                    Err(e) => return err_page(&format!("正文抓取失败: {e}")),
-                };
-                let limit = match replace::user_cache_limit_mb(&db.0).await {
-                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                    None => s.cfg.cache_limit_bytes(),
-                };
-                let _ = save_content_cached(&db.0, &fetched, limit).await;
-                fetched
-            }
-        };
+    let mut c: BookContent = match load_cached_content(
+        &db.0,
+        &chapter.url,
+        &source.book_source_url,
+        s.cfg.content_ttl_secs,
+    )
+    .await
+    {
+        Ok(Some(c)) => c,
+        _ => {
+            let mut fetched = match web_book::chapter_content(&source, chapter).await {
+                Ok(c) => c,
+                Err(e) => return err_page(&format!("正文抓取失败: {e}")),
+            };
+            fetched.origin = source.book_source_url.clone();
+            let limit = match replace::user_cache_limit_mb(&db.0).await {
+                Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
+                None => s.cfg.cache_limit_bytes(),
+            };
+            let _ = save_content_cached(&db.0, &fetched, limit).await;
+            fetched
+        }
+    };
     if c.book_url.trim().is_empty() {
         c.book_url = q.book.clone();
     }

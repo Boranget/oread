@@ -104,7 +104,8 @@ async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> 
          COALESCE(SUM(CASE WHEN ct.url IS NOT NULL THEN 1 ELSE 0 END), 0), \
          COALESCE(SUM(ct.size_bytes), 0) \
          FROM book_chapters c LEFT JOIN book_content ct \
-           ON ct.url = c.url AND ct.content IS NOT NULL AND length(trim(ct.content)) > 0 \
+           ON ct.url = c.url AND ct.book_url = c.book_url \
+              AND ct.content IS NOT NULL AND length(trim(ct.content)) > 0 \
          WHERE c.book_url = ?1 AND c.is_volume = 0 AND c.url NOT LIKE 'volume:%'",
     )
     .bind(book_url)
@@ -257,11 +258,13 @@ async fn write_export(
         };
         file.write_all(heading.as_bytes()).await?;
 
-        // 一次只取一章正文；LIMIT 1 保证不会把同 URL 的多余行读进内存。
+        // 一次只取一章正文；LIMIT 1 保证同 URL 同书的重复行不会读进内存。
         let body: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM book_content WHERE url = ?1 AND content IS NOT NULL LIMIT 1",
+            "SELECT content FROM book_content \
+             WHERE url = ?1 AND book_url = ?2 AND content IS NOT NULL LIMIT 1",
         )
         .bind(&url)
+        .bind(book_url.trim())
         .fetch_optional(pool)
         .await?;
         match body.filter(|c| !c.trim().is_empty()) {
@@ -424,8 +427,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "CREATE TABLE book_content (url TEXT PRIMARY KEY, book_url TEXT NOT NULL, \
-             title TEXT, content TEXT, size_bytes INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE book_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
+             book_url TEXT NOT NULL, title TEXT, content TEXT, \
+             size_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (url, origin))",
         )
         .execute(&pool)
         .await

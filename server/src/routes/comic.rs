@@ -145,22 +145,28 @@ async fn chapter_position(pool: &SqlitePool, book_url: &str, chapter: &BookChapt
 pub(crate) async fn load_cached_images(
     pool: &SqlitePool,
     url: &str,
+    origin: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<BookContent>> {
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images AS images_json \
-         FROM book_content WHERE url = ?1 AND updated_at >= datetime('now', ?2)",
+         FROM book_content WHERE url = ?1 AND origin = ?2 \
+           AND updated_at >= datetime('now', ?3)",
     )
     .bind(url)
+    .bind(origin)
     .bind(format!("-{ttl_secs} seconds"))
     .fetch_optional(pool)
     .await?;
     if row.is_some() {
-        let _ = sqlx::query("UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?")
-            .bind(url)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
+        )
+        .bind(url)
+        .bind(origin)
+        .execute(pool)
+        .await;
     }
     Ok(row)
 }
@@ -227,7 +233,13 @@ async fn chapter_images(
     let chapter = resolve_chapter(&db.0, &book_url, q.chapter_url.as_deref(), q.index).await?;
 
     // 1) 命中章节缓存：直接返回图片列表，不再回源
-    let cached = load_cached_images(&db.0, &chapter.url, s.cfg.content_ttl_secs).await?;
+    let cached = load_cached_images(
+        &db.0,
+        &chapter.url,
+        &source.book_source_url,
+        s.cfg.content_ttl_secs,
+    )
+    .await?;
     let (images, truncated, from_cache) = match cached {
         Some(c) if c.content_type == "image" => {
             let (v, t) = decode_images(c.images_json.as_deref());
@@ -249,6 +261,7 @@ async fn chapter_images(
                 .unwrap_or_default();
                 let c = BookContent {
                     url: chapter.url.clone(),
+                    origin: source.book_source_url.clone(),
                     book_url: book_url.clone(),
                     title: chapter.title.clone(),
                     content: Some(String::new()),

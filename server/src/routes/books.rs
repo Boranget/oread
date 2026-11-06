@@ -1357,6 +1357,7 @@ async fn book_info(
         book_url: q.book_url.clone(),
         origin: Some(source.book_source_url.clone()),
         origin_name: Some(source.book_source_name.clone()),
+        book_source_type: source.book_source_type,
         name: q.name.clone().filter(|s| !s.trim().is_empty()),
         author: q.author.clone().filter(|s| !s.trim().is_empty()),
         intro: q.intro.clone().filter(|s| !s.trim().is_empty()),
@@ -1485,7 +1486,9 @@ async fn backfill_word_counts(pool: &SqlitePool, book_url: &str) -> anyhow::Resu
     sqlx::query(
         "UPDATE book_chapters SET word_count = COALESCE((\
            SELECT length(trim(content)) FROM book_content \
-           WHERE book_content.url = book_chapters.url AND content IS NOT NULL\
+           WHERE book_content.url = book_chapters.url \
+             AND book_content.book_url = book_chapters.book_url \
+             AND content IS NOT NULL\
          ), 0) WHERE book_url = ?1",
     )
     .bind(book_url)
@@ -1759,7 +1762,9 @@ async fn content(
             "该条为分卷标题，请从目录选择章节".into(),
         ));
     }
-    let mut c = match load_cached_content(&db.0, &q.chapter_url, s.cfg.content_ttl_secs).await? {
+    let mut c = match load_cached_content(&db.0, &q.chapter_url, &q.source, s.cfg.content_ttl_secs)
+        .await?
+    {
         Some(c) => c,
         None => {
             let source = load_source(&s.shared, &q.source).await?;
@@ -1776,7 +1781,7 @@ async fn content(
                 }
                 _ => None,
             };
-            let c = if source.book_source_type == 2 {
+            let mut c = if source.book_source_type == 2 {
                 // 漫画源：只抽图片列表，content 置空以保持字段类型不变
                 let imgs = web_book::chapter_images_book(&source, &chapter, store.as_ref()).await?;
                 BookContent {
@@ -1792,6 +1797,7 @@ async fn content(
             } else {
                 web_book::chapter_content_book(&source, &chapter, store.as_ref()).await?
             };
+            c.origin = source.book_source_url.clone();
             if let Some(st) = &store {
                 persist_book_changes(&db.0, st.take_changes()).await;
             }
@@ -2220,6 +2226,7 @@ async fn cache_all(
                     if c.url.trim().is_empty() {
                         c.url = url.clone();
                     }
+                    c.origin = src.book_source_url.clone();
                     c.chapter_index = idx;
                     let size = c.content.as_deref().map(|s| s.len()).unwrap_or(0) as i64;
                     // 与单章读取一致：空正文/零图不写缓存，避免整批预取把空白固化下来。
@@ -2391,6 +2398,12 @@ async fn switch_source(
 
 // ---------------- 缓存落库辅助 ----------------
 
+/// 写入解析/抓取得到的书籍元信息。
+///
+/// 这是“解析路径”：只更新来源可重新提供的字段，`group` / `can_update` / `order` /
+/// `origin_order` / `variable` / `custom_tag` / `custom_cover_url` / `custom_intro` /
+/// `dur_chapter_*` 属于用户或本地阅读状态，冲突时一律保留旧值（首次插入仍按传入值落库）。
+/// 可空字段用 COALESCE 兜底，避免规则缺字段时把已有书名/作者等清空。
 pub(crate) async fn save_book_meta(pool: &SqlitePool, b: &Book) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO book_meta \
@@ -2400,18 +2413,25 @@ pub(crate) async fn save_book_meta(pool: &SqlitePool, b: &Book) -> anyhow::Resul
           can_update, \"order\", origin_order, variable, custom_tag, custom_cover_url, custom_intro) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27) \
          ON CONFLICT(book_url) DO UPDATE SET \
-          toc_url=excluded.toc_url, origin=excluded.origin, origin_name=excluded.origin_name, \
-          name=excluded.name, author=excluded.author, kind=excluded.kind, cover_url=excluded.cover_url, \
-          intro=excluded.intro, charset=excluded.charset, book_source_type=excluded.book_source_type, \
-          \"group\"=excluded.\"group\", latest_chapter_title=excluded.latest_chapter_title, \
-          latest_chapter_time=excluded.latest_chapter_time, \
+          toc_url=COALESCE(excluded.toc_url, book_meta.toc_url), \
+          origin=COALESCE(excluded.origin, book_meta.origin), \
+          origin_name=COALESCE(excluded.origin_name, book_meta.origin_name), \
+          name=COALESCE(NULLIF(excluded.name, ''), book_meta.name), \
+          author=COALESCE(NULLIF(excluded.author, ''), book_meta.author), \
+          kind=COALESCE(NULLIF(excluded.kind, ''), book_meta.kind), \
+          cover_url=COALESCE(NULLIF(excluded.cover_url, ''), book_meta.cover_url), \
+          intro=COALESCE(NULLIF(excluded.intro, ''), book_meta.intro), \
+          charset=COALESCE(NULLIF(excluded.charset, ''), book_meta.charset), \
+          book_source_type=CASE WHEN excluded.book_source_type > 0 \
+                                THEN excluded.book_source_type ELSE book_meta.book_source_type END, \
+          latest_chapter_title=COALESCE(NULLIF(excluded.latest_chapter_title, ''), \
+                                        book_meta.latest_chapter_title), \
+          latest_chapter_time=CASE WHEN excluded.latest_chapter_time > 0 \
+                                   THEN excluded.latest_chapter_time \
+                                   ELSE book_meta.latest_chapter_time END, \
           total_chapter_num=CASE WHEN excluded.total_chapter_num > 0 THEN excluded.total_chapter_num \
                                  ELSE book_meta.total_chapter_num END, \
-          dur_chapter_title=excluded.dur_chapter_title, dur_chapter_index=excluded.dur_chapter_index, \
-          dur_chapter_pos=excluded.dur_chapter_pos, dur_chapter_time=excluded.dur_chapter_time, \
-          word_count=excluded.word_count, can_update=excluded.can_update, \"order\"=excluded.\"order\", \
-          origin_order=excluded.origin_order, variable=excluded.variable, custom_tag=excluded.custom_tag, \
-          custom_cover_url=excluded.custom_cover_url, custom_intro=excluded.custom_intro",
+          word_count=COALESCE(NULLIF(excluded.word_count, ''), book_meta.word_count)",
     )
     .bind(&b.book_url)
     .bind(&b.toc_url)
@@ -2668,17 +2688,21 @@ pub(crate) fn content_cache_version() -> &'static str {
 }
 
 /// 正文缓存读取：TTL 内命中原管线指纹则更新 accessed_at（LRU 依据）。
+/// `origin` 是书源 URL，与章节 `url` 共同构成缓存键，避免镜像源同 URL 串正文。
 pub(crate) async fn load_cached_content(
     pool: &SqlitePool,
     url: &str,
+    origin: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<BookContent>> {
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images, cache_version \
-         FROM book_content WHERE url = ?1 AND updated_at >= datetime('now', ?2)",
+         FROM book_content WHERE url = ?1 AND origin = ?2 \
+           AND updated_at >= datetime('now', ?3)",
     )
     .bind(url)
+    .bind(origin)
     .bind(format!("-{ttl_secs} seconds"))
     .fetch_optional(pool)
     .await?;
@@ -2698,10 +2722,13 @@ pub(crate) async fn load_cached_content(
             );
             return Ok(None);
         }
-        let _ = sqlx::query("UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?")
-            .bind(url)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
+        )
+        .bind(url)
+        .bind(origin)
+        .execute(pool)
+        .await;
         return Ok(Some(row));
     }
     Ok(None)
@@ -2734,6 +2761,7 @@ fn text_is_blank(s: &str) -> bool {
 }
 
 /// 单条正文 upsert（不做淘汰），供 `/api/book/content` 与整本缓存共用。
+/// 缓存键为 `(url, origin)`；调用方必须先把 `c.origin` 填成书源 URL。
 pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
     let content_type = if c.content_type.trim().is_empty() {
         "text"
@@ -2744,10 +2772,13 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
         + c.images_json.as_deref().map(|s| s.len()).unwrap_or(0)) as i64;
     sqlx::query(
         "INSERT INTO book_content \
-         (url, book_url, title, content, chapter_index, resource_url, is_local, \
+         (url, origin, book_url, title, content, chapter_index, resource_url, is_local, \
           content_type, images, size_bytes, cache_version, updated_at, accessed_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11, datetime('now'), datetime('now')) \
-         ON CONFLICT(url) DO UPDATE SET title=excluded.title, content=excluded.content, \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now')) \
+         ON CONFLICT(url, origin) DO UPDATE SET \
+          book_url=CASE WHEN excluded.book_url <> '' THEN excluded.book_url \
+                        ELSE book_content.book_url END, \
+          title=excluded.title, content=excluded.content, \
           chapter_index=excluded.chapter_index, resource_url=excluded.resource_url, \
           is_local=excluded.is_local, content_type=excluded.content_type, \
           images=excluded.images, size_bytes=excluded.size_bytes, \
@@ -2755,6 +2786,7 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
           updated_at=datetime('now'), accessed_at=datetime('now')",
     )
     .bind(&c.url)
+    .bind(&c.origin)
     .bind(&c.book_url)
     .bind(&c.title)
     .bind(&c.content)
@@ -2769,11 +2801,15 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     .await?;
     // 正文字数回填到目录行（未知时保持 0）；SQLite TEXT 的 length() 按字符计数。
     let chars = c.content.as_deref().unwrap_or("").trim().chars().count() as i64;
-    let _ = sqlx::query("UPDATE book_chapters SET word_count = ?2 WHERE url = ?1")
-        .bind(&c.url)
-        .bind(chars)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE book_chapters SET word_count = ?2 \
+         WHERE url = ?1 AND (?3 = '' OR book_url = ?3)",
+    )
+    .bind(&c.url)
+    .bind(chars)
+    .bind(&c.book_url)
+    .execute(pool)
+    .await;
     Ok(())
 }
 
@@ -2800,8 +2836,8 @@ pub(crate) async fn save_content_cached(
             break;
         }
         let deleted = sqlx::query(
-            "DELETE FROM book_content WHERE url IN \
-             (SELECT url FROM book_content ORDER BY accessed_at ASC LIMIT 16)",
+            "DELETE FROM book_content WHERE rowid IN \
+             (SELECT rowid FROM book_content ORDER BY accessed_at ASC LIMIT 16)",
         )
         .execute(pool)
         .await?
@@ -2851,12 +2887,12 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE book_content (url TEXT PRIMARY KEY, book_url TEXT NOT NULL, \
-             title TEXT, content TEXT, chapter_index INTEGER NOT NULL DEFAULT 0, \
-             resource_url TEXT, is_local INTEGER NOT NULL DEFAULT 0, \
-             content_type TEXT NOT NULL DEFAULT 'text', images TEXT, \
-             size_bytes INTEGER NOT NULL DEFAULT 0, cache_version TEXT, \
-             updated_at TEXT, accessed_at TEXT)",
+            "CREATE TABLE book_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
+             book_url TEXT NOT NULL, title TEXT, content TEXT, \
+             chapter_index INTEGER NOT NULL DEFAULT 0, resource_url TEXT, \
+             is_local INTEGER NOT NULL DEFAULT 0, content_type TEXT NOT NULL DEFAULT 'text', \
+             images TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, cache_version TEXT, \
+             updated_at TEXT, accessed_at TEXT, PRIMARY KEY (url, origin))",
         )
         .execute(&pool)
         .await
@@ -2884,7 +2920,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(load_cached_content(&pool, "u1", 7 * 24 * 3600)
+        assert!(load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .is_none());
@@ -2919,7 +2955,7 @@ mod tests {
         // 带可见文字的 HTML 片段仍然落库并命中。
         let html = mk_content("u5", "b1", 5, "<p>有正文的段落</p>");
         save_content_cached(&pool, &html, 1 << 20).await.unwrap();
-        assert!(load_cached_content(&pool, "u5", 7 * 24 * 3600)
+        assert!(load_cached_content(&pool, "u5", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .is_some());
@@ -2927,7 +2963,7 @@ mod tests {
         // 正常正文仍然命中。
         let ok = mk_content("u2", "b1", 2, "正文内容");
         save_content_cached(&pool, &ok, 1 << 20).await.unwrap();
-        assert!(load_cached_content(&pool, "u2", 7 * 24 * 3600)
+        assert!(load_cached_content(&pool, "u2", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .is_some());
@@ -2940,7 +2976,7 @@ mod tests {
         let body = "当前管线抓到的完整正文";
         let c = mk_content("u1", "b1", 1, body);
         save_content_cached(&pool, &c, 1 << 20).await.unwrap();
-        let hit = load_cached_content(&pool, "u1", 7 * 24 * 3600)
+        let hit = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .expect("新写入的缓存应命中");
@@ -2952,7 +2988,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            load_cached_content(&pool, "u1", 7 * 24 * 3600)
+            load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2961,7 +2997,7 @@ mod tests {
 
         // 重建（重新抓取后写入）应回到命中，且指纹为当前版本。
         save_content_cached(&pool, &c, 1 << 20).await.unwrap();
-        let rebuilt = load_cached_content(&pool, "u1", 7 * 24 * 3600)
+        let rebuilt = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .expect("重建后应命中");
@@ -2985,7 +3021,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            load_cached_content(&pool, "legacy", 7 * 24 * 3600)
+            load_cached_content(&pool, "legacy", "", 7 * 24 * 3600)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2994,7 +3030,7 @@ mod tests {
 
         let rebuilt = mk_content("legacy", "b1", 1, "迁移前的正文");
         save_content_cached(&pool, &rebuilt, 1 << 20).await.unwrap();
-        let hit = load_cached_content(&pool, "legacy", 7 * 24 * 3600)
+        let hit = load_cached_content(&pool, "legacy", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .expect("回写后应命中");
@@ -3010,12 +3046,43 @@ mod tests {
         assert!(short.chars().count() > 20);
         let c = mk_content("short", "b1", 1, short);
         save_content_cached(&pool, &c, 1 << 20).await.unwrap();
-        let hit = load_cached_content(&pool, "short", 7 * 24 * 3600)
+        let hit = load_cached_content(&pool, "short", "", 7 * 24 * 3600)
             .await
             .unwrap()
             .expect("短且非空的正文应命中");
         assert_eq!(hit.content.as_deref(), Some(short));
         assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
+    }
+
+    // 同一章节 URL 在不同来源下必须分区缓存，不能互相串正文。
+    #[tokio::test]
+    async fn content_cache_is_partitioned_by_origin() {
+        let pool = mem_pool().await;
+        let url = "https://mirror.example/chapter/1";
+        let mut a = mk_content(url, "book-a", 1, "来源 A 的正文");
+        a.origin = "https://source-a.example".into();
+        let mut b = mk_content(url, "book-b", 1, "来源 B 的正文");
+        b.origin = "https://source-b.example".into();
+        save_content_cached(&pool, &a, 1 << 20).await.unwrap();
+        save_content_cached(&pool, &b, 1 << 20).await.unwrap();
+
+        let hit_a = load_cached_content(&pool, url, &a.origin, 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("来源 A 应命中");
+        assert_eq!(hit_a.content.as_deref(), Some("来源 A 的正文"));
+        let hit_b = load_cached_content(&pool, url, &b.origin, 7 * 24 * 3600)
+            .await
+            .unwrap()
+            .expect("来源 B 应命中");
+        assert_eq!(hit_b.content.as_deref(), Some("来源 B 的正文"));
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url = ?1")
+            .bind(url)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "不同来源各自保留一行缓存");
     }
 
     // 搜索调度：两批共用一个总预算，不再给 preferred 单独切分时段
@@ -3316,6 +3383,82 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(total, 520, "目录刷新应更新为最新章节数");
+    }
+
+    // 解析路径只更新可重新抓取的字段：用户/阅读状态字段必须原样保留，
+    // 且规则返回空值时不能用 NULL 清掉已有书名/作者。
+    #[allow(clippy::type_complexity)]
+    #[tokio::test]
+    async fn detail_save_preserves_user_fields_and_null_fallbacks() {
+        let pool = meta_pool().await;
+        let url = "https://x/book";
+        let initial = Book {
+            book_url: url.into(),
+            origin: Some("https://src".into()),
+            origin_name: Some("测试源".into()),
+            name: Some("原书名".into()),
+            author: Some("原作者".into()),
+            book_source_type: 2,
+            group: Some("收藏".into()),
+            can_update: true,
+            order: 7,
+            origin_order: 3,
+            variable: Some("{\"v\":1}".into()),
+            custom_tag: Some("自定义标签".into()),
+            custom_cover_url: Some("https://cover".into()),
+            custom_intro: Some("自定义简介".into()),
+            dur_chapter_title: Some("第 10 章".into()),
+            dur_chapter_index: 10,
+            dur_chapter_pos: 42,
+            dur_chapter_time: 123,
+            ..Default::default()
+        };
+        save_book_meta(&pool, &initial).await.unwrap();
+
+        // 详情刷新：没有用户字段，名字/封面等也为空（规则缺字段）。
+        let parsed = Book {
+            book_url: url.into(),
+            origin: Some("https://src".into()),
+            author: Some("新作者".into()),
+            book_source_type: 2,
+            ..Default::default()
+        };
+        save_book_meta(&pool, &parsed).await.unwrap();
+
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT name, author, \"group\", variable, can_update, \"order\", origin_order, \
+                 custom_tag, custom_cover_url, custom_intro, dur_chapter_title, origin \
+                 FROM book_meta WHERE book_url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("原书名"), "空书名不得清掉旧值");
+        assert_eq!(row.1.as_deref(), Some("新作者"), "非空作者应更新");
+        assert_eq!(row.2.as_deref(), Some("收藏"), "用户分组不得被覆盖");
+        assert_eq!(row.3.as_deref(), Some("{\"v\":1}"), "书籍变量不得被清空");
+        assert!(row.4, "can_update 不得被默认 false 覆盖");
+        assert_eq!(row.5, 7, "书架排序不得被覆盖");
+        assert_eq!(row.6, 3, "来源排序不得被覆盖");
+        assert_eq!(row.7.as_deref(), Some("自定义标签"));
+        assert_eq!(row.8.as_deref(), Some("https://cover"));
+        assert_eq!(row.9.as_deref(), Some("自定义简介"));
+        assert_eq!(row.10.as_deref(), Some("第 10 章"), "阅读进度不得被覆盖");
+        assert_eq!(row.11.as_deref(), Some("https://src"));
     }
 
     async fn chapters_pool() -> SqlitePool {
