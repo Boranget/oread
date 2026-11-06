@@ -484,6 +484,12 @@ pub struct ProbeLine {
     /// v2：`#k-stage` 的 `clientHeight`，页面无该元素时为 `-`
     #[serde(default)]
     pub stage_h: Option<String>,
+    /// v3：`calib_js` 标定并写入 `k_vh` 的真实可见高
+    #[serde(default)]
+    pub visible_h: Option<String>,
+    /// v3：底栏 `#k-bar` 实际 top（`getBoundingClientRect().top`）
+    #[serde(default)]
+    pub bar_top: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -514,6 +520,8 @@ pub struct ProbeQ {
     pub outer_h: Option<String>,
     pub body_h: Option<String>,
     pub stage_h: Option<String>,
+    pub visible_h: Option<String>,
+    pub bar_top: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -558,6 +566,8 @@ pub async fn probe(
         outer_h: norm(q.outer_h),
         body_h: norm(q.body_h),
         stage_h: norm(q.stage_h),
+        visible_h: norm(q.visible_h),
+        bar_top: norm(q.bar_top),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -838,6 +848,8 @@ mod tests {
             outer_h: Some("1268".into()),
             body_h: Some("1244".into()),
             stage_h: Some("1056".into()),
+            visible_h: Some("1180".into()),
+            bar_top: Some("1092".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -845,9 +857,30 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&line).unwrap();
         for k in [
-            "ts", "path", "vw_param", "vh_param", "inner_w", "inner_h", "client_w", "client_h",
-            "scroll_w", "scroll_h", "dpr", "screen_w", "screen_h", "avail_h", "outer_w", "outer_h",
-            "body_h", "stage_h", "fs", "ua_class", "ua", "sid",
+            "ts",
+            "path",
+            "vw_param",
+            "vh_param",
+            "inner_w",
+            "inner_h",
+            "client_w",
+            "client_h",
+            "scroll_w",
+            "scroll_h",
+            "dpr",
+            "screen_w",
+            "screen_h",
+            "avail_h",
+            "outer_w",
+            "outer_h",
+            "body_h",
+            "stage_h",
+            "visible_h",
+            "bar_top",
+            "fs",
+            "ua_class",
+            "ua",
+            "sid",
         ] {
             assert!(v.get(k).is_some(), "探针字段缺失：{k}");
         }
@@ -856,6 +889,8 @@ mod tests {
         assert_eq!(back.client_h.as_deref(), Some("1200"));
         assert_eq!(back.screen_h.as_deref(), Some("1268"));
         assert_eq!(back.stage_h.as_deref(), Some("1056"));
+        assert_eq!(back.visible_h.as_deref(), Some("1180"));
+        assert_eq!(back.bar_top.as_deref(), Some("1092"));
     }
 
     /// v1 的历史行没有 v2 字段，聚合读旧文件不能整行丢掉。
@@ -887,6 +922,8 @@ mod tests {
             outer_h: None,
             body_h: Some(long.clone()),
             stage_h: Some("-".into()),
+            visible_h: Some("1180".into()),
+            bar_top: Some("1092".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -907,6 +944,7 @@ mod tests {
         }
         assert_eq!(norm(p.screen_h).as_deref(), Some("1268"));
         assert_eq!(norm(p.stage_h).as_deref(), Some("-"));
+        assert_eq!(norm(p.visible_h).as_deref(), Some("1180"));
         assert_eq!(norm(Some("   ".into())), None);
     }
 }

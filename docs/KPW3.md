@@ -40,7 +40,7 @@
 | `vh` | **不可用** | `declared_accepted=false`、`style_readback=""`；`20vh` 回读 `0px`（宿主高度回落），期望 `253.6px`，`fallback_used=true` |
 | `calc()` | **不可用** | `declared_accepted=false`、`style_readback=""`；`calc(100px + 20px)` 回读 `320px`（宿主宽度回落，不是计算结果），期望 `120px`，`fallback_used=true` |
 | `clamp()` | **不可用** | `declared_accepted=false`、`style_readback=""`；`clamp(40px,50px,60px)` 回读 `320px`（宿主宽度回落，不是计算结果），期望 `50px`，`fallback_used=true` |
-| `position:fixed` | **可用（仅回读）** | `computed_position=fixed`、`rect=(0,0)`；已落地为 `/k` 阅读页底栏（`routes/kindle.rs`），其他页面未用 |
+| `position:fixed` | **可用但锚点不可信** | `computed_position=fixed`、`rect=(0,0)`；**已不再用于底栏**：老 Silk 把 `fixed` 锚在布局视口（1268），比真实可见高（约 1180）大，贴底元素会掉到可见区外。`/k` 阅读页改为 `position:absolute;bottom:0`（相对 `body`，`body` 高由标定脚本锁成「可见高 − 12」）；`fixed` 仅剩只读顶栏贴顶（贴顶不受影响） |
 | `position:sticky` | **不可用** | `computed_position=static`、`declared_readback=""`、`pass=false` |
 | `border-radius` | **可用** | `computed_radius=10px`；`-webkit-border-radius` 同样回读 `10px` |
 | `box-shadow` | **可用** | `computed_shadow=rgb(0, 0, 0) 2px 2px 2px 0px` |
