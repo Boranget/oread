@@ -544,9 +544,48 @@ pub struct ProbeLine {
     /// v7：底栏 `#k-bar` 的 `getBoundingClientRect().top`（滑动前后是否跟着动）
     #[serde(default)]
     pub bar_rect_top: Option<String>,
-    /// v7：`stage=move` 的来源（`touchmove`/`scroll`/`touchend`）
+    /// v7：`stage=move` 的来源（`touchmove`/`scroll`/`end`/`settle`）
     #[serde(default)]
     pub move_src: Option<String>,
+    /// v7：底栏 top 相对 load 基线的位移（pan 代理量）
+    #[serde(default)]
+    pub bar_top_delta: Option<String>,
+    /// v7：`window.scrollY`（与 scrollTop 三路对照）
+    #[serde(default)]
+    pub scroll_y: Option<String>,
+    /// v7-touch：触摸事件类型（`start`/`move`/`end`）
+    #[serde(default)]
+    pub tev: Option<String>,
+    /// v7-touch：事件是否可取消（决定 `preventDefault` 是否可能生效）
+    #[serde(default)]
+    pub cancelable: Option<String>,
+    /// v7-touch：`touches.length`
+    #[serde(default)]
+    pub touches_len: Option<String>,
+    /// v7-touch：首个触点的 `clientY`
+    #[serde(default)]
+    pub client_y: Option<String>,
+    /// v7-touch：首个触点的 `pageY`
+    #[serde(default)]
+    pub page_y_touch: Option<String>,
+    /// v7：锁定文档高（`documentElement.style.height`，即 `visibleH − 88`）
+    #[serde(default)]
+    pub doc_h: Option<String>,
+    /// v7：`doc_h − outerHeight`（真机 1136 − 1232 = −96）
+    #[serde(default)]
+    pub doc_minus_outer: Option<String>,
+    /// v7：`doc_h − clientHeight`
+    #[serde(default)]
+    pub doc_minus_client: Option<String>,
+    /// v7：`outerHeight − doc_h`
+    #[serde(default)]
+    pub outer_minus_doc: Option<String>,
+    /// v7：viewport meta 里的 `height=`（没输出则 `-`）
+    #[serde(default)]
+    pub meta_h: Option<String>,
+    /// v7：同 `meta_h`，命名对齐外部建议
+    #[serde(default)]
+    pub vw_meta_height: Option<String>,
     #[serde(default)]
     pub fs: Option<String>,
     pub ua_class: String,
@@ -598,6 +637,22 @@ pub struct ProbeQ {
     pub vv_off: Option<String>,
     pub bar_rect_top: Option<String>,
     pub move_src: Option<String>,
+    pub bar_top_delta: Option<String>,
+    pub scroll_y: Option<String>,
+    pub tev: Option<String>,
+    pub cancelable: Option<String>,
+    pub touches_len: Option<String>,
+    /// 触摸打点用驼峰键名（与页面 JS 的 `clientY=`/`pageY=` 对齐）
+    #[serde(rename = "clientY")]
+    pub client_y: Option<String>,
+    #[serde(rename = "pageY")]
+    pub page_y_touch: Option<String>,
+    pub doc_h: Option<String>,
+    pub doc_minus_outer: Option<String>,
+    pub doc_minus_client: Option<String>,
+    pub outer_minus_doc: Option<String>,
+    pub meta_h: Option<String>,
+    pub vw_meta_height: Option<String>,
     pub fs: Option<String>,
     pub path: Option<String>,
 }
@@ -668,6 +723,19 @@ pub async fn probe(
         vv_off: norm(q.vv_off),
         bar_rect_top: norm(q.bar_rect_top),
         move_src: norm(q.move_src),
+        bar_top_delta: norm(q.bar_top_delta),
+        scroll_y: norm(q.scroll_y),
+        tev: norm(q.tev),
+        cancelable: norm(q.cancelable),
+        touches_len: norm(q.touches_len),
+        client_y: norm(q.client_y),
+        page_y_touch: norm(q.page_y_touch),
+        doc_h: norm(q.doc_h),
+        doc_minus_outer: norm(q.doc_minus_outer),
+        doc_minus_client: norm(q.doc_minus_client),
+        outer_minus_doc: norm(q.outer_minus_doc),
+        meta_h: norm(q.meta_h),
+        vw_meta_height: norm(q.vw_meta_height),
         fs: norm(q.fs),
         ua_class: classify_ua(&ua_raw).to_string(),
         ua: Some(truncate(&ua_raw, 120)),
@@ -969,6 +1037,19 @@ mod tests {
             vv_off: Some("-".into()),
             bar_rect_top: Some("1092".into()),
             move_src: Some("touchmove".into()),
+            bar_top_delta: Some("24".into()),
+            scroll_y: Some("0".into()),
+            tev: Some("move".into()),
+            cancelable: Some("1".into()),
+            touches_len: Some("1".into()),
+            client_y: Some("640".into()),
+            page_y_touch: Some("640".into()),
+            doc_h: Some("1136".into()),
+            doc_minus_outer: Some("-96".into()),
+            doc_minus_client: Some("-132".into()),
+            outer_minus_doc: Some("96".into()),
+            meta_h: Some("1200".into()),
+            vw_meta_height: Some("1200".into()),
             fs: Some("2".into()),
             ua_class: "kindle".into(),
             ua: Some("Mozilla/5.0 Kindle Silk".into()),
@@ -1015,6 +1096,19 @@ mod tests {
             "vv_off",
             "bar_rect_top",
             "move_src",
+            "bar_top_delta",
+            "scroll_y",
+            "tev",
+            "cancelable",
+            "touches_len",
+            "client_y",
+            "page_y",
+            "doc_h",
+            "doc_minus_outer",
+            "doc_minus_client",
+            "outer_minus_doc",
+            "meta_h",
+            "vw_meta_height",
             "fs",
             "ua_class",
             "ua",
@@ -1080,7 +1174,20 @@ mod tests {
             max_seen: Some("8".into()),
             vv_off: Some("-".into()),
             bar_rect_top: Some("1092".into()),
-            move_src: Some("touchend".into()),
+            move_src: Some("end".into()),
+            bar_top_delta: Some("24".into()),
+            scroll_y: Some("0".into()),
+            tev: Some("end".into()),
+            cancelable: Some("0".into()),
+            touches_len: Some("0".into()),
+            client_y: Some("700".into()),
+            page_y_touch: Some("700".into()),
+            doc_h: Some("1136".into()),
+            doc_minus_outer: Some("-96".into()),
+            doc_minus_client: Some("-132".into()),
+            outer_minus_doc: Some("96".into()),
+            meta_h: Some("-".into()),
+            vw_meta_height: Some("-".into()),
             fs: None,
             path: Some("/k/read".repeat(30)),
         };
@@ -1125,7 +1232,15 @@ mod tests {
         assert_eq!(norm(p.scroll_top_doc).as_deref(), Some("0"));
         assert_eq!(norm(p.max_seen).as_deref(), Some("8"));
         assert_eq!(norm(p.vv_off).as_deref(), Some("-"));
-        assert_eq!(norm(p.move_src).as_deref(), Some("touchend"));
+        assert_eq!(norm(p.move_src).as_deref(), Some("end"));
+        assert_eq!(norm(p.bar_top_delta).as_deref(), Some("24"));
+        assert_eq!(norm(p.tev).as_deref(), Some("end"));
+        assert_eq!(norm(p.cancelable).as_deref(), Some("0"));
+        assert_eq!(norm(p.touches_len).as_deref(), Some("0"));
+        assert_eq!(norm(p.client_y).as_deref(), Some("700"));
+        assert_eq!(norm(p.page_y_touch).as_deref(), Some("700"));
+        assert_eq!(norm(p.doc_h).as_deref(), Some("1136"));
+        assert_eq!(norm(p.meta_h).as_deref(), Some("-"));
         assert_eq!(
             norm(p.scroll_top_body).unwrap().chars().count(),
             PROBE_LIMIT
