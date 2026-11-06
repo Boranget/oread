@@ -44,6 +44,18 @@ hmac = "0.12"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 
+# ---- 本地开发快档（只影响 `cargo build` 默认档与 `cargo test`）----
+# 目的：让本机迭代尽量快，同时避免依赖随 profile 切换反复重编。
+# 注意：发版、性能/内存测量一律用 release 档，dev 档数据不作结论。
+[profile.dev]
+opt-level = 0          # 本 crate 保持低优化，改一行只重编一个 crate
+debug = false          # 不生成调试信息：编译/链接更快、target 更小
+incremental = true
+
+# 依赖按 opt-level=2 编一次后长期缓存；本 crate 仍走上面的 dev 设置
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = "z"      # 体积/内存优先
 lto = true

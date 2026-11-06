@@ -5,11 +5,11 @@
 
 .DESCRIPTION
   历史上这个脚本是「交叉命令行 + 写死 d:\projects\read\server」的 gnu 构建；
-  现在统一走 scripts\build-dev.ps1（Windows msvc host 本机调试构建，产物在 D:\tools\oread-target-win）。
+  现在统一走 scripts\build-dev.ps1（Windows msvc host 本机调试构建，产物在 D:\tools\cache\target-dev）。
   需要 x86_64-pc-windows-gnu 目标的构建，请用 build_gnu.bat。
 
 .PARAMETER Release
-  以 release profile 构建（默认 debug）。
+  以 release profile 构建（默认 dev 快档）。
 
 .PARAMETER TargetDir
   覆盖 CARGO_TARGET_DIR。

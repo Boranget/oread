@@ -249,10 +249,17 @@ fn run_js_job(
 fn js_sender() -> &'static SyncSender<JsJob> {
     JS_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<JsJob>(8);
+        // 开发档（依赖 opt-level=2、本 crate 未优化）下 boa 解析/执行需要更多栈：
+        // 1 MiB 会让 req::tests::source_header_js_is_evaluated 栈溢出（STATUS_STACK_OVERFLOW）。
+        // release 档保持 1 MiB，真机内存红线不变。
+        let stack_size = if cfg!(debug_assertions) {
+            4 * 1024 * 1024
+        } else {
+            1024 * 1024
+        };
         std::thread::Builder::new()
             .name("boa-js".into())
-            // 单线程独占 1 MiB 栈：boa 递归/解析需要空间，仍远小于默认 8 MiB
-            .stack_size(1024 * 1024)
+            .stack_size(stack_size)
             .spawn(move || js_worker(rx))
             .expect("spawn boa js worker");
         tx
@@ -7661,11 +7668,11 @@ var enc=c.encrypt("hello 漫"); java.bytesToStr(c.decrypt(enc))"#,
 
     /// 构造一条「可控墙钟耗时」的慢 JS 规则。
     ///
-    /// 每轮做一次 8 KiB 字符串分配，迭代次数远低于 `loop_iteration_limit`(500k)，
-    /// 因此耗时由 `ms` 决定，而不会先撞上 RuntimeLimit（便于稳定复现慢源）。
+    /// 每轮做一次 64 KiB 字符串分配，保证在 dev 快档（依赖 opt-level=2）下也是墙钟先到、
+    /// 迭代次数远低于 `loop_iteration_limit`(500k)，而不会先撞上 RuntimeLimit。
     fn slow_js_rule(ms: u64) -> String {
         format!(
-            "@js:var t0=Date.now(), n=0; while(Date.now()-t0<{ms}) {{ 'abcdefghijklmnop'.repeat(500); n++; }} n"
+            "@js:var t0=Date.now(), n=0; while(Date.now()-t0<{ms}) {{ 'abcdefghijklmnop'.repeat(4000); n++; }} n"
         )
     }
 
