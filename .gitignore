@@ -28,3 +28,7 @@
 /server/.zig-cache/
 *.pow
 
+# 反编译参考与 APK 二进制：仅本地保留，不入库
+/decompiled/
+/base.apk
+
