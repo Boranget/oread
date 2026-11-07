@@ -1,6 +1,10 @@
 <script>
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { api, describeSourceError, describeFailure } from '../lib/api.js';
+  import { loadHistory, rememberKey } from '../lib/searchHistory.js';
+  import DiscoverHistory from '../lib/DiscoverHistory.svelte';
+  import DiscoverScopePicker from '../lib/DiscoverScopePicker.svelte';
+  import DiscoverResults from '../lib/DiscoverResults.svelte';
 
   const dispatch = createEventDispatcher();
   let mode = 'search'; // search | explore
@@ -81,11 +85,6 @@
   let ignoredSourceIds = []; // 后端回显的 ignored_source_ids
   let groupFilter = 'all';
 
-  // 搜索历史：本地持久化（localStorage），最多 12 条
-  const HISTORY_KEY = 'oread_search_history';
-  const HISTORY_MAX = 12;
-  let history = [];
-
   // 本次搜索的固定快照（用于结果页“只搜这些源重试”）
   let lastSearchKey = '';
   let lastSearchScopeIds = [];
@@ -111,7 +110,7 @@
   $: completedSources = Math.max(0, finishedSources - failedCount);
 
   onMount(async () => {
-    history = readHistory();
+    loadHistory();
     try {
       sources = await api.sources();
       sourcesReady = true;
@@ -143,37 +142,6 @@
     retrySeq += 1;
     cancelPolling();
   });
-
-  function readHistory() {
-    try {
-      const arr = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
-      if (!Array.isArray(arr)) return [];
-      return arr.filter((x) => typeof x === 'string' && x.trim()).slice(0, HISTORY_MAX);
-    } catch {
-      return [];
-    }
-  }
-
-  function writeHistory(list) {
-    history = list.slice(0, HISTORY_MAX);
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-    } catch {
-      /* 本地存储不可用时只作用于当前会话 */
-    }
-  }
-
-  function rememberKey(q) {
-    writeHistory([q, ...history.filter((x) => x !== q)]);
-  }
-
-  function removeHistory(q) {
-    writeHistory(history.filter((x) => x !== q));
-  }
-
-  function clearHistory() {
-    writeHistory([]);
-  }
 
   function useHistory(q) {
     if (starting || searching) return;
@@ -303,48 +271,6 @@
       if (inflight && inflight.ctrl === ctrl) inflight = null;
       if (pageNo === page) paging = false;
     }
-  }
-
-  function sname(s) {
-    return (s && s.book_source_name) || '未命名书源';
-  }
-
-  // 后端 type/type_name 正在加：有就显示，没有就跳过，不造字段
-  function typeOf(s) {
-    return (s && (s.type_name || s.type)) || '';
-  }
-
-  function togglePick(url) {
-    pickedSourceIds = pickedSourceIds.includes(url)
-      ? pickedSourceIds.filter((x) => x !== url)
-      : [...pickedSourceIds, url];
-  }
-
-  function selectAllEnabled() {
-    pickedSourceIds = searchableSources.map((s) => s.book_source_url);
-  }
-
-  // 按分组选择：只并入该分组下的可搜索源，保留已选的其他源
-  function pickGroup() {
-    if (groupFilter === 'all') return;
-    const add = searchableSources
-      .filter((s) => (s.book_source_group || '') === groupFilter)
-      .map((s) => s.book_source_url);
-    pickedSourceIds = [...new Set(pickedSourceIds.concat(add))];
-  }
-
-  function clearPicked() {
-    pickedSourceIds = [];
-  }
-
-  // ignored_source_ids 可能是 URL，也可能是 1-based 序号；能映射到书源名就显示名字
-  function sourceLabel(id) {
-    const s = sources.find((x) => x.book_source_url === id);
-    if (s) {
-      const t = typeOf(s);
-      return t ? `${sname(s)}（${t}）` : sname(s);
-    }
-    return /^\d+$/.test(id) ? `第 ${id} 个源（序号）` : id;
   }
 
   async function doSearch(preset) {
@@ -733,83 +659,20 @@
     <button on:click={doSearch} disabled={starting || (sourceScope === 'custom' && !pickedSourceIds.length)}>搜索</button>
   </div>
 
-  {#if history.length}
-    <div class="hist" aria-label="搜索历史">
-      <div class="hist-head">
-        <span class="muted">最近搜索（{history.length}）</span>
-        <button class="link-btn" on:click={clearHistory}>清空历史</button>
-      </div>
-      <div class="hist-list">
-        {#each history as h (h)}
-          <span class="hist-item">
-            <button class="hist-word" title={h} on:click={() => useHistory(h)} disabled={starting || searching}>{h}</button>
-            <button class="hist-del" aria-label="删除搜索历史 {h}" on:click={() => removeHistory(h)}>×</button>
-          </span>
-        {/each}
-      </div>
-    </div>
-  {/if}
+  <DiscoverHistory busy={starting || searching} on:pick={(e) => useHistory(e.detail)} />
 
-  <div class="search-scope">
-    <div class="row">
-      <select bind:value={sourceScope} on:change={() => (error = '')} style="flex:1;min-width:0" aria-label="搜索范围">
-        <option value="all">全部可搜索源（{searchableSources.length} 个）</option>
-        <option value="curated">精选源{curatedTotal ? `（${curatedTotal} 个）` : ''}</option>
-        <option value="custom">指定分类 / 书源（已选 {pickedSourceIds.length} 个）</option>
-      </select>
-      {#if sourceScope === 'custom'}
-        <button class="ghost" on:click={() => (scopeOpen = !scopeOpen)} aria-expanded={scopeOpen}>
-          {scopeOpen ? '收起书源' : '选择书源'}
-        </button>
-      {/if}
-    </div>
-
-    {#if sourceScope === 'custom' && scopeOpen}
-      {#if groupOptions.length}
-        <div class="row" style="margin-top:8px">
-          <select bind:value={groupFilter} style="width:100%;min-width:0" aria-label="按分类筛选书源">
-            <option value="all">全部分类</option>
-            {#each groupOptions as g}
-              <option value={g}>{g}</option>
-            {/each}
-          </select>
-          <button class="ghost" on:click={pickGroup} disabled={groupFilter === 'all'}>选入本分类</button>
-        </div>
-      {/if}
-      <div class="src-list" role="group" aria-label="选择参与搜索的书源">
-        {#each pickSources as s (s.book_source_url)}
-          <label class="src-item" class:off={!s.searchable}>
-            <input
-              type="checkbox"
-              disabled={!s.searchable}
-              checked={pickedSourceIds.includes(s.book_source_url)}
-              on:change={() => togglePick(s.book_source_url)}
-            />
-            <span class="src-name">{sname(s)}</span>
-            {#if s.book_source_group}<span class="src-type">{s.book_source_group}</span>{/if}
-            {#if typeOf(s)}<span class="src-type">{typeOf(s)}</span>{/if}
-            {#if !s.enabled}<span class="src-off">已禁用</span>{:else if !s.searchable}<span class="src-off">不可搜索</span>{/if}
-          </label>
-        {/each}
-        {#if !sources.length}<p class="muted" style="margin:6px 0">还没有书源，请先到「书源管理」添加。</p>{:else if !pickSources.length}<p class="muted" style="margin:6px 0">该分类下没有书源。</p>{/if}
-      </div>
-      <div class="row" style="margin-top:6px">
-        <button class="ghost" on:click={selectAllEnabled} disabled={!searchableSources.length}>全选可搜索源</button>
-        <button class="ghost" on:click={clearPicked} disabled={!pickedSourceIds.length}>清空</button>
-      </div>
-    {/if}
-
-    <p class="muted scope-hint">
-      本次范围：{sourceScope === 'all'
-        ? `全部可搜索源（${searchableSources.length} 个）`
-        : sourceScope === 'curated'
-          ? curatedTotal
-            ? `精选源（${curatedTotal} 个；集合为空时自动回退）`
-            : '精选源（集合尚未生成，搜索会自动回退）'
-          : `已选 ${pickedSourceIds.length} 个源`}
-      {#if sourceScope === 'custom' && !pickedSourceIds.length}&nbsp;· 至少选 1 个才能搜索{/if}
-    </p>
-  </div>
+  <DiscoverScopePicker
+    sources={sources}
+    searchableSources={searchableSources}
+    curatedTotal={curatedTotal}
+    bind:sourceScope
+    bind:pickedSourceIds
+    bind:scopeOpen
+    bind:groupFilter
+    groupOptions={groupOptions}
+    pickSources={pickSources}
+    on:clearError={() => (error = '')}
+  />
 
   <div class="row" style="margin-top:10px">
     <select bind:value={importSourceId} style="flex:0 0 34%;min-width:0" aria-label="按链接打开的书源">
@@ -853,368 +716,54 @@
   {/if}
 {/if}
 
-{#if error}<p class="err">{error}</p>{/if}
-{#if notice}<p class="ok-line">{notice}</p>{/if}
-
-{#if mode === 'search' && ignoredSourceIds.length}
-  <div class="warn-box" role="alert">
-    <div class="warn-title">已忽略 {ignoredSourceIds.length} 个书源：本次实际搜索 {sourceTotal} 个源</div>
-    <div class="warn-item">
-      本次请求 {requestSourceCount} 个源，后端只接受可搜索源（已启用、类型支持、搜索规则与地址完整、未隔离）。
-      被忽略：{ignoredSourceIds.map(sourceLabel).join('、')}
-    </div>
-    {#if !sourceTotal}
-      <div class="warn-item">没有可搜索的源，请到「书源管理」启用书源并补全搜索规则后重试。</div>
-    {/if}
-  </div>
-{/if}
-
-{#if mode === 'search' && sourceTotal && !error}
-  <p class="scope-report">
-    本次范围：<b>{sourceTotal}</b> 个源
-    {#if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
-      （用户指定 {resultRequested} 个，实际可执行 {sourceTotal} 个）
-    {:else if sourceMode === 'curated'}
-      精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
-    {:else if sourceMode === 'curated_fallback'}
-      （{curatedTotal ? '精选集暂无可用条目' : '尚未生成精选集'}，本次用兜底源；实际 {sourceTotal} 个源）
-    {:else if sourceMode === 'all_fallback'}
-      （{curatedTotal ? '精选集与常用源暂无可用条目' : '尚未生成精选集'}，已改用全部 {sourceTotal} 个源）
-    {:else}
-      （全部可搜索源）
-    {/if}
-    <button class="link-btn" on:click={retryScope} disabled={starting || searching || !lastSearchKey}>只搜这些源重试</button>
-  </p>
-{/if}
-
-{#if mode === 'search' && jobExpired}
-  <div class="warn-box" role="alert">
-    <div class="warn-title">搜索任务已过期，结果可能不完整</div>
-    <div class="warn-item">后端搜索任务只保留 60 秒；已完成任务最多 32 个，进行中任务另有 64 个硬上限。当前 job 已不在服务端，无法继续取回剩余结果。</div>
-    <div class="row" style="margin-top:8px">
-      <button on:click={doSearch} disabled={starting || !key.trim()}>重新搜索</button>
-    </div>
-  </div>
-{/if}
-
-{#if mode === 'search' && (starting || searching)}
-  <div class="search-wait" aria-live="polite">
-    <div class="sw-line">
-      <b>
-        {#if starting}
-          已发起搜索，正在创建任务并等待首个书源…
-        {:else}
-          已完成 {completedSources} / 共 {sourceTotal || '?'} 个源，慢源仍在返回…
-        {/if}
-      </b>
-      {#if !starting}<span class="sw-time">已等待 {searchElapsed}s</span>{/if}
-    </div>
-    <div class="sw-sub">
-      结果先到先显示：已完成的源会立即出现在下方，不需要等全部书源结束。
-      {#if pendingSources}&nbsp;仍有 {pendingSources} 个源未返回。{/if}
-      {#if deadlineMs}后端单源预算 {Math.round(deadlineMs / 1000)}s，超时源计入失败。{/if}
-    </div>
-  </div>
-{/if}
-
-{#if mode === 'search' && paging}
-  <p class="loading">正在读取第 {page} 页…</p>
-{/if}
-
-{#if mode === 'search' && (starting || searching) && results.length === 0}
-  <div class="grid auto" style="margin-top:12px" aria-hidden="true">
-    {#each [0, 1, 2] as _i}
-      <div class="card book skeleton">
-        <div class="sk-cover"></div>
-        <div class="sk-line w70"></div>
-        <div class="sk-line w45"></div>
-      </div>
-    {/each}
-  </div>
-{/if}
-
-{#if mode === 'explore' && loading}
-  <p class="loading">加载中…</p>
-{/if}
-
-{#if mode === 'search' && searched}
-  <div class="result-meta">
-    <span>
-      命中 <b>{total}</b> 本 · 本页 {results.length} 本
-      {#if starting}
-        &nbsp;· 正在创建搜索任务…
-      {:else if searching}
-        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal || '?'} 个源 · 搜索中 · 已等待 {searchElapsed}s
-      {:else if jobExpired}
-        &nbsp;· 任务已过期，结果可能不完整
-      {:else if sourceTotal}
-        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
-      {/if}
-      {#if sourceMode === 'curated' || (!sourceMode && requestedScope === 'curated')}
-        &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
-      {:else if sourceMode === 'curated_fallback'}
-        &nbsp;· {curatedTotal ? '精选集暂无可用条目，已回退' : '尚未生成精选集，已回退'}
-      {:else if sourceMode === 'all_fallback'}
-        &nbsp;· {curatedTotal ? '精选集与常用源暂无可用条目，已改用全部源' : '尚未生成精选集，已改用全部源'}
-      {:else if sourceMode === 'user' || (!sourceMode && resultScopeMode === 'custom')}
-        &nbsp;· 指定源
-      {:else}
-        &nbsp;· 全部可搜索源
-      {/if}
-    </span>
-  </div>
-{/if}
-
-{#if mode === 'search' && searchDone && total === 0}
-  {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
-    <p class="muted empty-hint">
-      当前还没有可用的书源，请先到<button class="ghost empty-retry" on:click={goSources}>书源管理</button>导入并启用书源。
-    </p>
-  {:else if requestedScope === 'curated' && searchCoverage === 'curated'}
-    <p class="muted empty-hint">
-      精选源没有结果，<button class="ghost empty-retry" on:click={retryWithAll}>用全部可搜索源重试</button>，或把上方范围切到「全部可搜索源」再试。
-    </p>
-  {:else if requestedScope === 'curated'}
-    {#if curatedTotal}
-      <p class="muted empty-hint">精选集暂无可用条目，已回退到常用/全部可搜索源，仍无结果；可换个关键词再试。</p>
-    {:else}
-      <p class="muted empty-hint">
-        尚未生成精选集，本次已用兜底源，仍无结果；可到<button class="ghost empty-retry" on:click={goSources}>书源管理</button>点「跑一次体检」生成精选集后重试。
-      </p>
-    {/if}
-  {:else}
-    <p class="muted empty-hint">没有找到结果，可换个关键词再试。</p>
-  {/if}
-{/if}
-
-{#if failedCount || failedSources.length}
-  <details class="warn-box">
-    <summary class="warn-title">
-      {failedCount || failedSources.length} 个书源失败{#if searching}（其余仍在搜索）{:else}，已返回其余结果{/if}
-    </summary>
-    <div class="warn-items">
-      {#each failedSources as f}
-        <div class="warn-item">{f.name}：{f.reason}</div>
-      {/each}
-      {#if !failedSources.length}
-        <div class="warn-item">后端未返回失败明细，可重试或到「书源管理」检查这些书源。</div>
-      {/if}
-      <div class="warn-item muted">可先换个关键词或稍后重试；长期失败请到「书源管理」检查这些源的地址与启用状态。</div>
-      <div class="row" style="margin-top:8px">
-        <button class="ghost" on:click={retryFailedSources} disabled={retrying || starting || searching || !failedSources.some((f) => f.url)}>
-          {retrying ? '正在仅重试失败源…' : '仅重试失败源'}
-        </button>
-        {#if !failedSources.some((f) => f.url)}<span class="muted">后端未返回失败源地址，无法按源重试</span>{/if}
-      </div>
-    </div>
-  </details>
-{/if}
-
-{#if retryNote}<p class="retry-note" role="status">{retryNote}</p>{/if}
-
-{#if results.length}
-  <div class="grid auto" style="margin-top:12px">
-    {#each results as r (r.book_url + '|' + (r.origin || ''))}
-      <div class="card book">
-        <button class="cover-btn" on:click={() => open(r)} aria-label="打开《{r.name || r.book_url}》">
-          <div class="cover-wrap">
-            <span class="cover-ph" aria-hidden="true">{(r.name || '?').slice(0, 2)}</span>
-            {#if r.cover_url}
-              <img class="cover" src={r.cover_url} alt="" referrerpolicy="no-referrer" on:error={(e) => (e.target.style.visibility = 'hidden')} />
-            {/if}
-          </div>
-        </button>
-        <div class="title" on:click={() => open(r)}>{r.name || r.book_url}</div>
-        <div class="author">{r.author || '未知作者'}{#if r.origin_name} · {r.origin_name}{/if}{#if r.retry} <span class="retry-tag">重试命中</span>{/if}</div>
-        {#if r.latest_chapter_title}<div class="author muted clamp1">{r.latest_chapter_title}</div>{/if}
-        <div class="row" style="margin-top:8px">
-          <button style="flex:1" on:click={() => open(r)}>阅读</button>
-          <button class="ghost" disabled={shelfIds.has(r.book_url)} on:click={() => addShelf(r)}>{shelfIds.has(r.book_url) ? '已加入' : '加入书架'}</button>
-        </div>
-      </div>
-    {/each}
-  </div>
-  <div class="row" style="justify-content:center;margin-top:16px">
-    {#if mode === 'search'}
-      {#if page > 1}<button class="ghost" on:click={() => changePage(page - 1)} disabled={paging || jobExpired}>上一页</button>{/if}
-      <span class="muted">第 {page} 页{#if total}&nbsp;· 共 {total} 本{/if}</span>
-      <button class="ghost" on:click={() => changePage(page + 1)} disabled={paging || !hasMore || jobExpired}>
-        {paging ? '读取中…' : '下一页'}
-      </button>
-      {#if !hasMore && !searching && !starting}<span class="muted">没有更多了</span>{/if}
-    {:else if hasMore}
-      <button class="ghost" on:click={loadMore} disabled={loadingMore}>{loadingMore ? '加载中…' : `加载更多（第 ${page + 1} 页）`}</button>
-    {:else}
-      <span class="muted">没有更多了</span>
-    {/if}
-  </div>
-{:else if mode === 'search'}
-  {#if !searched}
-    <div class="empty">输入关键词开始搜索</div>
-  {:else if !starting && !searching && !paging}
-    {#if failedSources.length || failedCount}
-      <div class="empty">没有拿到结果，且有 {failedCount || failedSources.length} 个书源失败，原因见上方。<br />换关键词、稍后重试，或到「书源管理」检查这些书源。</div>
-    {:else if !jobExpired && !error}
-      {#if sourceTotal === 0 || (sourcesReady && searchableSources.length === 0)}
-        <div class="empty">当前还没有可用的书源，请先到「书源管理」导入并启用书源。<br /><button class="ghost" on:click={goSources}>去书源管理</button></div>
-      {:else}
-        <div class="empty">书源正常返回，但没有匹配的书。<br />换个关键词，或到「书源管理」确认书源是否启用。</div>
-      {/if}
-    {/if}
-  {/if}
-{:else if !loading && !searched}
-  <div class="empty">选择书源与分类后开始发现</div>
-{:else if !loading && searched}
-  <div class="empty">没有找到结果。<br />换个分类，或到「书源管理」确认书源是否启用。</div>
-{/if}
-
-<style>
-  .search-scope {
-    margin-top: 8px;
-  }
-  .scope-hint {
-    margin: 6px 0 0;
-    font-size: 12px;
-  }
-  /* 搜索范围下拉的说明文案 */
-  .empty-hint {
-    margin: 10px 0 0;
-    font-size: 13px;
-  }
-  .empty-retry {
-    width: auto;
-    min-height: auto;
-    padding: 2px 8px;
-    margin: 0 4px;
-    font-size: 13px;
-  }
-  .scope-report {
-    margin: 8px 0;
-    font-size: 13px;
-    font-variant-numeric: tabular-nums;
-  }
-  /* 搜索历史：块级 + 行内块，墨水屏不依赖 flex/grid */
-  .hist {
-    margin-top: 8px;
-    padding: 8px 10px;
-    border: 1px solid var(--border, #e3e3e6);
-    border-radius: 8px;
-    background: var(--card, #fff);
-  }
-  .hist-head {
-    font-size: 12px;
-    margin-bottom: 6px;
-  }
-  .hist-head .link-btn {
-    float: right;
-  }
-  .hist-item {
-    display: inline-block;
-    margin: 0 6px 6px 0;
-    border: 1px solid var(--border, #e3e3e6);
-    border-radius: 6px;
-    background: var(--card, #fff);
-  }
-  .hist-word {
-    background: transparent;
-    color: var(--fg, #1d1d1f);
-    border: 0;
-    padding: 5px 8px;
-    font-size: 12px;
-    max-width: 220px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .hist-word:hover {
-    background: rgba(179, 57, 47, 0.08);
-  }
-  .hist-del {
-    background: transparent;
-    color: var(--muted, #666);
-    border: 0;
-    padding: 5px 8px;
-    font-size: 12px;
-  }
-  .link-btn {
-    background: transparent;
-    color: var(--accent);
-    border: 0;
-    padding: 2px 6px;
-    font-size: 12px;
-    text-decoration: underline;
-  }
-  .link-btn:hover {
-    background: transparent;
-  }
-  .retry-note {
-    margin: 8px 0;
-    padding: 8px 10px;
-    border: 1px solid #e8c7a7;
-    border-radius: 8px;
-    background: #fdf6ec;
-    color: #8a5a1f;
-    font-size: 12px;
-  }
-  .retry-tag {
-    display: inline-block;
-    padding: 0 6px;
-    border: 1px solid var(--accent);
-    border-radius: 999px;
-    font-size: 11px;
-    color: var(--accent);
-  }
-  .src-list {
-    margin-top: 8px;
-    max-height: 38vh;
-    overflow: auto;
-    border: 1px solid var(--border, #e3e3e6);
-    border-radius: 8px;
-    background: var(--card, #fff);
-  }
-  .src-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 40px;
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--border, #e3e3e6);
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .src-item:last-child {
-    border-bottom: 0;
-  }
-  .src-item.off {
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-  .src-item input {
-    width: 18px;
-    height: 18px;
-    flex: 0 0 auto;
-  }
-  .src-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .src-type {
-    flex: 0 0 auto;
-    font-size: 11px;
-    padding: 1px 6px;
-    border: 1px solid var(--border, #e3e3e6);
-    border-radius: 10px;
-    color: var(--muted, #666);
-  }
-  .src-off {
-    flex: 0 0 auto;
-    font-size: 11px;
-    color: var(--muted, #666);
-  }
-  :global(html[data-vp='sm']) .src-item {
-    min-height: 44px;
-  }
-</style>
+<DiscoverResults
+  mode={mode}
+  error={error}
+  notice={notice}
+  sources={sources}
+  ignoredSourceIds={ignoredSourceIds}
+  requestSourceCount={requestSourceCount}
+  sourceTotal={sourceTotal}
+  sourceMode={sourceMode}
+  resultScopeMode={resultScopeMode}
+  resultRequested={resultRequested}
+  scopeFiltered={scopeFiltered}
+  curatedTotal={curatedTotal}
+  jobExpired={jobExpired}
+  starting={starting}
+  searching={searching}
+  completedSources={completedSources}
+  pendingSources={pendingSources}
+  deadlineMs={deadlineMs}
+  searchElapsed={searchElapsed}
+  searchDuration={searchDuration}
+  paging={paging}
+  page={page}
+  searched={searched}
+  total={total}
+  results={results}
+  hasMore={hasMore}
+  searchDone={searchDone}
+  sourcesReady={sourcesReady}
+  searchableCount={searchableSources.length}
+  requestedScope={requestedScope}
+  searchCoverage={searchCoverage}
+  failedCount={failedCount}
+  failedSources={failedSources}
+  retrying={retrying}
+  retryNote={retryNote}
+  shelfIds={shelfIds}
+  lastSearchKey={lastSearchKey}
+  hasKey={!!key.trim()}
+  loading={loading}
+  loadingMore={loadingMore}
+  on:retryAll={() => retryWithAll()}
+  on:retryScope={() => retryScope()}
+  on:retryFailed={() => retryFailedSources()}
+  on:search={() => doSearch()}
+  on:goSources={() => goSources()}
+  on:page={(e) => changePage(e.detail)}
+  on:loadMore={() => loadMore()}
+  on:open={(e) => open(e.detail)}
+  on:addShelf={(e) => addShelf(e.detail)}
+/>
