@@ -2,6 +2,7 @@
   import { createEventDispatcher, onMount, onDestroy, tick } from 'svelte';
   import { api, describeFailure } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
+  import ReaderBookmarks from '../lib/ReaderBookmarks.svelte';
   import { convertZh, zhLabels } from '../lib/zhconvert.js';
   import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
   import { applyTheme } from '../lib/theme.js';
@@ -113,11 +114,6 @@
 
   // 书签 / 书内搜索
   let showBookmarks = false;
-  let bookmarks = [];
-  let bmNote = '';
-  let bmLoading = false;
-  let bmErr = '';
-  let bmBusy = false;
   let showSearch = false;
   let searchQ = '';
   let searchLoading = false;
@@ -911,23 +907,6 @@
   }
 
   // ---- 书签：位置沿用阅读进度同一套 0..1 章内比例 ----
-  async function loadBookmarks() {
-    if (!book.bookUrl) {
-      bmErr = '缺少书籍地址，无法读取书签。请从书架重新打开这本书。';
-      return;
-    }
-    bmLoading = true;
-    bmErr = '';
-    try {
-      const list = await api.bookmarks(book.bookUrl);
-      bookmarks = Array.isArray(list) ? list : [];
-    } catch (e) {
-      bmErr = describeFailure(e, '读取书签');
-    } finally {
-      bmLoading = false;
-    }
-  }
-
   function togglePanel() {
     if (!showPanel) {
       showToc = false;
@@ -944,35 +923,6 @@
     showToc = false;
     showJump = false;
     showBookmarks = !showBookmarks;
-    if (showBookmarks) loadBookmarks();
-  }
-
-  async function addBookmark() {
-    if (currentPos < 0) return;
-    if (!current) {
-      showToast('正文还没加载完，稍后再加书签');
-      return;
-    }
-    bmBusy = true;
-    bmErr = '';
-    const ratio = clamp01(currentRatio());
-    const note = bmNote.trim().slice(0, 2000);
-    try {
-      await api.addBookmark({
-        book_id: book.bookUrl,
-        chapter_index: currentPos,
-        position: ratio,
-        chapter_title: chapters[currentPos]?.title || '',
-        ...(note ? { note } : {}),
-      });
-      bmNote = '';
-      showToast(`已加书签：第 ${currentPos + 1} 章 · 章内 ${Math.round(ratio * 100)}%${note ? ' · 含备注' : ''}`);
-      if (showBookmarks) await loadBookmarks();
-    } catch (e) {
-      bmErr = describeFailure(e, '添加书签');
-    } finally {
-      bmBusy = false;
-    }
   }
 
   async function gotoBookmark(bm) {
@@ -987,20 +937,6 @@
       return;
     }
     await openChapter(idx, { ratio });
-  }
-
-  async function removeBookmark(bm) {
-    bmBusy = true;
-    bmErr = '';
-    try {
-      await api.deleteBookmark(bm.id);
-      bookmarks = bookmarks.filter((x) => x.id !== bm.id);
-      showToast('已删除书签');
-    } catch (e) {
-      bmErr = describeFailure(e, '删除书签');
-    } finally {
-      bmBusy = false;
-    }
   }
 
   // ---- 书内搜索：后端只检索已缓存正文，complete=false 要如实提示 ----
@@ -1033,17 +969,6 @@
     } finally {
       searchLoading = false;
     }
-  }
-
-  // 后端 created_at 是 SQLite UTC 的 "YYYY-MM-DD HH:MM:SS"，按本地时区展示
-  function bookmarkTime(s) {
-    const raw = String(s || '').trim();
-    if (!raw) return '';
-    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})$/.exec(raw);
-    const d = m ? new Date(`${m[1]}T${m[2]}Z`) : new Date(raw);
-    if (Number.isNaN(d.getTime())) return raw;
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
   // 片段来自正文原文，可能夹带 HTML；展示前只保留可读文本
@@ -1812,49 +1737,16 @@
     </div>
   {/if}
 
-  {#if showBookmarks}
-    <div class="panel-mask" on:click|self={() => (showBookmarks = false)}>
-      <div class="panel bm-panel" role="dialog" aria-label="书签">
-        <div class="panel-head">
-          <strong>书签（{bookmarks.length}）</strong>
-          <button class="rd-btn" on:click={() => (showBookmarks = false)}>关闭</button>
-        </div>
-        <div class="bm-tools">
-          <button class="rd-btn solid" on:click={addBookmark} disabled={bmBusy || currentPos < 0}>加当前页书签</button>
-          <button class="rd-btn" on:click={loadBookmarks} disabled={bmLoading}>刷新</button>
-        </div>
-        <input
-          class="bm-note"
-          maxlength="2000"
-          placeholder="备注（可选，最多 2000 字）"
-          aria-label="书签备注"
-          bind:value={bmNote}
-          on:keydown={(e) => e.key === 'Enter' && !bmBusy && addBookmark()}
-        />
-        <p class="rd-muted small-note">书签按账号保存；位置使用当前章节 + 0–1 的章内比例，和阅读进度同一套量纲。</p>
-        {#if bmErr}<p class="rd-error">{bmErr}</p>{/if}
-        {#if !bookmarks.length}
-          <p class="rd-muted">{bmLoading ? '读取书签…' : '还没有书签。翻到想标记的位置，点「加当前页书签」。'}</p>
-        {:else}
-          <div class="bm-list">
-            {#each bookmarks as bm (bm.id)}
-              <div class="bm-item" class:current={bm.chapter_index === currentPos}>
-                <button class="bm-main" on:click={() => gotoBookmark(bm)}>
-                  <strong>{bm.chapter_title || `第 ${Number(bm.chapter_index) + 1} 章`}</strong>
-                  <span class="rd-muted">
-                    第 {Number(bm.chapter_index) + 1} 章 · 章内 {Math.round(Number(bm.position) * 100)}%{#if bm.chapter_index === currentPos} · 当前章{/if}
-                  </span>
-                  <span class="rd-muted bm-time">{bookmarkTime(bm.created_at)}</span>
-                  {#if bm.note}<span class="bm-note-text">{bm.note}</span>{/if}
-                </button>
-                <button class="rd-btn" on:click={() => removeBookmark(bm)} disabled={bmBusy}>删除</button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    </div>
-  {/if}
+  <ReaderBookmarks
+    bookUrl={book.bookUrl}
+    bind:show={showBookmarks}
+    currentPos={currentPos}
+    chapterTitle={chapters[currentPos]?.title || ''}
+    hasContent={!!current}
+    getRatio={() => currentRatio()}
+    on:goto={(e) => gotoBookmark(e.detail)}
+    on:toast={(e) => showToast(e.detail)}
+  />
 
   {#if showSearch}
     <div class="panel-mask" on:click|self={() => (showSearch = false)}>
@@ -2494,25 +2386,6 @@
   }
 
   .row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-  .bm-tools { display: flex; gap: 8px; margin-bottom: 4px; }
-  .bm-note {
-    width: 100%; margin: 6px 0 2px;
-    background: transparent; color: var(--rd-fg);
-    border: 1px solid var(--rd-border); border-radius: 8px; padding: 8px 10px; font-size: 13px;
-  }
-  .bm-note-text { font-size: 12px; color: var(--rd-fg); white-space: pre-wrap; word-break: break-word; }
-  .bm-list { display: flex; flex-direction: column; gap: 6px; max-height: 52vh; overflow-y: auto; }
-  .bm-item { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--rd-border); padding-top: 8px; }
-  .bm-main {
-    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;
-    text-align: left; background: transparent; color: var(--rd-fg);
-    border: none; padding: 4px 0;
-  }
-  .bm-main strong { font-size: 14px; }
-  .bm-main span { font-size: 12px; }
-  .bm-main .bm-time { font-size: 11px; }
-  .bm-item.current .bm-main { border-left: 3px solid var(--rd-accent); padding-left: 8px; }
-  .bm-item.current .bm-main strong { font-weight: 700; }
   .search-box { display: flex; gap: 8px; margin-bottom: 4px; }
   .search-box input {
     flex: 1; min-width: 0; background: transparent; color: var(--rd-fg);
