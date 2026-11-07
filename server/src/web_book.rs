@@ -2,7 +2,10 @@
 //! 输入 HTML/JSON + 书源规则 -> 输出结构化书籍数据（纯函数管线）。
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde_json::Value;
 use url::Url;
@@ -13,6 +16,44 @@ use crate::entities::{
 };
 use crate::req;
 use crate::rule_engine::{AnalyzeRule, BookMeta};
+
+/// 抓取可注入点：生产走 [`ReqFetcher`]，路由冒烟测试可换成 fixture 实现，
+/// 从而在不起网络服务的前提下覆盖 toc/content。
+pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>>;
+
+pub trait Fetcher: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        method: &'a str,
+        headers: &'a HashMap<String, String>,
+        body: Option<&'a str>,
+        source_key: &'a str,
+        timeout: Option<Duration>,
+        limit: req::SourceLimit,
+    ) -> FetchFuture<'a>;
+}
+
+pub struct ReqFetcher;
+
+impl Fetcher for ReqFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        method: &'a str,
+        headers: &'a HashMap<String, String>,
+        body: Option<&'a str>,
+        source_key: &'a str,
+        timeout: Option<Duration>,
+        limit: req::SourceLimit,
+    ) -> FetchFuture<'a> {
+        Box::pin(async move {
+            req::fetch_for_source_limited(url, method, headers, body, source_key, timeout, limit)
+                .await
+        })
+    }
+}
 
 /// 判断书源是否为 JSON 型（规则以 $. 开头或 url 含 json）
 fn is_json_source(source: &BookSource) -> bool {

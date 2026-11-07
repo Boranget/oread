@@ -6,7 +6,7 @@ pub async fn chapter_content(
     source: &BookSource,
     chapter: &BookChapter,
 ) -> anyhow::Result<BookContent> {
-    chapter_content_book(source, chapter, None).await
+    chapter_content_book(&ReqFetcher, source, chapter, None).await
 }
 
 /// 正文规则以 `@textNodes` 结尾时，生成等价的 `@html` 回退规则。
@@ -22,6 +22,7 @@ pub(super) fn content_text_fallback(rule: &str) -> Option<String> {
 
 /// 带 book 作用域的正文（正文规则里的 `@get` 变量按同书预载）。
 pub async fn chapter_content_book(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     chapter: &BookChapter,
     store: Option<&BookStore>,
@@ -30,7 +31,7 @@ pub async fn chapter_content_book(
         Some(r) => r,
         None => return Ok(BookContent::default()),
     };
-    let pages = fetch_html_pages(source, chapter, rule).await?;
+    let pages = fetch_html_pages(fetcher, source, chapter, rule).await?;
     let book_url = chapter.book_url.clone().unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     for (page_url, html) in &pages {

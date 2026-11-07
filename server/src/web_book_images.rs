@@ -252,11 +252,12 @@ pub async fn chapter_images(
     source: &BookSource,
     chapter: &BookChapter,
 ) -> anyhow::Result<ChapterImages> {
-    chapter_images_book(source, chapter, None).await
+    chapter_images_book(&ReqFetcher, source, chapter, None).await
 }
 
 /// 带 book 作用域的图片章节（正文规则里的变量/cache 按同书预载）。
 pub async fn chapter_images_book(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     chapter: &BookChapter,
     store: Option<&BookStore>,
@@ -270,7 +271,7 @@ pub async fn chapter_images_book(
     if content_rule.is_empty() {
         return Ok(ChapterImages::default());
     }
-    let pages = fetch_html_pages(source, chapter, rule).await?;
+    let pages = fetch_html_pages(fetcher, source, chapter, rule).await?;
     let book_url = chapter.book_url.clone().unwrap_or_default();
     let mut per_page: Vec<(String, Vec<RawImage>)> = Vec::new();
     for (page_url, html) in &pages {

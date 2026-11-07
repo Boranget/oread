@@ -33,22 +33,24 @@ pub(super) fn make_ar_book(
 
 /// `java.refreshTocUrl()` 的同步等价：重抓详情页并按 `toc_url` 规则重算目录地址。
 pub(super) async fn refresh_toc_url_from_info(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     store: Option<&BookStore>,
     book_url: &str,
 ) -> Option<String> {
     let info = source.rule_book_info.as_ref()?;
     let headers = req::source_headers(source, book_url);
-    let html = match req::fetch_for_source_limited(
-        book_url,
-        "GET",
-        &headers,
-        None,
-        &source.book_source_url,
-        req::source_timeout(source),
-        req::source_limit(source),
-    )
-    .await
+    let html = match fetcher
+        .fetch(
+            book_url,
+            "GET",
+            &headers,
+            None,
+            &source.book_source_url,
+            req::source_timeout(source),
+            req::source_limit(source),
+        )
+        .await
     {
         Ok(v) => v,
         Err(e) => {

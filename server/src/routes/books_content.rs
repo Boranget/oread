@@ -42,7 +42,13 @@ pub(super) async fn content(
             };
             let mut c = if source.book_source_type == 2 {
                 // 漫画源：只抽图片列表，content 置空以保持字段类型不变
-                let imgs = web_book::chapter_images_book(&source, &chapter, store.as_ref()).await?;
+                let imgs = web_book::chapter_images_book(
+                    s.fetcher.as_ref(),
+                    &source,
+                    &chapter,
+                    store.as_ref(),
+                )
+                .await?;
                 BookContent {
                     book_url: chapter.book_url.clone().unwrap_or_default(),
                     url: chapter.url.clone(),
@@ -54,7 +60,13 @@ pub(super) async fn content(
                     ..Default::default()
                 }
             } else {
-                web_book::chapter_content_book(&source, &chapter, store.as_ref()).await?
+                web_book::chapter_content_book(
+                    s.fetcher.as_ref(),
+                    &source,
+                    &chapter,
+                    store.as_ref(),
+                )
+                .await?
             };
             c.origin = source.book_source_url.clone();
             if let Some(st) = &store {

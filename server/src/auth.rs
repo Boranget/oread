@@ -554,6 +554,7 @@ mod tests {
             shared: pool,
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
+            fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
         }
     }
 

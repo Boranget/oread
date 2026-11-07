@@ -467,6 +467,98 @@ async fn kindle_redirects_to_login_without_session() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 目录/正文冒烟用的固定抓取实现：不联网，按 URL 返回 fixture HTML。
+struct MockFetcher;
+
+impl boranlib::web_book::Fetcher for MockFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+        _method: &'a str,
+        _headers: &'a std::collections::HashMap<String, String>,
+        _body: Option<&'a str>,
+        _source_key: &'a str,
+        _timeout: Option<std::time::Duration>,
+        _limit: boranlib::req::SourceLimit,
+    ) -> boranlib::web_book::FetchFuture<'a> {
+        Box::pin(async move {
+            let html = match url {
+                "https://mock.example/book/1" => {
+                    "<html><body><ul>\
+                     <li class=\"c\"><a href=\"/c1\">第一章</a></li>\
+                     <li class=\"c\"><a href=\"/c2\">第二章</a></li>\
+                     </ul></body></html>"
+                }
+                "https://mock.example/c1" => {
+                    "<html><body><div id=\"content\"><p>正文一</p><p>正文二</p></div></body></html>"
+                }
+                other => anyhow::bail!("unexpected url: {other}"),
+            };
+            Ok(html.to_string())
+        })
+    }
+}
+
+#[tokio::test]
+async fn toc_and_content_routes_with_injected_fetcher() {
+    let dir = temp_dir("toc-content");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let app =
+        routes::build_router_with_fetcher(shared.clone(), cfg, std::sync::Arc::new(MockFetcher));
+    let token = register_admin(&app, &shared, "erin").await;
+
+    let source = r#"{
+        "book_source_url":"https://mock.example",
+        "book_source_name":"Mock",
+        "rule_toc":{
+            "chapter_list":"class.c",
+            "chapter_name":"tag.a@text",
+            "chapter_url":"tag.a@href"
+        },
+        "rule_content":{"content":"id.content@html"}
+    }"#;
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/sources", source, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "导入书源");
+
+    let toc_uri = "/api/book/toc?source=https%3A%2F%2Fmock.example\
+        &book_url=https%3A%2F%2Fmock.example%2Fbook%2F1&use_replace=0";
+    let resp = app
+        .clone()
+        .oneshot(authed_get(toc_uri, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "目录路由");
+    let toc = body_json(resp).await;
+    let chapters = toc.as_array().expect("目录为数组");
+    assert_eq!(chapters.len(), 2, "fixture 两章: {toc}");
+    assert_eq!(chapters[0]["title"], "第一章");
+    assert_eq!(chapters[0]["url"], "https://mock.example/c1");
+    assert_eq!(chapters[1]["url"], "https://mock.example/c2");
+
+    let content_uri = "/api/book/content?source=https%3A%2F%2Fmock.example\
+        &chapter_url=https%3A%2F%2Fmock.example%2Fc1\
+        &book_url=https%3A%2F%2Fmock.example%2Fbook%2F1&use_replace=0";
+    let resp = app
+        .clone()
+        .oneshot(authed_get(content_uri, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "正文路由");
+    let content = body_json(resp).await;
+    let text = content["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("正文一"),
+        "正文应包含 fixture 内容: {content}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 async fn response_text(resp: Response) -> String {
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)

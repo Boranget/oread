@@ -1333,6 +1333,7 @@ async fn search_result_rejects_other_users_job() {
             shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
+            fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
         })
     };
     let q = |job_id: &str| {

@@ -123,6 +123,7 @@ fn probe_summary_rejects_non_admin() {
             user_pools: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::routes::UserPoolCache::default(),
             )),
+            fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
         };
         let user = AuthUser {
             id: 2,

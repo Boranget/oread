@@ -4,11 +4,12 @@ use super::*;
 
 // ---------------- 书籍详情 ----------------
 pub async fn book_info(source: &BookSource, book: &mut Book) -> anyhow::Result<()> {
-    book_info_book(source, book, None).await
+    book_info_book(&ReqFetcher, source, book, None).await
 }
 
 /// 带 book 作用域的详情：预载同书变量（如搜索阶段写入的 `bid`），结束后回写。
 pub async fn book_info_book(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     book: &mut Book,
     store: Option<&BookStore>,
@@ -19,16 +20,17 @@ pub async fn book_info_book(
     }
     let url = book.book_url.clone();
     let headers = req::source_headers(source, &url);
-    let html = req::fetch_for_source_limited(
-        &url,
-        "GET",
-        &headers,
-        None,
-        &source.book_source_url,
-        req::source_timeout(source),
-        req::source_limit(source),
-    )
-    .await?;
+    let html = fetcher
+        .fetch(
+            &url,
+            "GET",
+            &headers,
+            None,
+            &source.book_source_url,
+            req::source_timeout(source),
+            req::source_limit(source),
+        )
+        .await?;
     parse_book_info_html(source, book, &html, store)
 }
 

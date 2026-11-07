@@ -77,7 +77,7 @@ pub(super) async fn book_info(
     }
     let key = web_book::book_key(&source, &book.book_url);
     let store = book_store_for(&db.0, &key).await;
-    web_book::book_info_book(&source, &mut book, Some(&store)).await?;
+    web_book::book_info_book(s.fetcher.as_ref(), &source, &mut book, Some(&store)).await?;
     persist_book_changes(&db.0, store.take_changes()).await;
     save_book_meta(&db.0, &book).await?;
     Ok(Json(book))
@@ -111,7 +111,8 @@ pub(super) async fn toc(
         }
         let key = web_book::book_key(&source, &book.book_url);
         let store = book_store_for(&db.0, &key).await;
-        let chapters = web_book::chapter_list_book(&source, &book, Some(&store)).await?;
+        let chapters =
+            web_book::chapter_list_book(s.fetcher.as_ref(), &source, &book, Some(&store)).await?;
         persist_book_changes(&db.0, store.take_changes()).await;
         save_chapters(&db.0, &q.book_url, &chapters).await?;
         // 目录落库时同步总章节数，供进度百分比与书架完成度使用

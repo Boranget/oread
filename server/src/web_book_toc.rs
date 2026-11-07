@@ -4,12 +4,13 @@ use super::*;
 
 // ---------------- 目录 ----------------
 pub async fn chapter_list(source: &BookSource, book: &Book) -> anyhow::Result<Vec<BookChapter>> {
-    chapter_list_book(source, book, None).await
+    chapter_list_book(&ReqFetcher, source, book, None).await
 }
 
 /// 带 book 作用域的目录：预载同书变量与 cache（快看目录要从 info 阶段缓存的
 /// `kkmh` 里 `java.setContent` 解析章节；爱看要用搜索阶段写的 `bid`）。
 pub async fn chapter_list_book(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     book: &Book,
     store: Option<&BookStore>,
@@ -47,7 +48,8 @@ pub async fn chapter_list_book(
             } else {
                 refreshed_book_url
             };
-            if let Some(new_toc) = refresh_toc_url_from_info(source, store, &target).await {
+            if let Some(new_toc) = refresh_toc_url_from_info(fetcher, source, store, &target).await
+            {
                 url = new_toc.replace("{{page}}", "1").replace("${page}", "1");
             }
         }
@@ -64,16 +66,17 @@ pub async fn chapter_list_book(
         seen.insert(url.clone());
         // 让规则里的 `${page}` / `{{page}}` 拿到当前页号
         ar.set_var("page", page.to_string());
-        let html = req::fetch_for_source_limited(
-            &url,
-            "GET",
-            &headers,
-            None,
-            &source.book_source_url,
-            req::source_timeout(source),
-            req::source_limit(source),
-        )
-        .await?;
+        let html = fetcher
+            .fetch(
+                &url,
+                "GET",
+                &headers,
+                None,
+                &source.book_source_url,
+                req::source_timeout(source),
+                req::source_limit(source),
+            )
+            .await?;
         let rule_text = rule.chapter_list.as_deref().unwrap_or("");
         // Legado 目录规则前缀：`-` 表示倒序（如 `-class.list@tag.li`），`+` 表示保持原序
         // （`+@js:…` 的「正序」标记，见 WebBookChapterList 对 chapterList 的前缀剥离）；
@@ -175,6 +178,7 @@ pub async fn chapter_list_book(
 /// 抓取正文所有分页：返回 `(当前页 URL, 原始 HTML)`。
 /// 正文与图片章节共用同一套 nextContentUrl 多页逻辑，规则各自只应用一次。
 pub(super) async fn fetch_html_pages(
+    fetcher: &dyn Fetcher,
     source: &BookSource,
     chapter: &BookChapter,
     rule: &ContentRule,
@@ -190,16 +194,17 @@ pub(super) async fn fetch_html_pages(
         }
         guard += 1;
         seen.insert(url.clone());
-        let html = req::fetch_for_source_limited(
-            &url,
-            "GET",
-            &headers,
-            None,
-            &source.book_source_url,
-            req::source_timeout(source),
-            req::source_limit(source),
-        )
-        .await?;
+        let html = fetcher
+            .fetch(
+                &url,
+                "GET",
+                &headers,
+                None,
+                &source.book_source_url,
+                req::source_timeout(source),
+                req::source_limit(source),
+            )
+            .await?;
         let ar = make_ar(source);
         let next = eval_field(
             source,
