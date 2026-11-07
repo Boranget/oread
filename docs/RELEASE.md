@@ -2,11 +2,11 @@
 
 ## 版本号
 
-- **发布版本以 git tag `v*` 为准**（CI 用 `github.ref_name` 生成 Release 标题）。
-- `server/Cargo.toml` 与 `server/web/package.json` 目前都是内部版本 `0.1.0`，与 tag 不一致；这一点**尚未拍板**：
-  - 方案 A（当前事实）：tag 即发布版本，Cargo/npm 版本只作内部标识，不对外暴露；
-  - 方案 B：每次发版把 `Cargo.toml` / `package.json` 改成与 tag 相同，并在构建时注入版本号。
-  未拍板前不要单方面改版本号，避免 CI 产物与 tag 语义漂移。
+- **版本号单源**：git tag `vX.Y.Z`（CI 用 `github.ref_name` 生成 Release 标题）与
+  `server/Cargo.toml`、`server/Cargo.lock`（`boranlib` 自身条目）、
+  `server/web/package.json`、`server/web/package-lock.json` 的 `version` 必须一致。
+  自 `v1.0.0` 起执行；发版前先对齐再 build，避免 CI 产物与 tag 语义漂移。
+- 发布版本以 tag 为准，Cargo/npm 版本随 tag 同步改动（不再保留内部 `0.1.0`）。
 - 工具链由根目录 `rust-toolchain.toml` 固定；CI 与本地 release 构建都带 `--locked`。
 
 ## 发版清单
