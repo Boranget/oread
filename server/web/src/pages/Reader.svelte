@@ -3,6 +3,7 @@
   import { api, describeFailure } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
   import ReaderBookmarks from '../lib/ReaderBookmarks.svelte';
+  import ReaderJump from '../lib/ReaderJump.svelte';
   import ReaderSearch from '../lib/ReaderSearch.svelte';
   import ReaderSwitch from '../lib/ReaderSwitch.svelte';
   import ReaderToc from '../lib/ReaderToc.svelte';
@@ -87,10 +88,6 @@
 
   // 跳转定位（章节 + 章内比例/页码 + 段落）
   let showJump = false;
-  let jumpChapter = 1;
-  let jumpPct = 0;
-  let jumpPage = 1;
-  let jumpPara = '';
   let readMode = MODES.includes(localStorage.getItem('oread_read_mode'))
     ? localStorage.getItem('oread_read_mode')
     : 'scroll';
@@ -744,44 +741,9 @@
     showBookmarks = false;
     showSearch = false;
     showJump = true;
-    jumpChapter = currentPos + 1;
-    jumpPct = Math.round(currentRatio() * 100);
-    jumpPage = pageIndex + 1;
-    jumpPara = '';
   }
 
-  // 换到另一章时回到章首（比例/页码清零），避免“跳到第 3 章”却落在中间的 8%
-  function onJumpChapter(v) {
-    jumpChapter = v;
-    const idx = clamp(Math.round(num(v, currentPos + 1)) - 1, 0, Math.max(0, chapters.length - 1));
-    if (idx !== currentPos) {
-      jumpPct = 0;
-      jumpPage = 1;
-    }
-  }
-
-  // 翻页模式下“比例”和“页码”是同一位置的两种写法，改动任意一个同步另一个，
-  // 避免用户拖了比例却被旧的页码覆盖。
-  function syncJumpPage() {
-    if (!isPaged || pageCount < 2) return;
-    jumpPage = clamp(Math.round(1 + clamp01(num(jumpPct, 0) / 100) * (pageCount - 1)), 1, pageCount);
-  }
-
-  function syncJumpPct() {
-    if (!isPaged || pageCount < 2) return;
-    const p = clamp(Math.round(num(jumpPage, 1)), 1, pageCount);
-    jumpPct = Math.round(((p - 1) / (pageCount - 1)) * 100);
-  }
-
-  async function doJump() {
-    const idx = clamp(Math.round(num(jumpChapter, currentPos + 1)) - 1, 0, Math.max(0, chapters.length - 1));
-    let ratio = clamp01(num(jumpPct, 0) / 100);
-    // 翻页模式下按页码折算成同一套 0..1 章内比例（同章才有页概念）
-    if (isPaged && idx === currentPos && pageCount > 1) {
-      ratio = (clamp(Math.round(num(jumpPage, pageIndex + 1)), 1, pageCount) - 1) / (pageCount - 1);
-    }
-    const para = Math.round(num(jumpPara, 0));
-    showJump = false;
+  async function gotoJump({ idx, ratio, para }) {
     if (idx !== currentPos) {
       await openChapter(idx, { ratio });
     } else {
@@ -1565,96 +1527,17 @@
     on:goto={(e) => gotoSearchHit(e.detail)}
   />
 
-  {#if showJump}
-    <div class="panel-mask" on:click|self={() => (showJump = false)}>
-      <div class="panel jump-panel" role="dialog" aria-label="跳转定位">
-        <div class="panel-head">
-          <strong>跳转定位</strong>
-          <button class="rd-btn" on:click={() => (showJump = false)}>关闭</button>
-        </div>
-
-        <div class="panel-row">
-          <span>章节</span>
-          <div class="stepper">
-            <input
-              class="jump-num"
-              type="number"
-              min="1"
-              max={chapters.length}
-              value={jumpChapter}
-              on:input={(e) => onJumpChapter(e.currentTarget.value)}
-              aria-label="章节序号"
-            />
-            <span class="val">/ {chapters.length}</span>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>章内位置</span>
-          <div class="slider-wrap">
-            <input
-              type="range"
-              min="0"
-              max="100"
-              step="1"
-              value={jumpPct}
-              on:input={(e) => {
-                jumpPct = Number(e.currentTarget.value);
-                syncJumpPage();
-              }}
-              aria-label="章内位置百分比"
-            />
-            <span class="val">{jumpPct}%</span>
-          </div>
-        </div>
-
-        {#if isPaged && (Number(jumpChapter) || 1) - 1 === currentPos}
-          <div class="panel-row">
-            <span>页码</span>
-            <div class="stepper">
-              <input
-                class="jump-num"
-                type="number"
-                min="1"
-                max={pageCount}
-                value={jumpPage}
-                on:input={(e) => {
-                  jumpPage = Number(e.currentTarget.value);
-                  syncJumpPct();
-                }}
-                aria-label="页码"
-              />
-              <span class="val">/ {pageCount}（本章）</span>
-            </div>
-          </div>
-        {/if}
-
-        <div class="panel-row">
-          <span>段落</span>
-          <div class="stepper">
-            <input
-              class="jump-num"
-              type="number"
-              min="1"
-              max={Math.max(1, paras.length)}
-              placeholder="可选"
-              bind:value={jumpPara}
-              aria-label="段落序号"
-            />
-            <span class="val">/ {paras.length}</span>
-          </div>
-        </div>
-
-        <p class="rd-muted small-note">
-          位置沿用 0–1 的章内比例（界面按百分比显示）；翻页模式在同一章内按页码折算。段落序号按目标章节的段落数。
-        </p>
-        <div class="jump-actions">
-          <button class="rd-btn solid" on:click={doJump}>跳转</button>
-          <button class="rd-btn" on:click={() => (showJump = false)}>取消</button>
-        </div>
-      </div>
-    </div>
-  {/if}
+  <ReaderJump
+    bind:show={showJump}
+    chapters={chapters}
+    currentPos={currentPos}
+    getRatio={() => currentRatio()}
+    pageIndex={pageIndex}
+    pageCount={pageCount}
+    isPaged={isPaged}
+    parasCount={paras.length}
+    on:jump={(e) => gotoJump(e.detail)}
+  />
 
   <ReaderSwitch
     bind:show={showSwitch}
@@ -2014,18 +1897,7 @@
   .seg.small button { background: transparent; color: var(--rd-fg); padding: 4px 10px; min-height: 30px; font-size: 12px; border-radius: 6px; }
   .seg.small button.on { background: var(--rd-accent); color: #fff; }
   .small-note { margin: 10px 0 0; font-size: 12px; line-height: 1.6; }
-  .err-actions, .jump-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
-  .jump-panel { max-height: 80vh; overflow-y: auto; }
-  .jump-num {
-    width: 76px;
-    padding: 6px 8px;
-    border: 1px solid var(--rd-border);
-    border-radius: 8px;
-    background: var(--rd-panel);
-    color: var(--rd-fg);
-    font-size: 14px;
-    font-variant-numeric: tabular-nums;
-  }
+  .err-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
 
   .row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 </style>
