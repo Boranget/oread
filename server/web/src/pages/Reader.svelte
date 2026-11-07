@@ -15,6 +15,10 @@
   import { htmlToParas, plainChars } from '../lib/readerHtml.js';
   import { createImageLoader } from '../lib/readerImages.js';
   import { createReadingStats } from '../lib/readerStats.js';
+  import { createAutoScroll } from '../lib/readerAuto.js';
+  import { createProgressTracker } from '../lib/readerProgress.js';
+  import { createGestures } from '../lib/readerGestures.js';
+  import { clamp, clamp01, clampPos, isReadable, num, sibling } from '../lib/readerMath.js';
   import { applyTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
@@ -31,11 +35,6 @@
   const dispatch = createEventDispatcher();
 
   const MODES = ['scroll', 'paged', 'fade'];
-
-  const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
-  const clamp01 = (v) => clamp(Number(v) || 0, 0, 1);
-  const num = (v, def) =>
-    v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? def : Number(v);
 
   let info = null;
   let chapters = [];
@@ -115,23 +114,12 @@
 
   let scrollEl = null;
 
-  let saveTimer = null;
-  // 进度上报节流：滚动/翻页最多每 30s 写一次后端；换章、离开页面时强制补发
-  const SAVE_INTERVAL = 30000;
-  let lastSaveAt = 0;
-  let snapTimer = null;
   let flipTimer = null;
-  let autoRaf = 0;
-  let autoTimer = null;
-  let autoLast = 0;
-  let autoAdvancing = false;
   let resizeTimer = null;
   let toastTimer = null;
   let reqId = 0;
   let suppressScroll = false;
   let restored = false;
-  let touchStart = null;
-  let suppressClickUntil = 0;
 
   // 阅读统计：本会话累计，定期增量上报
   let statsTimer = null;
@@ -144,7 +132,73 @@
     isVisible: () => document.visibilityState === 'visible',
   });
 
+  // 自动滚动 / 自动翻页
+  const auto = createAutoScroll({
+    isPaged: () => isPaged,
+    canStart: () => !!current && !contentLoading,
+    getScrollEl: () => scrollEl,
+    getNextPos: () => nextPos,
+    openChapter,
+    isLoading: () => contentLoading,
+    hasError: () => contentError,
+    setPage: (i) => setPage(i),
+    getPageIndex: () => pageIndex,
+    getPageCount: () => pageCount,
+    getSpeed: () => autoSpeed,
+    setOn: (v) => (autoOn = v),
+    onStart: () => (showPanel = false),
+    toast: showToast,
+  });
+
+  // 阅读进度：本地 0..1 章内比例 + 30s 节流上报
   const progressKey = (id) => `oread_progress:${id}`;
+  const progress = createProgressTracker({
+    setProgress: (payload, keepalive) => api.setProgress(payload, keepalive),
+    key: progressKey,
+    getScrollEl: () => scrollEl,
+    isPaged: () => isPaged,
+    getViewW: () => viewW,
+    getPageCount: () => pageCount,
+    setPageCount: (n) => (pageCount = n),
+    getPageIndex: () => pageIndex,
+    setPageIndex: (i) => (pageIndex = i),
+    getSuppress: () => suppressScroll,
+    setSuppress: (v) => (suppressScroll = v),
+    getPos: () => currentPos,
+    getBookUrl: () => book.bookUrl,
+    getChapterCount: () => chapters.length,
+    getRestored: () => restored,
+  });
+
+  // 手势：点击分区翻页/显隐控制栏、上下滑切章、滚轮与键盘
+  const gestures = createGestures({
+    getScrollEl: () => scrollEl,
+    isPaged: () => isPaged,
+    isBlocked: () =>
+      !current || contentLoading || showToc || showPanel || showBookmarks || showSearch || showJump,
+    panelsOpen: () => showToc || showPanel || showBookmarks || showSearch || showJump,
+    prevPage,
+    nextPage,
+    toggleControls,
+    toggleToc,
+    openChapter,
+    toggleAuto: auto.toggle,
+    stopAuto: () => {
+      if (autoOn) auto.stop();
+    },
+    getPrevPos: () => prevPos,
+    getNextPos: () => nextPos,
+    isExportOpen: () => showExport,
+    onEscape: () => {
+      if (showExport) showExport = false;
+      else if (showSwitch) showSwitch = false;
+      else if (showSearch) showSearch = false;
+      else if (showBookmarks) showBookmarks = false;
+      else if (showJump) showJump = false;
+      else if (showPanel) showPanel = false;
+      else if (showToc) showToc = false;
+    },
+  });
 
   onMount(() => {
     try {
@@ -157,50 +211,40 @@
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('beforeunload', onPageHide);
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('keydown', onKeydown);
+    window.addEventListener('keydown', gestures.onKeydown);
     window.addEventListener('resize', onResize);
     window.addEventListener('orientationchange', onResize);
     return () => {
       window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('beforeunload', onPageHide);
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('keydown', gestures.onKeydown);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onResize);
     };
   });
 
   onDestroy(() => {
-    clearTimeout(saveTimer);
-    clearTimeout(snapTimer);
     clearTimeout(flipTimer);
-    clearTimeout(autoTimer);
     clearTimeout(resizeTimer);
     clearTimeout(toastTimer);
     clearInterval(statsTimer);
     stats.flush(true);
-    cancelAnimationFrame(autoRaf);
+    auto.dispose();
+    progress.dispose();
     imageLoader.dispose();
   });
 
   function onPageHide() {
     // 页面不可见/卸载：强制补发一次（fetch keepalive 可在卸载过程中完成）
-    flushSave(true);
+    progress.flushSave(true);
     stats.flush(true);
   }
 
   function onVisibility() {
     if (document.visibilityState === 'hidden') {
-      flushSave(true);
+      progress.flushSave(true);
       stats.flush(true);
-    }
-  }
-
-  function readLocalProgress() {
-    try {
-      return JSON.parse(localStorage.getItem(progressKey(book.bookUrl)) || 'null');
-    } catch {
-      return null;
     }
   }
 
@@ -218,12 +262,12 @@
       // 页宽/字体族：服务端优先；首次读取时把旧本机值迁移到账号（服务端仍为默认值才写）
       const layout = await syncLayoutSettings(s);
       if (layout.width !== width || layout.fontFamily !== fontFamily) {
-        const keep = restored ? currentRatio() : 0;
+        const keep = restored ? progress.currentRatio() : 0;
         width = layout.width;
         fontFamily = layout.fontFamily;
         if (restored) {
           await measurePages();
-          applyRatio(keep);
+          progress.applyRatio(keep);
         }
       }
     } catch {
@@ -253,7 +297,7 @@
       }
     }
     if (currentPos >= 0) {
-      const ratio = currentRatio();
+      const ratio = progress.currentRatio();
       await openChapter(currentPos, { ratio });
     }
   }
@@ -292,14 +336,14 @@
       try {
         prog = await api.progress(book.bookUrl);
       } catch {
-        prog = readLocalProgress();
+        prog = progress.readLocal();
       }
       if (!prog || (prog.chapter_index === 0 && prog.position === 0)) {
-        prog = readLocalProgress() || prog || { chapter_index: 0, position: 0 };
+        prog = progress.readLocal() || prog || { chapter_index: 0, position: 0 };
       }
       // position 约定为 0..1 的章内比例；若来自其他客户端的字符偏移则从章首开始
       const ratio = prog.position > 0 && prog.position <= 1 ? prog.position : 0;
-      const start = clampPos(prog.chapter_index || 0);
+      const start = clampPos(prog.chapter_index || 0, chapters.length);
       // 先渲染阅读容器，再加载正文：分页模式必须先有容器宽度/高度才能测量列数
       tocLoading = false;
       await tick();
@@ -311,26 +355,8 @@
     }
   }
 
-  function clampPos(i) {
-    return Math.min(Math.max(0, i), Math.max(0, chapters.length - 1));
-  }
-
-  function isReadable(i) {
-    return i >= 0 && i < chapters.length && !chapters[i].is_volume;
-  }
-
-  // 跳过卷标题，找上一/下一可读章节
-  function sibling(pos, dir) {
-    let i = pos + dir;
-    while (i >= 0 && i < chapters.length) {
-      if (!chapters[i].is_volume) return i;
-      i += dir;
-    }
-    return -1;
-  }
-
-  $: prevPos = sibling(currentPos, -1);
-  $: nextPos = sibling(currentPos, 1);
+  $: prevPos = sibling(currentPos, -1, chapters);
+  $: nextPos = sibling(currentPos, 1, chapters);
   // 后端 content 可能是 HTML 片段（含 <p>/<br>/<img>）：保留图片，文本按段落切开
   $: paras = current && current.content
     ? htmlToParas(
@@ -394,7 +420,7 @@
   }
 
   async function openChapter(pos, opts = {}) {
-    if (!isReadable(pos)) {
+    if (!isReadable(pos, chapters)) {
       if (pos < 0) return;
       // 点到分卷标题：自动进入它后面的第一段正文
       let i = pos;
@@ -438,9 +464,9 @@
       stats.addChapter(pos, plainChars(data && data.content));
       await tick();
       await measurePages();
-      applyRatio(opts.ratio || 0);
+      progress.applyRatio(opts.ratio || 0);
       restored = true;
-      if (!opts.initial) saveProgressNow(opts.ratio || 0);
+      if (!opts.initial) progress.saveNow(opts.ratio || 0);
     } catch (e) {
       if (myReq !== reqId) return;
       contentError = describeFailure(e, '加载正文');
@@ -449,111 +475,7 @@
   }
 
   function retryChapter() {
-    if (currentPos >= 0) openChapter(currentPos, { ratio: currentRatio() });
-  }
-
-  // 把 0..1 的阅读比例还原到当前模式（滚动用 scrollTop，分页用 scrollLeft）
-  function applyRatio(r) {
-    if (!scrollEl) return;
-    const ratio = clamp01(r);
-    suppressScroll = true;
-    if (isPaged) {
-      const max = Math.max(0, scrollEl.scrollWidth - scrollEl.clientWidth);
-      scrollEl.scrollLeft = ratio * max;
-    } else {
-      const max = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
-      scrollEl.scrollTop = ratio * max;
-    }
-    // 图片等异步布局可能改变高度/列数，稍后再校正一次
-    setTimeout(() => {
-      if (!scrollEl) return;
-      if (isPaged) {
-        const w = Math.max(1, viewW);
-        pageCount = Math.max(1, Math.round(scrollEl.scrollWidth / w));
-        const idx = clamp(Math.round(scrollEl.scrollLeft / w), 0, pageCount - 1);
-        scrollEl.scrollLeft = idx * w;
-        pageIndex = idx;
-      } else {
-        const max = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
-        scrollEl.scrollTop = ratio * max;
-      }
-      suppressScroll = false;
-    }, 240);
-  }
-
-  function currentRatio() {
-    if (!scrollEl) return 0;
-    if (isPaged) {
-      const max = scrollEl.scrollWidth - scrollEl.clientWidth;
-      return max > 0 ? clamp01(scrollEl.scrollLeft / max) : 0;
-    }
-    const max = scrollEl.scrollHeight - scrollEl.clientHeight;
-    return max > 0 ? clamp01(scrollEl.scrollTop / max) : 0;
-  }
-
-  function recordRatio(ratio) {
-    if (currentPos < 0) return;
-    try {
-      localStorage.setItem(
-        progressKey(book.bookUrl),
-        JSON.stringify({ chapter_index: currentPos, position: ratio, at: Date.now() })
-      );
-    } catch {
-      /* 本地存储不可用时忽略 */
-    }
-    const pos = currentPos;
-    // 滚动过程中只更新本地与内存；满 30s 才写一次后端，避免每页一个 POST
-    if (Date.now() - lastSaveAt >= SAVE_INTERVAL) persist(pos, ratio);
-  }
-
-  function onScroll() {
-    if (currentPos < 0) return;
-    if (isPaged && viewW > 0) {
-      pageIndex = clamp(Math.round(scrollEl.scrollLeft / viewW), 0, pageCount - 1);
-    }
-    if (suppressScroll) return;
-    recordRatio(currentRatio());
-    if (isPaged) {
-      clearTimeout(snapTimer);
-      snapTimer = setTimeout(snapToPage, 160);
-    }
-  }
-
-  // 触摸横滑后吸附到整页
-  function snapToPage() {
-    if (!isPaged || suppressScroll || !scrollEl) return;
-    const w = Math.max(1, viewW);
-    const target = clamp(Math.round(scrollEl.scrollLeft / w), 0, pageCount - 1);
-    const left = target * w;
-    pageIndex = target;
-    if (Math.abs(scrollEl.scrollLeft - left) > 1) {
-      scrollEl.scrollTo({ left, behavior: 'smooth' });
-    }
-  }
-
-  function flushSave(keepalive = false) {
-    clearTimeout(saveTimer);
-    if (currentPos >= 0 && restored) persist(currentPos, currentRatio(), keepalive);
-  }
-
-  function saveProgressNow(ratio) {
-    persist(currentPos, ratio);
-  }
-
-  function persist(pos, ratio, keepalive = false) {
-    if (pos < 0) return;
-    lastSaveAt = Date.now();
-    api
-      .setProgress(
-        {
-          book_id: book.bookUrl,
-          chapter_index: pos,
-          position: clamp01(ratio),
-          total_chapters: chapters.length,
-        },
-        keepalive
-      )
-      .catch(() => {});
+    if (currentPos >= 0) openChapter(currentPos, { ratio: progress.currentRatio() });
   }
 
   function chooseChapter(pos) {
@@ -588,8 +510,8 @@
     if (idx !== currentPos) {
       await openChapter(idx, { ratio });
     } else {
-      applyRatio(ratio);
-      saveProgressNow(ratio);
+      progress.applyRatio(ratio);
+      progress.saveNow(ratio);
     }
     if (para > 0) {
       // applyRatio 会在 240ms 后做一次布局校正，等它落定再按段精确定位
@@ -620,7 +542,7 @@
     setTimeout(() => {
       suppressScroll = false;
       measurePages();
-      persist(currentPos, currentRatio());
+      progress.saveNow(progress.currentRatio());
     }, 260);
   }
 
@@ -649,8 +571,8 @@
     showBookmarks = false;
     if (idx === currentPos && current) {
       // 同章直接复用已有比例定位，不重新请求正文
-      applyRatio(ratio);
-      saveProgressNow(ratio);
+      progress.applyRatio(ratio);
+      progress.saveNow(ratio);
       showToast('已跳到书签位置');
       return;
     }
@@ -682,13 +604,13 @@
   // ---- 模式切换：保持当前阅读比例 ----
   async function changeMode(m, persist = true) {
     if (!MODES.includes(m) || m === readMode) return;
-    const keep = restored ? currentRatio() : 0;
-    stopAuto();
+    const keep = restored ? progress.currentRatio() : 0;
+    auto.stop();
     readMode = m;
     localStorage.setItem('oread_read_mode', m);
     if (persist) queueSettingsSave();
     await measurePages();
-    applyRatio(keep);
+    progress.applyRatio(keep);
   }
 
   function triggerFlip(dir) {
@@ -711,9 +633,9 @@
     suppressScroll = true;
 
     scrollEl.scrollTo({ left: target * viewW, behavior: smooth ? 'smooth' : 'auto' });
-    recordRatio(ratio);
+    progress.recordRatio(ratio);
     if (isFade) triggerFlip(dir);
-    clearTimeout(snapTimer);
+    progress.cancelSnap();
     setTimeout(() => {
       suppressScroll = false;
       if (scrollEl) pageIndex = clamp(Math.round(scrollEl.scrollLeft / Math.max(1, viewW)), 0, pageCount - 1);
@@ -721,7 +643,7 @@
   }
 
   function prevPage() {
-    if (autoOn) stopAuto();
+    if (autoOn) auto.stop();
     if (!scrollEl || contentLoading) return;
     if (isPaged) {
       if (pageIndex > 0) setPage(pageIndex - 1);
@@ -738,7 +660,7 @@
   }
 
   function nextPage() {
-    if (autoOn) stopAuto();
+    if (autoOn) auto.stop();
     if (!scrollEl || contentLoading) return;
     if (isPaged) {
       if (pageIndex < pageCount - 1) setPage(pageIndex + 1);
@@ -756,73 +678,19 @@
   }
 
   async function toggleControls() {
-    const keep = currentRatio();
+    const keep = progress.currentRatio();
     controlsVisible = !controlsVisible;
     await tick();
     await measurePages();
-    applyRatio(keep);
-  }
-
-  // ---- 手势：左右 1/3 翻页，中间显隐控制栏；上下滑到边界快速切章 ----
-  function onReaderClick(e) {
-    if (Date.now() < suppressClickUntil) return;
-    if (!current || contentLoading || showToc || showPanel || showBookmarks || showSearch || showJump) return;
-    if (e.target.closest('button,a,input,select,textarea,label')) return;
-    const sel = window.getSelection ? String(window.getSelection()).trim() : '';
-    if (sel) return; // 长按选中文本时不触发翻页
-    const el = scrollEl;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    if (x < r.width / 3) prevPage();
-    else if (x > (r.width * 2) / 3) nextPage();
-    else toggleControls();
-  }
-
-  function onReaderTouchStart(e) {
-    if (!e.touches || !e.touches.length) return;
-    const t = e.touches[0];
-    touchStart = {
-      x: t.clientX,
-      y: t.clientY,
-      at: Date.now(),
-      top: scrollEl ? scrollEl.scrollTop : 0,
-    };
-    if (autoOn) stopAuto();
-  }
-
-  function onReaderTouchEnd(e) {
-    const s = touchStart;
-    touchStart = null;
-    if (!s || !e.changedTouches || !e.changedTouches.length) return;
-    const t = e.changedTouches[0];
-    const dx = t.clientX - s.x;
-    const dy = t.clientY - s.y;
-    const dt = Date.now() - s.at;
-    // 有明显位移时抑制随后的 click，避免横滑/纵滑结束后误触翻页
-    if (Math.abs(dx) > 24 || Math.abs(dy) > 24) suppressClickUntil = Date.now() + 400;
-    // 长按 / 小幅滑动 / 以横滑为主时不切章，避免误触与选择文本冲突
-    if (dt > 600 || Math.abs(dy) < 100 || Math.abs(dy) <= Math.abs(dx) * 1.3) return;
-    if (window.getSelection && String(window.getSelection()).trim()) return;
-    suppressClickUntil = Date.now() + 400;
-    if (isPaged) {
-      if (dy < 0 && nextPos >= 0) openChapter(nextPos, { ratio: 0 });
-      else if (dy > 0 && prevPos >= 0) openChapter(prevPos, { ratio: 0.999 });
-      return;
-    }
-    const el = scrollEl;
-    if (!el) return;
-    const max = el.scrollHeight - el.clientHeight;
-    if (dy > 0 && s.top <= 4 && prevPos >= 0) openChapter(prevPos, { ratio: 0.999 });
-    else if (dy < 0 && s.top >= max - 4 && nextPos >= 0) openChapter(nextPos, { ratio: 0 });
+    progress.applyRatio(keep);
   }
 
   // ---- 排版调整：保持当前阅读比例不跳动 ----
   async function applyStyle(mutator) {
-    const keep = currentRatio();
+    const keep = progress.currentRatio();
     mutator();
     await measurePages();
-    applyRatio(keep);
+    progress.applyRatio(keep);
     queueSettingsSave();
   }
 
@@ -858,7 +726,7 @@
   function setAutoSpeed(v) {
     autoSpeed = clamp(Number(v), 1, 10);
     localStorage.setItem('oread_auto_speed', String(autoSpeed));
-    if (autoOn && isPaged) scheduleAutoPage();
+    if (autoOn && isPaged) auto.schedule();
   }
 
   let settingsTimer = null;
@@ -878,147 +746,10 @@
     }, 800);
   }
 
-  // ---- 自动滚动 / 自动翻页 ----
-  function toggleAuto() {
-    if (autoOn) {
-      stopAuto();
-      return;
-    }
-    if (!current || contentLoading) {
-      showToast('正文尚未加载');
-      return;
-    }
-    showPanel = false;
-    autoOn = true;
-    autoLast = 0;
-    if (isPaged) scheduleAutoPage(400);
-    else autoRaf = requestAnimationFrame(autoTick);
-  }
-
-  function stopAuto(msg) {
-    autoOn = false;
-    cancelAnimationFrame(autoRaf);
-    autoRaf = 0;
-    clearTimeout(autoTimer);
-    autoTimer = null;
-    if (msg) showToast(msg);
-  }
-
-  function autoTick(ts) {
-    if (!autoOn || isPaged) return;
-    if (!autoLast) autoLast = ts;
-    const dt = Math.min(80, ts - autoLast);
-    autoLast = ts;
-    if (contentLoading) {
-      autoRaf = requestAnimationFrame(autoTick);
-      return;
-    }
-    if (contentError) {
-      stopAuto('正文加载失败，已停止自动滚动');
-      return;
-    }
-    const el = scrollEl;
-    if (!el) {
-      autoRaf = requestAnimationFrame(autoTick);
-      return;
-    }
-    const max = el.scrollHeight - el.clientHeight;
-    if (el.scrollTop >= max - 1) {
-      if (nextPos >= 0) {
-        if (!autoAdvancing) {
-          autoAdvancing = true;
-          openChapter(nextPos, { ratio: 0 }).finally(() => (autoAdvancing = false));
-        }
-      } else {
-        stopAuto('已到全书末尾');
-        return;
-      }
-    } else {
-      el.scrollTop += (autoSpeed * 14) * dt / 1000;
-    }
-    autoRaf = requestAnimationFrame(autoTick);
-  }
-
-  function scheduleAutoPage(delay) {
-    clearTimeout(autoTimer);
-    if (!autoOn || !isPaged) return;
-    // 自动翻页节奏按档位线性变化，最低 900ms
-    const wait = delay != null ? delay : (11 - autoSpeed) * 1000;
-    autoTimer = setTimeout(autoPageStep, Math.max(900, wait));
-  }
-
-  async function autoPageStep() {
-    if (!autoOn || !isPaged) return;
-    if (contentLoading) {
-      scheduleAutoPage(900);
-      return;
-    }
-    if (contentError) {
-      stopAuto('正文加载失败，已停止自动滚动');
-      return;
-    }
-    if (pageIndex < pageCount - 1) {
-      setPage(pageIndex + 1);
-      scheduleAutoPage();
-    } else if (nextPos >= 0) {
-      await openChapter(nextPos, { ratio: 0 });
-      scheduleAutoPage();
-    } else {
-      stopAuto('已到全书末尾');
-    }
-  }
-
   function showToast(msg) {
     toast = msg;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toast = ''), 2200);
-  }
-
-  let wheelAt = 0;
-  // 桌面滚轮：滚动模式只负责停止自动滚动；分页模式把滚轮映射为翻页
-  function onWheel(e) {
-    if (autoOn) stopAuto();
-    if (!isPaged || showToc || showPanel || showBookmarks || showSearch || showJump) return;
-    if (Math.abs(e.deltaY) < 6 && Math.abs(e.deltaX) < 6) return;
-    const now = Date.now();
-    if (now - wheelAt < 320) return;
-    wheelAt = now;
-    if (e.deltaY > 0 || e.deltaX > 0) nextPage();
-    else prevPage();
-  }
-
-  function onKeydown(e) {
-    const tag = ((e.target && e.target.tagName) || '').toLowerCase();
-    if (['input', 'textarea', 'select', 'button'].includes(tag)) return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (showExport && e.key !== 'Escape') return;
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      prevPage();
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      nextPage();
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (!isPaged && scrollEl) scrollEl.scrollBy({ top: -80, behavior: 'smooth' });
-    } else if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      if (!isPaged && scrollEl) scrollEl.scrollBy({ top: 80, behavior: 'smooth' });
-    } else if (e.key === ' ' || e.key === 'Spacebar') {
-      e.preventDefault();
-      toggleAuto();
-    } else if (e.key === 't' || e.key === 'T') {
-      // 键盘用户无需先点中间唤出控制栏再点“目录”。
-      toggleToc();
-    } else if (e.key === 'Escape') {
-      if (showExport) showExport = false;
-      else if (showSwitch) showSwitch = false;
-      else if (showSearch) showSearch = false;
-      else if (showBookmarks) showBookmarks = false;
-      else if (showJump) showJump = false;
-      else if (showPanel) showPanel = false;
-      else if (showToc) showToc = false;
-    }
   }
 
   // 窗口缩放/横竖屏切换：滚动与分页都保留章内阅读比例
@@ -1026,16 +757,16 @@
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(async () => {
       if (!scrollEl) return;
-      const keep = currentRatio();
+      const keep = progress.currentRatio();
       await tick();
       await measurePages();
-      applyRatio(keep);
+      progress.applyRatio(keep);
     }, 280);
   }
 
   function close() {
-    stopAuto();
-    flushSave();
+    auto.stop();
+    progress.flushSave();
     stats.flush(true);
     dispatch('close');
   }
@@ -1057,8 +788,8 @@
     // 旧源 seed 全部作废，避免“看似换源、实际还在旧源”。
     const nextUrl = c.book_url || c.bookUrl || '';
     const nextSource = c.origin || c.source_id || '';
-    stopAuto();
-    flushSave();
+    auto.stop();
+    progress.flushSave();
     stats.flush(true);
     showSwitch = false;
     dispatch('switch', {
@@ -1118,21 +849,21 @@
     {autoSpeed}
     {toast}
     bindScrollEl={(el) => (scrollEl = el)}
-    {onScroll}
-    {onReaderClick}
-    onTouchStart={onReaderTouchStart}
-    onTouchEnd={onReaderTouchEnd}
-    onTouchCancel={() => (touchStart = null)}
-    {onWheel}
+    onScroll={progress.onScroll}
+    onReaderClick={gestures.onClick}
+    onTouchStart={gestures.onTouchStart}
+    onTouchEnd={gestures.onTouchEnd}
+    onTouchCancel={gestures.onTouchCancel}
+    onWheel={gestures.onWheel}
     {loadAll}
     {retryChapter}
     {openChapter}
-    {currentRatio}
+    currentRatio={progress.currentRatio}
     retryImage={imageLoader.retry}
     onImgError={imageLoader.markError}
     {toggleSwitch}
     {toggleToc}
-    {stopAuto}
+    stopAuto={auto.stop}
     {prevPage}
     {nextPage}
   />
@@ -1168,7 +899,7 @@
     on:replace={(e) => setUseReplace(e.detail)}
     on:width={(e) => setWidth(e.detail)}
     on:brightness={(e) => setBrightness(e.detail)}
-    on:toggle-auto={toggleAuto}
+    on:toggle-auto={auto.toggle}
     on:speed={(e) => setAutoSpeed(e.detail)}
     on:bookmarks={toggleBookmarks}
     on:search={toggleBookSearch}
@@ -1184,7 +915,7 @@
     currentPos={currentPos}
     chapterTitle={chapters[currentPos]?.title || ''}
     hasContent={!!current}
-    getRatio={() => currentRatio()}
+    getRatio={() => progress.currentRatio()}
     on:goto={(e) => gotoBookmark(e.detail)}
     on:toast={(e) => showToast(e.detail)}
   />
@@ -1199,7 +930,7 @@
     bind:show={showJump}
     chapters={chapters}
     currentPos={currentPos}
-    getRatio={() => currentRatio()}
+    getRatio={() => progress.currentRatio()}
     pageIndex={pageIndex}
     pageCount={pageCount}
     isPaged={isPaged}
