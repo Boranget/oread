@@ -3,7 +3,6 @@
   import Login from './pages/Login.svelte';
   import Bookshelf from './pages/Bookshelf.svelte';
   import Discover from './pages/Discover.svelte';
-  import Reader from './pages/Reader.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
   import { syncTheme, applyTheme } from './lib/theme.js';
 
@@ -13,11 +12,15 @@
   // 阅读器通过 {bookUrl, sourceId, name, author, coverUrl, intro} 打开；后四项是详情 seed
   let reader = null;
 
-  // 首屏只留 搜索/书架/阅读器壳子。漫画阅读器（含 blob 图片缓存）与管理页按需 import()，
+  // 首屏只留 登录/书架/发现。阅读器（含正文解析与图片缓存）与管理页按需 import()，
   // 不进首屏包；失败时给出可见错误与重试，不静默吞掉。
   let ComicReader = null;
   let comicError = '';
   let comicLoading = null;
+  // 小说阅读器连同正文解析/图片缓存/统计等模块按需加载，不进首屏包。
+  let Reader = null;
+  let readerError = '';
+  let readerLoading = null;
 
   const LAZY_TABS = {
     stats: () => import('./pages/Stats.svelte'),
@@ -98,6 +101,22 @@
     return comicLoading;
   }
 
+  function loadReader() {
+    if (Reader || readerLoading) return readerLoading;
+    readerError = '';
+    readerLoading = import('./pages/Reader.svelte')
+      .then((mod) => {
+        Reader = mod.default;
+      })
+      .catch((e) => {
+        readerError = `阅读器加载失败：${e && e.message ? e.message : e}`;
+      })
+      .finally(() => {
+        readerLoading = null;
+      });
+    return readerLoading;
+  }
+
   let openSeq = 0;
   // 漫画与小说共用入口：搜索结果已带 type；书架条目没有类型时，
   // 用 /api/comic/source 轻量探测书源类型（不发回源请求），失败则按小说打开。
@@ -108,6 +127,7 @@
     if (known === 'image' || known === 'text') {
       reader = { ...book, bookType: known };
       if (known === 'image') loadComicReader();
+      else loadReader();
       return;
     }
     if (book.sourceId) {
@@ -125,6 +145,7 @@
     }
     if (my !== openSeq) return;
     reader = { ...book, bookType: 'text' };
+    loadReader();
   }
   function closeReader() { reader = null; }
 </script>
@@ -146,13 +167,22 @@
       {:else}
         <p class="empty">正在加载漫画阅读器…</p>
       {/if}
-    {:else}
-      <Reader
+    {:else if Reader}
+      <svelte:component
+        this={Reader}
         book={reader}
         on:close={closeReader}
         on:logout={onLogout}
         on:switch={(e) => openReader(e.detail)}
       />
+    {:else if readerError}
+      <div class="load-fail">
+        <p class="err">{readerError}</p>
+        <button class="ghost" on:click={loadReader}>重试</button>
+        <button class="ghost" on:click={closeReader}>返回</button>
+      </div>
+    {:else}
+      <p class="empty">正在加载阅读器…</p>
     {/if}
   {/key}
 {:else}
