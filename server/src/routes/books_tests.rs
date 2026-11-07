@@ -265,7 +265,7 @@ fn slow_and_failing_sources_queue_last() {
         s.book_source_name = name.into();
         s
     };
-    let mut list = vec![mk("slow"), mk("fail"), mk("unknown"), mk("fast")];
+    let mut list = [mk("slow"), mk("fail"), mk("unknown"), mk("fast")];
     list.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
     let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
     assert_eq!(
