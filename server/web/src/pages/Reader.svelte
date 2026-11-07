@@ -12,6 +12,7 @@
   import { convertZh } from '../lib/zhconvert.js';
   import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
   import { htmlToParas, plainChars } from '../lib/readerHtml.js';
+  import { createImageLoader } from '../lib/readerImages.js';
   import { applyTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
@@ -56,8 +57,11 @@
   // ---- 正文内嵌图片 ----
   // 与漫画链路共用 /api/book/image 代理：先 fetch 成 Blob，再由 objectURL 渲染，
   // 这样 <img src> 也能带上 Bearer，不新增任何图片请求方式。
-  let imgState = {};
-  const imgCache = new Map();
+  const imageLoader = createImageLoader({
+    load: (src) =>
+      api.comicImage(book.sourceId || '', src, (current && current.url) || '', book.bookUrl || ''),
+  });
+  const imgState = imageLoader.state;
 
   // 付费/VIP 章节来自 /api/book/toc 的 is_vip / is_pay；同时为真只按 V 展示
   let payNoticeClosed = -1;
@@ -172,10 +176,7 @@
     clearInterval(statsTimer);
     flushStats(true);
     cancelAnimationFrame(autoRaf);
-    for (const rec of imgCache.values()) {
-      if (rec && rec.objectUrl) URL.revokeObjectURL(rec.objectUrl);
-    }
-    imgCache.clear();
+    imageLoader.dispose();
   });
 
   function onPageHide() {
@@ -194,61 +195,6 @@
   function onStatsTick() {
     if (document.visibilityState === 'visible') statsSeconds += 1;
     if (statsSeconds >= 60) flushStats();
-  }
-
-  function setImg(src, rec) {
-    imgCache.set(src, rec);
-    imgState = { ...imgState, [src]: rec };
-  }
-
-  // 最多保留 40 张，超出按插入顺序淘汰并释放 objectURL，避免长时间阅读内存上涨
-  function dropOldImages() {
-    while (imgCache.size > 40) {
-      const [key, val] = imgCache.entries().next().value;
-      imgCache.delete(key);
-      if (val && val.objectUrl) URL.revokeObjectURL(val.objectUrl);
-      const next = { ...imgState };
-      delete next[key];
-      imgState = next;
-    }
-  }
-
-  async function loadInlineImage(src, force = false) {
-    if (!src) return;
-    const prev = imgCache.get(src);
-    if (!force && prev && prev.status !== 'error') return;
-    if (prev && prev.objectUrl) URL.revokeObjectURL(prev.objectUrl);
-    setImg(src, { status: 'loading' });
-    const chapterUrl = (current && current.url) || '';
-    try {
-      const rec = await api.comicImage(
-        book.sourceId || '',
-        src,
-        chapterUrl,
-        book.bookUrl || ''
-      );
-      setImg(src, { status: 'ok', objectUrl: rec.objectUrl, bytes: rec.bytes });
-      dropOldImages();
-    } catch (e) {
-      setImg(src, { status: 'error', error: (e && e.message) || '图片加载失败，请重试' });
-    }
-  }
-
-  // 触发本章图片加载：已在缓存（含加载中/成功）的跳过，失败的等用户点“重试”
-  function queueImages(segs) {
-    for (const p of segs) {
-      if (p.type !== 'image') continue;
-      const rec = imgCache.get(p.src);
-      if (!rec) loadInlineImage(p.src);
-    }
-  }
-
-  function retryImage(src) {
-    loadInlineImage(src, true);
-  }
-
-  function onImgError(src) {
-    setImg(src, { status: 'error', error: '图片解码失败，请重试' });
   }
 
   function flushStats(keepalive = false) {
@@ -424,7 +370,7 @@
       )
     : [];
   $: imageParas = paras.filter((p) => p.type === 'image');
-  $: if (current && imageParas.length) queueImages(imageParas);
+  $: if (current && imageParas.length) imageLoader.queue(imageParas);
   // 阅读模式由用户在阅读器内选择；墨水屏主题只改配色，不改布局与模式
   $: isPaged = readMode !== 'scroll';
   $: isFade = readMode === 'fade';
@@ -1201,7 +1147,7 @@
     {chapterEmpty}
     {emptyTitle}
     {emptyHint}
-    {imgState}
+    imgState={$imgState}
     {prevPos}
     {nextPos}
     {controlsVisible}
@@ -1220,8 +1166,8 @@
     {retryChapter}
     {openChapter}
     {currentRatio}
-    {retryImage}
-    {onImgError}
+    retryImage={imageLoader.retry}
+    onImgError={imageLoader.markError}
     {toggleSwitch}
     {toggleToc}
     {stopAuto}
