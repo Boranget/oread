@@ -18,6 +18,14 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const KINDLE_FILE = path.join(ROOT, 'server', 'src', 'routes', 'kindle.rs');
 const KINDLE_DIR = path.join(ROOT, 'server', 'src', 'routes', 'kindle');
+const ROUTES_DIR = path.dirname(KINDLE_FILE);
+
+/// 拆分后的 `kindle_*.rs` 与 `kindle.rs` 同级；默认扫描全部，避免门禁漏掉新文件。
+const KINDLE_SIBLINGS = fs
+  .readdirSync(ROUTES_DIR)
+  .filter((name) => name !== 'kindle.rs' && /^kindle.*\.rs$/.test(name))
+  .map((name) => path.join(ROUTES_DIR, name))
+  .sort();
 
 function collectRustFiles(target) {
   if (!fs.existsSync(target)) return [];
@@ -36,7 +44,11 @@ function collectRustFiles(target) {
 const cliTarget = process.argv[2] ? path.resolve(process.argv[2]) : null;
 const targets = cliTarget
   ? collectRustFiles(cliTarget)
-  : [...collectRustFiles(KINDLE_FILE), ...collectRustFiles(KINDLE_DIR)];
+  : [
+      ...collectRustFiles(KINDLE_FILE),
+      ...collectRustFiles(KINDLE_DIR),
+      ...KINDLE_SIBLINGS,
+    ];
 
 if (!targets.length) {
   console.error(
