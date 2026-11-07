@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "compression-gzip"] }
 futures = "0.3"
 once_cell = "1"
+getrandom = "0.2"           # 首启随机管理员口令（OS 熵源）
 
 # ---- 规则引擎 ----
 scraper = "0.20"            # CSS 选择器 / JSoup 等价

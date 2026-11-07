@@ -17,11 +17,11 @@ use super::{Mode, RuleError};
 
 pub struct AnalyzeRule {
     pub variables: RefCell<HashMap<String, String>>,
-    /// Legado JS 环境里的 `cache`（上游 规则语义 `bindings["cache"] = CacheManager`）。
+    /// 规则 JS 环境里的 `cache` 全局（由引擎注入缓存管理对象）。
     /// 最小等价版：同作用域可读写的字符串 map。上游 CacheManager 是 App 级单例 + SQLite，
     /// 本服务**每作用域一份**（随 AnalyzeRule 存活），不共享、不持久化。
     pub cache: RefCell<HashMap<String, String>>,
-    /// 跨请求的 book 层变量（Legado `book.putVariable`，上游 规则语义）。
+    /// 跨请求的 book 层变量（由引擎在求值之间透传）。
     /// `@put:{key:rule}` 除了写当前 `variables`，也写这里；路由层在请求结束后按
     /// `book_key` 落库，下一次同书请求（info → toc → content）预载回来。
     pub book_vars: RefCell<HashMap<String, String>>,
@@ -47,7 +47,7 @@ pub struct AnalyzeRule {
     pub book_meta: RefCell<BookMeta>,
 }
 
-/// `book` 绑定里的只读元信息（对应 Legado `Book` 的同名属性）。
+/// `book` 绑定里的只读元信息（对应 书源对象 的同名属性）。
 #[derive(Clone, Default)]
 pub struct BookMeta {
     pub name: String,

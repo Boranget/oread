@@ -13,7 +13,7 @@ pub(in crate::rule_engine) fn split_css_rule(rule: &str) -> (String, Vec<&str>) 
     (selector, tokens)
 }
 
-/// 拆出 Legado 末尾的 `[n]` / `[n,m]` / `[a:b]` 下标表达式。
+/// 拆出上游规则末尾的 `[n]` / `[n,m]` / `[a:b]` 下标表达式。
 pub(in crate::rule_engine) fn split_bracket_indices(selector: &str) -> (String, Option<String>) {
     let s = selector.trim();
     if !s.ends_with(']') {
@@ -31,7 +31,7 @@ pub(in crate::rule_engine) fn split_bracket_indices(selector: &str) -> (String, 
     (s.to_string(), None)
 }
 
-/// 对已选元素应用 Legado 下标表达式：`[3,4]` 取第 3/4 个，`[0:2]` 切片，`[-1:0]` 倒序。
+/// 对已选元素应用上游规则下标表达式：`[3,4]` 取第 3/4 个，`[0:2]` 切片，`[-1:0]` 倒序。
 pub(in crate::rule_engine) fn apply_index_expr<'a>(
     els: Vec<scraper::ElementRef<'a>>,
     expr: &str,
@@ -134,7 +134,7 @@ pub(in crate::rule_engine) fn split_name_index(s: &str) -> (String, Option<i64>)
     (s.to_string(), None)
 }
 
-/// Legado 的 `class.a b` 表示「同时具备 a 和 b 两个类」（AND），
+/// 上游规则的 `class.a b` 表示「同时具备 a 和 b 两个类」（AND），
 /// 但 CSS 里空格是后代选择器，必须归一化成 `.a.b`。
 pub(in crate::rule_engine) fn class_name_css(rest: &str) -> String {
     let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -144,7 +144,7 @@ pub(in crate::rule_engine) fn class_name_css(rest: &str) -> String {
     format!(".{}", parts.join("."))
 }
 
-/// `class.x.y` / `id.x.y` / `tag.x.y` 只取第一个点分段：上游 `JSoup 规则`
+/// `class.x.y` / `id.x.y` / `tag.x.y` 只取第一个点分段：上游规则引擎
 /// 对 `beforeRule.split(".")` 的结果只用 `rules[1]`，其余分段被忽略
 /// （`class.list.ul` 等价 `class.list`）。
 pub(in crate::rule_engine) fn shorthand_segment(name: &str) -> &str {

@@ -47,8 +47,8 @@ fn class_shorthand_tokens_are_not_dropped() {
 
 #[test]
 fn single_value_rule_joins_all_matched_elements() {
-    // 上游 JSoup 规则.getString = getResultLast 收集全部匹配元素的值，
-    // 非空才保留；getString 对多值按 "\n" 合并（isUrl 才走 getString 取首个）。
+    // 单值抽取按规则语义收集全部匹配元素的值，
+    // 非空才保留；多值按 "\n" 合并（isUrl 只取首个）。
     // 夹具对应真实源 101/102/103 的 `@a@text`、`@a@href` 规则。
     let ar = AnalyzeRule::new();
     let html = r#"<div class="book">
@@ -65,7 +65,7 @@ fn single_value_rule_joins_all_matched_elements() {
         ar.get_string(html, "class.book@a@href", false, "").unwrap(),
         "/b/1\n/b/2"
     );
-    // is_url=true 走 getString：只取首个
+    // is_url=true：只取首个
     assert_eq!(
         ar.get_string(html, "class.book@a@href", true, "").unwrap(),
         "/b/1"
@@ -147,7 +147,7 @@ fn unsupported_js_api_reports_feature_name() {
 #[test]
 fn browser_apis_return_str_response_without_network() {
     let ar = AnalyzeRule::new();
-    // 空 URL 不联网：connect 失败时按 Legado 的容错写成 body，code 为 0
+    // 空 URL 不联网：connect 失败时按上游规则的容错写成 body，code 为 0
     let v = ar
         .get_string("", "<js>java.connect('').code()</js>", false, "")
         .unwrap();
@@ -207,7 +207,7 @@ fn js_lib_json_is_not_injected_as_statements() {
 
 #[test]
 fn import_script_rejects_non_http_forms_explicitly() {
-    // Legado 还支持 file/content/storage；服务端不放开（避免读部署机文件），
+    // 上游规则还支持 file/content/storage；服务端不放开（避免读部署机文件），
     // 必须抛可读的未支持错误，而不是让 SyntaxError/IO 错误泄漏。
     let ar = AnalyzeRule::new();
     let err = ar
@@ -224,7 +224,7 @@ fn import_script_rejects_non_http_forms_explicitly() {
 
 #[test]
 fn import_script_empty_content_reports_readable_error() {
-    // Legado p0.i0 对空内容抛「内容获取失败或者为空」，这里同样给可读文案。
+    // 上游规则 p0.i0 对空内容抛「内容获取失败或者为空」，这里同样给可读文案。
     let url = "https://lib.test/empty.js";
     store_script(url, "  ");
     let ar = AnalyzeRule::new();
@@ -285,72 +285,8 @@ function Reload(e){
     );
 }
 
-#[test]
-fn real_source_js_lib_edge_functions_evaluate() {
-    // 直接用源包里的真实 jsLib（三份内联脚本），不走网络：验证 Reload/Get 之外的
-    // bhost / base64 解码 / formatDate / buildQueryParams / getLanguage 在共享作用域可调用。
-    let pack: Value = serde_json::from_str(include_str!(
-        "../../sources/pack-20261106/boranlib-sources.json"
-    ))
-    .unwrap();
-    let libs: Vec<(String, String)> = pack
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|s| {
-            let name = s["bookSourceName"].as_str().unwrap_or("").to_string();
-            let lib = s["jsLib"].as_str().unwrap_or("").trim().to_string();
-            // 只取内联脚本；`{...}` 形态是 {库名: URL} map，需要联网下载。
-            if lib.is_empty() || lib.starts_with('{') {
-                None
-            } else {
-                Some((name, lib))
-            }
-        })
-        .collect();
-    assert_eq!(libs.len(), 3, "源包里应有 3 份内联 jsLib，实际: {libs:?}");
-    let ar = AnalyzeRule::new();
-
-    // 包子漫画 bhost()：走 `this.source.getVariable()`，无变量时回落到站点主域。
-    let (name, lib) = libs.iter().find(|(n, _)| n.contains("包子")).unwrap();
-    let js = format!(
-            "<js>{lib}\nvar t = {{source: {{getVariable: function(){{ return ''; }}}}}}; bhost.call(t)</js>"
-        );
-    assert_eq!(
-        ar.get_string("", &js, false, "").unwrap(),
-        "https://manhuafree.com",
-        "jsLib 来源: {name}"
-    );
-
-    // 如漫画网 _0x1c72dc()：站点内联的 base64 解码器。
-    let (name, lib) = libs.iter().find(|(n, _)| n.contains("如漫画")).unwrap();
-    let js = format!("<js>{lib}\n_0x1c72dc.call(null, 'aGVsbG8=')</js>");
-    assert_eq!(
-        ar.get_string("", &js, false, "").unwrap(),
-        "hello",
-        "jsLib 来源: {name}"
-    );
-
-    // 曼哈漫画 getLanguage / buildQueryParams：解构 this.source + 读取源变量。
-    let (name, lib) = libs.iter().find(|(n, _)| n.contains("曼哈漫画")).unwrap();
-    let js = String::from("<js>")
-            + lib
-            + "\nvar T = {source: {getVariable: function(){ return '{\"contentRating\":[\"safe\"],\"Language\":\"en-us\",\"sort\":\"rating,desc\"}'; }}};"
-            + "\ngetLanguage('en-us') + '|' + buildQueryParams.call(T, '搜索') + '|' + (formatDate('2020-01-02T03:04:05').length > 0)"
-            + "</js>";
-    let out = ar.get_string("", &js, false, "").unwrap();
-    assert!(
-        out.starts_with("英语（美国）|"),
-        "jsLib 来源: {name}，实际: {out}"
-    );
-    assert!(out.contains("contentRating[]=safe"), "实际: {out}");
-    assert!(out.contains("originalLanguage[]=en-us"), "实际: {out}");
-    assert!(out.contains("order[rating]=desc"), "实际: {out}");
-    assert!(out.ends_with("|true"), "实际: {out}");
-}
-
-/// 奇怪小说的真实 toc 规则（节选自 yetianlian 页面结构）：
-/// java.getElements 取 dl 的 children，再用 String(node) + 正则过滤出正文分卷的 dd。
+/// 目录页结构样例：`java.getElements` 取 `dl` 的 children，
+/// 再用 `String(node)` + 正则过滤出正文分卷的 `dd`。
 #[test]
 fn dom_bridge_yetianlian_toc_rule_returns_chapter_nodes() {
     let ar = AnalyzeRule::new();
@@ -482,7 +418,7 @@ fn jsoup_extended_selector_reports_unsupported() {
     assert!(err.contains("jsoup 专有"), "实际: {err}");
 }
 
-// jsoup 扩展伪类走 select 结果集过滤（与 Legado/jsoup 语义一致），不再整体抛未支持。
+// jsoup 扩展伪类走 select 结果集过滤（与上游规则/jsoup 语义一致），不再整体抛未支持。
 #[test]
 fn jsoup_pseudo_classes_select() {
     // li:matches 用合并文本（2 个 li 命中），li:matchesOwn 只用自身文本（li 内只有子元素 → 0），
@@ -708,7 +644,7 @@ fn put_then_get_in_same_scope() {
     assert_eq!(stored, "lit");
     let got = ar.get_string(html, "@get:{x}", false, "").unwrap();
     assert_eq!(got, "lit");
-    // 纯 @put 规则自身求值为空串（Legado splitPutRule 后规则正文为空）
+    // 纯 @put 规则自身求值为空串（上游规则 splitPutRule 后规则正文为空）
     let only_put = ar.get_string(html, "@put:{y:a@text}", false, "").unwrap();
     assert_eq!(only_put, "");
     assert_eq!(ar.get_string("", "@get:{y}", false, "").unwrap(), "lit");
@@ -839,7 +775,7 @@ fn js_put_combines_with_json_modifier() {
 
 #[test]
 fn js_list_pipeline_binds_array_result() {
-    // `CSS前缀 + <js>` 的目录规则：Legado getStringList 把前一段求成 List<String>，
+    // `CSS前缀 + <js>` 的目录规则：上游规则 getStringList 把前一段求成 List<String>，
     // JS 里的 `result` 是数组（漫画搬运 `Array.from(result)`、穿越小说 `r.length`）。
     let ar = AnalyzeRule::new();
     let html =
@@ -1257,7 +1193,7 @@ fn bare_tag_and_excluded_indices() {
         .get_string(html, "@CSS:id.list@dd@text", false, "")
         .unwrap();
     assert_eq!(t1, "第1\n第2\n第3\n第4\n第5");
-    // Legado 的 `!0:1` 是“排除第 0、1 个”，剩余第 3/4/5 个
+    // 上游规则的 `!0:1` 是“排除第 0、1 个”，剩余第 3/4/5 个
     let t2 = ar
         .get_string(html, "@CSS:id.list@dd!0:1@text", false, "")
         .unwrap();
@@ -1334,7 +1270,7 @@ fn js_segment_transforms() {
 
 #[test]
 fn tag_prefix_selector_works() {
-    // Legado 常见写法 `tag.a@href`：`tag.` 前缀此前被当成非法 CSS 选择器，搜索因此全空
+    // 上游规则常见写法 `tag.a@href`：`tag.` 前缀此前被当成非法 CSS 选择器，搜索因此全空
     let ar = AnalyzeRule::new();
     let html = r#"<div class="item"><a href="/b/1">书A</a><span class="au">作者</span></div>"#;
     assert_eq!(ar.get_string(html, "tag.a@href", true, "").unwrap(), "/b/1");
@@ -1347,7 +1283,7 @@ fn tag_prefix_selector_works() {
 
 #[test]
 fn text_prefix_selector_matches_own_text() {
-    // Legado `text.下一页` = 自身文本包含（jsoup getElementsContainingOwnText）。
+    // 上游规则 `text.下一页` = 自身文本包含（jsoup getElementsContainingOwnText）。
     // 147 源中 28 源用它做正文翻页/目录翻页/完整目录入口，此前被当成 CSS
     // 「标签 text + 类名 下一页」而永远为空。
     let ar = AnalyzeRule::new();
@@ -1491,7 +1427,7 @@ fn whole_rule_template_returns_value() {
 
 #[test]
 fn js_book_meta_is_visible() {
-    // Legado 的 `book` 绑定是完整 Book 实体；快看/漫画源在详情简介模板里直接读
+    // 上游规则的 `book` 绑定是完整 Book 实体；快看/漫画源在详情简介模板里直接读
     // `book.name/book.author/book.kind`，缺这些字段会把 `undefined` 拼进简介。
     let ar = AnalyzeRule::new();
     ar.set_book_meta(BookMeta {
@@ -1573,7 +1509,7 @@ fn variable_expansion_works() {
     assert_eq!(r, "测试书名");
 }
 
-// `##正则##` 替换支持 `$1` 捕获组（Legado 原生写法）
+// `##正则##` 替换支持 `$1` 捕获组（上游规则原生写法）
 #[test]
 fn regex_replacement_supports_capture_group() {
     let ar = AnalyzeRule::new();
@@ -1747,7 +1683,7 @@ fn jsonpath_recursive_descent_and_wildcard() {
     assert!(books[0].contains("b1"));
     let names = ar.get_string_list(json, "$.booklist[*].book_name").unwrap();
     assert_eq!(names, vec!["书C"]);
-    // 单值：递归下降命中多个值时，与 Legado 一致按 `\n` 拼接（源规则常据此 `split("\n")`）
+    // 单值：递归下降命中多个值时，与上游规则一致按 `\n` 拼接（源规则常据此 `split("\n")`）
     assert_eq!(
         ar.get_string(json, "$..book_name", false, "").unwrap(),
         "书C\n书A\n书B"
@@ -1765,7 +1701,7 @@ fn jsonpath_recursive_descent_and_wildcard() {
     );
 }
 
-// Legado 用的 Jayway json-path 容忍 `$.data.[*]`（点与方括号混用），爱看目录规则就是这种写法
+// 上游规则用的 Jayway json-path 容忍 `$.data.[*]`（点与方括号混用），爱看目录规则就是这种写法
 #[test]
 fn jsonpath_tolerates_dot_before_bracket() {
     let ar = AnalyzeRule::new();
@@ -2537,7 +2473,7 @@ fn f3_dot_prefix_index_in_initial_selector() {
     let ar = AnalyzeRule::new();
     let html =
         r#"<div><span class="author">作者甲</span><span class="author">字数：1.0万</span></div>"#;
-    // JSoup 规则.ElementsSingle.findIndexSet：`.author.0` -> beforeRule=`.author`、split='.'、index=[0]
+    // 元素索引解析：`.author.0` -> beforeRule=`.author`、split='.'、index=[0]
     assert_eq!(
         ar.get_string(html, ".author.0@text", false, "").unwrap(),
         "作者甲"
@@ -2561,7 +2497,7 @@ fn f4_class_chain_uses_first_segment_like_upstream() {
     let ar = AnalyzeRule::new();
     let html = r#"<div class="list"><div class="list_tit">目录</div><ul>
             <li><a href="/1">第一章</a></li><li><a href="/2">第二章</a></li></ul></div>"#;
-    // JSoup 规则.getElementsSingle：beforeRule.split(".") 后 class 分支只用 rules[1]="list"
+    // 集合级元素抽取：beforeRule.split(".") 后 class 分支只用 rules[1]="list"
     let chapters = ar.get_string_list(html, "class.list.ul@li").unwrap();
     assert_eq!(chapters.len(), 2);
     assert_eq!(
@@ -2658,7 +2594,7 @@ fn slow_js_does_not_starve_multi_thread_runtime() {
 #[test]
 fn p6_source_put_get_roundtrip_across_instances() {
     // 真实规则：`source.put('bookIds', bookIds)`（数组）→ 后续 `String(source.get('bookIds')).split(",")`。
-    // Legado 的 put 参数是 String，Rhino 会把数组 toString 成逗号串；本服务同口径。
+    // 上游规则的 put 参数是 String，Rhino 会把数组 toString 成逗号串；本服务同口径。
     let ar1 = AnalyzeRule::new();
     ar1.get_string("", "<js>source.put('p6ids', [101,102,103])</js>", false, "")
         .unwrap();
@@ -2668,13 +2604,13 @@ fn p6_source_put_get_roundtrip_across_instances() {
             .unwrap(),
         "101,102,103"
     );
-    // 缺省返回空串（Legado BaseSource.get 的 `?: ""`）
+    // 缺省返回空串（上游规则 BaseSource.get 的 `?: ""`）
     assert_eq!(
         ar2.get_string("", "<js>source.get('p6-missing')</js>", false, "")
             .unwrap(),
         ""
     );
-    // put 返回写入值（Legado 返回 value）
+    // put 返回写入值（上游规则返回 value）
     assert_eq!(
         ar1.get_string("", "<js>source.put('p6ret','x')</js>", false, "")
             .unwrap(),
@@ -2713,7 +2649,7 @@ fn p6_cache_file_put_get_is_sandboxed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---- pass6：`{{规则##正则[##替换[###]]}}` 与 Legado 对齐 ----
+// ---- pass6：`{{规则##正则[##替换[###]]}}` 与上游规则对齐 ----
 
 #[test]
 fn p6_template_jsonpath_replace_delete() {

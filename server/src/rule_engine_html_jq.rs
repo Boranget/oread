@@ -96,14 +96,14 @@ pub(in crate::rule_engine) fn apply_jq_filters<'a>(
     els
 }
 
-/// 初始选择器：支持 Legado 的 `class.x` / `id.x` / `tag.x`、可选索引（取第 i 个），
-/// `!下标`（Legado 语义是**排除**这些下标，如 `li!0:1:2:3:4` 去掉前 5 个 li），
+/// 初始选择器：支持上游规则的 `class.x` / `id.x` / `tag.x`、可选索引（取第 i 个），
+/// `!下标`（上游规则语义是**排除**这些下标，如 `li!0:1:2:3:4` 去掉前 5 个 li），
 /// 以及 jQuery 伪类（`:first/:last/:eq(n)/:lt(n)/:gt(n)/:contains(...)`）。
 pub(in crate::rule_engine) fn select_initial<'a>(
     doc: &'a scraper::Html,
     selector: &str,
 ) -> Vec<scraper::ElementRef<'a>> {
-    // Legado 末尾下标：class.x[3,4] / tag.li[0:2] / class.x[-1:0]（倒序）
+    // 上游规则末尾下标：class.x[3,4] / tag.li[0:2] / class.x[-1:0]（倒序）
     let (selector, index_expr) = split_bracket_indices(selector.trim());
     let selector = selector.as_str();
     let (core, excluded) = match selector.find('!') {
@@ -113,7 +113,7 @@ pub(in crate::rule_engine) fn select_initial<'a>(
     let (core, jq) = split_jquery_filters(core.trim());
     let mut text_filter: Option<String> = None;
     let (css, idx) = if let Some(rest) = core.trim().strip_prefix("text.") {
-        // Legado `text.xxx`：元素**自身**直接文本包含 xxx（jsoup
+        // 上游规则 `text.xxx`：元素**自身**直接文本包含 xxx（jsoup
         // `getElementsContainingOwnText`）。此前被当成 CSS「标签 text + 类名 xxx」，
         // 永远匹配不到元素，正文下一页/目录翻页/完整目录入口因此全空（28 源）。
         let (name, i) = split_name_index(rest);
@@ -126,7 +126,7 @@ pub(in crate::rule_engine) fn select_initial<'a>(
         let (name, i) = split_name_index(rest);
         (format!("#{}", shorthand_segment(&name)), i)
     } else if let Some(rest) = core.trim().strip_prefix("tag.") {
-        // Legado 常用 `tag.a@href`：`tag.` 前缀表示标签名，不是合法 CSS 选择器
+        // 上游规则常用 `tag.a@href`：`tag.` 前缀表示标签名，不是合法 CSS 选择器
         let (name, i) = split_name_index(rest);
         (shorthand_segment(&name).to_string(), i)
     } else {
@@ -184,7 +184,7 @@ pub(in crate::rule_engine) fn child_elements<'a>(
 }
 
 /// 从当前元素集合向下钻取到指定标签（@tag.name[.index]）。
-/// Legado 的 `@tag.x` 是**后代**查询（jsoup `getElementsByTag`），不是只看直接子元素；
+/// 上游规则的 `@tag.x` 是**后代**查询（jsoup `getElementsByTag`），不是只看直接子元素；
 /// 需要直接子元素时用 `@children`。
 pub(in crate::rule_engine) fn apply_tag<'a>(
     els: Vec<scraper::ElementRef<'a>>,
@@ -235,7 +235,7 @@ pub(in crate::rule_engine) fn text_nodes(el: &scraper::ElementRef) -> String {
         .collect()
 }
 
-/// Legado `text.xxx` 的单元素判定：自身直接文本（空白归一、忽略大小写）包含 needle。
+/// 上游规则 `text.xxx` 的单元素判定：自身直接文本（空白归一、忽略大小写）包含 needle。
 pub(in crate::rule_engine) fn own_text_contains(
     el: &scraper::ElementRef,
     needle_lower: &str,
@@ -269,7 +269,7 @@ pub(in crate::rule_engine) fn text_contains_from<'a>(
     out
 }
 
-/// 裸抽取标记（`text` / `href` 等）：Legado 语义是对“当前节点”直接取值。
+/// 裸抽取标记（`text` / `href` 等）：上游规则语义是对“当前节点”直接取值。
 /// 解析片段，取第一个真实元素（跳过 html/head/body 容器）；没有元素时按纯文本处理。
 pub(in crate::rule_engine) fn extract_first(html: &str, tok: &str) -> String {
     let doc = scraper::Html::parse_document(html);

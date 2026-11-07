@@ -37,7 +37,7 @@ pub(in crate::rule_engine) fn parse_css_document(html: &str) -> scraper::Html {
     }
 }
 
-/// 单值抽取的集合级实现：对应上游 `JSoup 规则.getResultLast`。
+/// 单值抽取的集合级实现：保留最后一个匹配结果。
 /// - text / ownText：逐元素取值，空值跳过；
 /// - textNodes：逐元素把直接文本节点 trim 后按 `\n` 合并，空元素跳过；
 /// - html：先删 script/style，再取整组元素的 outerHtml（合并为一个值）；
@@ -134,7 +134,7 @@ pub(in crate::rule_engine) enum Token {
         name: String,
         index: Option<i64>,
         indices: Vec<usize>,
-        /// Legado 的 `!` 是“排除这些下标”，而不是倒序索引（`li!0:1` = 去掉前两个）。
+        /// 上游规则的 `!` 是“排除这些下标”，而不是倒序索引（`li!0:1` = 去掉前两个）。
         exclude: bool,
     },
     Terminal(String),
@@ -192,7 +192,7 @@ pub(in crate::rule_engine) fn parse_token(tok: &str) -> Token {
         };
     }
     if let Some(rest) = tok.strip_prefix("text.") {
-        // `@text.xxx`：Legado 的「自身文本包含」遍历步骤，保留 text. 前缀交给 apply_tag 处理。
+        // `@text.xxx`：上游规则的「自身文本包含」遍历步骤，保留 text. 前缀交给 apply_tag 处理。
         let (name, index) = split_name_index(rest);
         return Token::Tag {
             name: format!("text.{name}"),
@@ -205,7 +205,7 @@ pub(in crate::rule_engine) fn parse_token(tok: &str) -> Token {
         return Token::Terminal(tok.to_string());
     }
     let (raw_name, index) = split_name_index(tok);
-    // Legado 的 `class.xxx` / `id.xxx` 是类/ID 选择器简写，不是末端抽取标记
+    // 上游规则的 `class.xxx` / `id.xxx` 是类/ID 选择器简写，不是末端抽取标记
     let name = if let Some(rest) = raw_name.strip_prefix("class.") {
         class_name_css(shorthand_segment(rest))
     } else if let Some(rest) = raw_name.strip_prefix("id.") {
@@ -213,7 +213,7 @@ pub(in crate::rule_engine) fn parse_token(tok: &str) -> Token {
     } else {
         raw_name
     };
-    // `@.book.0` / `@#id` 是 Legado 默认规则里的 class/id 简写；此前被当成末端抽取
+    // `@.book.0` / `@#id` 是上游规则默认规则里的 class/id 简写；此前被当成末端抽取
     // 标记，选择器结果直接丢弃（错层小说网详情 cover/kind 全 null 的原因）。
     let css_shorthand = (name.starts_with('.') || name.starts_with('#')) && name.len() > 1;
     // jQuery 伪类 / 属性选择器同样属于选择器（`@li:eq(0)`、`@a[href]`），不能当抽取标记

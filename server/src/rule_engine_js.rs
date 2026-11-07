@@ -1,6 +1,6 @@
 //! JS 规则执行层（move-only 从 rule_engine.rs 拆出）。
 //!
-//! 包含 boa 运行时、worker/并发闸门、Legado Java/JSoup shim 与原生扩展；
+//! 包含 boa 运行时、worker/并发闸门、上游规则 Java/JSoup shim 与原生扩展；
 //! 对父模块暴露 init_js / js_metrics 与内部 job 入口，其余保持模块私有。
 
 use std::collections::HashMap;
@@ -59,10 +59,10 @@ pub(super) fn rule_cache_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("boranlib-rule-cache"))
 }
 
-/// `cache.putFile` 单文件上限（Legado 无上限，这里给出明确边界）。
+/// `cache.putFile` 单文件上限（上游规则无上限，这里给出明确边界）。
 pub(super) const CACHE_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Legado `cache.getFile/putFile` 用 `key.hashCode()` 作文件名；这里改用 md5
+/// 上游规则 `cache.getFile/putFile` 用 `key.hashCode()` 作文件名；这里改用 md5
 /// （跨进程稳定，且天然屏蔽 `../` 等路径穿越——key 只当不透明标识，不当路径用）。
 pub(super) fn cache_file_path(key: &str) -> PathBuf {
     let mut hasher = Md5::new();
@@ -92,7 +92,7 @@ pub(super) fn js_cache_file_put(key: &str, value: &str, save_time: i64) -> Resul
     let dir = rule_cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cache.putFile 创建缓存目录失败：{e}"))?;
     let body = if save_time != 0 {
-        // Legado 的过期前缀：13 位当前毫秒 + "-" + saveTime + 空格 + 内容（getFile 原样返回）。
+        // 上游规则的过期前缀：13 位当前毫秒 + "-" + saveTime + 空格 + 内容（getFile 原样返回）。
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -104,8 +104,8 @@ pub(super) fn js_cache_file_put(key: &str, value: &str, save_time: i64) -> Resul
     std::fs::write(cache_file_path(key), body).map_err(|e| format!("cache.putFile 写入失败：{e}"))
 }
 
-/// 书源级变量（Legado `source.get/put` 落到 `CacheManager` 的 `v_<sourceKey>_<key>`）。
-/// 本服务按进程内、按书源分桶保存：不落盘，重启即清空；Legado 的磁盘缓存语义未复刻。
+/// 书源级变量（上游规则 `source.get/put` 落到 `CacheManager` 的 `v_<sourceKey>_<key>`）。
+/// 本服务按进程内、按书源分桶保存：不落盘，重启即清空；上游规则的磁盘缓存语义未复刻。
 pub(super) const SOURCE_VAR_MAX_VALUE_BYTES: usize = 256 * 1024;
 pub(super) const SOURCE_VAR_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
@@ -510,7 +510,7 @@ pub(super) fn native_cookie_clear(
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from("")))
 }
 
-/// `source.get(key)`：按当前书源读进程内变量；无值返回空串（与 Legado 一致）。
+/// `source.get(key)`：按当前书源读进程内变量；无值返回空串（与上游规则一致）。
 pub(super) fn native_source_var_get(
     _this: &boa_engine::JsValue,
     args: &[boa_engine::JsValue],
@@ -524,7 +524,7 @@ pub(super) fn native_source_var_get(
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from(s)))
 }
 
-/// `source.put(key, value)`：按当前书源写进程内变量，返回写入的字符串值（与 Legado 一致）。
+/// `source.put(key, value)`：按当前书源写进程内变量，返回写入的字符串值（与上游规则一致）。
 pub(super) fn native_source_var_put(
     _this: &boa_engine::JsValue,
     args: &[boa_engine::JsValue],
@@ -622,7 +622,7 @@ pub(super) fn native_ajax(
 }
 
 /// `java.head(url[, headersJson])` 的原生实现：不读正文，返回
-/// `{status, url, headers}` 供 JS 构造与 Legado StrResponse 同形的响应对象。
+/// `{status, url, headers}` 供 JS 构造与上游规则 StrResponse 同形的响应对象。
 pub(super) fn native_head(
     _this: &boa_engine::JsValue,
     args: &[boa_engine::JsValue],
@@ -698,7 +698,7 @@ pub(super) fn store_script(url: &str, text: &str) {
     }
 }
 
-/// `java.importScript` 的地址形态判定。Legado `p0.i0` 还支持 file/content/storage
+/// `java.importScript` 的地址形态判定。上游规则 `p0.i0` 还支持 file/content/storage
 /// （App 私有目录），服务端放开会变成“书源可读部署机任意路径”，故只允许 http(s)。
 pub(super) fn import_script_supported(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -842,7 +842,7 @@ pub(super) fn native_aes_decode_to_string(
     Ok(boa_engine::JsValue::from(boa_engine::JsString::from(out)))
 }
 
-/// key/iv 参数：JS 字节数组走 JSON（`[..]`），字符串按 Legado `String.toByteArray()`（UTF-8）。
+/// key/iv 参数：JS 字节数组走 JSON（`[..]`），字符串按上游规则 `String.toByteArray()`（UTF-8）。
 pub(super) fn parse_key_arg(s: &str) -> Vec<u8> {
     if s.trim_start().starts_with('[') {
         parse_bytes_arg(s)
@@ -977,7 +977,7 @@ pub(super) fn js_unescape(s: &str) -> String {
     out
 }
 
-/// 解析书源 `jsLib` 字段（Legado 约定：`{库名: 脚本URL}` 的 JSON map）为脚本地址列表。
+/// 解析书源 `jsLib` 字段（上游规则约定：`{库名: 脚本URL}` 的 JSON map）为脚本地址列表。
 ///
 /// 真实源里存在三种形态：空串/非法 JSON（忽略）、JSON map（取非空字符串值）、
 /// JSON 数组；个别源把整个字段直接写成单个 http(s) URL，也接受。
@@ -1019,12 +1019,12 @@ pub(super) fn js_lib_urls(js_lib: &str) -> Vec<String> {
     out
 }
 
-/// jsLib 预载片段。**必须插在 `JAVA_BOOK_SHIM` 之后**：jsLib 是 Legado 的共享作用域脚本
+/// jsLib 预载片段。**必须插在 `JAVA_BOOK_SHIM` 之后**：jsLib 是上游规则的共享作用域脚本
 /// （`const { java, source, cookie, cache } = this;`），需要 `this` 上已有这些对象；
 /// 它定义的 `Reload/Get` 等函数声明要能被执行规则代码的作用域看到，规则
 /// `<js> eval(String(Reload('url'))) </js>` 才能直接调用。
 ///
-/// 用**间接 eval**（`(0, eval)(src)`）把 jsLib 放到全局作用域执行，对齐 Legado：
+/// 用**间接 eval**（`(0, eval)(src)`）把 jsLib 放到全局作用域执行，对齐上游规则：
 /// jsLib 内部大量 `this.testUrl(...)`/`this.Option()` 依赖“顶层函数声明成为共享作用域
 /// 的成员、函数里的 this 就是该作用域”。若用直接 eval 落进 IIFE 的局部作用域，
 /// 这些 `this.xxx` 会全部 undefined。代价是这些全局名在单一 JS Context 里跨源留存；

@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::html::unquote_arg;
 use super::RuleError;
 
-/// Legado 常用 JSONPath 子集：`$.a.b` / `$..field`（递归下降）/ `[*]` / `[n]` / `['key']`。
+/// 上游规则常用 JSONPath 子集：`$.a.b` / `$..field`（递归下降）/ `[*]` / `[n]` / `['key']`。
 #[derive(Debug, Clone, PartialEq)]
 enum JpSeg {
     Key(String),
@@ -272,7 +272,7 @@ fn parse_json_path(path: &str) -> Result<Vec<JpSeg>, String> {
                         segs.push(JpSeg::Wildcard);
                         i += 1;
                     } else if cs.get(i) == Some(&'[') {
-                        // Legado 用 Jayway json-path，容忍 `$.data.[*]` 这类多余的点
+                        // 上游规则用 Jayway json-path，容忍 `$.data.[*]` 这类多余的点
                         continue;
                     } else {
                         let (k, ni) = read_key(i);
@@ -533,7 +533,7 @@ fn split_top_level_and(rule: &str) -> Option<Vec<&str>> {
 
 pub(super) fn json_query(v: &Value, rule: &str) -> Result<Vec<Value>, RuleError> {
     let rule = rule.trim();
-    // Legado 的 JSONPath `&&` 表示多个路径结果合并（`$.a.*&&$.b.*`）
+    // 上游规则的 JSONPath `&&` 表示多个路径结果合并（`$.a.*&&$.b.*`）
     if let Some(parts) = split_top_level_and(rule) {
         let mut out = Vec::new();
         for p in parts {

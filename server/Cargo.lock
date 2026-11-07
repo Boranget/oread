@@ -393,6 +393,7 @@ dependencies = [
  "chrono",
  "encoding_rs",
  "futures",
+ "getrandom 0.2.17",
  "hmac",
  "image",
  "jsonpath-rust",

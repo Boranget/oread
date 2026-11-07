@@ -160,7 +160,7 @@ pub(in crate::rule_engine) fn is_simple_json_key(k: &str) -> bool {
 }
 
 /// JSON 对象列表项取字段：`rule` 是裸字段名（`text`/`href`/`name`/`title`…）时按键取值。
-/// 别名与 Legado 章节项约定一致：标题取 `text/name/title`，链接取 `href/url/src`。
+/// 别名与上游规则章节项约定一致：标题取 `text/name/title`，链接取 `href/url/src`。
 /// 返回 `None` 表示 content 不是 JSON 对象（交给原有 CSS/正则链路）；是对象但字段缺失返回空串。
 pub(in crate::rule_engine) fn json_item_field(content: &str, key: &str) -> Option<String> {
     if !is_simple_json_key(key) {

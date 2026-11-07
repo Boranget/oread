@@ -6,7 +6,7 @@
 //   node scripts/golden.mjs snapshot --base-url http://127.0.0.1:18080 --out scripts/golden/baseline
 //   node scripts/golden.mjs diff --expected scripts/golden/baseline --actual scripts/golden/current
 //
-// 登录凭据默认 admin/__INITIAL_ADMIN_PASS__，可用 --user/--pass 或 BORANLIB_BASELINE_USER/PASS 覆盖。
+// 登录凭据需显式提供：--user/--pass 或 BORANLIB_BASELINE_USER/PASS。
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -24,7 +24,7 @@ const valueOf = (name, fallback = null) => {
 
 const baseUrl = (valueOf('--base-url', process.env.BORANLIB_BASE_URL || 'http://127.0.0.1:18080')).replace(/\/$/, '');
 const user = valueOf('--user', process.env.BORANLIB_BASELINE_USER || 'admin');
-const pass = valueOf('--pass', process.env.BORANLIB_BASELINE_PASS || '__INITIAL_ADMIN_PASS__');
+const pass = valueOf('--pass', process.env.BORANLIB_BASELINE_PASS || null);
 const outDir = valueOf('--out', join(ROOT, 'scripts', 'golden', 'baseline'));
 const expectedDir = valueOf('--expected', join(ROOT, 'scripts', 'golden', 'baseline'));
 const actualDir = valueOf('--actual', join(ROOT, 'scripts', 'golden', 'current'));
@@ -81,6 +81,7 @@ function nameOf(path) {
 }
 
 async function login() {
+  if (!pass) throw new Error('缺少登录口令：请传 --pass 或设置 BORANLIB_BASELINE_PASS');
   const r = await fetch(`${baseUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

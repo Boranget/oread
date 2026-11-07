@@ -3,7 +3,7 @@
 use super::*;
 
 impl AnalyzeRule {
-    /// 单值入口：对应 Legado `getString(..., unescape = true)`。
+    /// 单值入口：`getString(..., unescape = true)` 的等价实现。
     /// HTML4 实体只在**最外层**反转义一次；内部递归走 `get_string_inner`，避免重复反转义。
     pub fn get_string(
         &self,
@@ -39,7 +39,7 @@ impl AnalyzeRule {
         if only_get {
             return Ok(rule.trim().to_string());
         }
-        // 整条规则就是一个 `{{…}}` 模板：Legado 直接返回模板求值结果，不能把结果再当
+        // 整条规则就是一个 `{{…}}` 模板：上游规则直接返回模板求值结果，不能把结果再当
         // 规则/选择器解析。此前 `{{book.name}}`、`{{java.timeFormat(...)}}` 展开后会被
         // 当作 CSS 选择器，解析失败返回空串（库内 5 条规则 / 3 源）。
         let whole_template = {
@@ -47,7 +47,7 @@ impl AnalyzeRule {
             t.starts_with("{{") && t.ends_with("}}") && !t[2..t.len() - 2].contains("}}")
         };
         // 局部模板（`{{$.a}}\n{{$.b}}`、`第{$.n}章`、`https://…/{{$.cover}}`）展开后是**字面量值**；
-        // Legado 里含模板的规则整条按模板求值，不会再把展开结果当 JSONPath/选择器。
+        // 上游规则里含模板的规则整条按模板求值，不会再把展开结果当 JSONPath/选择器。
         // 此前 JSON 源被强制走 JSONPath，把值当路径报“必须以 $ 开头”，kind / cover_url /
         // last_chapter 因此全空（pass4 真实日志 187 条）。
         let had_template = rule.contains("{{") || rule.contains("{$");
@@ -56,7 +56,7 @@ impl AnalyzeRule {
         if whole_template && !rule.starts_with("{{") {
             return Ok(rule);
         }
-        // 模板展开后的字面量：Legado 里含 `{{…}}` 的规则整条按模板求值，结果直接返回，
+        // 模板展开后的字面量：上游规则里含 `{{…}}` 的规则整条按模板求值，结果直接返回，
         // 不能当 JSONPath/选择器。仅当展开后仍带规则语法（`$.`、`<js>`、抽取后缀
         // `@text`、`##` 等）时才继续走规则管道（如 `{{'a'}}@text`）。
         if had_template && expanded_is_literal(&rule) {
@@ -80,13 +80,13 @@ impl AnalyzeRule {
         if rule.starts_with('{') && rule.ends_with('}') && rule.contains(':') {
             return Ok(rule.to_string());
         }
-        // @get:{key} / @put:{key:value} 已在 `apply_put_get` 里按 Legado 的
+        // @get:{key} / @put:{key:value} 已在 `apply_put_get` 里按上游规则的
         // `splitPutRule` + `makeUpRule` 语义处理（可出现在规则任意位置，不只整串）。
         // 顶层操作符（不在 <js>…</js> / @js: 段内）。
-        // 顺序与 Legado 一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
+        // 顺序与上游规则一致：先在 makeUpRule 里拆 `##`，再交给解析器处理 `||`/`&&`/`%%`。
         if let Some(parts) = split_outside_js(rule, "##") {
             // `##` 前半段可能只是模板展开后的字面量（如 `📂 简介：{{$.introduction}}##…`）：
-            // Legado 里整条规则按模板求值，前半段不再当选择器解析，否则会得到空串。
+            // 上游规则里整条规则按模板求值，前半段不再当选择器解析，否则会得到空串。
             let head = parts[0].trim();
             let sub = if had_template && expanded_is_literal(head) {
                 head.to_string()
@@ -116,7 +116,7 @@ impl AnalyzeRule {
             return Ok(String::new());
         }
         if let Some(parts) = split_outside_js(rule, "&&") {
-            // Legado 的 `&&` 是「列表合并」：多值用 `\n` 连接，而不是空串粘连。
+            // 上游规则的 `&&` 是「列表合并」：多值用 `\n` 连接，而不是空串粘连。
             let mut items: Vec<String> = Vec::new();
             for p in &parts {
                 items.extend(self.eval_list(content, p, base_url));
@@ -147,7 +147,7 @@ impl AnalyzeRule {
             return Ok(items.join("\n"));
         }
         // JS 对象数组展开后的列表项（`{"text":"第一章","href":"/1.html"}`）：
-        // 裸字段名按键取值，别名见 `json_item_field`（Legado 章节项 text/name/title + href/url）。
+        // 裸字段名按键取值，别名见 `json_item_field`（上游规则章节项 text/name/title + href/url）。
         // 不按源级 `is_json` 开关跳过：JSON 源的列表项本身就是对象，字段规则（`chapterName: name`）
         // 若落到 JSONPath 会报“路径必须以 $ 开头”，把整源目录清空（中文万维 1→0 即此因）。
         let key = rule.trim().strip_prefix('@').unwrap_or(rule.trim());
@@ -244,8 +244,8 @@ impl AnalyzeRule {
                 }
             }
         }
-        // 单值抽取：Legado `JSoup 规则.getString` = getResultLast 收集**全部**匹配
-        // 元素的值（空值/重复属性跳过），多值再按 `\n` 合并；isUrl 走 getString 只取首个。
+        // 单值抽取：按规则语义收集**全部**匹配
+        // 元素的值（空值/重复属性跳过），多值再按 `\n` 合并；isUrl 只取首个。
         match terminal {
             Some(t) => {
                 let vals = terminal_values(&els, &t);
@@ -262,7 +262,7 @@ impl AnalyzeRule {
     pub(super) fn apply_json(&self, json: &str, rule: &str) -> Result<String, RuleError> {
         let v: Value = serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
         let vals = json_query(&v, rule)?;
-        // Legado 的 getString 对多值结果按 `\n` 拼接（`$..image` 这类递归路径会命中多个节点）。
+        // 上游规则的 getString 对多值结果按 `\n` 拼接（`$..image` 这类递归路径会命中多个节点）。
         // 此前只取最后一个，导致「章节多图」被压成 1 张，源规则里 `@js:result.split("\n")` 也只剩一行。
         if vals.is_empty() {
             return Ok(String::new());

@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// JS 返回的 JSON 数组展开为列表项（Legado `getStringList` 的 List 语义）。
+/// JS 返回的 JSON 数组展开为列表项（上游规则 `getStringList` 的 List 语义）。
 ///
 /// `keep_objects=true`（目录）：对象保留为紧凑 JSON，供 `chapterName/chapterUrl` 逐项取字段；
 /// `keep_objects=false`（图片等纯值）：对象取 `src/url/href`，缺则取文本字段。

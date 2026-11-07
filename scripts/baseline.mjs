@@ -6,7 +6,7 @@
 //   node scripts/baseline.mjs
 //   node scripts/baseline.mjs --frontend --json docs/baseline/2026-11-07.json
 //   node scripts/baseline.mjs --build --build-release --test
-//   node scripts/baseline.mjs --url http://127.0.0.1:18080 --user admin --pass __INITIAL_ADMIN_PASS__
+//   node scripts/baseline.mjs --url http://127.0.0.1:18080 --user admin --pass '<口令>'
 //
 // 环境变量：
 //   CARGO_TARGET_DIR       复用本地 target，默认 server/target
@@ -41,7 +41,7 @@ const opt = {
   json: valueOf('--json'),
   url: valueOf('--url'),
   user: valueOf('--user', process.env.BORANLIB_BASELINE_USER || 'admin'),
-  pass: valueOf('--pass', process.env.BORANLIB_BASELINE_PASS || '__INITIAL_ADMIN_PASS__'),
+  pass: valueOf('--pass', process.env.BORANLIB_BASELINE_PASS || null),
 };
 
 const out = {
@@ -276,6 +276,10 @@ async function measureRuntime(baseUrl) {
 }
 
 if (opt.url) {
+  if (!opt.pass) {
+    console.error('缺少登录口令：使用 --url 时需传 --pass 或设置 BORANLIB_BASELINE_PASS');
+    process.exit(2);
+  }
   out.runtime = await measureRuntime(opt.url);
 }
 

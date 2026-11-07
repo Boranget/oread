@@ -604,13 +604,19 @@ mod tests {
         assert_eq!(stored, "alice", "落库用户名必须已 trim");
     }
 
-    // 生产首次启动：必须显式提供足够强的 ADMIN_PASS；开发允许缺省 __INITIAL_ADMIN_PASS__。
+    // 生产首次启动：必须显式提供足够强的 ADMIN_PASS；开发环境缺省时随机生成一次性口令。
     #[test]
     fn production_bootstrap_requires_strong_password() {
-        assert_eq!(resolve_bootstrap_pass(false, None).unwrap(), "__INITIAL_ADMIN_PASS__");
+        let dev_pass = resolve_bootstrap_pass(false, None).unwrap();
+        assert_eq!(dev_pass.len(), 32, "生成口令应为 32 位十六进制");
+        assert!(dev_pass.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            dev_pass,
+            resolve_bootstrap_pass(false, None).unwrap(),
+            "每次生成的口令不应相同"
+        );
         assert!(resolve_bootstrap_pass(false, Some("x".into())).is_ok());
         assert!(resolve_bootstrap_pass(true, None).is_err());
-        assert!(resolve_bootstrap_pass(true, Some("__INITIAL_ADMIN_PASS__".into())).is_err());
         assert!(resolve_bootstrap_pass(true, Some("short".into())).is_err());
         assert_eq!(
             resolve_bootstrap_pass(true, Some("correct-horse".into())).unwrap(),
@@ -622,25 +628,40 @@ mod tests {
 /// 生产环境管理员口令最小长度（字节）。
 const MIN_ADMIN_PASS_LEN: usize = 8;
 
-/// 解析首次启动口令：生产环境必须显式设置且足够强；开发环境允许缺省 __INITIAL_ADMIN_PASS__。
+/// 生成一次性管理员口令：16 字节 OS 随机数的十六进制表示。
+fn generate_bootstrap_pass() -> AppResult<String> {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| AppError::Internal(format!("生成初始管理员口令失败: {e}")))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// 解析首次启动口令：生产环境必须显式设置且不少于最小长度；
+/// 非生产环境缺省时随机生成并在启动日志中打印一次。
 fn resolve_bootstrap_pass(production: bool, pass: Option<String>) -> AppResult<String> {
     match pass {
-        Some(pass) if production && (pass.len() < MIN_ADMIN_PASS_LEN || pass == "__INITIAL_ADMIN_PASS__") => {
+        Some(pass) if production && pass.len() < MIN_ADMIN_PASS_LEN => {
             Err(AppError::Internal(format!(
-                "生产环境 ADMIN_PASS 至少 {MIN_ADMIN_PASS_LEN} 字节，且不能使用默认口令 __INITIAL_ADMIN_PASS__"
+                "生产环境 ADMIN_PASS 至少 {MIN_ADMIN_PASS_LEN} 字节"
             )))
         }
         Some(pass) => Ok(pass),
         None if production => Err(AppError::Internal(format!(
-            "生产环境首次启动必须设置 ADMIN_PASS（BORANLIB_ADMIN_PASS 或 LEGADO_ADMIN_PASS，至少 {MIN_ADMIN_PASS_LEN} 字节，且不能是 __INITIAL_ADMIN_PASS__）"
+            "生产环境首次启动必须设置 ADMIN_PASS（BORANLIB_ADMIN_PASS 或 LEGADO_ADMIN_PASS，至少 {MIN_ADMIN_PASS_LEN} 字节）"
         ))),
-        None => Ok("__INITIAL_ADMIN_PASS__".into()),
+        None => {
+            let generated = generate_bootstrap_pass()?;
+            eprintln!(
+                "[bootstrap] 未提供 ADMIN_PASS，已生成一次性管理员口令（仅本次显示，请立即保存并在登录后修改）：{generated}"
+            );
+            Ok(generated)
+        }
     }
 }
 
 /// 首次启动引导：若 users 表为空，则创建管理员账号。
 /// 用户名来自 `ADMIN_USER`（缺省 admin）；口令来自 `ADMIN_PASS`。
-/// 生产环境必须显式设置 `ADMIN_PASS`（至少 8 字节且不能是 __INITIAL_ADMIN_PASS__），否则拒绝创建。
+/// 生产环境必须显式设置 `ADMIN_PASS`（至少 8 字节），否则拒绝创建。
 pub async fn bootstrap_admin(pool: &SqlitePool, cfg: &crate::config::Config) -> AppResult<()> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(pool)

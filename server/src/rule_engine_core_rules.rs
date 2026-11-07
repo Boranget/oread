@@ -4,7 +4,7 @@ use super::*;
 
 impl AnalyzeRule {
     pub(super) fn detect_mode(rule: &str, is_json: bool, content: &str) -> Mode {
-        // Legado 的 `@CSS:`/`@XPath:`/`@Json:` 前缀全部大小写不敏感。
+        // 上游规则的 `@CSS:`/`@XPath:`/`@Json:` 前缀全部大小写不敏感。
         if starts_with_ci(rule, "@xpath:") {
             Mode::XPath
         } else if starts_with_ci(rule, "@json:") {
@@ -111,7 +111,7 @@ impl AnalyzeRule {
         parts
     }
 
-    /// 大小写不敏感的前缀剥离（Legado `startsWith(..., ignoreCase = true)`）。
+    /// 大小写不敏感的前缀剥离（上游规则 `startsWith(..., ignoreCase = true)`）。
     pub(super) fn strip_prefix<'a>(rule: &'a str, p: &str) -> &'a str {
         if starts_with_ci(rule, p) {
             &rule[p.len()..]
@@ -120,7 +120,7 @@ impl AnalyzeRule {
         }
     }
 
-    /// Legado `@put:{key:rule}` / `@get:{key}`：
+    /// 上游规则 `@put:{key:rule}` / `@get:{key}`：
     /// - 上游 `AnalyzeRule.splitPutRule`（L516，正则 L1027 `@put:(\{[^}]+?\})`，大小写不敏感）
     ///   先把 `@put:{…}` 从规则正文里摘掉；求值时 `putRule`（L507）把每个 value 当**完整规则**
     ///   在当前 content 上求值后 `put(key, value)`（L856；chapter→book→ruleData→source 依次落库）。

@@ -117,7 +117,7 @@ function __hexBin(h){
   return out;
 }
 function __b64Charset(bin, charset){
-  // 只实现 Legado 源里常见的几种；GBK 等无 JS 解码表，退化为 UTF-8（与上游的 GBK 解码有差异）。
+  // 只实现上游规则源里常见的几种；GBK 等无 JS 解码表，退化为 UTF-8（与上游的 GBK 解码有差异）。
   var c = String(charset).toUpperCase().replace(/[_-]/g, "");
   if (c === "UTF8" || c === "") return __fromUtf8(bin);
   if (c === "LATIN1" || c === "ISO88591" || c === "ASCII" || c === "USASCII") return bin;
@@ -218,7 +218,7 @@ function __md5(s){
 /// 简→繁常用字表（供 `java.t2s`）。只覆盖常见字；未收录字原样返回。
 pub(crate) const JS_T2S: &str = r#"var __T2S = {"爱":"愛","罢":"罷","摆":"擺","败":"敗","办":"辦","帮":"幫","宝":"寶","报":"報","备":"備","贝":"貝","笔":"筆","毕":"畢","边":"邊","变":"變","标":"標","表":"錶","别":"彆","宾":"賓","补":"補","参":"參","惨":"慘","灿":"燦","仓":"倉","产":"產","长":"長","尝":"嘗","车":"車","彻":"徹","尘":"塵","陈":"陳","衬":"襯","称":"稱","惩":"懲","迟":"遲","冲":"衝","丑":"醜","础":"礎","处":"處","触":"觸","传":"傳","疮":"瘡","闯":"闖","创":"創","纯":"純","词":"詞","从":"從","丛":"叢","窜":"竄","达":"達","带":"帶","贷":"貸","担":"擔","单":"單","胆":"膽","当":"當","党":"黨","荡":"蕩","档":"檔","导":"導","敌":"敵","邓":"鄧","递":"遞","点":"點","电":"電","垫":"墊","钓":"釣","调":"調","叠":"疊","东":"東","动":"動","冻":"凍","斗":"鬥","独":"獨","读":"讀","断":"斷","对":"對","队":"隊","吨":"噸","夺":"奪","堕":"墮","儿":"兒","尔":"爾","发":"發","罚":"罰","阀":"閥","飞":"飛","费":"費","废":"廢","纷":"紛","坟":"墳","奋":"奮","粪":"糞","风":"風","丰":"豐","冯":"馮","凤":"鳳","肤":"膚","妇":"婦","复":"復","该":"該","干":"乾","赶":"趕","冈":"岡","刚":"剛","岗":"崗","纲":"綱","钢":"鋼","个":"個","给":"給","巩":"鞏","沟":"溝","构":"構","购":"購","谷":"穀","顾":"顧","刮":"颳","关":"關","观":"觀","馆":"館","惯":"慣","广":"廣","归":"歸","龟":"龜","规":"規","国":"國","过":"過","汉":"漢","号":"號","轰":"轟","后":"後","胡":"鬍","壶":"壺","沪":"滬","护":"護","划":"劃","怀":"懷","坏":"壞","欢":"歡","环":"環","还":"還","回":"迴","汇":"匯","会":"會","秽":"穢","荤":"葷","浑":"渾","伙":"夥","获":"獲","击":"擊","鸡":"雞","积":"積","极":"極","际":"際","继":"繼","家":"傢","价":"價","艰":"艱","歼":"殲","舰":"艦","姜":"薑","浆":"漿","桨":"槳","奖":"獎","讲":"講","酱":"醬","胶":"膠","浇":"澆","骄":"驕","娇":"嬌","搅":"攪","缴":"繳","觉":"覺","较":"較","阶":"階","节":"節","洁":"潔","结":"結","借":"藉","仅":"僅","惊":"驚","竞":"競","旧":"舊","剧":"劇","据":"據","惧":"懼","卷":"捲","决":"決","绝":"絕","军":"軍","开":"開","克":"剋","壳":"殼","夸":"誇","矿":"礦","亏":"虧","困":"睏","腊":"臘","蜡":"蠟","来":"來","赖":"賴","兰":"蘭","拦":"攔","栏":"欄","烂":"爛","垒":"壘","类":"類","里":"裡","礼":"禮","丽":"麗","厉":"厲","励":"勵","离":"離","历":"歷","帘":"簾","联":"聯","怜":"憐","炼":"煉","练":"練","粮":"糧","两":"兩","辆":"輛","疗":"療","辽":"遼","了":"瞭","猎":"獵","临":"臨","邻":"鄰","岭":"嶺","庐":"廬","芦":"蘆","炉":"爐","陆":"陸","虏":"虜","录":"錄","虑":"慮","乱":"亂","罗":"羅","萝":"蘿","络":"絡","妈":"媽","马":"馬","骂":"罵","买":"買","麦":"麥","卖":"賣","迈":"邁","脉":"脈","猫":"貓","么":"麼","门":"門","闷":"悶","梦":"夢","弥":"彌","觅":"覓","绵":"綿","面":"麵","庙":"廟","灭":"滅","亩":"畝","恼":"惱","脑":"腦","拟":"擬","酿":"釀","鸟":"鳥","聂":"聶","宁":"寧","农":"農","齐":"齊","岂":"豈","启":"啟","气":"氣","弃":"棄","牵":"牽","签":"簽","迁":"遷","窍":"竅","窃":"竊","亲":"親","轻":"輕","庆":"慶","琼":"瓊","穷":"窮","秋":"鞦","区":"區","驱":"驅","趋":"趨","权":"權","劝":"勸","确":"確","让":"讓","扰":"擾","热":"熱","认":"認","荣":"榮","绒":"絨","洒":"灑","伞":"傘","丧":"喪","扫":"掃","涩":"澀","杀":"殺","晒":"曬","纱":"紗","设":"設","绅":"紳","审":"審","声":"聲","胜":"勝","圣":"聖","师":"師","湿":"濕","时":"時","实":"實","适":"適","势":"勢","兽":"獸","书":"書","术":"術","树":"樹","帅":"帥","双":"雙","谁":"誰","顺":"順","说":"說","丝":"絲","松":"鬆","苏":"蘇","诉":"訴","虽":"雖","随":"隨","台":"臺","态":"態","摊":"攤","滩":"灘","坛":"壇","叹":"嘆","汤":"湯","烫":"燙","涛":"濤","体":"體","条":"條","铁":"鐵","听":"聽","厅":"廳","头":"頭","图":"圖","涂":"塗","团":"團","洼":"窪","袜":"襪","弯":"彎","万":"萬","网":"網","韦":"韋","违":"違","围":"圍","为":"為","卫":"衛","温":"溫","闻":"聞","问":"問","稳":"穩","务":"務","雾":"霧","牺":"犧","习":"習","系":"係","戏":"戲","细":"細","虾":"蝦","吓":"嚇","鲜":"鮮","纤":"纖","咸":"鹹","显":"顯","险":"險","现":"現","献":"獻","乡":"鄉","详":"詳","响":"響","向":"嚮","协":"協","挟":"挾","泻":"瀉","谢":"謝","兴":"興","须":"須","许":"許","悬":"懸","选":"選","学":"學","寻":"尋","压":"壓","亚":"亞","严":"嚴","盐":"鹽","阳":"陽","养":"養","样":"樣","痒":"癢","谣":"謠","药":"藥","爷":"爺","业":"業","叶":"葉","页":"頁","义":"義","议":"議","亿":"億","忆":"憶","艺":"藝","隐":"隱","应":"應","营":"營","拥":"擁","优":"優","忧":"憂","邮":"郵","余":"餘","鱼":"魚","与":"與","屿":"嶼","语":"語","吁":"籲","郁":"鬱","誉":"譽","渊":"淵","园":"園","员":"員","圆":"圓","缘":"緣","远":"遠","愿":"願","跃":"躍","云":"雲","杂":"雜","灾":"災","赞":"讚","赃":"贓","脏":"臟","凿":"鑿","枣":"棗","灶":"竈","责":"責","择":"擇","则":"則","泽":"澤","贼":"賊","赠":"贈","扎":"紮","张":"張","帐":"帳","战":"戰","这":"這","针":"針","征":"徵","争":"爭","挣":"掙","症":"癥","证":"證","只":"隻","帜":"幟","质":"質","种":"種","众":"眾","昼":"晝","烛":"燭","筑":"築","庄":"莊","装":"裝","妆":"妝","壮":"壯","状":"狀","准":"準","浊":"濁","总":"總","钻":"鑽","纵":"縱","邹":"鄒","诅":"詛","组":"組","话":"話","记":"記","写":"寫","诗":"詩","请":"請","难":"難","乐":"樂","进":"進","岁":"歲","间":"間","见":"見","龙":"龍","颜":"顏","恋":"戀","泪":"淚","华":"華","画":"畫"};"#;
 
-/// `cache` 全局（Legado: 规则语义 `bindings["cache"] = CacheManager`）。
+/// `cache` 全局（由引擎注入缓存管理对象）。
 /// 上游 CacheManager 的方法名是 `get / put / delete`（另有 getFromMemory / putMemory /
 /// deleteMemory，CacheManager.kt:60-160），**没有** set/remove/clear。
 /// 本实现是每作用域一份的字符串 map：`get` 未命中返回 null（同上游返回 String?），
@@ -239,7 +239,7 @@ var cache = {
   putMemory: function(k, v){ cache.put(k, v); },
   delete: function(k){ delete __cache[String(k)]; },
   deleteMemory: function(k){ cache.delete(k); },
-  // Legado `CacheManager.getFile/putFile`：key 只当不透明标识（服务端把它 md5 成文件名），
+  // 上游规则 `CacheManager.getFile/putFile`：key 只当不透明标识（服务端把它 md5 成文件名），
   // 不允许用它直接拼路径；落盘目录固定为部署侧 `<data_dir>/cache/rule`。
   getFile: function(k){ return __nativeCacheFileGet(k == null ? "" : String(k)); },
   putFile: function(k, v, saveTime){
@@ -285,7 +285,7 @@ var book = {
   getVariable: function(k){ return __vars[k] !== undefined ? __vars[k] : ""; },
   putVariable: function(k,v){ __vars[k] = String(v); }
 };
-// 书源 key（= bookSourceUrl）由 Rust 侧在每次求值前注入。`get/put` 对齐 Legado
+// 书源 key（= bookSourceUrl）由 Rust 侧在每次求值前注入。`get/put` 对齐上游规则
 // `BaseSource.get/put`：按书源分桶的字符串变量（CacheManager key `v_<sourceKey>_<key>`）。
 // 本服务为进程内存储，不落盘；`put` 返回写入的字符串值，`get` 缺省返回空串。
 var source = {
@@ -298,7 +298,7 @@ var source = {
     return __nativeSourceVarPut(__sourceKey, k == null ? "" : String(k), s);
   }
 };
-// Legado `cookie` 全局：落到 Rust 侧按书源分桶的进程内 Cookie 存储（req.rs COOKIE_JAR），
+// 上游规则 `cookie` 全局：落到 Rust 侧按书源分桶的进程内 Cookie 存储（req.rs COOKIE_JAR），
 // 不新建全局 map；get 无值返回空串，set/remove/clear 返回空串（可直接拼进 {{ }} 模板）。
 var cookie = {
   getCookie: function(url){ return __nativeCookieGet(__sourceKey, url == null ? "" : String(url)); },
@@ -312,9 +312,9 @@ var cookie = {
   },
   clear: function(){ __nativeCookieClear(__sourceKey); return ""; }
 };
-// Legado `java.connect` / `java.startBrowserAwait` 返回 StrResponse。服务端没有 WebView/人工验证，
+// 上游规则 `java.connect` / `java.startBrowserAwait` 返回 StrResponse。服务端没有 WebView/人工验证，
 // 这里用与 java.ajax 相同的原生抓取层发请求，并返回同形状的响应对象（body/url/code/header）。
-// 抓取失败按 Legado 的容错方式把错误写进 body（调用方 `.body().includes(...)` 不会抛异常）。
+// 抓取失败按上游规则的容错方式把错误写进 body（调用方 `.body().includes(...)` 不会抛异常）。
 function __httpResponse(url, header){
   var u = String(url == null ? "" : url);
   var h = header == null ? "" : (typeof header === "string" ? header : JSON.stringify(header));
@@ -393,7 +393,7 @@ var java = {
     if (t === undefined || t === null || t === "") t = Date.now();
     var n = Number(t), d;
     if (!isNaN(n)) {
-      // Legado 的 time 多为毫秒；小于 1e11 视为秒级时间戳
+      // 上游规则的 time 多为毫秒；小于 1e11 视为秒级时间戳
       d = new Date(n < 100000000000 ? n * 1000 : n);
     } else { d = new Date(String(t)); }
     if (isNaN(d.getTime())) return "";
@@ -426,7 +426,7 @@ var java = {
   log: function(){},
   toast: function(){},
   longToast: function(){},
-  // Legado: java.ajax(url[, method[, body[, headers]]]) -> 响应文本。
+  // 上游规则: java.ajax(url[, method[, body[, headers]]]) -> 响应文本。
   // 由 Rust 原生 __nativeAjax 同步联网，复用 req 的 15s 超时 / 5MiB / 私网策略。
   ajax: function(url, method, body, headers){
     return __nativeAjax(String(url == null ? "" : url),
@@ -435,15 +435,15 @@ var java = {
       headers == null ? "" : (typeof headers === "string" ? headers : JSON.stringify(headers)));
   },
   post: function(url, body, headers){ return java.ajax(url, "POST", body, headers); },
-  // Legado `java.importScript(path)`：下载脚本文本供规则 `eval(String(...))`。本服务只接受
+  // 上游规则 `java.importScript(path)`：下载脚本文本供规则 `eval(String(...))`。本服务只接受
   // http(s)（进程内 TTL 缓存，见 __nativeImportScript）；file/content/storage 形态会读取
   // 部署机本地文件，等于把书源变成任意文件读取面，故显式报未支持而不是静默失败。
   importScript: function(path){
     return String(__nativeImportScript(path == null ? "" : String(path)));
   },
-  // Legado `java.connect(url[, header])`：返回 StrResponse（body/url/code/header）。
+  // 上游规则 `java.connect(url[, header])`：返回 StrResponse（body/url/code/header）。
   connect: function(url, header){ return __httpResponse(url, header); },
-  // Legado `java.head(url[, header])`：HEAD 请求，返回带响应头的 StrResponse（不读正文）。
+  // 上游规则 `java.head(url[, header])`：HEAD 请求，返回带响应头的 StrResponse（不读正文）。
   // 书源 jsLib（如哔哩漫画 Reload）常用 `.header('etag')` 拿缓存指纹。
   head: function(url, header){
     var u = String(url == null ? "" : url);
@@ -507,12 +507,12 @@ var java = {
     }
     return __DOMS[key];
   },
-  // Legado 的 java.getElement：从“当前页面”取第一个匹配元素（jsoup Element）。
+  // 上游规则的 java.getElement：从“当前页面”取第一个匹配元素（jsoup Element）。
   getElement: function(rule){
     var doc = new JsoupDocument(__jsoupParse(__page == null ? "" : String(__page), __base));
     return doc.selectFirst(rule == null ? "" : String(rule));
   },
-  // Legado java.aesBase64DecodeToString(data, key, transformation, iv)
+  // 上游规则 java.aesBase64DecodeToString(data, key, transformation, iv)
   aesBase64DecodeToString: function(data, key, transformation, iv){
     return __nativeAesDecodeToString(
       data == null ? "" : String(data),
@@ -520,7 +520,7 @@ var java = {
       transformation == null ? "" : String(transformation),
       iv == null ? "" : String(iv));
   },
-  // Legado java.createSymmetricCrypto(transformation, key, iv) -> {encrypt, decrypt}
+  // 上游规则 java.createSymmetricCrypto(transformation, key, iv) -> {encrypt, decrypt}
   createSymmetricCrypto: function(transformation, key, iv){
     var tf = transformation == null ? "" : String(transformation);
     var k = __keyArg(key);
@@ -534,9 +534,9 @@ var java = {
       }
     };
   },
-  // Legado java.bytesToStr(bytes) -> UTF-8 字符串
+  // 上游规则 java.bytesToStr(bytes) -> UTF-8 字符串
   bytesToStr: function(bytes){ return __nativeBytesToStr(JSON.stringify(__toByteArray(bytes))); },
-  // Legado java.timeFormatUTC(time, format, offsetHours)
+  // 上游规则 java.timeFormatUTC(time, format, offsetHours)
   timeFormatUTC: function(t, f, offset){
     if (typeof t === "string" && f === undefined) { f = t; t = undefined; }
     if (t === undefined || t === null || t === "") t = Date.now();
@@ -556,17 +556,17 @@ var java = {
     f = f || "yyyy-MM-dd HH:mm:ss";
     return String(f).replace(/yyyy|MM|dd|HH|mm|ss|SSS/g, function(k){ return map[k]; });
   },
-  // Legado java.refreshTocUrl：标记“需要用 bookUrl 重新取目录”，由 toc 流程消费。
+  // 上游规则 java.refreshTocUrl：标记“需要用 bookUrl 重新取目录”，由 toc 流程消费。
   refreshTocUrl: function(){ __refreshToc = true; },
   getCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.getCookie（本服务无 Cookie 桥接）"); },
   setCookie: function(){ throw new Error("UNSUPPORTED_JS_API:java.setCookie（本服务无 Cookie 桥接）"); },
-  // Legado `java.startBrowserAwait(url, title[, refetchAfterSuccess])`：内置浏览器人工过验证后返回页面。
+  // 上游规则 `java.startBrowserAwait(url, title[, refetchAfterSuccess])`：内置浏览器人工过验证后返回页面。
   // 服务端没有人机交互界面，这里直接抓取目标页并返回 StrResponse；遇到站点质询页时 body 就是质询页，
   // 由书源规则自行判断，行为与“验证失败但拿到了响应”一致。
   startBrowserAwait: function(url){ return __httpResponse(url, null); },
-  // Legado `java.startBrowser(url, title)`：只打开内置浏览器，无返回值。服务端无 UI，等价空操作。
+  // 上游规则 `java.startBrowser(url, title)`：只打开内置浏览器，无返回值。服务端无 UI，等价空操作。
   startBrowser: function(){ return ""; },
-  // Legado `java.webView(html, url, js)`：无 WebView 时只覆盖“取整页源码”的形态——
+  // 上游规则 `java.webView(html, url, js)`：无 WebView 时只覆盖“取整页源码”的形态——
   // html 非空直接返回 html；否则抓取 url；传入 js 需要页面内 DOM 执行，显式报未支持。
   webView: function(html, url, js){
     if (js != null && String(js).trim() !== "") {
@@ -717,7 +717,7 @@ function __toByteArray(d){
   }
   return [];
 }
-// key/iv 参数：字节数组按 JSON 传给原生；字符串交给 Rust 按 UTF-8（Legado 的
+// key/iv 参数：字节数组按 JSON 传给原生；字符串交给 Rust 按 UTF-8（上游规则的
 // String.toByteArray()）转换，避免 `String([1,2,3])` 变成 "1,2,3"。
 function __keyArg(x){
   if (x == null) return "";

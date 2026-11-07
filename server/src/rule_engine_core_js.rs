@@ -52,7 +52,7 @@ impl AnalyzeRule {
         (lists, singles)
     }
 
-    /// 把规则变量注入 JS 作用域（等价于 Legado evalJS 前绑定 page/title 等变量）。
+    /// 把规则变量注入 JS 作用域（等价于上游规则 evalJS 前绑定 page/title 等变量）。
     pub(super) fn js_vars(&self) -> String {
         const RESERVED: &[&str] = &[
             "result",
@@ -111,7 +111,7 @@ impl AnalyzeRule {
         self.eval_js_lit(&lit, input, code, base_url)
     }
 
-    /// 列表语义的 JS 求值：`result` 绑定为 JS 数组（Legado `getStringList` 的
+    /// 列表语义的 JS 求值：`result` 绑定为 JS 数组（上游规则 `getStringList` 的
     /// `evalJS(rule, List)`，见 AnalyzeRule.getStringList：Default 段先出 List<String>）。
     pub(super) fn eval_js_list(
         &self,
@@ -136,7 +136,7 @@ impl AnalyzeRule {
         if !conf.enabled {
             return Err(RuleError::Other("JS rules disabled by JS_ENABLED=0".into()));
         }
-        // 规则级 `{{…}}` 模板先于脚本展开（Legado `makeUpRule` 的模板语义），
+        // 规则级 `{{…}}` 模板先于脚本展开（上游规则 `makeUpRule` 的模板语义），
         // 覆盖 `@js:` 与 `<js>` 段，也覆盖 searchUrl 的 `@js:` 分支（p11 根因）。
         let code = &self.expand_js_template(code, input);
         // 整段包成 IIFE，避免不同书源/不同次执行之间的全局变量污染
@@ -235,7 +235,7 @@ impl AnalyzeRule {
                 }
                 // JS 侧 `java.put` / `book.putVariable` / `java.putVariable` 的写入回填到
                 // 规则变量表：本请求后续规则（含 `@get:{key}`）立即可见；book 层同步写
-                // `book_vars`，由编排层按 book_key 落库，与 Legado `book.putVariable` 一致。
+                // `book_vars`，由编排层按 book_key 落库，与上游规则 `book.putVariable` 一致。
                 if let Some(idx) = s.rfind(JS_VARS_SENTINEL) {
                     let tail = s[idx + JS_VARS_SENTINEL.len()..].to_string();
                     if tail.len() <= 1_048_576 {

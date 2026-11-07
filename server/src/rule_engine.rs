@@ -1,4 +1,4 @@
-//! Legado 规则引擎（AnalyzeRule 等价实现）
+//! 规则引擎（AnalyzeRule 等价实现）
 //!
 //! 支持：CSS 选择器(scraper) / JsonPath / XPath(sxd-xpath, XML 源) / 正则 / 变量 `${name}` 展开 /
 //! 整串 JS 段(`<js>`、`@js:`)切分 / 列表解析(get_string_list)。

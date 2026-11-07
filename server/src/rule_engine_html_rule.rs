@@ -3,7 +3,7 @@
 use super::*;
 
 /// 解析 `@put:{k1:v1,k2:v2}` 的 `{…}` 内部：顶层（不在引号/括号内）按 `,` 分组，再按首个 `:`
-/// 拆 key/value。对应上游 `splitPutRule`（规则语义 L516-530）里的 GSON 宽松解析。
+/// 拆 key/value，使用宽松 JSON 解析。
 pub(in crate::rule_engine) fn split_put_pairs(inner: &str) -> Vec<(String, String)> {
     let mut groups: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -158,7 +158,7 @@ pub(in crate::rule_engine) fn split_outside_js<'a>(
     }
 }
 
-/// ASCII 大小写不敏感前缀判断（Legado `startsWith(..., ignoreCase = true)`）。
+/// ASCII 大小写不敏感前缀判断（上游规则 `startsWith(..., ignoreCase = true)`）。
 pub(in crate::rule_engine) fn starts_with_ci(rule: &str, prefix: &str) -> bool {
     rule.len() >= prefix.len()
         && rule.as_bytes()[..prefix.len()]
@@ -176,7 +176,7 @@ pub(in crate::rule_engine) fn strip_prefix_ci<'a>(rule: &'a str, prefix: &str) -
 }
 
 /// 模板展开后的整串是否就是最终值（而非还需要继续解析的规则）。
-/// 依据 Legado 语义：含 `{{…}}` 的规则整体按模板求值，展开结果即字段值；
+/// 依据上游规则语义：含 `{{…}}` 的规则整体按模板求值，展开结果即字段值；
 /// 只有仍带 `@text` 这类抽取后缀、`$.`/`@js:`/`<js>` 前缀或 `##`/`||` 管道时才继续解析。
 pub(in crate::rule_engine) fn expanded_is_literal(rule: &str) -> bool {
     let t = rule.trim();
@@ -264,7 +264,7 @@ pub(in crate::rule_engine) fn resolve_index(i: i64, len: usize) -> Option<usize>
     }
 }
 
-/// `##` 替换的三种形态（Legado `AnalyzeRule.replaceRegex`）：
+/// `##` 替换的三种形态（上游规则 `AnalyzeRule.replaceRegex`）：
 /// - `##pat`：删除所有匹配（replacement 为空）；
 /// - `##pat##repl`：替换所有匹配；
 /// - `##pat##repl###`：只替换第一个匹配（无匹配时原样返回）。

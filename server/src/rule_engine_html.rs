@@ -1,4 +1,4 @@
-//! HTML/CSS 选择器与 Legado 取词辅助（move-only 从 rule_engine.rs 拆出）。
+//! HTML/CSS 选择器与上游规则取词辅助（move-only 从 rule_engine.rs 拆出）。
 //!
 //! 这些函数同时服务 AnalyzeRule 的 CSS/CSS 增强语法与 JS 的 org.jsoup 桥；
 //! 对外只暴露给父模块（pub(in crate::rule_engine)），不扩展 crate 公共 API。

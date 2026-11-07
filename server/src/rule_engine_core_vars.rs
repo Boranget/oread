@@ -51,7 +51,7 @@ impl AnalyzeRule {
                 if js_spans.iter().any(|(a, b)| start >= *a && start < *b) {
                     return whole.to_string();
                 }
-                // `{{规则##正则[##替换[###]]}}`：Legado 把 `{{}}` 内带规则标志的内容包成
+                // `{{规则##正则[##替换[###]]}}`：上游规则把 `{{}}` 内带规则标志的内容包成
                 // SourceRule，`##` 属于规则本身，必须在求值之后应用。若把 `##…` 直接当路径/
                 // 选择器的一部分，JSONPath 会解析失败，整段展开为空（源包 11 处真实规则）。
                 if let Some(s) = self.template_rule_replace(content, key, json.as_ref()) {
@@ -78,7 +78,7 @@ impl AnalyzeRule {
             if let Some(v) = self.variables.borrow().get(key).cloned() {
                 return v;
             }
-            // `{{…}}`：Legado 对非规则内容一律交给 evalJS（`{{page*20}}`、`{{java.base64Encode(…)}}` 等），
+            // `{{…}}`：上游规则对非规则内容一律交给 evalJS（`{{page*20}}`、`{{java.base64Encode(…)}}` 等），
             // 变量已在 eval_js 作用域内绑定。
             if caps.get(2).is_some() {
                 let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
@@ -95,7 +95,7 @@ impl AnalyzeRule {
     }
 
     /// `{{规则##…}}` 里的 `##` 替换：先按规则标志求值前半段，再对结果做正则替换。
-    /// 与 Legado `AnalyzeRule.getString` 一致：`##pat` 删匹配、`##pat##repl` 全替换、
+    /// 与上游规则 `AnalyzeRule.getString` 一致：`##pat` 删匹配、`##pat##repl` 全替换、
     /// 出现第 4 段（常见写法 `##pat##repl###`）时只替换第一个匹配。
     /// 非规则标志内容（纯 JS）返回 `None`，维持原有的 JS 求值路径。
     pub(super) fn template_rule_replace(
@@ -133,7 +133,7 @@ impl AnalyzeRule {
         ))
     }
 
-    /// 进入 boa 前展开 JS 源码里的 `{{表达式}}`（Legado 规则级模板语义：模板优先于脚本）。
+    /// 进入 boa 前展开 JS 源码里的 `{{表达式}}`（规则级模板语义：模板优先于脚本）。
     /// - 表达式按当前输入 `content` 求值为字符串后**拼接进源码**；
     /// - 若占位符位于字符串字面量内，按该引号转义（反斜杠/引号/换行），避免破坏语法；
     /// - 展开失败记 warn 并保留原文（不静默丢内容）。

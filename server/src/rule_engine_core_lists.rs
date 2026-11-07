@@ -8,7 +8,7 @@ impl AnalyzeRule {
         self.current_content.replace(content.to_string());
         let rule = self.apply_put_get(rule, content, false, "");
         let rule = self.expand_vars(&rule, content);
-        // Legado 约定：规则以 `-` 开头表示「结果倒序」（多见于章节列表，如 `-$..comics.*`）。
+        // 上游规则约定：规则以 `-` 开头表示「结果倒序」（多见于章节列表，如 `-$..comics.*`）。
         if let Some(rest) = rule.trim_start().strip_prefix('-') {
             let mut v = self.get_string_list(content, rest.trim_start())?;
             v.reverse();
@@ -29,8 +29,8 @@ impl AnalyzeRule {
         if js_parts.len() >= 2 && js_parts.iter().any(|(m, _)| *m == Mode::Js) {
             let last = js_parts.len() - 1;
             let mut input = content.to_string();
-            // Default 段在**列表**语义里先求成 List<String>（Legado AnalyzeRule.getStringList
-            // 用 JSoup 规则.getStringList），JS 段拿到的是数组而不是单个字符串：
+            // Default 段在**列表**语义里先求成 List<String>（上游规则 AnalyzeRule.getStringList
+            // 用规则引擎的多值抽取），JS 段拿到的是数组而不是单个字符串：
             // 漫画搬运/穿越小说这类 `CSS前缀 + <js>` 的目录规则都依赖 `Array.from(result)`。
             let mut input_list: Option<Vec<String>> = None;
             for (i, (mode, text)) in js_parts.iter().enumerate() {
@@ -71,7 +71,7 @@ impl AnalyzeRule {
             // 不再把 `<js>` 标签和前缀一起塞进 boa（否则会在 `<js>` 处语法报错）。
             let res = self.get_string_inner(content, &rule, false, "")?;
             // 整段 JS 常返回数组（如 java.getElements 的结果），序列化为 JSON 数组则拆成多项；
-            // 对象数组（`[{text,href}]`）按 Legado 章节语义逐项展开，供后续字段规则取用。
+            // 对象数组（`[{text,href}]`）按上游规则章节语义逐项展开，供后续字段规则取用。
             if let Some(items) = expand_json_list_items(&res, true) {
                 return Ok(items);
             }
@@ -85,7 +85,7 @@ impl AnalyzeRule {
     }
 
     /// 列表求值（保留末端抽取标记）：用于 `nextTocUrl` / 漫画图片等“可能返回多条”的规则。
-    /// 与 Legado `getStringList` 对齐：`||` 取首个非空列表、`&&` 合并列表、`%%` 交错，
+    /// 与上游规则 `getStringList` 对齐：`||` 取首个非空列表、`&&` 合并列表、`%%` 交错，
     /// `##` 先解析出列表再**逐项**替换，`@js:` 结果按数组或换行拆项。
     pub fn get_string_list_all(&self, content: &str, rule: &str, base_url: &str) -> Vec<String> {
         let rule = self.apply_put_get(rule, content, false, base_url);
@@ -97,7 +97,7 @@ impl AnalyzeRule {
         self.eval_list(content, r, base_url)
     }
 
-    /// 列表层求值：先按 Legado 的优先级切分操作符，再调用单段解析。
+    /// 列表层求值：先按上游规则的优先级切分操作符，再调用单段解析。
     pub(super) fn eval_list(&self, content: &str, rule: &str, base_url: &str) -> Vec<String> {
         let rule = rule.trim();
         if rule.is_empty() {
@@ -167,7 +167,7 @@ impl AnalyzeRule {
         if r.is_empty() {
             return vec![];
         }
-        // JS 段：数组按 JSON 拆项，普通字符串按 `\n` 拆（Legado getStringList 对 String 的处理）
+        // JS 段：数组按 JSON 拆项，普通字符串按 `\n` 拆（上游规则 getStringList 对 String 的处理）
         if starts_with_ci(r, "@js:") || contains_ci(r, "@js:") || r.contains("<js>") {
             let js_parts = Self::split_js(r);
             if js_parts.len() >= 2 {
@@ -264,7 +264,7 @@ impl AnalyzeRule {
         let v: Value = serde_json::from_str(json).map_err(|e| RuleError::Json(e.to_string()))?;
         let mut out = Vec::new();
         // JSONPath 直接命中数组时（`$['hits']` / `$.data.topics`）按数组元素展开：
-        // Legado 的 getElements 会把 List 的每个元素当作列表项，不把整个数组当成一项。
+        // 上游规则的 getElements 会把 List 的每个元素当作列表项，不把整个数组当成一项。
         for val in json_query(&v, rule)? {
             match val {
                 Value::Array(a) => {
