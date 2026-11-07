@@ -4,6 +4,7 @@
   import ExportDialog from '../lib/ExportDialog.svelte';
   import ReaderBookmarks from '../lib/ReaderBookmarks.svelte';
   import ReaderSearch from '../lib/ReaderSearch.svelte';
+  import ReaderSwitch from '../lib/ReaderSwitch.svelte';
   import ReaderToc from '../lib/ReaderToc.svelte';
   import { convertZh, zhLabels } from '../lib/zhconvert.js';
   import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
@@ -65,9 +66,6 @@
   let showPanel = false;
   let showSwitch = false;
   let showExport = false;
-  let switchLoading = false;
-  let switchErr = '';
-  let candidates = [];
   let controlsVisible = true;
   let toast = '';
   // 正文替换规则：账号设置 use_replace_rule 控制的显式开关
@@ -1249,36 +1247,13 @@
       showJump = false;
     }
     showSwitch = !showSwitch;
-    if (showSwitch && !candidates.length && !switchLoading) loadCandidates();
-  }
-
-  async function loadCandidates() {
-    switchLoading = true;
-    switchErr = '';
-    candidates = [];
-    try {
-      const list = await api.switchSource(
-        (info && info.name) || seed.name || '',
-        (info && info.author) || seed.author || '',
-        book.sourceId
-      );
-      candidates = Array.isArray(list) ? list : [];
-    } catch (e) {
-      switchErr = describeFailure(e, '换源');
-    } finally {
-      switchLoading = false;
-    }
   }
 
   function useCandidate(c) {
-    // 换源后旧源的 seed 全部作废：只带候选自己的地址、书源与书名/作者/封面；
-    // 候选缺地址或缺来源时拒绝切换，避免回退到旧源造成“看似换源、实际还在旧源”。
+    // 候选校验在子组件内完成；这里只带候选自己的地址、书源与书名/作者/封面，
+    // 旧源 seed 全部作废，避免“看似换源、实际还在旧源”。
     const nextUrl = c.book_url || c.bookUrl || '';
     const nextSource = c.origin || c.source_id || '';
-    if (!nextUrl || !nextSource) {
-      switchErr = '该候选缺少书籍地址或书源标识，无法切换。请换一个书源或重新搜索。';
-      return;
-    }
     stopAuto();
     flushSave();
     flushStats(true);
@@ -1681,40 +1656,13 @@
     </div>
   {/if}
 
-  {#if showSwitch}
-    <div class="panel-mask" on:click|self={() => (showSwitch = false)}>
-      <div class="panel switch-panel">
-        <div class="panel-head">
-          <strong>换源</strong>
-          <button class="rd-btn" on:click={() => (showSwitch = false)}>关闭</button>
-        </div>
-        <p class="rd-muted small-note">当前：《{info?.name || book.name}》 · 书源 {book.sourceId}</p>
-        {#if switchLoading}
-          <p class="rd-muted">正在其他书源搜索同名书籍…</p>
-        {:else if switchErr}
-          <p class="rd-error">{switchErr}</p>
-        {:else if !candidates.length}
-          <p class="rd-muted">没有找到其他书源的同名书籍。可重新搜索，或先在「发现」页确认书源可用。</p>
-        {:else}
-          <div class="switch-list">
-            {#each candidates as c (c.book_url + '|' + (c.origin || ''))}
-              <div class="switch-item">
-                <div class="switch-main">
-                  <b>{c.name || c.book_url}</b>
-                  <span class="rd-muted">{c.author || '未知作者'} · {c.origin_name || c.origin || '未知书源'}</span>
-                  {#if c.latest_chapter_title}<span class="rd-muted small-note">最新：{c.latest_chapter_title}</span>{/if}
-                </div>
-                <button class="rd-btn" on:click={() => useCandidate(c)}>用此书源</button>
-              </div>
-            {/each}
-          </div>
-        {/if}
-        <div class="row" style="margin-top:10px">
-          <button class="rd-btn" on:click={loadCandidates} disabled={switchLoading}>重新搜索</button>
-        </div>
-      </div>
-    </div>
-  {/if}
+  <ReaderSwitch
+    bind:show={showSwitch}
+    title={info?.name || seed.name || ''}
+    author={info?.author || seed.author || ''}
+    sourceId={book.sourceId}
+    on:choose={(e) => useCandidate(e.detail)}
+  />
 
   {#if showExport}
     <ExportDialog
@@ -2056,11 +2004,6 @@
     box-shadow: 0 -4px 18px rgba(0,0,0,0.18);
   }
   .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-size: 14px; }
-  .switch-panel { max-height: 72vh; display: flex; flex-direction: column; }
-  .switch-list { overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-  .switch-item { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--rd-border); padding-top: 8px; }
-  .switch-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-  .switch-main b { font-size: 14px; }
   .panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; }
   .panel-row > span { font-size: 13px; color: var(--rd-muted); flex: 0 0 auto; }
   .stepper { display: flex; align-items: center; gap: 10px; }
