@@ -3,6 +3,7 @@
   "contentType": "application/json",
   "body": {
     "cache": {
+      "books": [],
       "bytes": "<volatile>",
       "image_cache_bytes": "<volatile>",
       "mb": 0,
@@ -10,6 +11,14 @@
       "total_bytes": "<volatile>"
     },
     "cache_limit_mb": 50,
+    "content_cache": {
+      "evicted_rows": "<volatile>",
+      "evictions": "<volatile>",
+      "hit_rate": "<volatile>",
+      "hits": "<volatile>",
+      "misses": "<volatile>",
+      "saves": "<volatile>"
+    },
     "http": {
       "concurrency": 16,
       "max_body_mb": 5,

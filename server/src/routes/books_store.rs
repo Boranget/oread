@@ -316,6 +316,7 @@ pub(crate) async fn load_cached_content(
         // 空正文（文本为空 / 图片章节零图）视为缓存未命中：旧版本的空白缓存不再命中，
         // 每次读取都会重新抓取，避免整个 TTL 周期内一直白屏。
         if content_is_empty(&row) {
+            crate::cache_metrics::record_miss();
             return Ok(None);
         }
         // 解析管线变了（或旧记录没有指纹）：旧结果可能残缺，按未命中重建。
@@ -326,6 +327,7 @@ pub(crate) async fn load_cached_content(
                 current = content_cache_version(),
                 "content cache version mismatch, refetch"
             );
+            crate::cache_metrics::record_miss();
             return Ok(None);
         }
         let _ = sqlx::query(
@@ -335,8 +337,10 @@ pub(crate) async fn load_cached_content(
         .bind(origin)
         .execute(pool)
         .await;
+        crate::cache_metrics::record_hit();
         return Ok(Some(row));
     }
+    crate::cache_metrics::record_miss();
     Ok(None)
 }
 
@@ -432,6 +436,7 @@ pub(crate) async fn save_content_cached(
         return Ok(());
     }
     upsert_content(pool, c).await?;
+    crate::cache_metrics::record_save();
 
     // 淘汰：每轮删除最久未读的一批，最多 8 轮，避免极端情况下长时间占用连接
     for _ in 0..8 {
@@ -451,6 +456,7 @@ pub(crate) async fn save_content_cached(
         if deleted == 0 {
             break;
         }
+        crate::cache_metrics::record_eviction(deleted as u64);
         tracing::info!(total, limit = limit_bytes, deleted, "content cache evicted");
         // 增量归还有界空间（256 页 ≈ 1 MiB），避免文件只涨不落；非增量库为空操作。
         let _ = crate::db::reclaim_pages(pool, 256).await;

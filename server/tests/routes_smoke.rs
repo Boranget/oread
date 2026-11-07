@@ -147,14 +147,22 @@ async fn healthz_returns_ok_without_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
-    assert!(
-        text.contains("ok") || text.contains("status"),
-        "healthz: {text}"
-    );
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], true, "healthz: {body}");
+    assert!(body["content_cache"].is_object(), "healthz: {body}");
+    for key in [
+        "hits",
+        "misses",
+        "hit_rate",
+        "saves",
+        "evictions",
+        "evicted_rows",
+    ] {
+        assert!(
+            body["content_cache"][key].is_number(),
+            "缺少 content_cache.{key}: {body}"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

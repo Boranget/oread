@@ -50,6 +50,7 @@ const VOLATILE = new Set([
   'rss', 'rss_bytes', 'rss_mb', 'uptime', 'uptime_secs', 'open_user_dbs',
   'size_bytes', 'bytes', 'rows', 'free_bytes', 'total_bytes', 'image_cache_bytes',
   'items', 'last_ms', 'max_ms', 'source_limit_wait_ms', 'source_limit_waits',
+  'hits', 'misses', 'hit_rate', 'saves', 'evictions', 'evicted_rows',
   'token', 'password',
 ]);
 

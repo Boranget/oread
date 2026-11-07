@@ -93,10 +93,22 @@ async fn cache_usage(pool: &SqlitePool) -> (i64, i64) {
     (bytes, rows)
 }
 
+/// 按书占用（前 5 本），用于定位正文缓存空间被谁占住。
+async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, i64)> {
+    sqlx::query_as(
+        "SELECT book_url, COALESCE(SUM(size_bytes),0) AS total \
+         FROM book_content GROUP BY book_url ORDER BY total DESC LIMIT 5",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
 fn base_metrics(state: &AppState) -> serde_json::Value {
     let rss = rss_bytes();
     let (js_last, js_max) = crate::rule_engine::js_metrics();
     let (img_bytes, img_items, img_limit) = crate::image_cache::stats();
+    let cache = crate::cache_metrics::stats();
     json!({
         "rss_bytes": rss,
         "rss_mb": rss.map(|b| (b as f64 / MB as f64 * 100.0).round() / 100.0),
@@ -132,6 +144,15 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
             "source_limit_waits": crate::req::source_limit_metrics().0,
             "source_limit_wait_ms": crate::req::source_limit_metrics().1,
         },
+        // 正文缓存命中/落库/淘汰计数（进程生命周期内累计，仅用于观察与调参）
+        "content_cache": {
+            "hits": cache.hits,
+            "misses": cache.misses,
+            "hit_rate": cache.hit_rate(),
+            "saves": cache.saves,
+            "evictions": cache.evictions,
+            "evicted_rows": cache.evicted_rows,
+        },
         // 图片代理进程内 LRU（与正文缓存分开，但同属缓存预算）
         "image_cache": {
             "bytes": img_bytes,
@@ -158,6 +179,7 @@ pub async fn healthz_user(
     db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
     let (bytes, rows) = cache_usage(&db.0).await;
+    let books = cache_usage_by_book(&db.0).await;
     let mut v = base_metrics(&state);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ok".into(), json!(true));
@@ -170,6 +192,11 @@ pub async fn healthz_user(
                 // 图片缓存计入缓存预算统计（进程级，所有用户共享）
                 "image_cache_bytes": crate::image_cache::stats().0,
                 "total_bytes": bytes + crate::image_cache::stats().0 as i64,
+                // 前 5 本按占用降序，便于定位缓存被谁占住
+                "books": books
+                    .iter()
+                    .map(|(url, bytes)| json!({ "book_url": url, "bytes": bytes }))
+                    .collect::<Vec<_>>(),
             }),
         );
     }

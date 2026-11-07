@@ -3,6 +3,14 @@
   "contentType": "application/json",
   "body": {
     "cache_limit_mb": 50,
+    "content_cache": {
+      "evicted_rows": "<volatile>",
+      "evictions": "<volatile>",
+      "hit_rate": "<volatile>",
+      "hits": "<volatile>",
+      "misses": "<volatile>",
+      "saves": "<volatile>"
+    },
     "http": {
       "concurrency": 16,
       "max_body_mb": 5,

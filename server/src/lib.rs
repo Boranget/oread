@@ -5,6 +5,7 @@
 //! 不必再通过 `include!` 或复制源码。
 
 pub mod auth;
+pub mod cache_metrics;
 pub mod config;
 pub mod crypto;
 pub mod db;
