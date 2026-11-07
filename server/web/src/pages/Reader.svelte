@@ -5,9 +5,10 @@
   import ReaderBookmarks from '../lib/ReaderBookmarks.svelte';
   import ReaderJump from '../lib/ReaderJump.svelte';
   import ReaderSearch from '../lib/ReaderSearch.svelte';
+  import ReaderSettings from '../lib/ReaderSettings.svelte';
   import ReaderSwitch from '../lib/ReaderSwitch.svelte';
   import ReaderToc from '../lib/ReaderToc.svelte';
-  import { convertZh, zhLabels } from '../lib/zhconvert.js';
+  import { convertZh } from '../lib/zhconvert.js';
   import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
   import { applyTheme } from '../lib/theme.js';
   import {
@@ -133,8 +134,6 @@
   const statsSeen = new Set();
 
 
-  const themeName = { light: '浅色', dark: '深色', sepia: '护眼', eink: '墨水屏' };
-  const modeName = { scroll: '滚动', paged: '翻页', fade: '仿真' };
 
   const progressKey = (id) => `oread_progress:${id}`;
 
@@ -1381,134 +1380,39 @@
     on:choose={(e) => chooseChapter(e.detail)}
   />
 
-  {#if showPanel}
-    <div class="panel-mask" on:click|self={() => (showPanel = false)}>
-      <div class="panel">
-        <div class="panel-head">
-          <strong>阅读设置</strong>
-          <button class="rd-btn" on:click={() => (showPanel = false)}>收起</button>
-        </div>
-
-        <div class="panel-row">
-          <span>模式</span>
-          <div class="seg small">
-            {#each MODES as m}
-              <button class:on={readMode === m} on:click={() => changeMode(m)}>{modeName[m]}</button>
-            {/each}
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>字号</span>
-          <div class="stepper">
-            <button class="rd-btn" on:click={() => stepFont(-1)} disabled={effFont <= 12}>A−</button>
-            <span class="val">{effFont}</span>
-            <button class="rd-btn" on:click={() => stepFont(1)} disabled={effFont >= 30}>A+</button>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>行距</span>
-          <div class="stepper">
-            <button class="rd-btn" on:click={() => stepLine(-0.1)} disabled={effLine <= 1.2}>−</button>
-            <span class="val">{effLine.toFixed(1)}</span>
-            <button class="rd-btn" on:click={() => stepLine(0.1)} disabled={effLine >= 2.6}>+</button>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>字体</span>
-          <div class="seg small">
-            {#each FONT_OPTIONS as f}
-              <button class:on={fontFamily === f.id} on:click={() => setFontFamily(f.id)}>{f.label}</button>
-            {/each}
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>定位</span>
-          <button class="rd-btn" on:click={openJump}>跳转章节 / 段</button>
-        </div>
-
-        <div class="panel-row">
-          <span>配色</span>
-          <div class="seg small">
-            {#each ['light', 'dark', 'sepia', 'eink'] as t}
-              <button class:on={theme === t} on:click={() => setTheme(t)}>{themeName[t]}</button>
-            {/each}
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>字形</span>
-          <div class="seg small">
-            {#each ['off', 's', 't'] as m}
-              <button class:on={zhMode === m} on:click={() => setZh(m)}>{zhLabels[m]}</button>
-            {/each}
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>替换规则</span>
-          <button class="rd-btn" class:solid={useReplaceRules} on:click={() => setUseReplace(!useReplaceRules)}>
-            {useReplaceRules ? '已开启' : '已关闭'}
-          </button>
-        </div>
-
-        {#if !isPaged}
-          <div class="panel-row">
-            <span>页宽</span>
-            <div class="seg small">
-              {#each WIDTH_OPTIONS as w}
-                <button class:on={width === w.id} on:click={() => setWidth(w.id)}>{w.label}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
-        <div class="panel-row">
-          <span>亮度</span>
-          <div class="slider-wrap">
-            <input type="range" min="0" max="100" step="5" bind:value={brightness} on:input={(e) => setBrightness(e.target.value)} />
-            <span class="val">{brightness}%</span>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>自动滚动</span>
-          <div class="stepper">
-            <button class="rd-btn" class:solid={autoOn} on:click={toggleAuto}>{autoOn ? '暂停' : '开始'}</button>
-            <span class="val">{autoSpeed} 档</span>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>速度</span>
-          <div class="slider-wrap">
-            <input type="range" min="1" max="10" step="1" bind:value={autoSpeed} on:input={(e) => setAutoSpeed(e.target.value)} />
-            <span class="val">{autoSpeed}</span>
-          </div>
-        </div>
-
-        <div class="panel-row">
-          <span>本书</span>
-          <div class="row-actions">
-            <button class="rd-btn" on:click={toggleBookmarks}>书签</button>
-            <button class="rd-btn" on:click={toggleBookSearch}>书内搜索</button>
-            <button class="rd-btn" on:click={() => { showPanel = false; toggleSwitch(); }}>换源</button>
-          </div>
-        </div>
-
-        <p class="rd-muted small-note">
-          左 1/3 上一页，右 1/3 下一页，中间显隐控制栏；上下滑到边界快速切章；长按正文可选中复制。
-          字号/行距/配色/模式/页宽/字体族保存到账号设置，本机保留一份用于离线兜底；亮度、字形、速度仅存本机。
-        </p>
-        <p class="rd-muted small-note desk-only">
-          快捷键 <kbd>←</kbd> <kbd>→</kbd> 翻页，<kbd>↑</kbd> <kbd>↓</kbd> 滚动，<kbd>空格</kbd> 暂停/开始自动滚动，<kbd>Esc</kbd> 收起面板。
-        </p>
-      </div>
-    </div>
-  {/if}
+  <ReaderSettings
+    bind:show={showPanel}
+    readMode={readMode}
+    effFont={effFont}
+    effLine={effLine}
+    fontFamily={fontFamily}
+    theme={theme}
+    zhMode={zhMode}
+    useReplaceRules={useReplaceRules}
+    isPaged={isPaged}
+    width={width}
+    brightness={brightness}
+    autoOn={autoOn}
+    autoSpeed={autoSpeed}
+    on:mode={(e) => changeMode(e.detail)}
+    on:font-step={(e) => stepFont(e.detail)}
+    on:line-step={(e) => stepLine(e.detail)}
+    on:font-family={(e) => setFontFamily(e.detail)}
+    on:jump={openJump}
+    on:theme={(e) => setTheme(e.detail)}
+    on:zh={(e) => setZh(e.detail)}
+    on:replace={(e) => setUseReplace(e.detail)}
+    on:width={(e) => setWidth(e.detail)}
+    on:brightness={(e) => setBrightness(e.detail)}
+    on:toggle-auto={toggleAuto}
+    on:speed={(e) => setAutoSpeed(e.detail)}
+    on:bookmarks={toggleBookmarks}
+    on:search={toggleBookSearch}
+    on:switch={() => {
+      showPanel = false;
+      toggleSwitch();
+    }}
+  />
 
   <ReaderBookmarks
     bookUrl={book.bookUrl}
@@ -1874,30 +1778,5 @@
     border-color: #333;
   }
 
-  /* 底部设置面板 */
-  .panel-mask { position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: rgba(0,0,0,0.3); z-index: 28; display: flex; align-items: flex-end; }
-  .panel {
-    width: 100%;
-    max-height: 86vh;
-    overflow-y: auto;
-    background: var(--rd-panel);
-    border-top-left-radius: 16px;
-    border-top-right-radius: 16px;
-    padding: 14px 16px calc(18px + env(safe-area-inset-bottom));
-    box-shadow: 0 -4px 18px rgba(0,0,0,0.18);
-  }
-  .panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-size: 14px; }
-  .panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; }
-  .panel-row > span { font-size: 13px; color: var(--rd-muted); flex: 0 0 auto; }
-  .stepper { display: flex; align-items: center; gap: 10px; }
-  .stepper .val { min-width: 40px; text-align: center; font-variant-numeric: tabular-nums; }
-  .slider-wrap { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
-  .slider-wrap input[type='range'] { flex: 1; min-width: 80px; accent-color: var(--rd-accent); padding: 0; }
-  .seg.small { margin: 0; padding: 3px; border: 1px solid var(--rd-border); background: transparent; }
-  .seg.small button { background: transparent; color: var(--rd-fg); padding: 4px 10px; min-height: 30px; font-size: 12px; border-radius: 6px; }
-  .seg.small button.on { background: var(--rd-accent); color: #fff; }
-  .small-note { margin: 10px 0 0; font-size: 12px; line-height: 1.6; }
   .err-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
-
-  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 </style>
