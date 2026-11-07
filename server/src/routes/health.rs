@@ -110,6 +110,8 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
     let (img_bytes, img_items, img_limit) = crate::image_cache::stats();
     let cache = crate::cache_metrics::stats();
     json!({
+        // 当前运行的服务版本，前端设置页直接展示
+        "version": env!("CARGO_PKG_VERSION"),
         "rss_bytes": rss,
         "rss_mb": rss.map(|b| (b as f64 / MB as f64 * 100.0).round() / 100.0),
         "open_user_dbs": state.user_pools.lock().map(|c| c.len()).unwrap_or(0),

@@ -663,6 +663,7 @@
     {#if healthErr}<p class="err">{healthErr}</p>{/if}
     {#if health}
       <div class="health-grid">
+        <div><span class="muted">当前服务版本</span><b>{health.version ? `v${health.version}` : '未返回'}</b></div>
         <div><span class="muted">进程内存 RSS</span><b>{health.rss_mb == null ? '当前平台不可用' : health.rss_mb + ' MB'}</b></div>
         <div><span class="muted">打开的用户库</span><b>{health.open_user_dbs ?? 0}</b></div>
         <div><span class="muted">正文缓存</span><b>{health.cache ? `${health.cache.mb} MB · ${health.cache.rows} 行` : '未返回'}</b></div>

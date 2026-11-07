@@ -46,6 +46,7 @@
       "source_slots": 16,
       "total_all_secs": 10,
       "total_curated_secs": 6
-    }
+    },
+    "version": "1.0.0"
   }
 }
