@@ -166,6 +166,64 @@ async fn healthz_returns_ok_without_auth() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// 响应编码层只挂在 `/k`：/k/login 的 HTML 走 gzip，API 热路径（/healthz）保持 identity。
+#[tokio::test]
+async fn kindle_pages_are_gzipped_but_api_stays_identity() {
+    let (app, _pool, dir) = test_app("gzip").await;
+    let plain = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/k/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        plain.headers().get(header::CONTENT_ENCODING).is_none(),
+        "未声明 accept-encoding 时不应压缩"
+    );
+    let gz = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/k/login")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gz.status(), StatusCode::OK);
+    assert_eq!(
+        gz.headers()
+            .get(header::CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap()),
+        Some("gzip")
+    );
+    assert!(
+        gz.headers().contains_key(header::VARY),
+        "压缩响应应带 Vary，避免缓存串味"
+    );
+    // API 热路径不压缩：压缩层只挂在 /k，避免 /healthz 与搜索结果多付 gzip CPU。
+    let api = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        api.headers().get(header::CONTENT_ENCODING).is_none(),
+        "API 热路径不应带 content-encoding"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn protected_api_rejects_missing_token() {
     let (app, _pool, dir) = test_app("auth").await;
