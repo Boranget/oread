@@ -150,7 +150,7 @@ if ($ThinLto) {
     Write-Host '[build-release] 使用 Cargo.toml 的 release profile（lto=true / codegen-units=1，最慢但最小）'
 }
 
-$cargoArgsList = @('zigbuild', '--target', $TargetTriple, '--release')
+$cargoArgsList = @('zigbuild', '--target', $TargetTriple, '--release', '--locked')
 if ($CargoArgs) { $cargoArgsList += $CargoArgs }
 
 if ($LogFile -and -not (Test-Writable $LogFile)) {
