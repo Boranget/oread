@@ -1,4 +1,9 @@
 // 轻量 API 封装：所有请求走同源 /api/*（由 Rust 后端提供）
+import { errorText } from './apiErrors.js';
+import { buildQuery } from './apiUrl.js';
+
+export { describeFailure, describeSourceError } from './apiErrors.js';
+
 const TOKEN_KEY = 'legado_token';
 const ROLE_KEY = 'legado_role';
 
@@ -33,102 +38,11 @@ export function parseJwt(token) {
   }
 }
 
-// 后端返回的固定文案 -> 界面文案
-const KNOWN_ERRORS = {
-  'source not found': '书源不存在',
-  'url or urls required': '至少需要一个书源 URL',
-  'book_id or book_ids required': '至少需要选择一本书',
-  'group name required': '分组名不能为空',
-  missing_book_url: '缺少书籍地址，请从书架重新打开',
-  unauthorized: '登录已失效，请重新登录',
-  forbidden: '没有权限执行该操作（需要管理员）',
-  'internal:': '书源抓取失败',
-};
-
 function apiError(message, status, data) {
   const err = new Error(message);
   err.status = status;
   err.data = data;
   return err;
-}
-
-function shortText(s) {
-  const t = String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  return t.length > 160 ? t.slice(0, 160) + '…' : t;
-}
-
-// 后端聚合搜索里的 errors[].error 是上游抓取错误原文；这里翻成人话。
-// 真实书源的报错形态：builder error（请求头/URL 规则非法）、error sending request（连不上）、
-// timeout（超时）、internal: ...（解析失败）。
-export function describeSourceError(raw) {
-  const t = String(raw || '').trim();
-  if (!t) return '未知错误';
-  if (/builder error/i.test(t)) return '书源配置有误，请求无法构造（请求头或 URL 规则非法）';
-  if (/timeout|timed ?out|deadline/i.test(t)) return '书源站点响应超时';
-  if (/error sending request|connection (?:refused|reset)|dns|connect/i.test(t)) return '无法连接书源站点（网络不可达或被拦截）';
-  if (/^internal:/i.test(t)) return '书源解析失败：' + shortText(t.slice(9));
-  const m = /(?:\bHTTP\b|status(?:_code)?[=: ]+)(\d{3})/i.exec(t);
-  if (m) return '书源站点返回 HTTP ' + m[1];
-  return shortText(t);
-}
-
-// 统一失败提示：先说“发生了什么”，再说“能做什么”。
-// scene 是动作名（搜索/发现/读取目录/加载正文/换源），拼成 “搜索失败：…。请…”。
-export function describeFailure(e, scene = '操作') {
-  const status = e && e.status;
-  const msg = shortText(e && e.message) || '未知错误';
-  if (status === 401) return scene + '失败：登录已失效。请重新登录后再试。';
-  if (status === 403) return scene + '失败：当前账号没有权限。请联系管理员，或换用有权限的账号。';
-  if (status === 0) {
-    if (/超时/.test(msg)) {
-      return scene + '失败：请求超时，服务器或书源响应太慢。请稍后重试；搜索可先换个关键词或减少书源。';
-    }
-    return scene + '失败：连不上服务器。请确认后端服务已启动、网络正常，然后重试。';
-  }
-  // 504 是后端主动的超时预算（如书内搜索 5s），优先按超时文案处理
-  if (status === 504) {
-    return scene + '失败：请求超时（服务端或书源响应太慢）。请稍后重试；书内搜索可缩短关键词。';
-  }
-  if (status >= 500) {
-    return scene + '失败：服务端出错（HTTP ' + status + '）。请稍后重试；持续出现可到「设置」页查看服务状态。';
-  }
-  if (/missing_book_url|缺少书籍地址/.test(msg)) {
-    return scene + '失败：缺少书籍地址。请从书架重新打开这本书，或点「换源」换一个可用书源。';
-  }
-  if (/目录为空/.test(msg)) {
-    return scene + '失败：书源没有返回章节，目录规则可能失效。请点「换源」改用其他书源。';
-  }
-  if (status === 400 || status === 422) {
-    return scene + '失败：' + msg + '。请按提示修改后重试。';
-  }
-  return scene + '失败：' + msg + '。请稍后重试；若一直失败，可到「设置」页查看服务状态。';
-}
-
-// 把 400/422 的纯文本、JSON error 统一成用户能看懂的中文
-function errorText(status, data) {
-  // 新错误体：{ error: <稳定错误码>, message: <面向用户的文案>, request_id }
-  const raw = data && typeof data === 'object'
-    ? String(data.message ?? data.error ?? '')
-    : typeof data === 'string' ? data : '';
-  const text = shortText(raw);
-  if (KNOWN_ERRORS[text]) return KNOWN_ERRORS[text];
-  if (text.startsWith('internal:')) {
-    return KNOWN_ERRORS['internal:'] + '（' + shortText(text.slice(9)) + '）';
-  }
-  if (status === 400 || status === 422) {
-    // 后端 400 常带 {"error":"具体原因"}（如设置越界），按原意直接展示
-    const isJsonError = data && typeof data === 'object' && (data.message || data.error);
-    if (isJsonError && text) return text;
-    const missing = /missing field `([^`]+)`/.exec(text);
-    if (missing) return '缺少参数：' + missing[1];
-    if (/invalid type|Failed to deserialize/.test(text)) return '请求参数格式不正确';
-    if (/Expected request with|Content-Type: application\/json/i.test(text)) return '请求体不是合法的 JSON';
-    return text ? '请求参数有误：' + text : '请求参数有误';
-  }
-  if (status === 403) return KNOWN_ERRORS.forbidden;
-  if (status === 404) return '资源不存在';
-  if (status >= 500) return '服务端错误（HTTP ' + status + '）' + (text ? '：' + text : '');
-  return text || '请求失败（HTTP ' + status + '）';
 }
 
 // 统一处理响应：401 清会话，非 2xx 抛错，空响应返回 null
@@ -217,7 +131,7 @@ function filenameFromDisposition(v) {
 // 返回 { blob, bytes, headers }，文件名由调用方按「书名.txt」决定，
 // objectURL 的创建与释放也在调用方完成，避免这里泄漏。
 async function downloadTxt(bookUrl, opts = {}) {
-  const path = `/book/export/txt?${query({ book_url: bookUrl })}`;
+  const path = `/book/export/txt?${buildQuery({ book_url: bookUrl })}`;
   const headers = {};
   const token = getToken();
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -284,7 +198,7 @@ async function downloadTxt(bookUrl, opts = {}) {
 // 漫画单图：<img src> 带不上 Bearer，必须 fetch + Blob + objectURL。
 // 后端 /api/book/image 已做 SSRF、Referer、大小/超时限制与内存 LRU 缓存。
 async function fetchComicImage(source, url, chapterUrl = '', bookUrl = '') {
-  const path = `/book/image?${query({ source, book_url: bookUrl, url, chapter_url: chapterUrl })}`;
+  const path = `/book/image?${buildQuery({ source, book_url: bookUrl, url, chapter_url: chapterUrl })}`;
   const headers = {};
   const token = getToken();
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -348,14 +262,6 @@ async function fetchComicImage(source, url, chapterUrl = '', bookUrl = '') {
   };
 }
 
-// 空值不写进查询串，保持 /search?key=&page=1 这类请求干净
-function query(obj) {
-  const qs = new URLSearchParams();
-  Object.entries(obj).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
-  });
-  return qs.toString();
-}
 
 export const api = {
   // ---- auth ----
@@ -419,7 +325,7 @@ export const api = {
 
   // ---- discovery / reading ----
   search: (key, page = 1, pageSize = 30) =>
-    request('GET', `/search?${query({ key, page, page_size: pageSize })}`),
+    request('GET', `/search?${buildQuery({ key, page, page_size: pageSize })}`),
   // 两段式搜索：job 轮询，books 先到先渲染
   // result 轮询已完成源；后端只读 key（不是 q），翻页复用同一 job_id
   // sourceIds 可传 book_source_url 或 /api/sources 排序后的 1-based 序号（逗号分隔）
@@ -427,7 +333,7 @@ export const api = {
   searchStart: (key, sourceIds = [], scope = 'all') =>
     request(
       'GET',
-      `/search/start?${query({
+      `/search/start?${buildQuery({
         key,
         source_ids: Array.isArray(sourceIds) && sourceIds.length ? sourceIds.join(',') : undefined,
         scope,
@@ -438,20 +344,20 @@ export const api = {
   searchResult: (jobId, page = 1, pageSize = 30, signal) =>
     request(
       'GET',
-      `/search/result?${query({ job_id: jobId, page, page_size: pageSize })}`,
+      `/search/result?${buildQuery({ job_id: jobId, page, page_size: pageSize })}`,
       undefined,
       { timeout: 15000, signal }
     ),
   // 发现分类：source 传书源 ID（book_source_url）
   exploreCategories: (source, page = 1) =>
-    request('GET', `/explore/categories?${query({ source, page })}`),
+    request('GET', `/explore/categories?${buildQuery({ source, page })}`),
   // 发现列表：url 必须是 exploreCategories 返回的分类 URL
-  explore: (url, page = 1) => request('GET', `/explore?${query({ url, page })}`),
+  explore: (url, page = 1) => request('GET', `/explore?${buildQuery({ url, page })}`),
   // 详情/目录都接受搜索结果的 seed：详情规则为空时由后端沿用，避免“错层”源全空
   bookInfo: (source, bookUrl, seed = {}) =>
     request(
       'GET',
-      `/book/info?${query({
+      `/book/info?${buildQuery({
         source,
         book_url: bookUrl,
         name: seed.name,
@@ -467,7 +373,7 @@ export const api = {
   toc: (source, bookUrl, seed = {}, useReplace = null) =>
     request(
       'GET',
-      `/book/toc?${query({
+      `/book/toc?${buildQuery({
         source,
         book_url: bookUrl,
         name: seed.name,
@@ -483,7 +389,7 @@ export const api = {
   content: (source, chapterUrl, bookUrl = '', title = '', useReplace = null) =>
     request(
       'GET',
-      `/book/content?${query({
+      `/book/content?${buildQuery({
         source,
         chapter_url: chapterUrl,
         book_url: bookUrl,
@@ -494,12 +400,12 @@ export const api = {
   // ---- 漫画 ----
   // 轻量探测书源类型：comic=true 时进入漫画阅读器
   comicSource: (source, bookUrl = '') =>
-    request('GET', `/comic/source?${query({ source, book_url: bookUrl })}`),
+    request('GET', `/comic/source?${buildQuery({ source, book_url: bookUrl })}`),
   // 章节图片列表：chapterUrl 优先；index 为 1-based 目录序号（与 /book/toc 数组一致）
   comicChapter: (source, bookUrl, chapterUrl = '', index) =>
     request(
       'GET',
-      `/comic/chapter?${query({ source, book_url: bookUrl, chapter_url: chapterUrl, index })}`,
+      `/comic/chapter?${buildQuery({ source, book_url: bookUrl, chapter_url: chapterUrl, index })}`,
       undefined,
       { timeout: 60000 }
     ),
@@ -513,12 +419,12 @@ export const api = {
       exclude_source: excludeSource || undefined,
     }),
   // 书签：position 与阅读进度同一套 0..1 章内比例
-  bookmarks: (bookId) => request('GET', `/bookmarks?${query({ book_id: bookId })}`),
+  bookmarks: (bookId) => request('GET', `/bookmarks?${buildQuery({ book_id: bookId })}`),
   addBookmark: (b) => request('POST', '/bookmarks', b),
   deleteBookmark: (id) => request('DELETE', `/bookmarks/delete?id=${encodeURIComponent(id)}`),
   // 书内搜索：后端只检索已缓存正文，5s 预算，超时返回 504
   bookSearch: (bookId, q, limit = 20) =>
-    request('GET', `/book/search?${query({ book_id: bookId, q, limit })}`, undefined, { timeout: 30000 }),
+    request('GET', `/book/search?${buildQuery({ book_id: bookId, q, limit })}`, undefined, { timeout: 30000 }),
   // 整本缓存可能跑几十秒，单独放宽超时；limited=true 表示还有章节未处理
   cacheAll: (bookUrl, limit = 200, source = '') =>
     request(
@@ -536,7 +442,7 @@ export const api = {
   exportInfo: (bookUrl) =>
     request(
       'GET',
-      `/book/export/info?${query({ book_url: bookUrl })}`,
+      `/book/export/info?${buildQuery({ book_url: bookUrl })}`,
       undefined,
       { timeout: 20000, noAuthReload: true }
     ),
@@ -544,7 +450,7 @@ export const api = {
   exportTxt: (bookUrl) => downloadTxt(bookUrl),
 
   // ---- bookshelf ----
-  bookshelf: (group = '') => request('GET', `/bookshelf?${query({ group })}`),
+  bookshelf: (group = '') => request('GET', `/bookshelf?${buildQuery({ group })}`),
   addToShelf: (b) => request('POST', '/bookshelf', b),
   removeFromShelf: (bookId) => request('DELETE', `/bookshelf?book_id=${encodeURIComponent(bookId)}`),
   moveToGroup: (bookIds, group) =>
@@ -597,7 +503,7 @@ export const api = {
 
   // ---- stats ----
   recordReading: (p, keepalive = false) => request('POST', '/stats/reading', p, { keepalive }),
-  statsOverview: (days = 7) => request('GET', `/stats/overview?${query({ days })}`),
+  statsOverview: (days = 7) => request('GET', `/stats/overview?${buildQuery({ days })}`),
   // /api/healthz：进程指标 + 当前用户正文缓存用量（只读）
   healthz: () => request('GET', '/healthz'),
 };

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/lib/readerContent.test.js src/lib/readerHtml.test.js src/lib/readerImages.test.js src/lib/readerStats.test.js src/lib/readerAuto.test.js src/lib/readerMath.test.js src/lib/readerProgress.test.js src/lib/readerGestures.test.js",
+    "test": "node --test src/lib/readerContent.test.js src/lib/readerHtml.test.js src/lib/readerImages.test.js src/lib/readerStats.test.js src/lib/readerAuto.test.js src/lib/readerMath.test.js src/lib/readerProgress.test.js src/lib/readerGestures.test.js src/lib/apiErrors.test.js src/lib/apiUrl.test.js",
     "check": "svelte-check --tsconfig ./jsconfig.json",
     "preview": "vite preview"
   },
