@@ -218,6 +218,24 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
     view
 }
 
+/// 同一批次内的入队顺序键（越小越先占并发槽）：
+/// - `0`：有延迟样本且最近一次不是站点失败 → 按 p90/均值延迟升序；
+/// - `1`：无观测数据（新导入/从未搜到过）→ 排在已知快源之后；
+/// - `2`：最近一次是站点失败 → 垫底，让预算优先给可用源。
+///
+/// 只调整顺序，不改变参与集合、预算与并发上限，因此不会减少「本来能在预算内完成」的源。
+pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64) {
+    let Some(h) = h else {
+        return (1, 0);
+    };
+    let latency = h.ttfb_ms_p90.or(h.avg_latency_ms);
+    match (h.last_status == source_health::STATUS_FAIL, latency) {
+        (true, l) => (2, l.unwrap_or(i64::MAX)),
+        (false, Some(ms)) => (0, ms),
+        (false, None) => (1, 0),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消），拆分仅把参数列表搬到另一层。
 pub(super) async fn run_search_job(
     job: Arc<SearchJob>,
@@ -240,9 +258,14 @@ pub(super) async fn run_search_job(
     // 两批同时进调度：preferred 先入队（优先占源级并发槽），但不再等它整批跑完；
     // observing 立刻跟上，共用同一总预算与同一套源级并发信号量。
     // 各自完成即写回结果，首批慢站不再拖住首屏。
-    let (preferred, observing): (Vec<_>, Vec<_>) = sources
+    let (mut preferred, mut observing): (Vec<_>, Vec<_>) = sources
         .into_iter()
         .partition(|s| source_health::is_preferred(health.get(&s.book_source_url)));
+
+    // 慢源后置：并发槽按入队顺序分配，先入队的是「已知快且近期正常」的源；
+    // 慢源/近期站点失败源排到队尾，临近总预算时被自然截断（只记 skipped，不当站点故障冷却）。
+    preferred.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
+    observing.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
 
     let (mut pref_outcomes, obs_outcomes) = tokio::join!(
         run_search_batch(

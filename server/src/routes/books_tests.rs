@@ -236,6 +236,46 @@ fn pipeline_uses_single_total_budget_for_both_batches() {
     );
 }
 
+// 慢源后置：有延迟样本且正常的按延迟升序，无观测居中，近期站点失败垫底。
+#[test]
+fn slow_and_failing_sources_queue_last() {
+    let mk_row = |last: &str, p90: Option<i64>, avg: Option<i64>| {
+        let mut h = source_health::HealthRow::default();
+        h.last_status = last.to_string();
+        h.ttfb_ms_p90 = p90;
+        h.avg_latency_ms = avg;
+        h
+    };
+    let mut health = HashMap::new();
+    health.insert(
+        "https://fast.example".to_string(),
+        mk_row(source_health::STATUS_OK, Some(120), Some(90)),
+    );
+    health.insert(
+        "https://slow.example".to_string(),
+        mk_row(source_health::STATUS_OK, None, Some(5200)),
+    );
+    health.insert(
+        "https://fail.example".to_string(),
+        mk_row(source_health::STATUS_FAIL, Some(800), None),
+    );
+    let mk = |name: &str| {
+        let mut s = crate::entities::BookSource::default();
+        s.book_source_url = format!("https://{name}.example");
+        s.book_source_name = name.into();
+        s
+    };
+    let mut list = vec![mk("slow"), mk("fail"), mk("unknown"), mk("fast")];
+    list.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
+    let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["fast", "slow", "unknown", "fail"],
+        "快源先占槽：正常按延迟升序 → 无观测 → 失败源垫底"
+    );
+    assert_eq!(health_order_key(None), (1, 0), "无健康行按无观测处理");
+}
+
 fn mk_book(name: String, url: String) -> SearchBook {
     let mut b = SearchBook::default();
     b.name = Some(name);
