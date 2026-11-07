@@ -76,6 +76,48 @@ fn authed_get(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn authed_post(uri: &str, body: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn authed_delete(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// 注册后直接提权并重新登录，返回管理员 token。
+async fn register_admin(app: &axum::Router, pool: &SqlitePool, username: &str) -> String {
+    register(app, username).await;
+    sqlx::query("UPDATE users SET role = 'admin' WHERE username = ?1")
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/auth/login",
+            &format!(r#"{{"username":"{username}","password":"secret123"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "管理员重新登录");
+    body_json(resp).await["token"]
+        .as_str()
+        .expect("admin token")
+        .to_string()
+}
+
 async fn register(app: &axum::Router, username: &str) -> String {
     let resp = app
         .clone()
@@ -183,6 +225,254 @@ async fn regular_user_cannot_write_sources() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn admin_sources_crud_and_export() {
+    let (app, pool, dir) = test_app("sources-crud").await;
+    let token = register_admin(&app, &pool, "dave").await;
+    let url = "https://smoke.example";
+    let body = format!(
+        r#"{{"book_source_url":"{url}","book_source_name":"Smoke Source","search_url":"{url}/search?q={{{{key}}}}"}}"#
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/sources", &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "保存书源: {}",
+        response_text(resp).await
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/sources", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = body_json(resp).await;
+    assert!(
+        list.as_array()
+            .is_some_and(|a| a.iter().any(|s| s["book_source_url"] == url)),
+        "列表应包含新建书源: {list}"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/sources/export", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let exported = body_json(resp).await;
+    assert!(
+        exported
+            .as_array()
+            .is_some_and(|a| a.iter().any(|s| s["bookSourceUrl"] == url)),
+        "导出应包含新建书源: {exported}"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed_delete(
+            "/api/sources/delete?url=https%3A%2F%2Fsmoke.example",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(authed_get("/api/sources", &token))
+        .await
+        .unwrap();
+    let list = body_json(resp).await;
+    assert_eq!(list, Value::Array(Vec::new()), "删除后列表应为空");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn settings_validation_and_roundtrip() {
+    let (app, _pool, dir) = test_app("settings").await;
+    let token = register(&app, "erin").await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/settings", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let defaults = body_json(resp).await;
+    assert_eq!(defaults["font_size"], 18, "默认字号: {defaults}");
+    assert_eq!(defaults["theme"], "light", "默认主题: {defaults}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/settings", r#"{"font_size":99}"#, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "越界字号应被拒绝");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/settings",
+            r#"{"font_size":20,"line_height":1.8,"theme":"sepia"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(authed_get("/api/settings", &token))
+        .await
+        .unwrap();
+    let saved = body_json(resp).await;
+    assert_eq!(saved["font_size"], 20);
+    assert_eq!(saved["theme"], "sepia");
+    assert_eq!(saved["line_height"], 1.8);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn bookshelf_progress_roundtrip() {
+    let (app, _pool, dir) = test_app("progress").await;
+    let token = register(&app, "frank").await;
+    let book = "https://book.example/smoke-1";
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/bookshelf",
+            &format!(r#"{{"book_id":"{book}","name":"Smoke Book","author":"Tester"}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/bookshelf/progress",
+            &format!(
+                r#"{{"book_id":"{book}","chapter_index":3,"position":0.5,"total_chapters":10}}"#
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "写入进度");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/bookshelf/progress?book_id=https%3A%2F%2Fbook.example%2Fsmoke-1",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let progress = body_json(resp).await;
+    assert_eq!(progress["chapter_index"], 3, "进度: {progress}");
+    assert_eq!(progress["position"], 0.5, "进度: {progress}");
+
+    let resp = app
+        .oneshot(authed_get("/api/bookshelf", &token))
+        .await
+        .unwrap();
+    let shelf = body_json(resp).await;
+    assert!(
+        shelf
+            .as_array()
+            .is_some_and(|a| a.iter().any(|b| b["book_id"] == book)),
+        "书架应包含新书: {shelf}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn search_job_lifecycle_without_sources() {
+    let (app, _pool, dir) = test_app("search-job").await;
+    let token = register(&app, "gina").await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/search/start?key=smoke", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let started = body_json(resp).await;
+    let job_id = started["job_id"].as_str().expect("job_id").to_string();
+    assert_eq!(started["source_total"], 0, "没有书源: {started}");
+
+    let resp = app
+        .oneshot(authed_get(
+            &format!("/api/search/result?job_id={job_id}&page=1"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = body_json(resp).await;
+    assert_eq!(
+        result["books"].as_array().map(Vec::len),
+        Some(0),
+        "空源搜索应返回空结果: {result}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn kindle_redirects_to_login_without_session() {
+    let (app, _pool, dir) = test_app("kindle-auth").await;
+
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/k").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/k/login")
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/k/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("<form"), "登录页应包含表单: {html}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+async fn response_text(resp: Response) -> String {
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap_or_default();
+    format!("{status}: {}", String::from_utf8_lossy(&bytes))
 }
 
 #[tokio::test]
