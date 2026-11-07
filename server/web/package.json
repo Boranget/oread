@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/lib/readerContent.test.js src/lib/readerHtml.test.js src/lib/readerImages.test.js",
+    "test": "node --test src/lib/readerContent.test.js src/lib/readerHtml.test.js src/lib/readerImages.test.js src/lib/readerStats.test.js",
     "check": "svelte-check --tsconfig ./jsconfig.json",
     "preview": "vite preview"
   },

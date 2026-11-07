@@ -14,6 +14,7 @@
   import { isEmptyChapter, isVolumeTitle } from '../lib/readerContent.js';
   import { htmlToParas, plainChars } from '../lib/readerHtml.js';
   import { createImageLoader } from '../lib/readerImages.js';
+  import { createReadingStats } from '../lib/readerStats.js';
   import { applyTheme } from '../lib/theme.js';
   import {
     FONT_OPTIONS,
@@ -134,12 +135,14 @@
 
   // 阅读统计：本会话累计，定期增量上报
   let statsTimer = null;
-  let statsSeconds = 0;
-  let statsChars = 0;
-  let statsBusy = false;
-  const statsSeen = new Set();
-
-
+  const stats = createReadingStats({
+    recordReading: (payload, keepalive) => api.recordReading(payload, keepalive),
+    getBookId: () => book.bookUrl,
+    getName: () => (info && info.name) || book.name,
+    getChapterIndex: () => currentPos,
+    getTotalChapters: () => chapters.length,
+    isVisible: () => document.visibilityState === 'visible',
+  });
 
   const progressKey = (id) => `oread_progress:${id}`;
 
@@ -150,7 +153,7 @@
       /* ignore */
     }
     loadAll();
-    statsTimer = setInterval(onStatsTick, 1000);
+    statsTimer = setInterval(stats.tick, 1000);
     window.addEventListener('pagehide', onPageHide);
     window.addEventListener('beforeunload', onPageHide);
     document.addEventListener('visibilitychange', onVisibility);
@@ -175,7 +178,7 @@
     clearTimeout(resizeTimer);
     clearTimeout(toastTimer);
     clearInterval(statsTimer);
-    flushStats(true);
+    stats.flush(true);
     cancelAnimationFrame(autoRaf);
     imageLoader.dispose();
   });
@@ -183,49 +186,14 @@
   function onPageHide() {
     // 页面不可见/卸载：强制补发一次（fetch keepalive 可在卸载过程中完成）
     flushSave(true);
-    flushStats(true);
+    stats.flush(true);
   }
 
   function onVisibility() {
     if (document.visibilityState === 'hidden') {
       flushSave(true);
-      flushStats(true);
+      stats.flush(true);
     }
-  }
-
-  function onStatsTick() {
-    if (document.visibilityState === 'visible') statsSeconds += 1;
-    if (statsSeconds >= 60) flushStats();
-  }
-
-  function flushStats(keepalive = false) {
-    if (statsBusy || !book || currentPos < 0) return;
-    if (statsSeconds < 1 && statsChars < 1) return;
-    const seconds = Math.min(86400, statsSeconds);
-    const chars = Math.min(10000000, statsChars);
-    statsBusy = true;
-    api
-      .recordReading(
-        {
-          book_id: book.bookUrl,
-          name: (info && info.name) || book.name,
-          seconds,
-          chars,
-          chapter_index: currentPos,
-          total_chapters: chapters.length,
-        },
-        keepalive
-      )
-      .then(() => {
-        statsSeconds = Math.max(0, statsSeconds - seconds);
-        statsChars = Math.max(0, statsChars - chars);
-      })
-      .catch(() => {
-        /* 失败保留计数，下次心跳重试 */
-      })
-      .finally(() => {
-        statsBusy = false;
-      });
   }
 
   function readLocalProgress() {
@@ -434,7 +402,7 @@
       if (i >= chapters.length) return;
       pos = i;
     }
-    if (!opts.initial) flushStats();
+    if (!opts.initial) stats.flush();
     // 打开本书任一章节即视为已看到最新目录，清空书架新章节角标（每次阅读会话只发一次）
     if (!seenMarked && book.bookUrl) {
       seenMarked = true;
@@ -467,10 +435,7 @@
       if (myReq !== reqId) return;
       current = data;
       contentLoading = false;
-      if (!statsSeen.has(pos)) {
-        statsSeen.add(pos);
-        statsChars += plainChars(data && data.content);
-      }
+      stats.addChapter(pos, plainChars(data && data.content));
       await tick();
       await measurePages();
       applyRatio(opts.ratio || 0);
@@ -1071,7 +1036,7 @@
   function close() {
     stopAuto();
     flushSave();
-    flushStats(true);
+    stats.flush(true);
     dispatch('close');
   }
 
@@ -1094,7 +1059,7 @@
     const nextSource = c.origin || c.source_id || '';
     stopAuto();
     flushSave();
-    flushStats(true);
+    stats.flush(true);
     showSwitch = false;
     dispatch('switch', {
       bookUrl: nextUrl,
