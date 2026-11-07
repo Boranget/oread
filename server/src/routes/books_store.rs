@@ -301,6 +301,27 @@ pub(crate) async fn load_cached_content(
     origin: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<BookContent>> {
+    load_cached_content_inner(pool, url, origin, ttl_secs, true).await
+}
+
+/// single-flight 闸门后的复查：命中照常计数，未命中不计数。
+/// 否则 N 个并发请求会各记一次 miss，把命中率算低。
+pub(crate) async fn peek_cached_content(
+    pool: &SqlitePool,
+    url: &str,
+    origin: &str,
+    ttl_secs: i64,
+) -> anyhow::Result<Option<BookContent>> {
+    load_cached_content_inner(pool, url, origin, ttl_secs, false).await
+}
+
+async fn load_cached_content_inner(
+    pool: &SqlitePool,
+    url: &str,
+    origin: &str,
+    ttl_secs: i64,
+    count_miss: bool,
+) -> anyhow::Result<Option<BookContent>> {
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images, cache_version \
@@ -316,7 +337,9 @@ pub(crate) async fn load_cached_content(
         // 空正文（文本为空 / 图片章节零图）视为缓存未命中：旧版本的空白缓存不再命中，
         // 每次读取都会重新抓取，避免整个 TTL 周期内一直白屏。
         if content_is_empty(&row) {
-            crate::cache_metrics::record_miss();
+            if count_miss {
+                crate::cache_metrics::record_miss();
+            }
             return Ok(None);
         }
         // 解析管线变了（或旧记录没有指纹）：旧结果可能残缺，按未命中重建。
@@ -327,7 +350,9 @@ pub(crate) async fn load_cached_content(
                 current = content_cache_version(),
                 "content cache version mismatch, refetch"
             );
-            crate::cache_metrics::record_miss();
+            if count_miss {
+                crate::cache_metrics::record_miss();
+            }
             return Ok(None);
         }
         let _ = sqlx::query(
@@ -340,7 +365,9 @@ pub(crate) async fn load_cached_content(
         crate::cache_metrics::record_hit();
         return Ok(Some(row));
     }
-    crate::cache_metrics::record_miss();
+    if count_miss {
+        crate::cache_metrics::record_miss();
+    }
     Ok(None)
 }
 

@@ -10,7 +10,7 @@ use super::*;
 /// 文本源仍返回原 `content` 且 `images: []`；图片源 `content` 为空串 + `images` 列表。
 pub(super) async fn content(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     db: UserDb,
     Query(q): Query<ContentQ>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -21,64 +21,88 @@ pub(super) async fn content(
             "该条为分卷标题，请从目录选择章节".into(),
         ));
     }
-    let mut c = match load_cached_content(&db.0, &q.chapter_url, &q.source, s.cfg.content_ttl_secs)
-        .await?
+    let mut c = match super::books_store::peek_cached_content(
+        &db.0,
+        &q.chapter_url,
+        &q.source,
+        s.cfg.content_ttl_secs,
+    )
+    .await?
     {
         Some(c) => c,
         None => {
-            let source = load_source(&s.shared, &q.source).await?;
-            let chapter = BookChapter {
-                url: q.chapter_url.clone(),
-                // 书籍地址用于按 book_key 预载跨请求变量/cache（老客户端可能不传）
-                book_url: q.book_url.clone().filter(|s| !s.trim().is_empty()),
-                ..Default::default()
-            };
-            let store = match chapter.book_url.as_deref() {
-                Some(bu) if !bu.trim().is_empty() => {
-                    let key = web_book::book_key(&source, bu);
-                    Some(book_store_for(&db.0, &key).await)
-                }
-                _ => None,
-            };
-            let mut c = if source.book_source_type == 2 {
-                // 漫画源：只抽图片列表，content 置空以保持字段类型不变
-                let imgs = web_book::chapter_images_book(
-                    s.fetcher.as_ref(),
-                    &source,
-                    &chapter,
-                    store.as_ref(),
-                )
-                .await?;
-                BookContent {
-                    book_url: chapter.book_url.clone().unwrap_or_default(),
-                    url: chapter.url.clone(),
-                    title: chapter.title.clone(),
-                    content: Some(String::new()),
-                    chapter_index: chapter.index,
-                    content_type: "image".into(),
-                    images_json: Some(serde_json::to_string(&imgs)?),
-                    ..Default::default()
-                }
+            // 同用户同章节并发未命中只抓取一次：等待者拿到闸门后先重查缓存。
+            let _flight = crate::routes::inflight::acquire(format!(
+                "{}|{}|{}",
+                u.id, q.source, q.chapter_url
+            ))
+            .await;
+            if let Some(c) = super::books_store::peek_cached_content(
+                &db.0,
+                &q.chapter_url,
+                &q.source,
+                s.cfg.content_ttl_secs,
+            )
+            .await?
+            {
+                c
             } else {
-                web_book::chapter_content_book(
-                    s.fetcher.as_ref(),
-                    &source,
-                    &chapter,
-                    store.as_ref(),
-                )
-                .await?
-            };
-            c.origin = source.book_source_url.clone();
-            if let Some(st) = &store {
-                persist_book_changes(&db.0, st.take_changes()).await;
+                // 真正触发抓取时才记一次 miss；并发等待者只记 hit，命中率不被稀释。
+                crate::cache_metrics::record_miss();
+                let source = load_source(&s.shared, &q.source).await?;
+                let chapter = BookChapter {
+                    url: q.chapter_url.clone(),
+                    // 书籍地址用于按 book_key 预载跨请求变量/cache（老客户端可能不传）
+                    book_url: q.book_url.clone().filter(|s| !s.trim().is_empty()),
+                    ..Default::default()
+                };
+                let store = match chapter.book_url.as_deref() {
+                    Some(bu) if !bu.trim().is_empty() => {
+                        let key = web_book::book_key(&source, bu);
+                        Some(book_store_for(&db.0, &key).await)
+                    }
+                    _ => None,
+                };
+                let mut c = if source.book_source_type == 2 {
+                    // 漫画源：只抽图片列表，content 置空以保持字段类型不变
+                    let imgs = web_book::chapter_images_book(
+                        s.fetcher.as_ref(),
+                        &source,
+                        &chapter,
+                        store.as_ref(),
+                    )
+                    .await?;
+                    BookContent {
+                        book_url: chapter.book_url.clone().unwrap_or_default(),
+                        url: chapter.url.clone(),
+                        title: chapter.title.clone(),
+                        content: Some(String::new()),
+                        chapter_index: chapter.index,
+                        content_type: "image".into(),
+                        images_json: Some(serde_json::to_string(&imgs)?),
+                        ..Default::default()
+                    }
+                } else {
+                    web_book::chapter_content_book(
+                        s.fetcher.as_ref(),
+                        &source,
+                        &chapter,
+                        store.as_ref(),
+                    )
+                    .await?
+                };
+                c.origin = source.book_source_url.clone();
+                if let Some(st) = &store {
+                    persist_book_changes(&db.0, st.take_changes()).await;
+                }
+                // 用户设置的缓存上限优先（且不超过全局上限），未设置时用全局配置
+                let limit = match replace::user_cache_limit_mb(&db.0).await {
+                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
+                    None => s.cfg.cache_limit_bytes(),
+                };
+                save_content_cached(&db.0, &c, limit).await?;
+                c
             }
-            // 用户设置的缓存上限优先（且不超过全局上限），未设置时用全局配置
-            let limit = match replace::user_cache_limit_mb(&db.0).await {
-                Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                None => s.cfg.cache_limit_bytes(),
-            };
-            save_content_cached(&db.0, &c, limit).await?;
-            c
         }
     };
     if c.content_type.trim().is_empty() {

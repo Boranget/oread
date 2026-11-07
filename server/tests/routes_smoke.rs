@@ -476,7 +476,10 @@ async fn kindle_redirects_to_login_without_session() {
 }
 
 /// 目录/正文冒烟用的固定抓取实现：不联网，按 URL 返回 fixture HTML。
-struct MockFetcher;
+struct MockFetcher {
+    /// 正文 URL（/c1）被真实抓取的次数，用于验证 single-flight 合并。
+    content_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl boranlib::web_book::Fetcher for MockFetcher {
     fn fetch<'a>(
@@ -490,6 +493,12 @@ impl boranlib::web_book::Fetcher for MockFetcher {
         _limit: boranlib::req::SourceLimit,
     ) -> boranlib::web_book::FetchFuture<'a> {
         Box::pin(async move {
+            if url == "https://mock.example/c1" {
+                self.content_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 留出并发窗口，确保并发请求真的重叠，single-flight 才可被验证。
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            }
             let html = match url {
                 "https://mock.example/book/1" => {
                     "<html><body><ul>\
@@ -512,8 +521,13 @@ async fn toc_and_content_routes_with_injected_fetcher() {
     let dir = temp_dir("toc-content");
     let cfg = test_config(&dir);
     let shared = db::init_shared(&cfg).await.expect("初始化共享库");
-    let app =
-        routes::build_router_with_fetcher(shared.clone(), cfg, std::sync::Arc::new(MockFetcher));
+    let app = routes::build_router_with_fetcher(
+        shared.clone(),
+        cfg,
+        std::sync::Arc::new(MockFetcher {
+            content_calls: Default::default(),
+        }),
+    );
     let token = register_admin(&app, &shared, "erin").await;
 
     let source = r#"{
@@ -562,6 +576,63 @@ async fn toc_and_content_routes_with_injected_fetcher() {
     assert!(
         text.contains("正文一"),
         "正文应包含 fixture 内容: {content}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 8 个并发同章请求：只有第一个真正抓取，其余等待后命中缓存。
+#[tokio::test]
+async fn concurrent_content_requests_share_one_fetch() {
+    let dir = temp_dir("content-single-flight");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = routes::build_router_with_fetcher(
+        shared.clone(),
+        cfg,
+        std::sync::Arc::new(MockFetcher {
+            content_calls: calls.clone(),
+        }),
+    );
+    let token = register_admin(&app, &shared, "frank").await;
+
+    let source = r#"{
+        "book_source_url":"https://mock.example",
+        "book_source_name":"Mock",
+        "rule_content":{"content":"id.content@html"}
+    }"#;
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/sources", source, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "导入书源");
+
+    let uri = "/api/book/content?source=https%3A%2F%2Fmock.example\
+        &chapter_url=https%3A%2F%2Fmock.example%2Fc1\
+        &book_url=https%3A%2F%2Fmock.example%2Fbook%2F1&use_replace=0"
+        .to_string();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let token = token.clone();
+        let uri = uri.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = app.oneshot(authed_get(&uri, &token)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "并发正文请求");
+            let body = body_json(resp).await;
+            let text = body["content"].as_str().unwrap_or_default();
+            assert!(text.contains("正文一"), "正文内容: {body}");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "并发同章只应抓取一次"
     );
 
     let _ = std::fs::remove_dir_all(dir);
