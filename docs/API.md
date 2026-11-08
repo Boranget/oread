@@ -1110,6 +1110,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 > `SearchQ` 为 5.1/5.2/5.5 共用；`key`/`q` 都不传时按空串搜索，通常是 `200 []`（已实测），**不再返回 400**。
 > 5.1/5.2 默认只打**活跃源**：`enabled && rule_search && search_url`、非隔离区、且不在冷却期；`include_cooled=1` 才会把冷却源加回来。
+> **服务端书名过滤（5.1/5.2/5.5/5.6/`/k/search` 全入口共用）**：结果在交给客户端前只保留**书名包含关键词**的条目；只比对书名，作者/简介不参与。比对前做归一化：全角→半角、忽略大小写、剔除空白与标点（《》、`·`、括号等），因此《百年孤独》与“百年孤独”等价。不做繁简转换，也不为别名/译名/副标题保留，字面不匹配直接丢弃。过滤在去重/排序之后执行，不影响打分、精选与源健康；被过滤不等于源失败；全部被过滤时正常返回空列表。
 
 - 成功 `200`：`SearchBook[]`（**无 `total`、无分页元数据**）
 - `SearchBook` 结构（响应对所有字段都会出现，未填充的为 `null`/`0`）：
@@ -1179,6 +1180,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "page": 1,
   "page_size": 30,
   "total": 87,
+  "title_filter": { "raw": 240, "kept": 87, "dropped": 153 },
   "has_more": true,
   "source_failed": 1,
   "source_total": 5,
@@ -1195,7 +1197,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `errors` | object[] | 否 | 单源失败明细：`source`(string)、`source_name`(string)、`error`(string) |
 | `page` | integer | 否 | 回显（最小 1） |
 | `page_size` | integer | 否 | 回显（1..200） |
-| `total` | integer | 否 | 去重后完整结果数，**最多 400**；只基于各源第 1 页 |
+| `total` | integer | 否 | 书名过滤后、去重排序的完整结果数，**最多 400**；只基于各源第 1 页 |
+| `title_filter` | object | 否 | `raw`=过滤前候选数、`kept`=过滤后（= `total`）、`dropped`=书名不含关键词而丢弃的条数 |
 | `has_more` | boolean | 否 | `skip + page_size < total` |
 | `source_failed` | integer | 否 | **数字**，失败源数量（不是数组）。明细看 `errors` |
 | `source_total` | integer | 否 | 本次实际参与搜索的活跃源数（已排除隔离区与冷却源；`source_ids` 过滤后） |
@@ -1372,6 +1375,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "page": 1,
   "page_size": 30,
   "total": 183,
+  "title_filter": { "raw": 296, "kept": 183, "dropped": 113 },
   "has_more": true,
   "done": false,
   "phase": "first",
@@ -1397,7 +1401,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `errors` | object[] | 否 | 已完成源的失败明细：`source`、`source_name`、`error` |
 | `page` | integer | 否 | 回显（最小 1） |
 | `page_size` | integer | 否 | 回显（1..200） |
-| `total` | integer | 否 | 当前已完成源去重排序后的条数，最多 400；**会随源完成而增长** |
+| `total` | integer | 否 | 书名过滤后、当前已完成源的去重排序条数，最多 400；**会随源完成而增长** |
+| `title_filter` | object | 否 | `raw`=过滤前候选、`kept`=过滤后（= `total`）、`dropped`=被丢弃条数；全部被过滤时 `books=[]` 且不报错 |
 | `has_more` | boolean | 否 | `skip + page_size < total`；`page` 超出末尾时为 `false` |
 | `done` | boolean | 否 | `pending == 0`，即所有源都已结束（成功/失败/超时都算结束） |
 | `phase` | string | 否 | `first`（仍有未完成源）/ `final`（全部完成） |
@@ -2998,6 +3003,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `search.source_concurrency_min` / `search.source_concurrency_max` | integer | 否 | 每源在飞上限的夹取范围（1 / 8） |
 | `search.source_limit_waits` | integer | 否 | 进程生命周期内「按源限流导致的等待次数」（超限排队才计数，立即拿到许可不计） |
 | `search.source_limit_wait_ms` | integer | 否 | 上述等待的累计毫秒 |
+| `search.title_filter` | object | 否 | 服务端书名包含过滤的进程内累计计数：`calls`（过滤调用次数）、`raw`（过滤前候选）、`kept`（保留）、`dropped`（书名不含关键词而丢弃）；用于判断过滤是否过狠 |
 
 - 说明：`search` 块与启动日志 `search budgets resolved` 同源，直接反映进程真实生效值；改环境变量后无需再靠日志猜。
 

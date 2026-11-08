@@ -1185,6 +1185,63 @@ async fn legacy_aggregate_path_keeps_all_sources() {
     assert_eq!(out.books[0].name.as_deref(), Some("测试书"));
 }
 
+// 聚合入口（legacy `/api/search`、`/api/search/aggregate`、`/k/search` 共用）
+// 在返回调用方之前做书名包含过滤；缓存只存过滤前结果，命中缓存时仍重新过滤。
+#[tokio::test]
+async fn aggregated_filters_title_matches_and_refilters_on_cache_hit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = srv.accept().await {
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            // 两条都能通过相关性排序（partial 以上），但只有第一条书名完整包含关键词。
+            let body = r#"<div class="item"><a href="/b/1">百年孤独</a></div><div class="item"><a href="/b/2">百年争战</a></div>"#;
+            let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let mut s = crate::entities::BookSource::default();
+    s.enabled = true;
+    s.book_source_url = format!("http://{addr}");
+    s.book_source_name = "aggregate-filter".into();
+    s.search_url = Some(format!("http://{addr}/s?q={{{{key}}}}"));
+    s.rule_search = Some(crate::entities::SearchRule {
+        book_list: Some("class.item".into()),
+        name: Some("a@text".into()),
+        book_url: Some("a@href".into()),
+        ..Default::default()
+    });
+
+    for round in 0..2 {
+        let (books, errors, stats) = aggregated(
+            &[s.clone()],
+            "百年孤独",
+            false,
+            crate::req::SearchScope::All,
+        )
+        .await;
+        assert!(errors.is_empty(), "round {round}: {:?}", errors);
+        assert_eq!(
+            books.iter().map(|b| b.name.as_deref()).collect::<Vec<_>>(),
+            vec![Some("百年孤独")],
+            "round {round}: 只保留书名包含关键词的条目"
+        );
+        assert_eq!(stats.raw, 2, "round {round}: raw 是过滤前候选");
+        assert_eq!(stats.kept, 1, "round {round}: kept 是过滤后候选");
+        assert_eq!(stats.dropped, 1, "round {round}: 书名不含关键词的被丢弃");
+    }
+}
+
 fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
     Arc::new(SearchJob {
         id: id.into(),
@@ -1358,6 +1415,122 @@ fn search_source_ids_filter_and_report_ignored() {
     let (sel, ign) = select_sources(&enabled, &parse_source_ids(None));
     assert_eq!(sel.len(), 2);
     assert!(ign.is_empty());
+}
+
+// 两段式结果在出参前做书名包含过滤：只保留书名含关键词的条目，
+// 作者/简介不参与；过滤计数进 title_filter，全部被过滤时返回空数组而非报错。
+#[tokio::test]
+async fn search_result_filters_by_title_at_response_boundary() {
+    let mut job = test_job("title-filter", 0, 0);
+    {
+        let j = Arc::get_mut(&mut job).unwrap();
+        j.key = "百年孤独".into();
+        let mut st = j.state.lock().unwrap();
+        st.books = vec![
+            SearchBook {
+                name: Some("《百年孤独》".into()),
+                book_url: "https://x/1".into(),
+                origin: Some("https://s/1".into()),
+                ..Default::default()
+            },
+            // 只命中查询片段：排序阶段保留（partial），书名过滤阶段丢弃
+            SearchBook {
+                name: Some("百年争战".into()),
+                book_url: "https://x/2".into(),
+                origin: Some("https://s/1".into()),
+                ..Default::default()
+            },
+            // 相关性为 0，在排序阶段就被丢弃，不计入 title_filter.raw
+            SearchBook {
+                name: Some("海贼王".into()),
+                book_url: "https://x/3".into(),
+                origin: Some("https://s/1".into()),
+                ..Default::default()
+            },
+        ];
+    }
+    job_registry().lock().unwrap().push(job);
+
+    let state = || {
+        State(AppState {
+            shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            cfg: crate::config::Config::from_env(),
+            user_pools: Default::default(),
+            fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
+        })
+    };
+    let owner = AuthUser {
+        id: 7,
+        username: "owner".into(),
+        role: "user".into(),
+    };
+    let ok = search_result(
+        state(),
+        owner,
+        Query(JobResultQ {
+            job_id: "title-filter".to_string(),
+            page: Some(1),
+            page_size: None,
+            cursor: None,
+        }),
+    )
+    .await
+    .expect("任务创建者应可读");
+
+    let v = ok.0;
+    let books = v["books"].as_array().expect("books 应为数组");
+    assert_eq!(books.len(), 1, "只保留书名包含关键词的条目");
+    assert_eq!(books[0]["name"], "《百年孤独》");
+    assert_eq!(v["title_filter"]["raw"], 2);
+    assert_eq!(v["title_filter"]["kept"], 1);
+    assert_eq!(v["title_filter"]["dropped"], 1);
+}
+
+// 全部被过滤时正常返回空列表（200），不报错。
+#[tokio::test]
+async fn search_result_all_filtered_returns_empty_list() {
+    let mut job = test_job("all-filtered", 0, 0);
+    {
+        let j = Arc::get_mut(&mut job).unwrap();
+        j.key = "百年孤独".into();
+        let mut st = j.state.lock().unwrap();
+        st.books = vec![SearchBook {
+            name: Some("百年争战".into()),
+            book_url: "https://x/2".into(),
+            origin: Some("https://s/1".into()),
+            ..Default::default()
+        }];
+    }
+    job_registry().lock().unwrap().push(job);
+
+    let state = || {
+        State(AppState {
+            shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            cfg: crate::config::Config::from_env(),
+            user_pools: Default::default(),
+            fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
+        })
+    };
+    let owner = AuthUser {
+        id: 7,
+        username: "owner".into(),
+        role: "user".into(),
+    };
+    let ok = search_result(
+        state(),
+        owner,
+        Query(JobResultQ {
+            job_id: "all-filtered".to_string(),
+            page: Some(1),
+            page_size: None,
+            cursor: None,
+        }),
+    )
+    .await
+    .expect("全部被过滤不是错误");
+    assert!(ok.0["books"].as_array().unwrap().is_empty());
+    assert_eq!(ok.0["title_filter"]["kept"], 0);
+    assert_eq!(ok.0["title_filter"]["dropped"], 1);
 }
 
 // 搜索任务归属：别人的 job_id 与不存在都返回 404，防越权读取与存在性探测。

@@ -145,6 +145,9 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
             // 按源限流导致的等待次数 / 累计等待毫秒（进程生命周期内累计）。
             "source_limit_waits": crate::req::source_limit_metrics().0,
             "source_limit_wait_ms": crate::req::source_limit_metrics().1,
+            // 服务端书名包含过滤：raw/kept/dropped 为进程内累计，
+            // 用于判断过滤是否过狠（每响应明细见 5.2/5.6 的 title_filter 字段）。
+            "title_filter": crate::title_filter::metrics(),
         },
         // 正文缓存命中/落库/淘汰计数（进程生命周期内累计，仅用于观察与调参）
         "content_cache": {

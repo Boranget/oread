@@ -197,7 +197,9 @@ pub(super) async fn search_result(
     let attempted = view.attempted;
     // 未排上的源（两批同时调度后通常为 0）
     let pending_scheduled = job.source_total.saturating_sub(scheduled);
-    let full = view.books;
+    // 客户端响应边界：只保留书名包含关键词的条目。
+    // 过滤发生在去重/排序之后，不改变打分、精选与源健康（健康统计用源原始命中数）。
+    let (full, title_filter) = crate::title_filter::retain_title_matches(view.books, &job.key);
     let errors = view.errors;
 
     let total = full.len();
@@ -246,6 +248,9 @@ pub(super) async fn search_result(
         "page": page,
         "page_size": page_size,
         "total": total,
+        // 书名包含过滤：raw=过滤前候选数，kept=过滤后候选总数（即 total），
+        // dropped=被过滤掉的候选数。全部被过滤时 books 为空数组，不报错。
+        "title_filter": title_filter,
         "has_more": has_more,
         // 下一页游标：`bucket:seq`；传回 `cursor=` 即从该位置继续，翻页不重不漏。
         "next_cursor": next_cursor,
@@ -301,18 +306,25 @@ pub(super) async fn search(
         CuratedMissingFallback::All,
     )
     .await;
-    let (full, _) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
+    let (full, _, _) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
 
-/// 取一次完整聚合结果（带 60s 缓存），供 `/api/search` 与 `/api/search/aggregate` 共用，
-/// 保证两个入口的分页都基于同一份结果，不重不漏。
+/// 取一次完整聚合结果（带 60s 缓存），供 `/api/search`、`/api/search/aggregate` 与
+/// `/k/search` 共用，保证三个入口的分页都基于同一份结果，不重不漏。
+///
+/// 缓存里存的是**未做书名过滤**的原始聚合结果；过滤在返回调用方之前统一执行，
+/// 因此缓存不会因为关键词归一化差异而串味，客户端拿到的也始终是同一套边界规则。
 pub(crate) async fn aggregated(
     sources: &[crate::entities::BookSource],
     key: &str,
     include_cooled: bool,
     scope: crate::req::SearchScope,
-) -> (Vec<SearchBook>, Vec<web_book::SourceFailure>) {
+) -> (
+    Vec<SearchBook>,
+    Vec<web_book::SourceFailure>,
+    crate::title_filter::TitleFilterStats,
+) {
     // 缓存键必须包含实际参与源集合（显式子集 / scope / 冷却都会改变它）与预算档位，
     // 否则 60s 内不同请求会串用结果。
     let mut urls: Vec<&str> = sources.iter().map(|s| s.book_source_url.as_str()).collect();
@@ -330,25 +342,36 @@ pub(crate) async fn aggregated(
             .find(|e| e.key == cache_key)
             .map(|e| (e.books.clone(), e.errors.clone()))
     };
-    if let Some(v) = hit {
-        return v;
-    }
-    let outcome = web_book::search_all_with_errors_scoped(sources, key, 1, scope).await;
-    let mut books = outcome.books;
-    books.truncate(AGG_MAX_BOOKS);
-    let errors = outcome.errors;
-    if !books.is_empty() {
-        let mut g = agg_cache().lock().unwrap();
-        prune_cache(&mut g);
-        g.push(AggEntry {
-            key: cache_key,
-            at: Instant::now(),
-            books: books.clone(),
-            errors: errors.clone(),
-        });
-        prune_cache(&mut g);
-    }
-    (books, errors)
+    let (raw_books, errors) = match hit {
+        Some(v) => v,
+        None => {
+            let outcome = web_book::search_all_with_errors_scoped(sources, key, 1, scope).await;
+            let mut books = outcome.books;
+            books.truncate(AGG_MAX_BOOKS);
+            let errors = outcome.errors;
+            if !books.is_empty() {
+                let mut g = agg_cache().lock().unwrap();
+                prune_cache(&mut g);
+                g.push(AggEntry {
+                    key: cache_key,
+                    at: Instant::now(),
+                    books: books.clone(),
+                    errors: errors.clone(),
+                });
+                prune_cache(&mut g);
+            }
+            (books, errors)
+        }
+    };
+    let (books, title_filter) = crate::title_filter::retain_title_matches(raw_books, key);
+    tracing::debug!(
+        target: "search_filter",
+        raw = title_filter.raw,
+        kept = title_filter.kept,
+        dropped = title_filter.dropped,
+        "title filter"
+    );
+    (books, errors, title_filter)
 }
 
 /// 聚合搜索明细：书籍 + 成功/失败书源统计（单源失败不影响整体返回）。
@@ -373,7 +396,8 @@ pub(super) async fn search_aggregate(
         CuratedMissingFallback::All,
     )
     .await;
-    let (full, errors) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
+    let (full, errors, title_filter) =
+        aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
 
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;
@@ -385,6 +409,8 @@ pub(super) async fn search_aggregate(
         "page": page,
         "page_size": page_size,
         "total": total,
+        // 书名包含过滤计数：raw=过滤前候选，kept=过滤后（=total），dropped=被丢弃。
+        "title_filter": title_filter,
         "has_more": skip + page_size < total,
         "source_failed": source_failed,
         "scope": plan.scope.as_str(),

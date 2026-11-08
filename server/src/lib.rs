@@ -27,4 +27,5 @@ pub mod source_bench;
 pub mod source_health;
 pub mod source_ledger;
 pub mod source_quality;
+pub mod title_filter;
 pub mod web_book;
