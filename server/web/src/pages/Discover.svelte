@@ -7,7 +7,7 @@
   import DiscoverResults from '../lib/DiscoverResults.svelte';
 
   const dispatch = createEventDispatcher();
-  let mode = 'search'; // search | explore
+  let mode = 'search'; // search | explore | import
   let key = '';
   let results = [];
   let error = '';
@@ -651,6 +651,7 @@
 <div class="seg" role="tablist">
   <button role="tab" aria-selected={mode === 'search'} class:on={mode === 'search'} on:click={() => switchMode('search')}>搜索</button>
   <button role="tab" aria-selected={mode === 'explore'} class:on={mode === 'explore'} on:click={() => switchMode('explore')}>发现</button>
+  <button role="tab" aria-selected={mode === 'import'} class:on={mode === 'import'} on:click={() => switchMode('import')}>按链接打开</button>
 </div>
 
 {#if mode === 'search'}
@@ -674,22 +675,7 @@
     on:clearError={() => (error = '')}
   />
 
-  <div class="row" style="margin-top:10px">
-    <select bind:value={importSourceId} style="flex:0 0 34%;min-width:0" aria-label="按链接打开的书源">
-      {#each sources as s (s.book_source_url)}
-        <option value={s.book_source_url}>{s.book_source_name}{s.enabled ? '' : '（已禁用）'}</option>
-      {/each}
-    </select>
-    <input
-      placeholder="粘贴书籍详情页链接（需与书源同域名）"
-      bind:value={importUrl}
-      on:keydown={(e) => e.key === 'Enter' && doImport()}
-    />
-    <button on:click={doImport} disabled={importing || !importSourceId || !importUrl.trim()}>
-      {importing ? '导入中…' : '按链接打开'}
-    </button>
-  </div>
-{:else}
+{:else if mode === 'explore'}
   <div class="row">
     <select bind:value={selectedSource} on:change={loadCategories} style="flex:1;min-width:0">
       {#each sources as s}
@@ -714,8 +700,34 @@
   {:else if !error && sources.length}
     <p class="muted" style="margin-top:8px">该书源没有可展开的分类（exploreUrl 为空、为 @js 或解析为空）。</p>
   {/if}
+{:else}
+  <p class="muted" style="margin:0 0 8px">
+    不用先搜索：选择书源后，粘贴该书源站点上的书籍详情页链接，后端会按书源规则解析并直接打开。
+  </p>
+  <div class="row">
+    <select bind:value={importSourceId} style="flex:1 1 180px;min-width:0" aria-label="按链接打开的书源">
+      {#each sources as s (s.book_source_url)}
+        <option value={s.book_source_url}>{s.book_source_name}{s.enabled ? '' : '（已禁用）'}</option>
+      {/each}
+    </select>
+    <input
+      style="flex:2 1 260px;min-width:0"
+      placeholder="粘贴书籍详情页链接（需与书源同域名）"
+      bind:value={importUrl}
+      on:keydown={(e) => e.key === 'Enter' && doImport()}
+    />
+    <button on:click={doImport} disabled={importing || !importSourceId || !importUrl.trim()}>
+      {importing ? '导入中…' : '按链接打开'}
+    </button>
+  </div>
+  {#if !sources.length && sourcesReady}
+    <p class="muted" style="margin:8px 0 0">当前还没有书源，请先到「书源管理」导入并启用。</p>
+  {/if}
+  {#if error}<p class="err">{error}</p>{/if}
+  {#if notice}<p class="ok-line">{notice}</p>{/if}
 {/if}
 
+{#if mode !== 'import'}
 <DiscoverResults
   mode={mode}
   error={error}
@@ -767,3 +779,4 @@
   on:open={(e) => open(e.detail)}
   on:addShelf={(e) => addShelf(e.detail)}
 />
+{/if}
