@@ -163,14 +163,56 @@ pub async fn revalidate_curated_source(pool: &SqlitePool, source_url: &str) -> A
     Ok(())
 }
 
+/// 后台体检等用户搜索空闲的轮询间隔 / 连续空闲次数 / 最长等待时间。
+const BENCH_QUIET_POLL: Duration = Duration::from_secs(2);
+/// 连续 2 次（约 4s）都没有搜索在跑才算空闲，避免搜索刚创建、计数器还没加上的竞态。
+const BENCH_QUIET_STREAK: u32 = 2;
+const SCHEDULED_BENCH_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// 等到用户搜索连续空闲返回 true；超过最长等待仍繁忙返回 false。
+async fn wait_for_search_quiet() -> bool {
+    let started = Instant::now();
+    let mut quiet = 0u32;
+    loop {
+        if crate::routes::books::searches_active() {
+            quiet = 0;
+        } else {
+            quiet += 1;
+            if quiet >= BENCH_QUIET_STREAK {
+                return true;
+            }
+        }
+        if started.elapsed() >= SCHEDULED_BENCH_MAX_WAIT {
+            return false;
+        }
+        tokio::time::sleep(BENCH_QUIET_POLL).await;
+    }
+}
+
+/// 同一时间只允许一个“等待搜索空闲”的后台任务，避免每次搜索都堆一个 waiter。
+static SCHEDULED_BENCH_WAITER: AtomicBool = AtomicBool::new(false);
+
+struct WaiterGuard;
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        SCHEDULED_BENCH_WAITER.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 搜索前调用：最近一次体检超过 interval_hours 时，在后台跑一次整批体检。
 /// 不阻塞当前搜索；同一时间只允许一个整批体检。
+///
+/// 体检与用户搜索共用同一台设备：先等用户搜索空闲，再开始跑；
+/// 最多等 [`SCHEDULED_BENCH_MAX_WAIT`]，仍忙则放弃本次（下一次搜索会再触发）。
+/// 等待期间不占用 `try_begin_bench` 的“运行中”标志，手动体检仍可立即开始。
 pub fn maybe_schedule_stale_bench(pool: SqlitePool, cfg: &Config) {
-    if !try_begin_bench() {
+    if SCHEDULED_BENCH_WAITER.swap(true, Ordering::SeqCst) {
         return;
     }
     let interval = cfg.source_bench_interval_hours;
     tokio::spawn(async move {
+        let _waiter = WaiterGuard;
         let last: Option<i64> =
             sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(last_bench_at) FROM source_curated")
                 .fetch_one(&pool)
@@ -178,11 +220,38 @@ pub fn maybe_schedule_stale_bench(pool: SqlitePool, cfg: &Config) {
                 .ok()
                 .flatten();
         if !bench_due(last, now_ms(), interval) {
-            end_bench();
+            return;
+        }
+        if !wait_for_search_quiet().await {
+            tracing::info!(
+                target: "search_job",
+                "source bench deferred: user search still active, skip this round"
+            );
+            return;
+        }
+        // 等待期间可能已有手动体检跑完：重新确认是否还需要跑。
+        let last: Option<i64> =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(last_bench_at) FROM source_curated")
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
+        if !bench_due(last, now_ms(), interval) {
+            return;
+        }
+        if !try_begin_bench() {
             return;
         }
         tracing::info!(target: "search_job", interval_hours = interval, "source bench stale; running in background");
-        let result = run_bench(&pool, &Config::from_env(), None, None, None).await;
+        let result = run_bench(
+            &pool,
+            &Config::from_env(),
+            None,
+            None,
+            None,
+            BENCH_CONCURRENCY_BACKGROUND,
+        )
+        .await;
         end_bench();
         if let Err(e) = result {
             tracing::warn!(error = %e, "scheduled source bench failed");

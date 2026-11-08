@@ -126,6 +126,39 @@ pub(super) fn median(values: &[f64]) -> f64 {
     }
 }
 
+/// 各 category 的全局命中率（仅内置、计分、观测数达到阈值的条目）。
+///
+/// 用于判断“这类语料是否整体与当前源池匹配”：全局 0 命中的 category
+/// 不能用来区分源质量，否则会无差别拉低所有源的 bench_score。
+pub(super) fn category_hit_rates(
+    runs: &[BenchRun],
+    corpus: &[CorpusEntry],
+) -> HashMap<String, f64> {
+    let mut per_key: HashMap<&str, (i64, i64)> = HashMap::new();
+    for r in runs {
+        let e = per_key.entry(r.corpus_key.as_str()).or_insert((0, 0));
+        e.1 += 1;
+        if r.found {
+            e.0 += 1;
+        }
+    }
+    let mut cat_rates: HashMap<String, Vec<f64>> = HashMap::new();
+    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
+        if let Some((hits, obs)) = per_key.get(e.id.as_str()) {
+            if *obs >= MIN_CURATED_SAMPLES {
+                cat_rates
+                    .entry(e.category.clone())
+                    .or_default()
+                    .push(*hits as f64 / *obs as f64);
+            }
+        }
+    }
+    cat_rates
+        .into_iter()
+        .map(|(k, v)| (k, median(&v)))
+        .collect()
+}
+
 /// 标记“语料可能失效”的条目：命中率显著低于同 category 中位数（< 中位数 × 0.5）。
 /// 只影响评分口径，run 明细全部保留。
 pub(super) fn mark_suspicious(runs: &mut [BenchRun], corpus: &[CorpusEntry]) {
@@ -141,21 +174,7 @@ pub(super) fn mark_suspicious(runs: &mut [BenchRun], corpus: &[CorpusEntry]) {
     }
     // 同 category 中位数只用内置且计分的样本计算
     // （用户冷门书名、出版/实体书这类 scored=false 的条目都不应拉低基线）
-    let mut cat_rates: HashMap<String, Vec<f64>> = HashMap::new();
-    for e in corpus.iter().filter(|e| e.builtin && e.scored) {
-        if let Some((hits, obs, _)) = per_key.get(&e.id) {
-            if *obs >= MIN_CURATED_SAMPLES {
-                cat_rates
-                    .entry(e.category.clone())
-                    .or_default()
-                    .push(*hits as f64 / *obs as f64);
-            }
-        }
-    }
-    let medians: HashMap<String, f64> = cat_rates
-        .iter()
-        .map(|(k, v)| (k.clone(), median(v)))
-        .collect();
+    let medians = category_hit_rates(runs, corpus);
     let mut flagged: HashSet<String> = HashSet::new();
     for (key, (hits, obs, category)) in per_key.iter() {
         if *obs < MIN_CURATED_SAMPLES {
@@ -206,6 +225,8 @@ pub(super) fn compute_source_rows(
         .map(|e| e.id.as_str())
         .collect();
 
+    // 全局 category 命中率：用于剔除“所有源都搜不到”的语料类别。
+    let global_cat = category_hit_rates(runs, corpus);
     let mut out: Vec<SourceBenchRow> = Vec::new();
     for (url, list) in by_source.iter() {
         let src = sources.get(url);
@@ -246,6 +267,11 @@ pub(super) fn compute_source_rows(
         let cats = scoring_cats.get(&source_type).cloned().unwrap_or_default();
         let mut per_cat: Vec<CategoryRate> = Vec::new();
         for cat in cats.iter() {
+            // 整个 category 在所有源上都 0 命中（或观测不足）→ 语料与源池不匹配，
+            // 不进入评分；否则所有源的 hit_rate 会被同一类冷门语料无差别拉低。
+            if global_cat.get(cat).copied().unwrap_or(0.0) <= 0.0 {
+                continue;
+            }
             let cs = ok.iter().filter(|r| r.category == *cat).count() as i64;
             if cs == 0 {
                 continue;
@@ -395,12 +421,14 @@ pub(super) fn select_curated(
 }
 
 /// 执行一次体检。`source_ids` 为 None 表示全部启用源（排除隔离区）。
+/// `concurrency` 由调用方区分手动（[`BENCH_CONCURRENCY`]）与后台（[`BENCH_CONCURRENCY_BACKGROUND`]）。
 pub async fn run_bench(
     pool: &SqlitePool,
     cfg: &Config,
     source_ids: Option<Vec<String>>,
     limit: Option<usize>,
     progress: Option<Arc<BenchProgress>>,
+    concurrency: usize,
 ) -> AppResult<BenchReport> {
     let started_at = now_ms();
     let started = Instant::now();
@@ -418,6 +446,7 @@ pub async fn run_bench(
         .unwrap_or_default();
     let corpus = load_corpus(pool).await?;
     let samples_per_source = limit.unwrap_or(cfg.source_bench_samples).clamp(1, 20);
+    let health = source_health::load_map(pool).await.unwrap_or_default();
 
     let mut sources: Vec<BookSource> = Vec::new();
     match source_ids {
@@ -441,6 +470,9 @@ pub async fn run_bench(
             }
         }
     }
+    // 恢复优先：被质量档隔离/近期失败的源先跑。整批预算紧张时（源多、并发低）
+    // 队尾样本会被截断，若不排序，最需要体检复活的源反而永远排在最后跑不到。
+    sources.sort_by_key(|s| bench_priority(&health, &s.book_source_url));
 
     let corpus_for_type = |t: i64| -> Vec<CorpusEntry> {
         corpus
@@ -452,9 +484,13 @@ pub async fn run_bench(
     let novel_corpus = corpus_for_type(TYPE_NOVEL);
     let comic_corpus = corpus_for_type(TYPE_COMIC);
 
-    let health = source_health::load_map(pool).await.unwrap_or_default();
-    let deadline =
-        started + Duration::from_secs(batch_budget_secs(sources.len(), samples_per_source));
+    let concurrency = concurrency.max(1);
+    let deadline = started
+        + Duration::from_secs(batch_budget_secs(
+            sources.len(),
+            samples_per_source,
+            concurrency,
+        ));
     let prev_streak: HashMap<String, i64> =
         sqlx::query_as::<_, (String, i64)>("SELECT source_url, fail_streak FROM source_curated")
             .fetch_all(pool)
@@ -498,7 +534,7 @@ pub async fn run_bench(
             out
         }
     }))
-    .buffer_unordered(BENCH_CONCURRENCY)
+    .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
     .await;
 
@@ -660,6 +696,24 @@ pub async fn run_bench(
     })
 }
 
+/// 体检排队优先级：数字越小越先跑。
+///
+/// - `0`：质量档已被隔离（`quarantined`）——最需要一次有效体检来复活；
+/// - `1`：观察档但有连续失败 / 最近一次失败——次优先，防止体检没跑到就继续恶化；
+/// - `2`：其余（preferred / 正常 observing / 无健康行）。
+pub(super) fn bench_priority(health: &HashMap<String, source_health::HealthRow>, url: &str) -> u8 {
+    match health.get(url) {
+        Some(h) if h.tier == crate::source_quality::TIER_QUARANTINED => 0,
+        Some(h)
+            if h.tier == crate::source_quality::TIER_OBSERVING
+                && (h.consecutive_failures > 0 || h.last_status == source_health::STATUS_FAIL) =>
+        {
+            1
+        }
+        _ => 2,
+    }
+}
+
 /// 冷启动直通的纯规则，供单测与写库共用。
 pub(super) fn bench_fast_track_ok(row: &SourceBenchRow) -> bool {
     row.samples >= MIN_CURATED_SAMPLES
@@ -669,9 +723,12 @@ pub(super) fn bench_fast_track_ok(row: &SourceBenchRow) -> bool {
 
 /// 体检回写健康：每源每批折合成 1 条观测，再按 [`BENCH_FAST_TRACK_MIN_SCORE`] 直通 preferred。
 ///
-/// - 有有效响应 → `ok`（parsed=true，hits=本批命中数）；全失败 → `partial`
-///   （按引擎类处理：不因为“体检没响应”把站点连续失败计数拉高、进而误隔离）。
-/// - `usage=true`：体检也是真实搜索，命中/搜索计数进入健康分口径。
+/// - **只写“有有效响应”的源**（`samples > 0`）：整批超时/没拿到响应的源不写健康，
+///   避免体检把暂时连不上的源打成 `partial` 并累计引擎失败。
+/// - 有有效响应 → `ok`，但 `usage=false`：体检命中不计入用户搜索的 hit_rate，
+///   否则冷门语料会无差别拉低所有源的健康分。
+/// - 直通 preferred 现在也允许复活隔离源（显式清理失败计数与冷却），
+///   否则一旦被误隔离就永远进不了搜索，无法靠体检自愈。
 pub(super) async fn record_bench_health(
     pool: &SqlitePool,
     rows: &[SourceBenchRow],
@@ -681,28 +738,21 @@ pub(super) async fn record_bench_health(
     let tier_cfg = crate::source_quality::TierConfig::from_config(cfg);
     let outcomes: Vec<Outcome> = rows
         .iter()
+        .filter(|r| r.samples > 0)
         .map(|r| {
-            let ok = r.samples > 0;
             let rule_complete = by_url
                 .get(&r.source_url)
                 .map(crate::source_quality::rule_completeness)
                 .unwrap_or(0.0);
             Outcome {
                 source_url: r.source_url.clone(),
-                status: if ok {
-                    source_health::STATUS_OK
-                } else {
-                    source_health::STATUS_PARTIAL
-                },
+                status: source_health::STATUS_OK,
                 latency_ms: r.avg_latency_ms,
-                error: if ok {
-                    None
-                } else {
-                    Some("bench: no usable response".into())
-                },
+                error: None,
                 hits: r.hits,
-                parsed: ok,
-                usage: true,
+                parsed: true,
+                // 体检不是用户搜索：只更新可用性/延迟，不污染 hit_rate。
+                usage: false,
                 rule_complete,
             }
         })
@@ -714,11 +764,31 @@ pub(super) async fn record_bench_health(
     for r in rows.iter().filter(|r| bench_fast_track_ok(r)) {
         sqlx::query(
             "UPDATE source_health SET tier = ?1, promote_streak = MAX(promote_streak, ?2), \
-             demote_streak = 0, last_eval_at = ?3 \
-             WHERE source_url = ?4 AND tier <> ?5",
+             demote_streak = 0, consecutive_failures = 0, fail_site_count = 0, \
+             cooldown_until = NULL, last_error = NULL, last_eval_at = ?3 \
+             WHERE source_url = ?4",
         )
         .bind(crate::source_quality::TIER_PREFERRED)
         .bind(promote)
+        .bind(now)
+        .bind(&r.source_url)
+        .execute(pool)
+        .await?;
+    }
+    // 有有效响应但未达到直通门槛：被质量档隔离的源先降回 observing，重新参与用户搜索。
+    // 隔离通常源于历史误判（如预算耗尽被记成站点失败）；体检连续拿到响应即视为可用。
+    // 同时清零连续失败与站点失败证据，给源一个干净的重评起点；后续真实搜索仍无命中会被再次评分/隔离。
+    for r in rows
+        .iter()
+        .filter(|r| r.samples > 0 && !bench_fast_track_ok(r))
+    {
+        sqlx::query(
+            "UPDATE source_health SET tier = ?1, demote_streak = 0, \
+             consecutive_failures = 0, fail_site_count = 0, \
+             cooldown_until = NULL, last_error = NULL, last_eval_at = ?2 \
+             WHERE source_url = ?3 AND tier = ?4",
+        )
+        .bind(crate::source_quality::TIER_OBSERVING)
         .bind(now)
         .bind(&r.source_url)
         .bind(crate::source_quality::TIER_QUARANTINED)

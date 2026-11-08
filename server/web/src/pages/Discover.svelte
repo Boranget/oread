@@ -65,6 +65,8 @@
   let curatedTotal = 0;
   let failedCount = 0;
   let failedSources = []; // [{ name, reason }]
+  let skippedCount = 0; // 全局预算耗尽导致未执行/未完成的源
+  let skippedSources = []; // [{ name, reason }]
   let resultsPage = 1; // 当前卡片实际对应的页码，过期时回退显示
 
   // 发现模式
@@ -106,8 +108,8 @@
   // 书架状态（用于“已加入”标记）
   let shelfIds = new Set();
 
-  // 已完成源 = 已结束 - 失败（失败源也计入 finished）
-  $: completedSources = Math.max(0, finishedSources - failedCount);
+  // 已完成源 = 已结束 - 失败 - 预算未完成（两者也计入 finished）
+  $: completedSources = Math.max(0, finishedSources - failedCount - skippedCount);
 
   onMount(async () => {
     loadHistory();
@@ -206,14 +208,27 @@
     searchDone = !!r.done;
     deadlineMs = Number(r.deadline_ms) || deadlineMs;
     const rawFailed = Array.isArray(r.errors) ? r.errors : [];
-    failedSources = rawFailed.map((e) => ({
-      name: e.source_name || e.source || '未知书源',
-      reason: describeSourceError(e.error),
-      url: e.source || '',
-    }));
+    const budgetSkipped = (e) => e.kind === 'skipped' || e.kind === 'truncated';
+    failedSources = rawFailed
+      .filter((e) => !budgetSkipped(e))
+      .map((e) => ({
+        name: e.source_name || e.source || '未知书源',
+        reason: describeSourceError(e.error),
+        url: e.source || '',
+      }));
+    skippedSources = rawFailed
+      .filter(budgetSkipped)
+      .map((e) => ({
+        name: e.source_name || e.source || '未知书源',
+        reason: describeSourceError(e.error),
+        url: e.source || '',
+      }));
     failedCount = Number.isFinite(Number(r.source_failed))
       ? Math.max(0, Number(r.source_failed))
       : failedSources.length;
+    skippedCount = Number.isFinite(Number(r.source_skipped))
+      ? Math.max(0, Number(r.source_skipped))
+      : skippedSources.length;
   }
 
   function finishJob() {
@@ -310,6 +325,8 @@
     scopeFiltered = 0;
     failedSources = [];
     failedCount = 0;
+    skippedSources = [];
+    skippedCount = 0;
     pollFailures = 0;
     error = '';
     notice = '';
@@ -372,7 +389,7 @@
   // 轮询完成后按 book_url 去重并入当前列表，并把新增项标记为“重试命中”。
   async function retryFailedSources() {
     if (retrying || starting || searching) return;
-    const ids = failedSources.map((f) => f.url).filter(Boolean);
+    const ids = [...failedSources, ...skippedSources].map((f) => f.url).filter(Boolean);
     if (!ids.length) {
       retryNote = '后端未返回失败源地址，无法只重试这些源；可整次重试，或到「书源管理」检查后再试。';
       return;
@@ -401,6 +418,7 @@
               name: e.source_name || e.source || '未知书源',
               reason: describeSourceError(e.error),
               url: e.source || '',
+              kind: e.kind || 'site',
             }))
           : [];
         pages += 1;
@@ -425,13 +443,16 @@
       retryExtra = dedupeByUrl(retryExtra.concat(fresh));
       results = dedupeByUrl(results.concat(fresh));
       total = Math.max(total, results.length);
-      failedSources = lastErrors;
-      failedCount = lastErrors.length;
+      const budgetSkipped = (e) => e.kind === 'skipped' || e.kind === 'truncated';
+      failedSources = lastErrors.filter((e) => !budgetSkipped(e));
+      failedCount = failedSources.length;
+      skippedSources = lastErrors.filter(budgetSkipped);
+      skippedCount = skippedSources.length;
       if (fresh.length) {
-        notice = `仅重试失败源：新增 ${fresh.length} 本（已按 book_url 去重）`;
+        notice = `仅重试失败/未完成源：新增 ${fresh.length} 本（已按 book_url 去重）`;
       } else {
-        retryNote = `仅重试 ${ids.length} 个失败源：没有新增结果` +
-          (lastErrors.length ? `，仍有 ${lastErrors.length} 个源失败，原因见上方列表。` : '，这些源均已正常返回但无匹配。');
+        retryNote = `仅重试 ${ids.length} 个失败/未完成源：没有新增结果` +
+          (lastErrors.length ? `，仍有 ${lastErrors.length} 个源未成功，原因见上方列表。` : '，这些源均已正常返回但无匹配。');
       }
     } catch (e) {
       if (seq !== retrySeq) return;
@@ -515,6 +536,8 @@
     results = [];
     failedSources = [];
     failedCount = 0;
+    skippedSources = [];
+    skippedCount = 0;
     total = 0;
     hasMore = false;
     searched = false;
@@ -575,6 +598,8 @@
       searched = true;
       failedSources = [];
       failedCount = 0;
+      skippedSources = [];
+      skippedCount = 0;
     } catch (e) {
       error = describeFailure(e, reset ? '发现' : `加载第 ${page} 页`);
       if (!reset && page > 1) page -= 1;
@@ -762,6 +787,8 @@
   searchCoverage={searchCoverage}
   failedCount={failedCount}
   failedSources={failedSources}
+  skippedCount={skippedCount}
+  skippedSources={skippedSources}
   retrying={retrying}
   retryNote={retryNote}
   shelfIds={shelfIds}

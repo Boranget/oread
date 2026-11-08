@@ -9,15 +9,24 @@ pub const TYPE_COMIC: i64 = 2;
 pub const PER_SAMPLE_BUDGET_SECS: u64 = 5;
 pub const BATCH_BUDGET_SECS: u64 = 60;
 pub const MAX_BATCH_BUDGET_SECS: u64 = 600;
-/// 体检源的并发数；真正的 HTTP 并发仍由 `req` 全局信号量（HTTP_CONCURRENCY）兜底。
+/// 手动体检（用户点「跑一次体检」）的源并发数；真正的 HTTP 并发仍由
+/// `req` 全局信号量（HTTP_CONCURRENCY）兜底。
 pub const BENCH_CONCURRENCY: usize = 8;
+/// 后台自动体检的源并发数：与用户搜索共用同一台小设备，降到 4，
+/// 避免 8 路体检抢光带宽/连接，让用户搜索里的正常源被全局预算截断。
+pub const BENCH_CONCURRENCY_BACKGROUND: usize = 4;
 
 /// 整批预算：源多/样本多时按最坏情况（每条都打满单条预算）估算，
 /// 避免源较多时只跑完前几十个、后面的源被记成 timeout。
-pub fn batch_budget_secs(source_count: usize, samples_per_source: usize) -> u64 {
+pub fn batch_budget_secs(
+    source_count: usize,
+    samples_per_source: usize,
+    concurrency: usize,
+) -> u64 {
+    let concurrency = concurrency.max(1) as u64;
     let est = (source_count.saturating_mul(samples_per_source) as u64)
         .saturating_mul(PER_SAMPLE_BUDGET_SECS)
-        / BENCH_CONCURRENCY as u64;
+        / concurrency;
     est.clamp(BATCH_BUDGET_SECS, MAX_BATCH_BUDGET_SECS)
 }
 

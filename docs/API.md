@@ -1175,7 +1175,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 {
   "books": [ /* SearchBook[]，见 5.1 */ ],
   "errors": [
-    { "source": "https://bad.example", "source_name": "坏源", "error": "error sending request" }
+    { "source": "https://bad.example", "source_name": "坏源", "error": "error sending request", "kind": "site" }
   ],
   "page": 1,
   "page_size": 30,
@@ -1183,6 +1183,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "title_filter": { "raw": 240, "kept": 87, "dropped": 153 },
   "has_more": true,
   "source_failed": 1,
+  "source_skipped": 0,
   "source_total": 5,
   "include_cooled": false,
   "skipped_cooldown": 2,
@@ -1194,13 +1195,14 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `books` | SearchBook[] | 否 | 当前页数据 |
-| `errors` | object[] | 否 | 单源失败明细：`source`(string)、`source_name`(string)、`error`(string) |
+| `errors` | object[] | 否 | 单源失败明细：`source`(string)、`source_name`(string)、`error`(string)、`kind`(string) |
 | `page` | integer | 否 | 回显（最小 1） |
 | `page_size` | integer | 否 | 回显（1..200） |
 | `total` | integer | 否 | 书名过滤后、去重排序的完整结果数，**最多 400**；只基于各源第 1 页 |
 | `title_filter` | object | 否 | `raw`=过滤前候选数、`kept`=过滤后（= `total`）、`dropped`=书名不含关键词而丢弃的条数 |
 | `has_more` | boolean | 否 | `skip + page_size < total` |
-| `source_failed` | integer | 否 | **数字**，失败源数量（不是数组）。明细看 `errors` |
+| `source_failed` | integer | 否 | **数字**，真实失败源数量（不含 `truncated`/`skipped`）。明细看 `errors` |
+| `source_skipped` | integer | 否 | **数字**，因全局预算耗尽未执行/未完成的源数量（不算站点故障） |
 | `source_total` | integer | 否 | 本次实际参与搜索的活跃源数（已排除隔离区与冷却源；`source_ids` 过滤后） |
 | `include_cooled` | boolean | 否 | 回显是否放行冷却源 |
 | `skipped_cooldown` | integer | 否 | 因冷却被跳过的源数（`source_ids` 过滤后计数） |
@@ -1208,7 +1210,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `cache_ttl_secs` | integer | 否 | 恒 60 |
 
 - 错误：缺 `key` → 400 纯文本；`401`；`500`。
-- **`source_failed` 与 `errors` 的关系**：`source_failed` 是**整数计数**；失败明细在 `errors[]`，每项 `{source, source_name, error}`。前端不要按数组解析 `source_failed`，也不要指望 `errors` 里有总数以外的信息。
+- **`source_failed` / `source_skipped` 与 `errors` 的关系**：两者都是**整数计数**；失败明细在 `errors[]`，每项 `{source, source_name, error, kind}`。`kind` 为 `site`/`engine`/`timeout`/`truncated`/`skipped`；`source_failed` 只统计前三类，后两类（全局预算耗尽）计入 `source_skipped`。前端不要按数组解析计数字段。
 - 行为（详细）：
   - 先查进程级缓存（`key` 精确匹配，TTL 60s，最多 4 个查询，每查询最多 400 本）；命中则直接对完整结果切片（[books.rs](../server/src/routes/books.rs#L68-L171)）。
   - 未命中：并发搜索所有源**第 1 页** → 去重排序 → `truncate(400)` → 仅当非空才写缓存。
@@ -1349,7 +1351,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `source_ids` 全部无效时仍会创建 job，`source_total=0`、`pending=0`，首次查询即 `done=true`；前端可据 `warning` 提示并决定是否重新搜索。
   - **前端接线（2026-11-03 复核）**：`api.searchStart(key, sourceIds)` 已把 `source_ids` 传给本接口；`Discover.svelte` 提供“全部/指定书源”范围切换，并用 `ignored_source_ids` 提示被忽略的源。此前“前端仍未传 `source_ids`”的记录作废。
   - 分页、去重与权重排序都使用 job 创建时的源快照（`source_ids` 过滤后的子集）；之后改书源不影响该 job。
-  - **冷却源默认不进入 job**：不会发出请求，也不会出现在 `errors`；`skipped_cooldown` 只做展示。job 收尾时会把本次每源的探测结果批量写回健康表（成功清零、站点级失败累加），同一任务只写一次。
+  - **冷却源默认不进入 job**：不会发出请求，也不会出现在 `errors`；`skipped_cooldown` 只做展示。job 收尾时会把本次每源的探测结果批量写回健康表（成功清零、真实站点级失败累加），同一任务只写一次；**全局预算耗尽（`truncated`/`skipped`）不写健康**，避免把健康源误冷却/误隔离。
   - `deadline_ms` 只约束单个源；多个源共享 `HTTP_CONCURRENCY` 信号量，网络慢时整次搜索可能明显超过 `deadline_ms`。搜索对每个源只发 1 个请求，因此同一次 job 内按源上限（默认 8）不会触发排队；它主要约束「打开一本书」时的目录/正文/图片并发（同一源多请求），排队次数见 `/healthz` 的 `search.source_limit_waits`。
 
 ### 5.6 `GET /api/search/result`
@@ -1370,7 +1372,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 {
   "books": [ /* SearchBook[] */ ],
   "errors": [
-    { "source": "https://bad.example", "source_name": "坏源", "error": "搜索超时（单源 8s 预算）" }
+    { "source": "https://bad.example", "source_name": "坏源", "error": "搜索超时（单源 8s 预算）", "kind": "timeout" }
   ],
   "page": 1,
   "page_size": 30,
@@ -1388,6 +1390,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "pending": 21,
   "source_total": 25,
   "source_failed": 5,
+  "source_skipped": 3,
   "skipped_cooldown": 2,
   "cooldown_total": 3,
   "deadline_ms": 6000,
@@ -1398,7 +1401,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `books` | SearchBook[] | 否 | 当前页数据（见 5.1 字段表） |
-| `errors` | object[] | 否 | 已完成源的失败明细：`source`、`source_name`、`error` |
+| `errors` | object[] | 否 | 已完成源的失败明细：`source`、`source_name`、`error`、`kind`（`site`/`engine`/`timeout`/`truncated`/`skipped`） |
 | `page` | integer | 否 | 回显（最小 1） |
 | `page_size` | integer | 否 | 回显（1..200） |
 | `total` | integer | 否 | 书名过滤后、当前已完成源的去重排序条数，最多 400；**会随源完成而增长** |
@@ -1415,7 +1418,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `finished` | integer | 否 | 已结束的源数（含失败） |
 | `pending` | integer | 否 | 尚未结束的源数；`finished + pending == source_total` |
 | `source_total` | integer | 否 | 创建 job 时的参与源数（`source_ids` 过滤后的活跃源快照，已排除隔离区与冷却源；不随书源配置变化） |
-| `source_failed` | integer | 否 | **数字**，`errors.length`；不是数组 |
+| `source_failed` | integer | 否 | **数字**，真实失败源数（`kind` 为 `site`/`engine`/`timeout`）；不含预算未完成 |
+| `source_skipped` | integer | 否 | **数字**，因全局搜索总预算耗尽未执行/未完成的源数（`kind` 为 `truncated`/`skipped`），不写健康、不触发冷却 |
 | `skipped_cooldown` | integer | 否 | 因冷却被跳过、未参与本 job 的源数 |
 | `cooldown_total` | integer | 否 | 本地全部处于冷却中的源数 |
 | `deadline_ms` | integer | 否 | 单源预算（与 5.5 一致），每次响应都回传 |
@@ -3123,7 +3127,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 12 | POST | `/api/sources/validate` | JWT | 否 | `source?,check_url?` | `{valid,errors,warnings}` |
 | 13 | DELETE | `/api/sources/delete` | JWT | **是** | `url` | `{ok}` |
 | 14 | GET | `/api/search` | JWT | 否 | `key,page?,page_size?,include_cooled?` | `SearchBook[]` |
-| 15 | GET | `/api/search/aggregate` | JWT | 否 | `key,page?,page_size?,include_cooled?` | 聚合对象（含 `include_cooled/skipped_cooldown/cooldown_total`） |
+| 15 | GET | `/api/search/aggregate` | JWT | 否 | `key,page?,page_size?,include_cooled?` | 聚合对象（含 `include_cooled/skipped_cooldown/cooldown_total/source_failed/source_skipped`；`errors[].kind` 区分失败类型） |
 | 16 | GET | `/api/explore` | JWT | 否 | `url,page?` | `SearchBook[]` |
 | 17 | GET | `/api/explore/categories` | JWT | 否 | `source,page?` | `ExploreCategory[]` |
 | 18 | GET | `/api/book/info` | JWT | 否 | `source,book_url` | `Book` |
@@ -3164,7 +3168,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 53 | DELETE | `/api/bookmarks/delete` | JWT | 否 | `id` | `{ok,deleted}` |
 | 54 | POST | `/api/bookshelf/batch` | JWT | 否 | `action,book_ids,group?` | `{ok,action,group,updated,failed,results[]}` |
 | 55 | GET | `/api/search/start` | JWT | 否 | `key`/`q`（别名）,`source_ids?`,`include_cooled?`,`scope?` | `{job_id,scope,source_total,skipped_cooldown,cooldown_total,include_cooled,deadline_ms,total_budget_ms,phase,partial,scheduled_sources,attempted_sources,pending_sources,source_ids_requested,ignored_source_ids,warning}` |
-| 56 | GET | `/api/search/result` | JWT | 否 | `job_id,page?,page_size?` | `{books,errors,page,page_size,total,has_more,done,phase,partial,scheduled_sources,attempted_sources,pending_sources,scope,finished,pending,source_total,source_failed,skipped_cooldown,cooldown_total,deadline_ms,total_budget_ms}` |
+| 56 | GET | `/api/search/result` | JWT | 否 | `job_id,page?,page_size?` | `{books,errors,page,page_size,total,has_more,done,phase,partial,scheduled_sources,attempted_sources,pending_sources,scope,finished,pending,source_total,source_failed,source_skipped,skipped_cooldown,cooldown_total,deadline_ms,total_budget_ms}` |
 | 57 | GET | `/api/book/export/info` | JWT | 否 | `book_url` | `{book_url,name,author,source,total_chapters,cached_chapters,missing_chapters,cached_bytes,complete,export_url}` |
 | 58 | GET | `/api/book/export/txt` | JWT | 否 | `book_url` | `text/plain` 附件 + `x-total/cached/missing/written-chapters`、`x-file-bytes` |
 | 59 | POST | `/api/sources/health/check` | JWT | 否 | `source_ids?,only_due?,key?` | `{ok,selected,checked,elapsed_ms,budget_secs,cooldown_secs,fail_threshold,results[]}` |

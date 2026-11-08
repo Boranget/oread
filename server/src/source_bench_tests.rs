@@ -466,17 +466,305 @@ fn suspicious_corpus_is_flagged_and_excluded_from_score() {
 }
 
 #[test]
-fn batch_budget_scales_with_source_count() {
-    assert_eq!(batch_budget_secs(1, 5), BATCH_BUDGET_SECS, "单源仍用 60s");
+fn globally_zero_category_is_excluded_from_score() {
+    // 两个 category：玄幻两条都命中，出版在所有源上 0 命中。
+    // 出版类与源池不匹配，不应把每个源的 hit_rate 从 1.0 拉到 0.5。
+    let corpus = vec![
+        entry("热门", "玄幻", TYPE_NOVEL, true),
+        entry("冷门", "出版", TYPE_NOVEL, true),
+    ];
+    let runs = vec![
+        run("https://s1", "玄幻", "热门", true, false),
+        run("https://s1", "出版", "冷门", false, false),
+        run("https://s2", "玄幻", "热门", true, false),
+        run("https://s2", "出版", "冷门", false, false),
+    ];
+    let mut src = BookSource::default();
+    src.book_source_url = "https://s1".into();
+    src.book_source_name = "s1".into();
+    let sources = HashMap::from([("https://s1".to_string(), src)]);
+    let rows = compute_source_rows(
+        &runs,
+        &sources,
+        &corpus,
+        &Config::from_env(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let row = &rows[0];
+    assert_eq!(row.samples, 2, "冷门 category 仍可测，样本照常记录");
     assert_eq!(
-        batch_budget_secs(139, 5),
-        434,
-        "139 源×5 样本：按最坏情况估算"
+        row.per_category_hit_rate.len(),
+        1,
+        "全局 0 命中类不参与评分"
+    );
+    assert!(
+        (row.hit_rate - 1.0).abs() < 1e-9,
+        "剔除全局 0 命中 category 后命中率不应被拉低"
+    );
+}
+
+#[tokio::test]
+async fn bench_health_skips_no_response_and_does_not_pollute_search_stats() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    create_health_tables(&pool).await;
+
+    // 已有真实搜索统计：体检不能改动 search_count / hit_count。
+    sqlx::query(
+        "INSERT INTO source_health \
+         (source_url, last_status, search_count, hit_count, parse_ok_count, tier, score) \
+         VALUES ('https://ok', 'ok', 10, 1, 8, 'observing', 60)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut src = BookSource::default();
+    src.book_source_url = "https://ok".into();
+    src.book_source_name = "ok".into();
+    let by_url = HashMap::from([("https://ok".to_string(), src)]);
+
+    let rows = vec![
+        bench_row("https://ok", 2, 0, 0.0, 80),
+        // 整批无有效响应：不应写入健康表。
+        bench_row("https://dead", 0, 0, 0.0, 0),
+    ];
+    record_bench_health(&pool, &rows, &by_url, &Config::from_env())
+        .await
+        .unwrap();
+
+    let (status, search_count, hit_count, last_ok): (String, i64, i64, Option<i64>) =
+        sqlx::query_as(
+            "SELECT last_status, search_count, hit_count, last_ok_at \
+             FROM source_health WHERE source_url = 'https://ok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, source_health::STATUS_OK);
+    assert_eq!(search_count, 10, "体检 usage=false，不增加 search_count");
+    assert_eq!(hit_count, 1, "体检命中不进入用户搜索 hit_count");
+    assert!(last_ok.is_some(), "有有效响应应刷新 last_ok_at");
+
+    let dead: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM source_health WHERE source_url = 'https://dead' LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(dead.is_none(), "无有效响应的源不写健康记录");
+}
+
+#[tokio::test]
+async fn bench_fast_track_revives_quarantined_source() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    create_health_tables(&pool).await;
+
+    let future = crate::source_health::now_ms() + 24 * 3600 * 1000;
+    sqlx::query(
+        "INSERT INTO source_health \
+         (source_url, last_status, last_error, consecutive_failures, cooldown_until, \
+          tier, score, fail_site_count) \
+         VALUES ('https://revive', 'fail', 'bench: no usable response', 3, ?, \
+                 'quarantined', 20, 3)",
+    )
+    .bind(future)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut src = BookSource::default();
+    src.book_source_url = "https://revive".into();
+    src.book_source_name = "revive".into();
+    let by_url = HashMap::from([("https://revive".to_string(), src)]);
+    let rows = vec![bench_row("https://revive", 2, 2, 1.0, 90)];
+    record_bench_health(&pool, &rows, &by_url, &Config::from_env())
+        .await
+        .unwrap();
+
+    let (tier, cooldown, cf, fs, err): (String, Option<i64>, i64, i64, Option<String>) =
+        sqlx::query_as(
+            "SELECT tier, cooldown_until, consecutive_failures, fail_site_count, last_error \
+             FROM source_health WHERE source_url = 'https://revive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tier,
+        crate::source_quality::TIER_PREFERRED,
+        "体检直通复活隔离源"
+    );
+    assert!(cooldown.is_none(), "复活时清除冷却");
+    assert_eq!(cf, 0, "复活时清零连续失败");
+    assert_eq!(fs, 0, "复活时清零站点失败率证据");
+    assert!(err.is_none(), "复活时清除旧错误");
+}
+
+#[test]
+fn bench_priority_puts_recovery_candidates_first() {
+    let mut quarantined = source_health::HealthRow::default();
+    quarantined.source_url = "https://q".into();
+    quarantined.tier = crate::source_quality::TIER_QUARANTINED.into();
+
+    let mut failing = source_health::HealthRow::default();
+    failing.source_url = "https://f".into();
+    failing.consecutive_failures = 2;
+
+    let mut healthy = source_health::HealthRow::default();
+    healthy.source_url = "https://ok".into();
+
+    let health = HashMap::from([
+        ("https://q".to_string(), quarantined),
+        ("https://f".to_string(), failing),
+        ("https://ok".to_string(), healthy),
+    ]);
+    assert_eq!(bench_priority(&health, "https://q"), 0, "隔离源最先跑");
+    assert_eq!(bench_priority(&health, "https://f"), 1, "近期失败源次优先");
+    assert_eq!(bench_priority(&health, "https://ok"), 2);
+    assert_eq!(bench_priority(&health, "https://missing"), 2);
+
+    let mut order = vec!["https://ok", "https://q", "https://f", "https://missing"];
+    order.sort_by_key(|u| bench_priority(&health, u));
+    assert_eq!(
+        order,
+        vec!["https://q", "https://f", "https://ok", "https://missing"],
+        "排序后恢复候选在前，同优先级保持原顺序"
+    );
+}
+
+#[tokio::test]
+async fn bench_valid_response_demotes_quarantined_to_observing() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    create_health_tables(&pool).await;
+
+    let future = crate::source_health::now_ms() + 24 * 3600 * 1000;
+    sqlx::query(
+        "INSERT INTO source_health \
+         (source_url, last_status, last_error, consecutive_failures, cooldown_until, \
+          tier, score, fail_site_count) \
+         VALUES ('https://cold', 'fail', '全局搜索预算耗尽', 3, ?, \
+                 'quarantined', 20, 3)",
+    )
+    .bind(future)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut src = BookSource::default();
+    src.book_source_url = "https://cold".into();
+    src.book_source_name = "cold".into();
+    let by_url = HashMap::from([("https://cold".to_string(), src)]);
+    // 有有效响应（samples>0）但命中率 0、分数不够直通：不应直接 preferred。
+    let rows = vec![bench_row("https://cold", 2, 0, 0.0, 40)];
+    record_bench_health(&pool, &rows, &by_url, &Config::from_env())
+        .await
+        .unwrap();
+
+    let (tier, cooldown, cf, fs): (String, Option<i64>, i64, i64) = sqlx::query_as(
+        "SELECT tier, cooldown_until, consecutive_failures, fail_site_count \
+         FROM source_health WHERE source_url = 'https://cold'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tier,
+        crate::source_quality::TIER_OBSERVING,
+        "有响应但未达直通门槛 → 先降回 observing 重新参与搜索"
+    );
+    assert!(cooldown.is_none(), "降回 observing 时清除冷却");
+    assert_eq!(cf, 0, "清零连续失败");
+    assert_eq!(fs, 0, "清零历史站点失败证据");
+}
+
+fn bench_row(
+    url: &str,
+    samples: i64,
+    hits: i64,
+    hit_rate: f64,
+    bench_score: i32,
+) -> SourceBenchRow {
+    SourceBenchRow {
+        source_url: url.into(),
+        name: url.into(),
+        source_type: TYPE_NOVEL,
+        samples,
+        hits,
+        hit_rate,
+        avg_latency_ms: 100,
+        errors: 0,
+        error_kinds: serde_json::json!({}),
+        bench_score,
+        curated: false,
+        excluded_samples: 0,
+        per_category_hit_rate: vec![],
+    }
+}
+
+async fn create_health_tables(pool: &SqlitePool) {
+    sqlx::query(
+        "CREATE TABLE source_health (\
+         source_url TEXT PRIMARY KEY, last_checked_at INTEGER, \
+         last_status TEXT NOT NULL DEFAULT 'never', last_error TEXT, \
+         consecutive_failures INTEGER NOT NULL DEFAULT 0, last_ok_at INTEGER, \
+         cooldown_until INTEGER, avg_latency_ms INTEGER, \
+         check_total INTEGER NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'observing', \
+         score INTEGER NOT NULL DEFAULT 50, evidence_json TEXT, last_eval_at INTEGER, \
+         search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+         parse_ok_count INTEGER NOT NULL DEFAULT 0, \
+         fail_site_count INTEGER NOT NULL DEFAULT 0, \
+         fail_engine_count INTEGER NOT NULL DEFAULT 0, ttfb_ms_p90 INTEGER, \
+         ttfb_samples_json TEXT, promote_streak INTEGER NOT NULL DEFAULT 0, \
+         demote_streak INTEGER NOT NULL DEFAULT 0)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE source_curated (\
+         source_url TEXT PRIMARY KEY, source_type INTEGER, bench_score INTEGER, \
+         curated INTEGER NOT NULL DEFAULT 0, samples INTEGER NOT NULL DEFAULT 0, \
+         fail_streak INTEGER NOT NULL DEFAULT 0, last_bench_at INTEGER, \
+         meta_json TEXT, last_run_at INTEGER)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[test]
+fn batch_budget_scales_with_source_count() {
+    assert_eq!(
+        batch_budget_secs(1, 5, BENCH_CONCURRENCY),
+        BATCH_BUDGET_SECS,
+        "单源仍用 60s"
     );
     assert_eq!(
-        batch_budget_secs(200, 20),
+        batch_budget_secs(139, 5, BENCH_CONCURRENCY),
+        434,
+        "139 源×5 样本：手动并发 8 按最坏情况估算"
+    );
+    assert_eq!(
+        batch_budget_secs(200, 20, BENCH_CONCURRENCY),
         MAX_BATCH_BUDGET_SECS,
         "封顶 600s"
+    );
+    assert_eq!(
+        batch_budget_secs(139, 5, BENCH_CONCURRENCY_BACKGROUND),
+        MAX_BATCH_BUDGET_SECS,
+        "后台并发 4：估算超过 600s，按封顶值"
     );
 }
 

@@ -10,6 +10,11 @@ pub(super) fn search_phase(pending: usize) -> &'static str {
     }
 }
 
+/// 是否属于“全局预算耗尽”导致的未完成（不写健康、不算站点失败）。
+pub(super) fn is_budget_skip(kind: &str) -> bool {
+    matches!(kind, "truncated" | "skipped")
+}
+
 /// 解析翻页游标：`bucket:seq`；`start` 表示“从头开始”（配合冻结快照）。
 pub(super) fn parse_cursor(raw: &str) -> Option<(u8, u64)> {
     let t = raw.trim();
@@ -195,6 +200,7 @@ pub(super) async fn search_result(
     let pending = view.pending;
     let scheduled = view.scheduled;
     let attempted = view.attempted;
+    let skipped = view.skipped;
     // 未排上的源（两批同时调度后通常为 0）
     let pending_scheduled = job.source_total.saturating_sub(scheduled);
     // 客户端响应边界：只保留书名包含关键词的条目。
@@ -241,7 +247,9 @@ pub(super) async fn search_result(
             (page_books, has_more, next)
         }
     };
-    let source_failed = errors.len();
+    // 真实失败与“全局预算未完成”分开计数：后者不写健康、不算站点故障。
+    let source_failed = errors.iter().filter(|e| !is_budget_skip(&e.kind)).count();
+    let source_skipped = skipped;
     Ok(Json(json!({
         "books": books,
         "errors": errors,
@@ -275,6 +283,7 @@ pub(super) async fn search_result(
         "pending": pending,
         "source_total": job.source_total,
         "source_failed": source_failed,
+        "source_skipped": source_skipped,
         "deadline_ms": crate::req::search_budget_for(job.scope).as_millis() as u64,
         "total_budget_ms": crate::req::search_total_budget(job.scope).as_millis() as u64,
         "coverage": job.coverage.as_str(),
@@ -402,7 +411,8 @@ pub(super) async fn search_aggregate(
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;
     let books: Vec<SearchBook> = full.into_iter().skip(skip).take(page_size).collect();
-    let source_failed = errors.len();
+    let source_failed = errors.iter().filter(|e| !is_budget_skip(&e.kind)).count();
+    let source_skipped = errors.len() - source_failed;
     Ok(Json(json!({
         "books": books,
         "errors": errors,
@@ -413,6 +423,7 @@ pub(super) async fn search_aggregate(
         "title_filter": title_filter,
         "has_more": skip + page_size < total,
         "source_failed": source_failed,
+        "source_skipped": source_skipped,
         "scope": plan.scope.as_str(),
         "source_mode": plan.source_mode,
         "scope_filtered": plan.scope_filtered,

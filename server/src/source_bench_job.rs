@@ -263,7 +263,15 @@ pub fn start_bench_job(
 
     let job_id = run_id.clone();
     tokio::spawn(async move {
-        let result = run_bench(&pool, &cfg, source_ids, limit, Some(progress)).await;
+        let result = run_bench(
+            &pool,
+            &cfg,
+            source_ids,
+            limit,
+            Some(progress),
+            BENCH_CONCURRENCY,
+        )
+        .await;
         let finished_at = now_ms();
         let mut jobs = bench_jobs().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = jobs.get_mut(&job_id) {

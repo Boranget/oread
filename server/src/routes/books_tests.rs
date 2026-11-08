@@ -1134,7 +1134,28 @@ async fn queued_but_never_executed_is_not_attempted() {
     assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
     assert_eq!(view.finished, 1);
     assert_eq!(view.pending, 0);
+    assert_eq!(view.skipped, 1, "预算耗尽未执行计入 skipped");
     assert!(outcomes.is_empty(), "排队未执行的源不写健康记录");
+}
+
+// 全局预算截断 vs 真实单源超时：留 1s 宽限，避免把“几乎跑满预算”的源误判成截断。
+#[test]
+fn global_budget_truncation_has_one_second_grace() {
+    let budget = Duration::from_secs(8);
+    assert!(timeout_is_truncation(Duration::from_secs(3), budget));
+    assert!(timeout_is_truncation(Duration::from_millis(6500), budget));
+    // 剩余 7s：+1s 宽限刚好等于单源预算 → 仍算真实超时
+    assert!(!timeout_is_truncation(Duration::from_secs(7), budget));
+    assert!(!timeout_is_truncation(budget, budget));
+}
+
+#[test]
+fn budget_skip_kinds_are_not_site_failures() {
+    assert!(is_budget_skip("truncated"));
+    assert!(is_budget_skip("skipped"));
+    assert!(!is_budget_skip("timeout"));
+    assert!(!is_budget_skip("site"));
+    assert!(!is_budget_skip("engine"));
 }
 
 // 回归：legacy `/api/search` 走的 `search_all_with_errors_budgeted` 不做 tier 过滤，

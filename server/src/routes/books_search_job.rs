@@ -86,6 +86,8 @@ pub(super) struct SearchJobState {
     pub(super) scheduled: usize,
     /// 真正拿到并发槽并发出过至少一次请求的源数
     pub(super) attempted: usize,
+    /// 因全局预算耗尽而未执行/未完成的源数（不写健康状态）
+    pub(super) skipped: usize,
     /// job 内的稳定排序/快照：首次翻页后冻结，保证同一会话不重不漏。
     pub(super) rank: web_book::RankFreeze,
 }
@@ -163,6 +165,31 @@ pub(super) struct JobView {
     pub(super) pending: usize,
     pub(super) scheduled: usize,
     pub(super) attempted: usize,
+    /// 因全局预算耗尽而“未执行/未完成”的源数（不写入健康状态）。
+    pub(super) skipped: usize,
+}
+
+/// 正在运行的搜索任务数：后台体检用它判断是否该让路（见 `source_bench`）。
+static ACTIVE_SEARCH_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct SearchActiveGuard;
+
+impl SearchActiveGuard {
+    fn new() -> Self {
+        ACTIVE_SEARCH_JOBS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for SearchActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_SEARCH_JOBS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 是否有用户搜索正在跑；后台体检会先等搜索空闲，避免抢并发/预算。
+pub(crate) fn searches_active() -> bool {
+    ACTIVE_SEARCH_JOBS.load(Ordering::Relaxed) > 0
 }
 
 /// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）。
@@ -179,6 +206,7 @@ pub(super) fn job_view(job: &SearchJob) -> JobView {
     let pending = st.pending;
     let scheduled = st.scheduled;
     let attempted = st.attempted;
+    let skipped = st.skipped;
     drop(st);
     full.truncate(AGG_MAX_BOOKS);
     JobView {
@@ -189,6 +217,7 @@ pub(super) fn job_view(job: &SearchJob) -> JobView {
         pending,
         scheduled,
         attempted,
+        skipped,
     }
 }
 
@@ -206,6 +235,7 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
                 pending: st.pending,
                 scheduled: st.scheduled,
                 attempted: st.attempted,
+                skipped: st.skipped,
             };
             return view;
         }
@@ -236,6 +266,14 @@ pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64
     }
 }
 
+/// 全局预算是否“明显不足”单源预算。
+///
+/// 留 1s 宽限：剩余 7.2s / 单源 8s 仍按真实单源超时处理，
+/// 避免把“几乎跑满单源预算”的站点误判成预算截断而漏掉站点故障。
+pub(super) fn timeout_is_truncation(remain: Duration, budget: Duration) -> bool {
+    remain.saturating_add(Duration::from_secs(1)) < budget
+}
+
 #[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消），拆分仅把参数列表搬到另一层。
 pub(super) async fn run_search_job(
     job: Arc<SearchJob>,
@@ -249,6 +287,8 @@ pub(super) async fn run_search_job(
     health: HashMap<String, source_health::HealthRow>,
     scope: crate::req::SearchScope,
 ) {
+    // 后台体检通过 `searches_active()` 感知用户搜索，先让路再跑。
+    let _active = SearchActiveGuard::new();
     // 单源与整批预算独立：curated 5s/6s，all 6s/10s（见 req::search_budget_for）。
     let budget = crate::req::search_budget_for(scope);
     let total_budget = crate::req::search_total_budget(scope);
@@ -298,8 +338,10 @@ pub(super) async fn run_search_batch(
 ) -> Vec<source_health::Outcome> {
     enum TaskOutcome {
         Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
-        /// 拿到槽后真实请求超时（或全局剩余时间不足被截断）
+        /// 拿到槽后用满单源预算仍超时：算真实站点失败
         Timeout(String),
+        /// 全局 deadline 提前截断（剩余预算明显不足单源预算）：不算站点失败
+        Truncated(String),
         /// 排队到全局 deadline 仍未拿到并发槽
         Skipped(String),
     }
@@ -351,15 +393,14 @@ pub(super) async fn run_search_batch(
             let outcome = match r {
                 Ok(x) => TaskOutcome::Done(x),
                 Err(_) => {
-                    let err = if remain < budget {
-                        format!(
+                    if timeout_is_truncation(remain, budget) {
+                        TaskOutcome::Truncated(format!(
                             "全局搜索预算耗尽（排队后仅剩 {}ms，未完成请求）",
                             remain.as_millis()
-                        )
+                        ))
                     } else {
-                        format!("搜索超时（单源 {}s 预算）", budget.as_secs())
-                    };
-                    TaskOutcome::Timeout(err)
+                        TaskOutcome::Timeout(format!("搜索超时（单源 {}s 预算）", budget.as_secs()))
+                    }
                 }
             };
             (s, outcome, latency_ms, true)
@@ -373,6 +414,7 @@ pub(super) async fn run_search_batch(
             TaskOutcome::Done(Ok(b)) => ("ok", b.len() as i64, false),
             TaskOutcome::Done(Err(_)) => ("error", 0, false),
             TaskOutcome::Timeout(_) => ("timeout", 0, true),
+            TaskOutcome::Truncated(_) => ("truncated", 0, false),
             TaskOutcome::Skipped(_) => ("skipped", 0, false),
         };
         tracing::debug!(
@@ -422,14 +464,15 @@ pub(super) async fn run_search_batch(
             }
             TaskOutcome::Done(Err(e)) => {
                 // 站点故障（连接/超时/HTTP 非成功）才计入失败；引擎故障记 partial，不冷却。
-                let status = match source_health::classify(&e) {
-                    source_health::FailureKind::Site => source_health::STATUS_FAIL,
-                    source_health::FailureKind::Engine => source_health::STATUS_PARTIAL,
+                let (status, kind) = match source_health::classify(&e) {
+                    source_health::FailureKind::Site => (source_health::STATUS_FAIL, "site"),
+                    source_health::FailureKind::Engine => (source_health::STATUS_PARTIAL, "engine"),
                 };
                 st.errors.push(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: format!("{e}"),
+                    kind: kind.to_string(),
                 });
                 outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
@@ -447,6 +490,7 @@ pub(super) async fn run_search_batch(
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: err.clone(),
+                    kind: "timeout".to_string(),
                 });
                 outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
@@ -459,12 +503,25 @@ pub(super) async fn run_search_batch(
                     rule_complete,
                 });
             }
-            TaskOutcome::Skipped(err) => {
-                // 源根本没被查询（排队耗尽），不能按源站故障冷却，只记录到本次 errors。
+            TaskOutcome::Truncated(err) => {
+                // 全局预算截断：请求可能已发出但没跑完，不是站点故障。
+                // 不写健康记录，避免连续 3 次预算截断把健康源打成隔离/冷却。
+                st.skipped += 1;
                 st.errors.push(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: err,
+                    kind: "truncated".to_string(),
+                });
+            }
+            TaskOutcome::Skipped(err) => {
+                // 源根本没被查询（排队耗尽），不能按源站故障冷却，只记录到本次 errors。
+                st.skipped += 1;
+                st.errors.push(web_book::SourceFailure {
+                    source: src.book_source_url.clone(),
+                    source_name: src.book_source_name.clone(),
+                    error: err,
+                    kind: "skipped".to_string(),
                 });
             }
         }

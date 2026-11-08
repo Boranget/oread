@@ -8,6 +8,10 @@ pub struct SourceFailure {
     pub source: String,
     pub source_name: String,
     pub error: String,
+    /// 失败类型：`site`（站点/连接）、`engine`（规则解析）、`timeout`（单源超时）、
+    /// `truncated`（全局预算截断，请求未跑完）、`skipped`（排队未执行）。
+    /// 前端据此把「真实失败」与「预算未完成」分开显示，健康写入也只看前两类。
+    pub kind: String,
 }
 
 /// 聚合搜索结果：书列表 + 各源失败明细
@@ -327,11 +331,22 @@ pub(super) async fn search_all_budgeted_scoped(
     for (src, r) in results {
         match r {
             Ok(mut books) => outcome.books.append(&mut books),
-            Err(e) => outcome.errors.push(SourceFailure {
-                source: src.book_source_url.clone(),
-                source_name: src.book_source_name.clone(),
-                error: e.to_string(),
-            }),
+            Err(e) => {
+                let msg = e.to_string();
+                let kind = if msg.starts_with("全局搜索预算耗尽") {
+                    "truncated"
+                } else if msg.starts_with("搜索超时") {
+                    "timeout"
+                } else {
+                    "site"
+                };
+                outcome.errors.push(SourceFailure {
+                    source: src.book_source_url.clone(),
+                    source_name: src.book_source_name.clone(),
+                    error: msg,
+                    kind: kind.to_string(),
+                })
+            }
         }
     }
     outcome.books = dedupe_and_sort(outcome.books, sources, key);

@@ -35,6 +35,8 @@
   export let searchCoverage = 'expanded';
   export let failedCount = 0;
   export let failedSources = [];
+  export let skippedCount = 0;
+  export let skippedSources = [];
   export let retrying = false;
   export let retryNote = '';
   export let shelfIds = new Set();
@@ -141,7 +143,7 @@
       {:else if jobExpired}
         &nbsp;· 任务已过期，结果可能不完整
       {:else if sourceTotal}
-        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
+        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if skippedCount}（预算未完成 {skippedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
       {/if}
       {#if sourceMode === 'curated' || (!sourceMode && requestedScope === 'curated')}
         &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
@@ -194,11 +196,35 @@
       {/if}
       <div class="warn-item muted">可先换个关键词或稍后重试；长期失败请到「书源管理」检查这些源的地址与启用状态。</div>
       <div class="row" style="margin-top:8px">
-        <button class="ghost" on:click={() => dispatch('retryFailed')} disabled={retrying || starting || searching || !failedSources.some((f) => f.url)}>
-          {retrying ? '正在仅重试失败源…' : '仅重试失败源'}
+        <button class="ghost" on:click={() => dispatch('retryFailed')} disabled={retrying || starting || searching || (!failedSources.some((f) => f.url) && !skippedSources.some((f) => f.url))}>
+          {retrying ? '正在仅重试失败/未完成源…' : '仅重试失败/未完成源'}
         </button>
-        {#if !failedSources.some((f) => f.url)}<span class="muted">后端未返回失败源地址，无法按源重试</span>{/if}
+        {#if !failedSources.some((f) => f.url) && !skippedSources.some((f) => f.url)}<span class="muted">后端未返回失败源地址，无法按源重试</span>{/if}
       </div>
+    </div>
+  </details>
+{/if}
+
+{#if skippedCount || skippedSources.length}
+  <details class="warn-box">
+    <summary class="warn-title">
+      {skippedCount || skippedSources.length} 个书源因搜索总预算耗尽未完成{#if searching}（其余仍在搜索）{:else}，不算站点故障{/if}
+    </summary>
+    <div class="warn-items">
+      {#each skippedSources as f}
+        <div class="warn-item">{f.name}：{f.reason}</div>
+      {/each}
+      {#if !skippedSources.length}
+        <div class="warn-item">后端未返回未完成源的明细。</div>
+      {/if}
+      <div class="warn-item muted">这些源没有跑完，不会写入书源健康、不会触发冷却；重试或稍后再搜即可。</div>
+      {#if !(failedCount || failedSources.length)}
+        <div class="row" style="margin-top:8px">
+          <button class="ghost" on:click={() => dispatch('retryFailed')} disabled={retrying || starting || searching || !skippedSources.some((f) => f.url)}>
+            {retrying ? '正在仅重试未完成源…' : '仅重试未完成源'}
+          </button>
+        </div>
+      {/if}
     </div>
   </details>
 {/if}
@@ -247,6 +273,8 @@
   {:else if !starting && !searching && !paging}
     {#if failedSources.length || failedCount}
       <div class="empty">没有拿到结果，且有 {failedCount || failedSources.length} 个书源失败，原因见上方。<br />换关键词、稍后重试，或到「书源管理」检查这些书源。</div>
+    {:else if skippedSources.length || skippedCount}
+      <div class="empty">没有拿到结果，且有 {skippedCount || skippedSources.length} 个源因搜索总预算耗尽未完成（不算站点故障）。<br />重试或稍后再搜即可。</div>
     {:else if !jobExpired && !error}
       {#if sourceTotal === 0 || (sourcesReady && searchableCount === 0)}
         <div class="empty">当前还没有可用的书源，请先到「书源管理」导入并启用书源。<br /><button class="ghost" on:click={() => dispatch('goSources')}>去书源管理</button></div>
