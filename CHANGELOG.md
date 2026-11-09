@@ -7,8 +7,9 @@
 
 ### Added
 
-- 新增 `scripts/deploy.ps1` 一键部署（交叉编译 → 打包 → 上传 → 备份 → 重启 → healthz
-  轮询 → 失败自动回滚），支持 `-DryRun` 离线预演；配套说明见 `docs/DEPLOY.md`。
+- 新增 `scripts/deploy.ps1` 一键部署（交叉编译 → 打包 → 上传 → SHA-256 校验 → 备份 →
+  重启 → healthz 轮询 → 失败自动回滚），支持 `-DryRun` 离线预演；二进制用临时名 + rename
+  原子替换，回滚前先停服务，避免 `Text file busy`。配套说明见 `docs/DEPLOY.md`。
 
 ### Changed
 

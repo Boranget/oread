@@ -18,9 +18,10 @@
 2. `npm --prefix server/web run build` 生成 `server\web\dist`
 3. 打包 `dist/` 并计算二进制、前端包、`index.html` 的 SHA-256
 4. **单次** SSH 探测（失败立即停止：不重试、不扫网段）
-5. `scp` 上传到 `/tmp`，远端脚本备份旧二进制 / 旧 `dist` 后原子替换
-6. `systemctl restart boranlib`，轮询 `http://127.0.0.1:3000/healthz`
-7. 健康检查失败：自动恢复旧二进制与旧 `dist` 并重启，打印 `journalctl`，退出码非 0
+5. `scp` 上传到安装目录（`/opt/boranlib/.upload-<stamp>.*`），远端先核对 SHA-256；通过后备份旧二进制 / 旧 `dist`
+6. 新二进制先写 `boranlib.new.<stamp>` 再 `mv` 原子替换（避免覆盖运行中文件的 `Text file busy`）
+7. `systemctl restart boranlib`，轮询 `http://127.0.0.1:3000/healthz`
+8. 健康检查失败：先停服务再恢复旧二进制与旧 `dist` 并重启，打印 `journalctl`，退出码非 0
 
 设备地址也可以放进环境变量，避免每次输入：
 
@@ -35,6 +36,14 @@ $env:OREAD_DEVICE = '192.168.1.191'
 .\scripts\deploy.ps1 -Device 192.168.1.191 -User admin -Port 2222 `
     -SshKey "$env:USERPROFILE\.ssh\id_ed25519"
 ```
+
+### 认证方式
+
+- 默认用户 `root`；`-Device` 写成 `user@host` 或传 `-User` 可覆盖。
+- **推荐密钥登录**：本机 `~/.ssh/config` 建 Host 条目（`IdentityFile` 指向 OpenStick 私钥），
+  或每次传 `-SshKey`。仓库不保存任何私钥。
+- 用密码登录也能部署，但脚本会建立多次连接（1 次探测 + 3 次上传 + 1 次执行），
+  密码模式下可能提示多次；密钥模式无提示。
 
 ## 1. 设备不可达时：离线预演
 
@@ -96,16 +105,19 @@ $env:OREAD_DEVICE = '192.168.1.191'
 - `HealthTimeoutSec` 内 healthz 未返回 200
 
 自动回滚后仍会再轮询一次 healthz；若仍失败，日志明确提示“请人工介入”。
+回滚前会先 `systemctl stop`，避免覆盖运行中的二进制导致 `Text file busy`。
+脚本以远端输出的 `REMOTE_RESULT=ok` 作为成功标记，不只依赖 SSH 退出码。
 
 ### 手动回滚
 
 ```bash
 TS=<部署输出的 STAMP>
+systemctl stop boranlib
 cp -a /opt/boranlib/boranlib.bak.$TS /opt/boranlib/boranlib
 rm -rf /opt/boranlib/web/dist
 tar xzf /opt/boranlib/web/dist.bak.$TS.tar.gz -C /opt/boranlib/web
 chown -R root:root /opt/boranlib/web/dist
-systemctl restart boranlib
+systemctl start boranlib
 journalctl -u boranlib -n 50 --no-pager
 ```
 
@@ -178,6 +190,8 @@ curl -s -X POST http://127.0.0.1:3000/api/sources/health/reset \
 | healthz 一直非 200 | 看脚本打印的 `journalctl`；常见为迁移失败（`VersionMismatch`）、端口占用、`boranlib.env` 配置（弱口令 / JWT secret） |
 | 前端 404 / 白屏 | 检查 `/opt/boranlib/web/dist/index.html` 是否存在、nginx root 是否指向 `web/dist` |
 | 上传很慢 | 静态二进制约 10 MB，属正常；避免在设备上编译 |
+| `上传文件缺失` / `校验失败` | 远端没收到 `/opt/boranlib/.upload-<stamp>.*` 或哈希不符；脚本会在改动任何文件前中止。检查设备磁盘空间、目录权限、网络后重跑 |
+| `Text file busy` | 旧版脚本直接覆盖运行中的二进制。新版先写 `boranlib.new.<stamp>` 再 rename，回滚也会先停服务；直接重跑即可 |
 | 迁移校验和失败 | 说明产物内嵌迁移换行或内容与库不一致。不要改库绕过，先按 `RUNBOOK.md` 第 2 步闸门核验 |
 
 ### 关于“只装 Release 产物”
@@ -192,7 +206,8 @@ curl -s -X POST http://127.0.0.1:3000/api/sources/health/reset \
 # 部署成功后可清理旧备份（确认新版本稳定后再删）
 rm -f /opt/boranlib/boranlib.bak.*
 rm -f /opt/boranlib/web/dist.bak.*.tar.gz
-rm -f /tmp/boranlib-*.bin /tmp/dist-*.tar.gz /tmp/deploy-*.sh
+rm -f /opt/boranlib/.upload-*
+rm -f /tmp/deploy-*.sh
 ```
 
 本机暂存目录也可整体删除：`Remove-Item -Recurse "$env:TEMP\boranlib-deploy"`。
