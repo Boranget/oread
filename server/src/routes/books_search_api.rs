@@ -315,7 +315,8 @@ pub(super) async fn search(
         CuratedMissingFallback::All,
     )
     .await;
-    let (full, _, _) = aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
+    let active = order_by_health(plan.active, &plan.health);
+    let (full, _, _) = aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
 
@@ -405,8 +406,9 @@ pub(super) async fn search_aggregate(
         CuratedMissingFallback::All,
     )
     .await;
+    let active = order_by_health(plan.active, &plan.health);
     let (full, errors, title_filter) =
-        aggregated(&plan.active, &q.keyword(), include_cooled, plan.scope).await;
+        aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
 
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;
@@ -430,7 +432,7 @@ pub(super) async fn search_aggregate(
         "curated_total": plan.curated_total,
         "source_ids_requested": plan.requested,
         "ignored_source_ids": plan.ignored,
-        "source_total": plan.active.len(),
+        "source_total": active.len(),
         "include_cooled": include_cooled,
         "skipped_cooldown": plan.skipped_cooldown,
         "cooldown_total": plan.cooldown_total,

@@ -143,6 +143,18 @@ pub(crate) struct SearchSourcePlan {
     pub(crate) cooldown_total: usize,
 }
 
+/// 统一入队顺序：慢源 / 近期站点失败源垫底，预算紧张时优先把并发槽给可用源。
+///
+/// 两段式搜索原本就按健康顺序入队；legacy `/api/search`、`/api/search/aggregate`
+/// 与 `/k/search` 也必须共用同一顺序，否则同一关键词会因入口不同而拿到不同结果。
+pub(crate) fn order_by_health(
+    mut sources: Vec<crate::entities::BookSource>,
+    health: &HashMap<String, source_health::HealthRow>,
+) -> Vec<crate::entities::BookSource> {
+    sources.sort_by_key(|s| books_search_job::health_order_key(health.get(&s.book_source_url)));
+    sources
+}
+
 /// 所有搜索入口唯一的源过滤链路。
 ///
 /// 语义：

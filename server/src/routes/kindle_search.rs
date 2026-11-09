@@ -58,8 +58,9 @@ pub(super) async fn search(
         )
         .await;
         // `/k/search` 与网页端共用 `aggregated` 的边界过滤：只保留书名包含关键词的结果。
+        let active = crate::routes::books::order_by_health(plan.active, &plan.health);
         let (books, _errors, _title_filter) =
-            crate::routes::books::aggregated(&plan.active, &key, include_cooled, plan.scope).await;
+            crate::routes::books::aggregated(&active, &key, include_cooled, plan.scope).await;
         let strong_total = books
             .iter()
             .filter(|b| b.relevance.as_deref() == Some("strong"))

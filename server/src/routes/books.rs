@@ -187,7 +187,7 @@ use books_store::*;
 pub(crate) use books_search_api::aggregated;
 pub(crate) use books_search_job::searches_active;
 pub(crate) use books_search_source::{
-    is_searchable_source, resolve_search_sources, CuratedMissingFallback,
+    is_searchable_source, order_by_health, resolve_search_sources, CuratedMissingFallback,
 };
 pub(crate) use books_store::{
     book_store_for, load_book_meta, load_cached_chapters, load_cached_content,
