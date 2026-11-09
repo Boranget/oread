@@ -69,6 +69,18 @@ pub async fn health_check(
     {
         tracing::warn!(error = %e, "record health check failed");
     }
+    // 巡检拿到有效响应（ok/partial）后同步复活账本自动隔离源：
+    // 默认巡检不选隔离区，显式 source_ids 复查时必须能真正回到搜索池。
+    let revive_urls: Vec<String> = probes
+        .iter()
+        .filter(|p| p.probed && p.status != source_health::STATUS_FAIL)
+        .map(|p| p.source_url.clone())
+        .collect();
+    match source_ledger::revive_auto(&s.shared, &revive_urls).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(revived = n, "health check revived auto-quarantined sources"),
+        Err(e) => tracing::warn!(error = %e, "health check ledger revival failed"),
+    }
     let health = source_health::load_map(&s.shared).await.unwrap_or_default();
     let results: Vec<Value> = probes
         .iter()

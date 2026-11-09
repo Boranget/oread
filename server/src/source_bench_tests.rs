@@ -558,6 +558,53 @@ async fn bench_health_skips_no_response_and_does_not_pollute_search_stats() {
     assert!(dead.is_none(), "无有效响应的源不写健康记录");
 }
 
+#[test]
+fn bench_candidates_include_auto_quarantined_but_not_manual() {
+    let mut enabled = BookSource::default();
+    enabled.book_source_url = "https://enabled".into();
+    enabled.book_source_name = "enabled".into();
+    enabled.enabled = true;
+    enabled.search_url = Some("https://x.example/search?q={key}".into());
+    enabled.rule_search = Some(crate::entities::SearchRule {
+        book_list: Some(".book".into()),
+        ..Default::default()
+    });
+
+    let mut auto = enabled.clone();
+    auto.book_source_url = "https://auto".into();
+    auto.enabled = false;
+
+    let mut manual = enabled.clone();
+    manual.book_source_url = "https://manual".into();
+    manual.enabled = false;
+
+    let mut disabled = enabled.clone();
+    disabled.book_source_url = "https://disabled".into();
+    disabled.enabled = false;
+
+    let mut login = enabled.clone();
+    login.book_source_url = "https://login".into();
+    login.enabled = false;
+    login.login_url = Some("https://x.example/login".into());
+
+    let all = vec![enabled, auto, manual, disabled, login];
+    let quarantined: HashSet<String> = ["https://auto", "https://manual", "https://login"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let auto_quarantined: HashSet<String> = ["https://auto", "https://login"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let out = bench_candidates(&all, &quarantined, &auto_quarantined);
+    let urls: Vec<&str> = out.iter().map(|s| s.book_source_url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec!["https://enabled", "https://auto"],
+        "自动隔离源要进体检；人工隔离/普通禁用/需登录源不进"
+    );
+}
+
 #[tokio::test]
 async fn bench_fast_track_revives_quarantined_source() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -579,6 +626,17 @@ async fn bench_fast_track_revives_quarantined_source() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO source_library_state (source_url, decision, reason) \
+         VALUES ('https://revive', 'quarantined', 'bench: no usable response')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO book_sources (id, enabled) VALUES ('https://revive', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut src = BookSource::default();
     src.book_source_url = "https://revive".into();
@@ -606,6 +664,21 @@ async fn bench_fast_track_revives_quarantined_source() {
     assert_eq!(cf, 0, "复活时清零连续失败");
     assert_eq!(fs, 0, "复活时清零站点失败率证据");
     assert!(err.is_none(), "复活时清除旧错误");
+
+    let (decision, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT decision, reason FROM source_library_state WHERE source_url = 'https://revive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(decision, "active", "体检复活必须同步清掉账本隔离");
+    assert!(reason.is_none(), "复活后清空隔离原因");
+    let enabled: i64 =
+        sqlx::query_scalar("SELECT enabled FROM book_sources WHERE id = 'https://revive'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(enabled, 1, "体检复活必须重新启用导入时被强制关闭的源");
 }
 
 #[test]
@@ -661,6 +734,17 @@ async fn bench_valid_response_demotes_quarantined_to_observing() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO source_library_state (source_url, decision, reason) \
+         VALUES ('https://cold', 'quarantined', '全局搜索预算耗尽')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO book_sources (id, enabled) VALUES ('https://cold', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut src = BookSource::default();
     src.book_source_url = "https://cold".into();
@@ -687,6 +771,21 @@ async fn bench_valid_response_demotes_quarantined_to_observing() {
     assert!(cooldown.is_none(), "降回 observing 时清除冷却");
     assert_eq!(cf, 0, "清零连续失败");
     assert_eq!(fs, 0, "清零历史站点失败证据");
+
+    let (decision, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT decision, reason FROM source_library_state WHERE source_url = 'https://cold'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(decision, "active", "有有效响应也应清掉账本自动隔离");
+    assert!(reason.is_none());
+    let enabled: i64 =
+        sqlx::query_scalar("SELECT enabled FROM book_sources WHERE id = 'https://cold'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(enabled, 1);
 }
 
 fn bench_row(
@@ -738,6 +837,21 @@ async fn create_health_tables(pool: &SqlitePool) {
          curated INTEGER NOT NULL DEFAULT 0, samples INTEGER NOT NULL DEFAULT 0, \
          fail_streak INTEGER NOT NULL DEFAULT 0, last_bench_at INTEGER, \
          meta_json TEXT, last_run_at INTEGER)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE source_library_state (\
+         source_url TEXT PRIMARY KEY, decision TEXT NOT NULL DEFAULT 'active', reason TEXT, \
+         first_imported_at INTEGER, last_imported_at INTEGER, last_batch_id TEXT, \
+         content_sha TEXT, review_state TEXT, review_reason TEXT, review_at INTEGER)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE book_sources (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)",
     )
     .execute(pool)
     .await

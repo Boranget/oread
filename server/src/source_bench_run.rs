@@ -441,9 +441,22 @@ pub async fn run_bench(
         .cloned()
         .map(|s| (s.book_source_url.clone(), s))
         .collect();
-    let quarantined = crate::source_ledger::quarantined_set(pool)
+    let states = crate::source_ledger::load_states(pool)
         .await
         .unwrap_or_default();
+    let quarantined: HashSet<String> = states
+        .iter()
+        .filter(|(_, st)| st.is_quarantined())
+        .map(|(url, _)| url.clone())
+        .collect();
+    let auto_quarantined: HashSet<String> = states
+        .iter()
+        .filter(|(_, st)| {
+            st.is_quarantined()
+                && crate::source_ledger::is_auto_quarantine_reason(st.reason.as_deref())
+        })
+        .map(|(url, _)| url.clone())
+        .collect();
     let corpus = load_corpus(pool).await?;
     let samples_per_source = limit.unwrap_or(cfg.source_bench_samples).clamp(1, 20);
     let health = source_health::load_map(pool).await.unwrap_or_default();
@@ -451,13 +464,7 @@ pub async fn run_bench(
     let mut sources: Vec<BookSource> = Vec::new();
     match source_ids {
         None => {
-            for s in all.iter() {
-                if crate::entities::is_searchable_source(s)
-                    && !quarantined.contains(&s.book_source_url)
-                {
-                    sources.push(s.clone());
-                }
-            }
+            sources = bench_candidates(&all, &quarantined, &auto_quarantined);
         }
         Some(ids) => {
             for id in ids {
@@ -470,9 +477,16 @@ pub async fn run_bench(
             }
         }
     }
-    // 恢复优先：被质量档隔离/近期失败的源先跑。整批预算紧张时（源多、并发低）
-    // 队尾样本会被截断，若不排序，最需要体检复活的源反而永远排在最后跑不到。
-    sources.sort_by_key(|s| bench_priority(&health, &s.book_source_url));
+    // 恢复优先：自动隔离源最先跑，其次是被质量档隔离/近期失败的源。
+    // 整批预算紧张时（源多、并发低）队尾样本会被截断，若不排序，
+    // 最需要体检复活的源反而永远排在最后跑不到。
+    sources.sort_by_key(|s| {
+        let auto = auto_quarantined.contains(&s.book_source_url);
+        (
+            if auto { 0u8 } else { 1u8 },
+            bench_priority(&health, &s.book_source_url),
+        )
+    });
 
     let corpus_for_type = |t: i64| -> Vec<CorpusEntry> {
         corpus
@@ -714,6 +728,36 @@ pub(super) fn bench_priority(health: &HashMap<String, source_health::HealthRow>,
     }
 }
 
+/// 体检候选源：正常可搜索源 + 自动隔离源。
+///
+/// 自动隔离源在导入时被强制 `enabled=0`，如果只按“可搜索源”筛选，
+/// 它们永远进不了体检，也就永远无法自愈。人工隔离 / 清理隔离仍排除在外，
+/// 避免后台体检推翻用户或清理策略的显式决定。
+pub(super) fn bench_candidates(
+    all: &[BookSource],
+    quarantined: &HashSet<String>,
+    auto_quarantined: &HashSet<String>,
+) -> Vec<BookSource> {
+    all.iter()
+        .filter(|s| {
+            if quarantined.contains(&s.book_source_url) {
+                auto_quarantined.contains(&s.book_source_url) && bench_static_eligible(s)
+            } else {
+                crate::entities::is_searchable_source(s)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// 忽略 `enabled` 的规则层可体检判定（自动隔离源需要绕过导入时写下的 enabled=0）。
+fn bench_static_eligible(s: &BookSource) -> bool {
+    crate::entities::is_supported_source_type(s.book_source_type)
+        && s.rule_search.is_some()
+        && s.search_url.is_some()
+        && !crate::entities::requires_login(s)
+}
+
 /// 冷启动直通的纯规则，供单测与写库共用。
 pub(super) fn bench_fast_track_ok(row: &SourceBenchRow) -> bool {
     row.samples >= MIN_CURATED_SAMPLES
@@ -794,6 +838,19 @@ pub(super) async fn record_bench_health(
         .bind(crate::source_quality::TIER_QUARANTINED)
         .execute(pool)
         .await?;
+    }
+
+    // 体检拿到有效响应（samples>0）即视为源可用：同步复活账本自动隔离，
+    // 并把导入隔离时强制写下的 enabled=0 恢复。人工/清理隔离由 revive_auto 过滤。
+    let revive_urls: Vec<String> = rows
+        .iter()
+        .filter(|r| r.samples > 0)
+        .map(|r| r.source_url.clone())
+        .collect();
+    match crate::source_ledger::revive_auto(pool, &revive_urls).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(revived = n, "bench revived auto-quarantined sources"),
+        Err(e) => tracing::warn!(error = %e, "bench ledger revival failed"),
     }
     Ok(())
 }

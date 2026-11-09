@@ -265,6 +265,63 @@ pub async fn quarantine(
     Ok(())
 }
 
+/// 自动隔离原因：可以被体检/巡检的“有效响应”自动复活。
+///
+/// 人工隔离（`manual_quarantine`）与清理隔离（`pruned_site_fail`）必须保持，
+/// 否则用户/清理策略的显式决定会被后台体检悄悄推翻。
+/// 历史数据里也可能存在 `reason IS NULL` 的自动隔离行，一并视为可复活。
+pub fn is_auto_quarantine_reason(reason: Option<&str>) -> bool {
+    let Some(raw) = reason else {
+        return true;
+    };
+    let r = raw.trim();
+    r.is_empty()
+        || r.starts_with("site_unreachable")
+        || r.starts_with("quality_quarantine")
+        || r.starts_with("engine_limited")
+        || r.starts_with("bench:")
+        || r.starts_with("全局搜索预算耗尽")
+}
+
+/// 体检/巡检拿到有效响应后复活自动隔离源：
+/// - 只处理 `decision='quarantined'` 且原因是自动隔离的行；
+/// - 同时把导入隔离时强制写下的 `enabled=0` 恢复为 1；
+/// - 返回实际复活的源数量。
+///
+/// 调用方必须只传“本轮确实拿到有效响应”的源，不能用整批源列表。
+pub async fn revive_auto(pool: &SqlitePool, source_urls: &[String]) -> AppResult<usize> {
+    if source_urls.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
+    let mut revived = 0usize;
+    for url in source_urls {
+        let res = sqlx::query(
+            "UPDATE source_library_state SET decision = 'active', reason = NULL \
+             WHERE source_url = ?1 AND decision = 'quarantined' \
+               AND (reason IS NULL OR TRIM(reason) = '' \
+                    OR reason LIKE 'site_unreachable%' \
+                    OR reason LIKE 'quality_quarantine%' \
+                    OR reason LIKE 'engine_limited%' \
+                    OR reason LIKE 'bench:%' \
+                    OR reason LIKE '全局搜索预算耗尽%')",
+        )
+        .bind(url)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            continue;
+        }
+        sqlx::query("UPDATE book_sources SET enabled = 1 WHERE id = ?1 AND enabled = 0")
+            .bind(url)
+            .execute(&mut *tx)
+            .await?;
+        revived += 1;
+    }
+    tx.commit().await?;
+    Ok(revived)
+}
+
 pub async fn clear_review(pool: &SqlitePool, source_url: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE source_library_state SET review_state = NULL, review_reason = NULL, review_at = NULL \
@@ -409,12 +466,92 @@ mod tests {
              CREATE TABLE source_library_state (source_url TEXT PRIMARY KEY, \
              decision TEXT NOT NULL DEFAULT 'active', reason TEXT, first_imported_at INTEGER, \
              last_imported_at INTEGER, last_batch_id TEXT, content_sha TEXT, \
-             review_state TEXT, review_reason TEXT, review_at INTEGER)",
+             review_state TEXT, review_reason TEXT, review_at INTEGER); \
+             CREATE TABLE book_sources (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1)",
         )
         .execute(&pool)
         .await
         .unwrap();
         pool
+    }
+
+    #[test]
+    fn auto_quarantine_reason_classification() {
+        for reason in [
+            None,
+            Some(""),
+            Some("site_unreachable: timeout"),
+            Some("quality_quarantine: score=12"),
+            Some("engine_limited: no items"),
+            Some("bench: no usable response"),
+        ] {
+            assert!(
+                is_auto_quarantine_reason(reason),
+                "{reason:?} 应视为可自动复活"
+            );
+        }
+        for reason in [
+            Some("manual_quarantine"),
+            Some("pruned_site_fail"),
+            Some("unknown_reason"),
+        ] {
+            assert!(
+                !is_auto_quarantine_reason(reason),
+                "{reason:?} 不应被体检悄悄复活"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revive_auto_only_restores_automatic_quarantine() {
+        let pool = test_pool().await;
+        for url in ["https://auto", "https://manual", "https://pruned"] {
+            sqlx::query("INSERT INTO book_sources (id, enabled) VALUES (?, 0)")
+                .bind(url)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        quarantine(&pool, "https://auto", Some("site_unreachable: x"), 1000)
+            .await
+            .unwrap();
+        quarantine(&pool, "https://manual", Some("manual_quarantine"), 1000)
+            .await
+            .unwrap();
+        quarantine(&pool, "https://pruned", Some("pruned_site_fail"), 1000)
+            .await
+            .unwrap();
+
+        let revived = revive_auto(
+            &pool,
+            &[
+                "https://auto".into(),
+                "https://manual".into(),
+                "https://pruned".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(revived, 1, "只复活自动隔离源");
+
+        let states = load_states(&pool).await.unwrap();
+        assert!(!states.get("https://auto").unwrap().is_quarantined());
+        assert!(states.get("https://manual").unwrap().is_quarantined());
+        assert!(states.get("https://pruned").unwrap().is_quarantined());
+
+        let enabled: Vec<(String, i64)> =
+            sqlx::query_as("SELECT id, enabled FROM book_sources ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            enabled,
+            vec![
+                ("https://auto".into(), 1),
+                ("https://manual".into(), 0),
+                ("https://pruned".into(), 0),
+            ]
+        );
     }
 
     #[tokio::test]
