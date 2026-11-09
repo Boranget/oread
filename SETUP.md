@@ -93,6 +93,12 @@ scp target\aarch64-unknown-linux-musl\release\boranlib root@<device>:/opt/boranl
 ssh root@<device> "chmod +x /opt/boranlib/boranlib && /opt/boranlib/boranlib"
 ```
 
+> 推荐用一键脚本（构建 → 打包 → 上传 → 备份 → 重启 → healthz → 失败自动回滚）：
+> ```powershell
+> .\scripts\deploy.ps1 -Device <device>
+> ```
+> 完整参数、离线 `-DryRun`、回滚与验收见 **`docs/DEPLOY.md`**。
+
 ## 4. 运行与冒烟测试
 - 运行时环境变量（见 `src/config.rs`）：前缀 `BORANLIB_`（兼容 `LEGADO_`，新缺失才读旧），如 `BORANLIB_DATA_DIR`、`BORANLIB_JWT_SECRET`、`BORANLIB_ADMIN_USER`、`BORANLIB_ADMIN_PASS`、`BORANLIB_CORS_ORIGINS`。
 - 首次启动自动建 admin（`bootstrap_admin`）。生产环境（release 或 `BORANLIB_ENV=production`）必须显式设置 `BORANLIB_JWT_SECRET`（≥32 字节）与 `BORANLIB_ADMIN_PASS`（≥8 字节且非 <寮€鍙戦粯璁ゅ彛浠?），否则拒绝启动；跨域部署用 `BORANLIB_CORS_ORIGINS` 列精确来源，默认不添加 CORS 层。

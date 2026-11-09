@@ -4,6 +4,10 @@
 > 传输工具：任意 SSH/SCP 客户端（本文件不含任何凭据）
 > 产物目录（Windows）：`<local-tools>\release\<tag>\`
 > 当前状态：设备已换到另一个网络，**不可达**。本文件仅为待执行清单，未执行。
+>
+> 只做常规换装时，可直接用一键脚本 `.\scripts\deploy.ps1 -Device <device>`
+> （构建 → 上传 → 备份 → 重启 → healthz → 失败自动回滚）；用法见 `docs/DEPLOY.md`。
+> 涉迁移校验和闸门、手工库备份或发版复核时，仍按本文件逐步执行。
 
 ## 0. 前置检查（Windows 侧，设备不可达也能做）
 
@@ -183,7 +187,8 @@ journalctl -u boranlib -n 50 --no-pager   # 原样贴出日志
 - 不改 `boranlib.env`（除非必须，且先报告）。
 - 不把 IP 写进 `/etc/hosts` 作为修复。
 - 不 commit / push，不打印凭据。
-- 设备只装 GitHub Release 产物；本机临时编译包仅限本机独立数据目录测试。
+- 设备只装 GitHub Release 产物或经过本文件核验 / 门禁通过的部署构建（`scripts\deploy.ps1`）；
+  未验证的本机临时包仅限本机独立数据目录测试。
 - 迁移换行不一致（LF/CRLF）属于产物问题：停用该产物，等重新发布的 LF 版，**不要改库 checksum 绕过**。
 
 ## 产物清单（预取留存）

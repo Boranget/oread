@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `scripts/deploy.ps1` 一键部署（交叉编译 → 打包 → 上传 → 备份 → 重启 → healthz
+  轮询 → 失败自动回滚），支持 `-DryRun` 离线预演；配套说明见 `docs/DEPLOY.md`。
+
 ### Changed
 
 - 搜索结果的「书名包含关键词」过滤统一放到服务端：网页端、Kindle `/k` 精简页与
