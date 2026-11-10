@@ -232,7 +232,7 @@ fn pipeline_uses_single_total_budget_for_both_batches() {
     );
     assert_eq!(
         crate::req::search_total_budget(crate::req::SearchScope::All),
-        Duration::from_secs(10)
+        Duration::from_secs(25)
     );
 }
 
@@ -303,6 +303,35 @@ fn all_search_entrypoints_share_health_ordering() {
     let list = order_by_health(vec![mk("fail"), mk("unknown"), mk("fast")], &health);
     let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
     assert_eq!(names, vec!["fast", "unknown", "fail"]);
+}
+
+// 搜索超时是「未知」而非「站点已死」：记 partial、不计入搜索统计，
+// 否则连续 3 次超时就会把源硬隔离，源池越搜越小，最后所有搜索都是 0 结果。
+#[test]
+fn search_timeout_is_partial_and_not_counted() {
+    let (status, kind, usage) = classify_search_failure("搜索超时（单源 5s 预算）", false);
+    assert_eq!(status, source_health::STATUS_PARTIAL);
+    assert_eq!(kind, "timeout");
+    assert!(!usage, "未完成的请求不能算一次 0 命中");
+
+    // 底层请求超时（含在 Done(Err) 里的文案）同样按超时处理
+    let (status, kind, usage) =
+        classify_search_failure("请求超时（15s 预算）: https://x.example/search", false);
+    assert_eq!(status, source_health::STATUS_PARTIAL);
+    assert_eq!(kind, "timeout");
+    assert!(!usage);
+
+    // 明确的站点故障仍然计入失败，避免真死站永远留在池子里
+    let (status, kind, usage) = classify_search_failure("连接失败: https://x.example", false);
+    assert_eq!(status, source_health::STATUS_FAIL);
+    assert_eq!(kind, "site");
+    assert!(usage);
+
+    // 引擎故障记 partial 但计入统计：留证据，不判死站点
+    let (status, kind, usage) = classify_search_failure("选择器解析失败", true);
+    assert_eq!(status, source_health::STATUS_PARTIAL);
+    assert_eq!(kind, "engine");
+    assert!(usage);
 }
 
 fn mk_book(name: String, url: String) -> SearchBook {

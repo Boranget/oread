@@ -266,6 +266,34 @@ pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64
     }
 }
 
+/// 该失败文案是否属于“超时”（单源预算用尽或底层请求超时）。
+///
+/// 超时在聚合搜索里是**不确定**证据：同一个源在体检（低并发）下可能很快。
+/// 因此它只记 `partial`，不参与连续失败/冷却判定。
+pub(super) fn is_timeout_message(msg: &str) -> bool {
+    msg.contains("超时")
+}
+
+/// 搜索失败的三元归类：`(健康状态, 错误 kind, 是否计入搜索统计)`。
+///
+/// - **超时**：`partial` + 不计统计。16 路并发 + 单源预算下超时是「未知」，
+///   既不能累计连续失败（会 24h 冷却/隔离），也不能算一次 0 命中
+///   （否则冷门关键词搜两轮就把正常源打成隔离）。
+/// - **站点故障**（连接失败/HTTP 非成功）：`fail` + 计入，这是明确的站点问题。
+/// - **引擎故障**（选择器/JSONPath/JS）：`partial` + 计入，留证据但不判死站点。
+pub(super) fn classify_search_failure(
+    msg: &str,
+    engine: bool,
+) -> (&'static str, &'static str, bool) {
+    if is_timeout_message(msg) {
+        (source_health::STATUS_PARTIAL, "timeout", false)
+    } else if engine {
+        (source_health::STATUS_PARTIAL, "engine", true)
+    } else {
+        (source_health::STATUS_FAIL, "site", true)
+    }
+}
+
 /// 全局预算是否“明显不足”单源预算。
 ///
 /// 留 1s 宽限：剩余 7.2s / 单源 8s 仍按真实单源超时处理，
@@ -289,7 +317,7 @@ pub(super) async fn run_search_job(
 ) {
     // 后台体检通过 `searches_active()` 感知用户搜索，先让路再跑。
     let _active = SearchActiveGuard::new();
-    // 单源与整批预算独立：curated 5s/6s，all 6s/10s（见 req::search_budget_for）。
+    // 单源与整批预算独立：curated 8s/6s，all 5s/25s（见 req::search_budget_for）。
     let budget = crate::req::search_budget_for(scope);
     let total_budget = crate::req::search_total_budget(scope);
     // 排队等槽不计入单源预算，但整次搜索仍受此上限约束。
@@ -463,29 +491,37 @@ pub(super) async fn run_search_batch(
                 });
             }
             TaskOutcome::Done(Err(e)) => {
-                // 站点故障（连接/超时/HTTP 非成功）才计入失败；引擎故障记 partial，不冷却。
-                let (status, kind) = match source_health::classify(&e) {
-                    source_health::FailureKind::Site => (source_health::STATUS_FAIL, "site"),
-                    source_health::FailureKind::Engine => (source_health::STATUS_PARTIAL, "engine"),
-                };
+                let msg = format!("{e}");
+                // 超时是「未知」而非「站点已死」：16 路并发 + 单源预算下，超时更多是
+                // 本机排队放大。与 truncated/skipped 同口径：不累计失败、不冷却、不写命中统计。
+                let engine = matches!(
+                    source_health::classify(&e),
+                    source_health::FailureKind::Engine
+                );
+                let (status, kind, usage) = classify_search_failure(&msg, engine);
                 st.errors.push(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
-                    error: format!("{e}"),
+                    error: msg.clone(),
                     kind: kind.to_string(),
                 });
                 outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status,
                     latency_ms,
-                    error: Some(format!("{e}")),
+                    error: Some(msg),
                     hits: 0,
                     parsed: false,
-                    usage: true,
+                    usage,
                     rule_complete,
                 });
             }
             TaskOutcome::Timeout(err) => {
+                // 超时只说明「这次没跑完」，不能据此把源判死：
+                // - 记 partial（不累计连续失败、不触发 24h 冷却、不拉低连通性到 0）；
+                // - usage=false（不把未完成的请求算成一次 0 命中，否则冷门关键词
+                //   搜两轮就会把大量正常源打成隔离）。
+                // 站点是否真的坏由体检/巡检（更低并发、独立预算）判定。
                 st.errors.push(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
@@ -494,12 +530,12 @@ pub(super) async fn run_search_batch(
                 });
                 outcomes.push(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
-                    status: source_health::STATUS_FAIL,
+                    status: source_health::STATUS_PARTIAL,
                     latency_ms,
                     error: Some(err),
                     hits: 0,
                     parsed: false,
-                    usage: true,
+                    usage: false,
                     rule_complete,
                 });
             }

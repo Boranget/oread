@@ -458,8 +458,9 @@ ssh root@<device> "chmod +x /opt/boranlib/boranlib && /opt/boranlib/boranlib"
 | `BORANLIB_<KEY>` | 运行时配置（新前缀，优先） | 服务进程 |
 | `BORANLIB_DB_BACKUP_KEEP` | 迁移前自动备份的保留份数（默认 5，范围 1–50） | 服务进程 |
 | `BORANLIB_JS_TIMEOUT_MS` | 单段书源 JS 规则的时间预算（默认 3000ms，范围 20–5000；跑完再判定，不硬中断）。200ms 会把慢设备上约 1.4s 的漫画图片规则误判超时 | 服务进程 |
-| `BORANLIB_SEARCH_TIMEOUT_SECS` | 聚合搜索**单源**预算（默认 8s，范围 5–30；curated/all 共用，决定 `deadline_ms`） | 服务进程 |
-| `BORANLIB_SEARCH_CURATED_BUDGET_SECS` / `BORANLIB_SEARCH_ALL_BUDGET_SECS` | 聚合搜索**整批**预算（默认 curated 6s / all 10s，范围 2–60；按 scope 分档，优先级高于统一覆盖值） | 服务进程 |
+| `BORANLIB_SEARCH_TIMEOUT_SECS` | 聚合搜索**curated 单源**预算（默认 8s，范围 5–30，决定 `curated` 的 `deadline_ms`） | 服务进程 |
+| `BORANLIB_SEARCH_ALL_TIMEOUT_SECS` | 聚合搜索**all 单源**预算（默认 5s，范围 5–30）。`all` 要覆盖上百个源，单源预算越短，同预算下能跑到的源越多；未设置时沿用 `SEARCH_TIMEOUT_SECS` | 服务进程 |
+| `BORANLIB_SEARCH_CURATED_BUDGET_SECS` / `BORANLIB_SEARCH_ALL_BUDGET_SECS` | 聚合搜索**整批**预算（默认 curated 6s / all 25s，范围 2–60；按 scope 分档，优先级高于统一覆盖值） | 服务进程 |
 | `BORANLIB_SEARCH_TOTAL_BUDGET_SECS` | 聚合搜索整批预算的统一覆盖值（两 scope 同值；显式按 scope 的变量优先。只设旧 `SEARCH_TIMEOUT_SECS` 时整批与之同值以兼容旧部署） | 服务进程 |
 | `BORANLIB_MIGRATION_REPAIR` | 换行血缘自愈开关（默认 `on`：备份后单事务修正纯换行差异，内容真不同仍拒绝；`off` 时完全不修，校验和不符直接报错） | 服务进程 |
 | `BORANLIB_EINK_JPEG_QUALITY` | 墨水屏灰度 JPEG 质量（默认 70，范围 60–90，越界夹取） | 服务进程（图片代理） |

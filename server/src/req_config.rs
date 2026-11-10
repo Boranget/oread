@@ -34,6 +34,8 @@ pub(super) struct HttpConf {
     pub(super) all_concurrency: usize,
     pub(super) timeout_secs: u64,
     pub(super) search_timeout_secs: u64,
+    /// `scope=all` 的单源预算（与 curated 解耦：all 覆盖上百个源，单源预算要短）。
+    pub(super) search_all_timeout_secs: u64,
     /// 整批搜索总预算：curated / all 两档。
     pub(super) search_curated_budget_secs: u64,
     pub(super) search_all_budget_secs: u64,
@@ -47,8 +49,9 @@ pub(super) const DEFAULT_CONF: HttpConf = HttpConf {
     all_concurrency: 16,
     timeout_secs: 15,
     search_timeout_secs: 8,
+    search_all_timeout_secs: 5,
     search_curated_budget_secs: 6,
-    search_all_budget_secs: 10,
+    search_all_budget_secs: 25,
     source_concurrency_default: SOURCE_CONCURRENCY_DEFAULT,
     max_body_bytes: 5 * 1024 * 1024,
 };
@@ -56,7 +59,7 @@ pub(super) const DEFAULT_CONF: HttpConf = HttpConf {
 /// 搜索范围：决定参与源集合与总预算。
 ///
 /// - `All`（默认）：全量可搜索源。流水线调度后首条结果通常 0.5s 左右，
-///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 10s。
+///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 25s、单源 5s。
 /// - `Curated`（用户显式选择「精选」）：只跑体检精选源；curated 集合不存在时退化为全量，
 ///   总预算随 `All`；交集为空时退化为 preferred。显式 `source_ids` 会跳过该收缩。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +89,7 @@ impl SearchScope {
     pub fn default_total_budget_secs(self) -> u64 {
         match self {
             Self::Curated => 6,
-            Self::All => 10,
+            Self::All => 25,
         }
     }
 }
@@ -110,18 +113,21 @@ pub fn init(cfg: &Config) {
         all_concurrency: cfg.search_all_slots,
         timeout_secs: cfg.http_timeout_secs,
         search_timeout_secs: cfg.search_timeout_secs,
+        search_all_timeout_secs: cfg.search_all_timeout_secs,
         search_curated_budget_secs: cfg.search_curated_budget_secs,
         search_all_budget_secs: cfg.search_all_budget_secs,
         source_concurrency_default: cfg.source_concurrency_default,
         max_body_bytes: cfg.http_max_body_bytes,
     });
     let per_source = cfg.search_timeout_secs;
+    let all_per_source = cfg.search_all_timeout_secs;
     let curated = cfg.search_curated_budget_secs;
     let all = cfg.search_all_budget_secs;
     // 启动日志：两个生效值必须一眼可见，避免又回到“两者同值”的隐式 bug。
     tracing::info!(
         target: "search_budget",
         per_source_secs = per_source,
+        all_per_source_secs = all_per_source,
         total_curated_secs = curated,
         total_all_secs = all,
         source_slots = cfg.http_concurrency,
@@ -140,12 +146,17 @@ pub fn search_budget() -> Duration {
     Duration::from_secs(conf().search_timeout_secs)
 }
 
-/// 按 scope 的单源预算：两者共用 `SEARCH_TIMEOUT_SECS`（默认 8s）。
+/// 按 scope 的单源预算：curated 用 `SEARCH_TIMEOUT_SECS`（默认 8s），
+/// all 用 `SEARCH_ALL_TIMEOUT_SECS`（默认 5s）。
 ///
-/// `scope` 参数保留用于调用点语义区分；实际值不再按 scope 硬编码 5/6，
-/// 否则环境变量只影响启动日志、不影响真实请求预算。
-pub fn search_budget_for(_scope: SearchScope) -> Duration {
-    Duration::from_secs(conf().search_timeout_secs)
+/// `all` 要覆盖上百个源：单源预算越长，16 个并发槽越容易被慢站占满，
+/// 同预算下跑到的源越少（实测 8s→5s 覆盖 20 → 90 个源）。
+pub fn search_budget_for(scope: SearchScope) -> Duration {
+    let secs = match scope {
+        SearchScope::Curated => conf().search_timeout_secs,
+        SearchScope::All => conf().search_all_timeout_secs,
+    };
+    Duration::from_secs(secs)
 }
 
 /// 一次聚合搜索的整批时长上限（含排队）。与单源预算独立：

@@ -33,6 +33,8 @@
     "rss_bytes": "<volatile>",
     "rss_mb": "<volatile>",
     "search": {
+      "all_per_source_ms": 5000,
+      "all_per_source_secs": 5,
       "all_source_slots": 16,
       "comic_slots": 4,
       "comic_slots_all": 4,
@@ -44,7 +46,7 @@
       "source_limit_wait_ms": "<volatile>",
       "source_limit_waits": "<volatile>",
       "source_slots": 16,
-      "total_all_secs": 10,
+      "total_all_secs": 25,
       "total_curated_secs": 6
     },
     "version": "1.0.0"

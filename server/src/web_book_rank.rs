@@ -269,7 +269,7 @@ pub async fn search_all_with_errors_budgeted(
 }
 
 /// 按 scope 使用与 `/api/search/start` 相同的单源/整批预算与并发池：
-/// `curated` 5s/6s、`all` 6s/10s。legacy `/api/search` 走这里，
+/// `curated` 8s/6s、`all` 5s/25s。legacy `/api/search` 走这里，
 /// 保证同一关键词在同一源集合下拿到的结果集合与两段式一致。
 pub async fn search_all_with_errors_scoped(
     sources: &[BookSource],

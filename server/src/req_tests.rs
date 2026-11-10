@@ -656,7 +656,7 @@ fn scope_parse_defaults_to_all() {
     assert_eq!(SearchScope::parse(Some("ENHANCED")), SearchScope::All);
 }
 
-// 两个预算独立：单源两个 scope 共用 8s；整批 curated 6s / all 10s
+// 两个预算独立：curated 单源 8s / 整批 6s；all 单源 5s / 整批 25s
 #[test]
 fn total_budget_defaults_follow_scope_not_per_source() {
     assert_eq!(search_budget(), Duration::from_secs(8), "通用单源默认 8s");
@@ -664,11 +664,10 @@ fn total_budget_defaults_follow_scope_not_per_source() {
         search_budget_for(SearchScope::Curated),
         Duration::from_secs(8)
     );
-    assert_eq!(search_budget_for(SearchScope::All), Duration::from_secs(8));
     assert_eq!(
-        search_budget_for(SearchScope::Curated),
         search_budget_for(SearchScope::All),
-        "单源预算不再按 scope 硬编码 5/6"
+        Duration::from_secs(5),
+        "all 要覆盖上百个源，单源预算必须更短才能跑更多源"
     );
     assert_eq!(
         search_total_budget(SearchScope::Curated),
@@ -676,7 +675,7 @@ fn total_budget_defaults_follow_scope_not_per_source() {
     );
     assert_eq!(
         search_total_budget(SearchScope::All),
-        Duration::from_secs(10)
+        Duration::from_secs(25)
     );
     assert_ne!(
         search_total_budget(SearchScope::All),

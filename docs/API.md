@@ -107,7 +107,7 @@
 | 单源 200 本、总结果 400 本上限 | 5.5 | 源码级，未直接触发截断 |
 | `@js:` 返回数组改为 JSON 字符串 | 2.7 | 仅单测（`rule_engine.rs` 用例） |
 | DOM 桥 `getElements/getString/getStringList` 仅字面量选择器；输入 1 MiB / 节点 2000 / 抽取 1 MiB；JS 3000ms 预算 | 2.7、6.4 | 字面量选择器与 DOM 桥**仅单测**；三个上限与 3000ms 超预算为**源码级，未验证** |
-| `HTTP_CONCURRENCY` 默认 16（1..16）、`SEARCH_TIMEOUT_SECS` 8（5..30）、`SEARCH_CURATED_BUDGET_SECS` 6 / `SEARCH_ALL_BUDGET_SECS` 10（2..60） | 15.4 | `HTTP_CONCURRENCY` 源码级；预算经 `/healthz` 的 `search` 块与 `deadline_ms`/`total_budget_ms` **HTTP 实测**（2026-11-04 扫参） |
+| `HTTP_CONCURRENCY` 默认 16（1..16）、`SEARCH_TIMEOUT_SECS` 8（5..30）、`SEARCH_ALL_TIMEOUT_SECS` 5（5..30）、`SEARCH_CURATED_BUDGET_SECS` 6 / `SEARCH_ALL_BUDGET_SECS` 25（2..60） | 15.4 | `HTTP_CONCURRENCY` 源码级；预算经 `/healthz` 的 `search` 块与 `deadline_ms`/`total_budget_ms` **HTTP 实测**（2026-11-04 扫参） |
 
 > 本轮 HTTP 证据来自 `:3000` 上运行的工程侧旧构建名 `legado-server.exe`（对外发布名 `boranlib.exe`；**9,259,520 B / mtime 2026-11-03 13:32:29**），与上一轮 11:08 回归二进制不同。`books.rs` 磁盘 mtime 为 14:06（晚于被测二进制）；两段式搜索的字段与行为按磁盘源码核对，若后续源码改动与实测不一致，以重新构建后的结果为准。
 
@@ -1294,7 +1294,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `q` | string | 否* | `key` 的别名；仅在未传 `key` 时生效 |
 | `source_ids` | string | 否 | 逗号分隔；去空、去重、保留输入顺序。每项先按 `book_source_url` 精确匹配；匹配不到再按**排序后的可搜索启用源**（`enabled && rule_search && search_url`，与 `/api/sources` 同一 `sort_sources` 顺序）的 1-based 序号解析；非法/禁用/越界项忽略。若前端列出的源含禁用/不可搜索项，序号只在该可搜索子集内计数 |
 | `include_cooled` | string | 否 | `1`/`true` 时把冷却中的源也加入 job（排查用）；默认跳过。隔离区源无论该参数如何都不参与 |
-| `scope` | string | 否 | `curated`（默认，只跑精选/优选源，总预算 6s）/ `all`（**加强搜索**，全量源，总预算 10s；源级并发 16）。单源预算两 scope 共用 `SEARCH_TIMEOUT_SECS`（默认 8s）。<br>**curated 退化行为**：精选集合（`8535ed22…`）未就绪时按 `tier=preferred` 近似；一个 preferred 都没有（tier 数据未建立）则退回全量，避免 0 命中 |
+| `scope` | string | 否 | `curated`（默认，只跑精选/优选源，总预算 6s）/ `all`（**加强搜索**，全量源，总预算 25s；源级并发 16）。单源预算按 scope 分档：`curated` 用 `SEARCH_TIMEOUT_SECS`（默认 8s），`all` 用 `SEARCH_ALL_TIMEOUT_SECS`（默认 5s）。<br>**curated 退化行为**：精选集合（`8535ed22…`）未就绪时按 `tier=preferred` 近似；一个 preferred 都没有（tier 数据未建立）则退回全量，避免 0 命中 |
 
 \* `key` 与 `q` 至少提供一个，且最终值非空；否则 400。`q` 别名同样适用于 5.1/5.2（共用 `SearchQ`；`/api/search?q=…` 已实测 200）。
 
@@ -1328,8 +1328,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `skipped_cooldown` | integer | 否 | 因冷却被跳过的源数（在 `source_ids` 过滤后的候选里计数） |
 | `cooldown_total` | integer | 否 | 本地全部处于冷却中的源数（不受 `source_ids` 影响） |
 | `include_cooled` | boolean | 否 | 回显是否放行冷却源 |
-| `deadline_ms` | integer | 否 | **单源**搜索预算（毫秒），= `SEARCH_TIMEOUT_SECS × 1000`，默认 `8000`，curated/all 共用；不是整次搜索的硬上限 |
-| `total_budget_ms` | integer | 否 | **整批**搜索总预算（毫秒）。优先级：`SEARCH_CURATED_BUDGET_SECS`/`SEARCH_ALL_BUDGET_SECS`（按 scope）> `SEARCH_TOTAL_BUDGET_SECS`（统一覆盖）> scope 默认（curated 6000 / all 10000） |
+| `deadline_ms` | integer | 否 | **单源**搜索预算（毫秒），按 scope 取值：`curated` = `SEARCH_TIMEOUT_SECS × 1000`（默认 `8000`），`all` = `SEARCH_ALL_TIMEOUT_SECS × 1000`（默认 `5000`）；不是整次搜索的硬上限 |
+| `total_budget_ms` | integer | 否 | **整批**搜索总预算（毫秒）。优先级：`SEARCH_CURATED_BUDGET_SECS`/`SEARCH_ALL_BUDGET_SECS`（按 scope）> `SEARCH_TOTAL_BUDGET_SECS`（统一覆盖）> scope 默认（curated 6000 / all 25000） |
 | `scope` | string | 否 | 回显生效范围：`curated` / `all` |
 | `phase` | string | 否 | 两段式阶段：仍有未完成源时为 `first`，全部完成（`done=true`）为 `final` |
 | `partial` | boolean | 否 | 是否为“部分结果”（`!done`）；与 `phase=first` 同义 |
@@ -2996,10 +2996,12 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `http.concurrency` | integer | 否 | 源级并发槽（`HTTP_CONCURRENCY`，1..16） |
 | `http.timeout_secs` | integer | 否 | `HTTP_TIMEOUT_SECS` |
 | `http.max_body_mb` | integer | 否 | `HTTP_MAX_BODY_MB` |
-| `search.per_source_secs` | integer | 否 | 单源搜索预算（`SEARCH_TIMEOUT_SECS`，curated/all 共用） |
-| `search.per_source_ms` | integer | 否 | 同上，毫秒（= `deadline_ms` 的取值来源） |
+| `search.per_source_secs` | integer | 否 | `curated` 单源搜索预算（`SEARCH_TIMEOUT_SECS`，默认 8） |
+| `search.per_source_ms` | integer | 否 | 同上，毫秒（= `curated` 的 `deadline_ms` 取值来源） |
+| `search.all_per_source_secs` | integer | 否 | `all` 单源搜索预算（`SEARCH_ALL_TIMEOUT_SECS`，默认 5） |
+| `search.all_per_source_ms` | integer | 否 | 同上，毫秒（= `all` 的 `deadline_ms` 取值来源） |
 | `search.total_curated_secs` | integer | 否 | `scope=curated` 整批预算（`SEARCH_CURATED_BUDGET_SECS`，默认 6） |
-| `search.total_all_secs` | integer | 否 | `scope=all` 整批预算（`SEARCH_ALL_BUDGET_SECS`，默认 10） |
+| `search.total_all_secs` | integer | 否 | `scope=all` 整批预算（`SEARCH_ALL_BUDGET_SECS`，默认 25） |
 | `search.source_slots` | integer | 否 | `curated` 的源级槽（= `HTTP_CONCURRENCY`） |
 | `search.all_source_slots` | integer | 否 | `all` 的源级槽（显式设置时为 `min(HTTP_CONCURRENCY,16)`，未设置时 16） |
 | `search.comic_slots` / `search.comic_slots_all` | integer | 否 | 漫画源独立小池（小说槽的 1/4，至少 1） |
@@ -3470,10 +3472,11 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 | `BORANLIB_CACHE_LIMIT_MB` | `LEGADO_CACHE_LIMIT_MB` | `50`（4..512） | 全局正文缓存上限 |
 | `BORANLIB_HTTP_CONCURRENCY` | `LEGADO_HTTP_CONCURRENCY` | `16`（1..16） | **出站 HTTP 请求并发**（进程级全局信号量），与「每源在飞上限」叠加：单源先受 `concurrentRate`（默认 8）约束，再参与全局 16 槽竞争。默认 16：2026-11-04 扫参照（同预算 10s、单源 8s）下 8→16 命中源 12.5%→15.8%（+3.3pt），首屏不变；显式设置时 `scope=all` 也取该值（上限 16） |
 | `BORANLIB_SOURCE_CONCURRENCY_DEFAULT` | `LEGADO_SOURCE_CONCURRENCY_DEFAULT` | `8`（1..8） | **每源在飞请求上限的默认值**，仅在书源未声明 `concurrentRate` 时使用；`0`/非法回退 8，超过 8 夹回。默认 8 与旧行为等价；收紧到 2/4 只在同源图片突发时增加排队、RSS 无显著收益（2026-11-05 对照），按设备需要自行下调。运行中改它需重启；单源覆盖见书源字段 `concurrentRate` |
-| `BORANLIB_SEARCH_TIMEOUT_SECS` | `LEGADO_SEARCH_TIMEOUT_SECS` | `8`（5..30） | **单源**搜索预算，curated/all 共用；影响 `/api/search`、`/api/search/aggregate`、`/api/search/start`、`/api/search/result` 的 `deadline_ms`。只设它、不设任何整批变量时整批预算与它同值（兼容旧部署） |
+| `BORANLIB_SEARCH_TIMEOUT_SECS` | `LEGADO_SEARCH_TIMEOUT_SECS` | `8`（5..30） | **curated 单源**搜索预算；影响 `/api/search`、`/api/search/aggregate`、`/api/search/start`、`/api/search/result` 的 `deadline_ms`。只设它、不设任何整批变量时整批预算与它同值（兼容旧部署） |
+| `BORANLIB_SEARCH_ALL_TIMEOUT_SECS` | `LEGADO_SEARCH_ALL_TIMEOUT_SECS` | `5`（5..30） | **all 单源**搜索预算。`all` 要覆盖上百个源，单源预算越长，16 个并发槽越容易被慢站占满，同预算下跑到的源越少（实测 8s→5s：覆盖 20 → 90 个源）。未设置时沿用 `SEARCH_TIMEOUT_SECS` |
 | `BORANLIB_SEARCH_CURATED_BUDGET_SECS` | `LEGADO_SEARCH_CURATED_BUDGET_SECS` | `6`（2..60） | **curated 整批**搜索总预算；优先级高于 `SEARCH_TOTAL_BUDGET_SECS` |
-| `BORANLIB_SEARCH_ALL_BUDGET_SECS` | `LEGADO_SEARCH_ALL_BUDGET_SECS` | `10`（2..60） | **all 整批**搜索总预算；优先级高于 `SEARCH_TOTAL_BUDGET_SECS` |
-| `BORANLIB_SEARCH_TOTAL_BUDGET_SECS` | `LEGADO_SEARCH_TOTAL_BUDGET_SECS` | 按 scope（curated `6` / all `10`，2..60） | **整批**搜索总预算的统一覆盖值（两 scope 同值）；显式按 scope 的变量优先。启动日志打印 `per_source_secs` / `total_curated_secs` / `total_all_secs`，`/healthz` 的 `search` 块同源可查 |
+| `BORANLIB_SEARCH_ALL_BUDGET_SECS` | `LEGADO_SEARCH_ALL_BUDGET_SECS` | `25`（2..60） | **all 整批**搜索总预算；优先级高于 `SEARCH_TOTAL_BUDGET_SECS` |
+| `BORANLIB_SEARCH_TOTAL_BUDGET_SECS` | `LEGADO_SEARCH_TOTAL_BUDGET_SECS` | 按 scope（curated `6` / all `25`，2..60） | **整批**搜索总预算的统一覆盖值（两 scope 同值）；显式按 scope 的变量优先。启动日志打印 `per_source_secs` / `all_per_source_secs` / `total_curated_secs` / `total_all_secs`，`/healthz` 的 `search` 块同源可查 |
 | `BORANLIB_HTTP_TIMEOUT_SECS` | `LEGADO_HTTP_TIMEOUT_SECS` | `15`（3..60） | 单次抓取超时 |
 | `BORANLIB_HTTP_MAX_BODY_MB` | `LEGADO_HTTP_MAX_BODY_MB` | `5`（1..32） | 响应体截断上限 |
 | `BORANLIB_JS_ENABLED` | `LEGADO_JS_ENABLED` | `true` | 书源 JS 规则开关 |
