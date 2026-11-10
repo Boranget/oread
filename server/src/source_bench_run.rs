@@ -799,6 +799,7 @@ pub(super) async fn record_bench_health(
                 parsed: true,
                 // 体检不是用户搜索：只更新可用性/延迟，不污染 hit_rate / yield。
                 usage: false,
+                query_class: crate::query_class::QueryClass::Normal,
                 rule_complete,
             }
         })

@@ -51,6 +51,7 @@ pub(super) async fn search(
             &s.shared,
             sources,
             &[],
+            &key,
             requested_scope,
             include_cooled,
             // `/k` 精选集合缺失时不退全量：只跑 preferred 层，保住 KPW3 首屏耗时。
@@ -58,7 +59,7 @@ pub(super) async fn search(
         )
         .await;
         // `/k/search` 与网页端共用 `aggregated` 的边界过滤：只保留书名包含关键词的结果。
-        let active = crate::routes::books::order_by_health(plan.active, &plan.health);
+        let active = crate::routes::books::order_by_health(plan.active, &plan.health, &plan.prior);
         let (books, _errors, _title_filter) =
             crate::routes::books::aggregated(&active, &key, include_cooled, plan.scope).await;
         let strong_total = books

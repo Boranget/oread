@@ -248,27 +248,6 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
     view
 }
 
-/// 同一批次内的入队顺序键（越小越先占并发槽）：
-/// - `0`：有延迟样本且最近一次不是站点失败 → 按「每秒有效结果」（`search_ev_ppm`）降序；
-/// - `1`：无观测数据（新导入/从未搜到过）→ 排在已知可用源之后；
-/// - `2`：最近一次是站点失败 → 垫底，让预算优先给可用源。
-///
-/// 产出证据用 `kept_hits`（书名匹配后的命中），不是解析条数：一个源能返回
-/// 30 条无关结果，对当前查询仍然是 0 产出。只调整顺序，不改变参与集合、
-/// 预算与并发上限，因此不会减少「本来能在预算内完成」的源。
-pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64) {
-    let Some(h) = h else {
-        return (1, 0);
-    };
-    let latency = h.ttfb_ms_p90.or(h.avg_latency_ms);
-    match (h.last_status == source_health::STATUS_FAIL, latency) {
-        (true, l) => (2, l.unwrap_or(i64::MAX)),
-        // 取负值：EV 越大越靠前（`sort_by_key` 是升序）。
-        (false, Some(_)) => (0, -source_health::search_ev_ppm(h)),
-        (false, None) => (1, 0),
-    }
-}
-
 /// 该失败文案是否属于“超时”（单源预算用尽或底层请求超时）。
 ///
 /// 超时在聚合搜索里是**不确定**证据：同一个源在体检（低并发）下可能很快。
@@ -305,7 +284,78 @@ pub(super) fn timeout_is_truncation(remain: Duration, budget: Duration) -> bool 
     remain.saturating_add(Duration::from_secs(1)) < budget
 }
 
-#[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消），拆分仅把参数列表搬到另一层。
+/// 早停门槛：已经拿到两页以上的书名匹配结果，且至少跑过一批源，才提前收工。
+///
+/// 宁可多跑几个源，也不要在冷门查询上因为「前几个源恰好命中」而错过正主：
+/// 阈值取一页（30）的两倍，并要求至少 24 个源已完成。
+const EARLY_STOP_KEPT: i64 = 60;
+const EARLY_STOP_MIN_FINISHED: usize = 24;
+
+/// 单个源的一次执行结果（尚未写入 job 状态）。
+pub(super) struct SourceRun {
+    pub(super) src: crate::entities::BookSource,
+    pub(super) outcome: TaskOutcome,
+    pub(super) latency_ms: i64,
+    pub(super) attempted: bool,
+}
+
+pub(super) enum TaskOutcome {
+    Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
+    /// 用满单源预算仍超时：记为「未知」（partial + 不计产出），不判死站点
+    Timeout(String),
+    /// 全局 deadline 提前截断（剩余预算明显不足单源预算）：不算站点失败
+    Truncated(String),
+    /// 排队到全局 deadline 仍未拿到并发槽，或剩余预算已不足以发请求
+    Skipped(String),
+}
+
+/// 动态单源预算：剩余时间按「还剩几轮并发」摊，最多给 2 份，夹在 [2s, cap]。
+///
+/// 固定 8s 上限在尾部会让慢源吃掉整批预算；这里让越接近 deadline 的请求
+/// 拿到越短的预算，保证「还能再试一个源」而不是「卡在最后一个源上超时」。
+pub(super) fn dynamic_budget(
+    deadline: tokio::time::Instant,
+    remaining_sources: usize,
+    slots: usize,
+    cap: Duration,
+) -> Duration {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let slots = slots.max(1);
+    let waves_left = remaining_sources.max(1).div_ceil(slots).max(1) as u32;
+    let share = left / waves_left;
+    let floor = Duration::from_secs(2).min(cap);
+    (share * 2).clamp(floor, cap)
+}
+
+pub(super) fn should_stop_early(kept_total: i64, finished: usize, total: usize) -> bool {
+    finished >= EARLY_STOP_MIN_FINISHED.min(total) && kept_total >= EARLY_STOP_KEPT
+}
+
+fn sort_queue(
+    queue: &mut [crate::entities::BookSource],
+    health: &HashMap<String, source_health::HealthRow>,
+    prior: &crate::search_priority::SearchPrior,
+) {
+    queue.sort_by_key(|s| prior.priority(&s.book_source_url, health.get(&s.book_source_url)));
+}
+
+fn resort_queue(
+    queue: &Mutex<Vec<crate::entities::BookSource>>,
+    health: &HashMap<String, source_health::HealthRow>,
+    prior: &crate::search_priority::SearchPrior,
+) {
+    let mut g = queue.lock().unwrap();
+    sort_queue(&mut g, health, prior);
+}
+
+/// 一次搜索的 anytime 调度：单一优先队列，每完成一个源就按最新证据重排。
+///
+/// 与旧的两批 `join!` 相比：
+/// - 不再让 `preferred` 整批占住槽位，慢的优选源不会挡住高产出普通源；
+/// - 每完成一个源就把结果折进证据，后续源的顺序反映本次搜索的实际产出；
+/// - 槽位空出即取当前最优的源，不需要等整轮跑完；
+/// - 达到早停门槛或 deadline 时停止**取新源**，已在飞的请求照常完成。
+#[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消）。
 pub(super) async fn run_search_job(
     job: Arc<SearchJob>,
     sources: Vec<crate::entities::BookSource>,
@@ -315,130 +365,94 @@ pub(super) async fn run_search_job(
     store: Arc<web_book::BookStore>,
     cooldown_secs: u64,
     tier_cfg: crate::source_quality::TierConfig,
-    health: HashMap<String, source_health::HealthRow>,
+    mut health: HashMap<String, source_health::HealthRow>,
+    mut prior: crate::search_priority::SearchPrior,
     scope: crate::req::SearchScope,
 ) {
     // 后台体检通过 `searches_active()` 感知用户搜索，先让路再跑。
     let _active = SearchActiveGuard::new();
-    // 单源与整批预算独立：curated 8s/6s，all 5s/25s（见 req::search_budget_for）。
-    let budget = crate::req::search_budget_for(scope);
+    let per_source_cap = crate::req::search_budget_for(scope);
     let total_budget = crate::req::search_total_budget(scope);
     // 排队等槽不计入单源预算，但整次搜索仍受此上限约束。
     let deadline = tokio::time::Instant::now() + total_budget;
+    let slots = crate::req::search_slots(scope).max(1);
 
-    // 两批同时进调度：preferred 先入队（优先占源级并发槽），但不再等它整批跑完；
-    // observing 立刻跟上，共用同一总预算与同一套源级并发信号量。
-    // 各自完成即写回结果，首批慢站不再拖住首屏。
-    let (mut preferred, mut observing): (Vec<_>, Vec<_>) = sources
-        .into_iter()
-        .partition(|s| source_health::is_preferred(health.get(&s.book_source_url)));
-
-    // 慢源后置：并发槽按入队顺序分配，先入队的是「已知快且近期正常」的源；
-    // 慢源/近期站点失败源排到队尾，临近总预算时被自然截断（只记 skipped，不当站点故障冷却）。
-    preferred.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
-    observing.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
-
-    let (mut pref_outcomes, obs_outcomes) = tokio::join!(
-        run_search_batch(
-            &job, preferred, &key, deadline, budget, &health, scope, &book_pool, &store,
-        ),
-        run_search_batch(
-            &job, observing, &key, deadline, budget, &health, scope, &book_pool, &store,
-        )
-    );
-    pref_outcomes.extend(obs_outcomes);
-
-    if let Err(e) =
-        source_health::record_outcomes(&pool, &pref_outcomes, cooldown_secs, &tier_cfg).await
-    {
-        tracing::warn!(error = %e, "record source health after search failed");
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // 与 `run_search_job` 同一批调度参数，保持签名对称便于对照。
-pub(super) async fn run_search_batch(
-    job: &Arc<SearchJob>,
-    sources: Vec<crate::entities::BookSource>,
-    key: &str,
-    phase_deadline: tokio::time::Instant,
-    budget: Duration,
-    health: &HashMap<String, source_health::HealthRow>,
-    scope: crate::req::SearchScope,
-    book_pool: &SqlitePool,
-    store: &Arc<web_book::BookStore>,
-) -> Vec<source_health::Outcome> {
-    enum TaskOutcome {
-        Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
-        /// 拿到槽后用满单源预算仍超时：算真实站点失败
-        Timeout(String),
-        /// 全局 deadline 提前截断（剩余预算明显不足单源预算）：不算站点失败
-        Truncated(String),
-        /// 排队到全局 deadline 仍未拿到并发槽
-        Skipped(String),
-    }
-
-    let mut pending = futures::stream::FuturesUnordered::new();
-    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
+    let mut queue: Vec<crate::entities::BookSource> = sources;
+    sort_queue(&mut queue, &health, &prior);
+    let source_total = queue.len();
     {
         let mut st = job.state.lock().unwrap();
-        st.scheduled += sources.len();
+        // anytime 调度下所有源都在同一个优先队列里，`scheduled` 在真正取源时累加，
+        // 这样进度接口仍能显示「已排上 / 尚未排上」，而不是一开始就全量排上。
+        st.pending = source_total;
     }
-    for src in sources {
-        let s = src.clone();
-        let k = key.to_string();
-        let st = store.clone();
-        let bp = book_pool.clone();
-        pending.push(async move {
-            let comic = crate::req::is_comic_source_type(s.book_source_type);
-            let queued_at = Instant::now();
-            let slot = match crate::req::acquire_search_slot(comic, phase_deadline, scope).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let waited = queued_at.elapsed().as_millis() as i64;
-                    return (s, TaskOutcome::Skipped(format!("{e}")), waited, false);
+    tracing::debug!(
+        target: "search_schedule",
+        job_id = %job.id,
+        scope = scope.as_str(),
+        query_class = prior.class.as_str(),
+        sources = source_total,
+        slots,
+        "anytime search start"
+    );
+
+    let queue = Arc::new(Mutex::new(queue));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut outcomes: Vec<source_health::Outcome> = Vec::new();
+    let mut kept_total: i64 = 0;
+
+    // 队列里只放「还没开始跑」的源；已开始的由 buffer_unordered 管理。
+    // unfold 每次只在有槽位时被拉取，因此拿到的 `left` 就是当下的剩余源数。
+    let src_stream = {
+        let q = queue.clone();
+        let stop = stop.clone();
+        let job = job.clone();
+        futures::stream::unfold(q, move |q| {
+            let stop = stop.clone();
+            let job = job.clone();
+            async move {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
                 }
-            };
-            let started = Instant::now();
-            let remain = phase_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remain.is_zero() {
-                drop(slot);
-                return (
-                    s,
-                    TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
-                    started.elapsed().as_millis() as i64,
-                    false,
-                );
-            }
-            let r = tokio::time::timeout(
-                remain.min(budget),
-                web_book::search_book(&s, &k, 1, Some(st.as_ref())),
-            )
-            .await;
-            // 搜索阶段的 `@put`（爱看写 bid）按 book_key 落库，供后续 info/toc 读回。
-            let changes = st.take_changes();
-            if !changes.is_empty() {
-                persist_book_changes(&bp, changes).await;
-            }
-            let latency_ms = started.elapsed().as_millis() as i64;
-            drop(slot);
-            let outcome = match r {
-                Ok(x) => TaskOutcome::Done(x),
-                Err(_) => {
-                    if timeout_is_truncation(remain, budget) {
-                        TaskOutcome::Truncated(format!(
-                            "全局搜索预算耗尽（排队后仅剩 {}ms，未完成请求）",
-                            remain.as_millis()
-                        ))
+                let next = {
+                    let mut g = q.lock().unwrap();
+                    if g.is_empty() {
+                        None
                     } else {
-                        TaskOutcome::Timeout(format!("搜索超时（单源 {}s 预算）", budget.as_secs()))
+                        Some((g.remove(0), g.len()))
                     }
+                };
+                if next.is_some() {
+                    // 只有真正从队列取出（交给 buffer_unordered）才算「已排上」。
+                    job.state.lock().unwrap().scheduled += 1;
                 }
-            };
-            (s, outcome, latency_ms, true)
-        });
-    }
-    // 健康状态只在任务收尾时批量写一次，不随每本书/每条结果写库。
-    while let Some((src, outcome, latency_ms, attempted)) = pending.next().await {
+                next.map(|(src, left)| ((src, left), q))
+            }
+        })
+    };
+
+    // 漫画源走独立小池（1/4 槽）。给 stream 多留出这部分并发，
+    // 否则等漫画槽的小说任务会占住 stream 槽位，拖慢小说源。
+    let stream_slots = slots + crate::req::comic_slot_count(slots);
+    let inflight = src_stream
+        .map(|(src, left)| {
+            let key = key.clone();
+            let bp = book_pool.clone();
+            let st = store.clone();
+            let budget = dynamic_budget(deadline, left + 1, slots, per_source_cap);
+            async move { search_one_source(src, key, deadline, budget, scope, bp, st).await }
+        })
+        .buffer_unordered(stream_slots);
+    // `unfold` 的闭包返回非 Unpin 的 async block，`next()` 需要显式钉住整个流。
+    futures::pin_mut!(inflight);
+
+    while let Some(run) = inflight.next().await {
+        let SourceRun {
+            src,
+            outcome,
+            latency_ms,
+            attempted,
+        } = run;
         // 逐源耗时埋点（默认 debug 不输出；扫参时开 `RUST_LOG=search_source=debug`）。
         // 排队时间不计入 latency_ms，`timed_out` 只标真实请求超时，与 Skipped 区分。
         // `hits` = 解析条数；`kept_hits` = 其中书名真匹配的条数（搜索产出率只用后者）。
@@ -446,7 +460,7 @@ pub(super) async fn run_search_batch(
             TaskOutcome::Done(Ok(b)) => (
                 "ok",
                 b.len() as i64,
-                crate::title_filter::count_title_matches(b, key),
+                crate::title_filter::count_title_matches(b, &key),
                 false,
             ),
             TaskOutcome::Done(Err(_)) => ("error", 0, 0, false),
@@ -466,6 +480,7 @@ pub(super) async fn run_search_batch(
             "search source done"
         );
         let rule_complete = crate::source_quality::rule_completeness(&src);
+        let mut recorded: Option<source_health::Outcome> = None;
         let mut st = job.state.lock().unwrap();
         if attempted {
             st.attempted += 1;
@@ -488,7 +503,7 @@ pub(super) async fn run_search_batch(
                     b.score = Some(src_score);
                 }
                 st.books.append(&mut books);
-                outcomes.push(source_health::Outcome {
+                recorded = Some(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status: source_health::STATUS_OK,
                     latency_ms,
@@ -497,6 +512,7 @@ pub(super) async fn run_search_batch(
                     kept_hits,
                     parsed: true,
                     usage: true,
+                    query_class: prior.class,
                     rule_complete,
                 });
             }
@@ -515,7 +531,7 @@ pub(super) async fn run_search_batch(
                     error: msg.clone(),
                     kind: kind.to_string(),
                 });
-                outcomes.push(source_health::Outcome {
+                recorded = Some(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status,
                     latency_ms,
@@ -524,6 +540,7 @@ pub(super) async fn run_search_batch(
                     kept_hits: 0,
                     parsed: false,
                     usage,
+                    query_class: prior.class,
                     rule_complete,
                 });
             }
@@ -539,7 +556,7 @@ pub(super) async fn run_search_batch(
                     error: err.clone(),
                     kind: "timeout".to_string(),
                 });
-                outcomes.push(source_health::Outcome {
+                recorded = Some(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status: source_health::STATUS_PARTIAL,
                     latency_ms,
@@ -548,6 +565,7 @@ pub(super) async fn run_search_batch(
                     kept_hits: 0,
                     parsed: false,
                     usage: false,
+                    query_class: prior.class,
                     rule_complete,
                 });
             }
@@ -575,7 +593,133 @@ pub(super) async fn run_search_batch(
         }
         st.finished += 1;
         st.pending = st.pending.saturating_sub(1);
+        let finished = st.finished;
         drop(st);
+
+        // 在线更新证据：本次结果立即影响后续源的顺序。落库仍在收尾统一做。
+        if let Some(o) = recorded {
+            if o.usage {
+                prior.observe(&o.source_url, o.kept_hits);
+                let row = source_health::apply_outcome(
+                    health.get(&o.source_url),
+                    &o,
+                    source_health::now_ms(),
+                    cooldown_secs,
+                );
+                health.insert(o.source_url.clone(), row);
+            }
+            outcomes.push(o);
+        }
+        kept_total += kept_hits;
+        resort_queue(&queue, &health, &prior);
+
+        if should_stop_early(kept_total, finished, source_total) {
+            tracing::debug!(
+                target: "search_schedule",
+                job_id = %job.id,
+                finished,
+                kept_total,
+                remaining = queue.lock().unwrap().len(),
+                reason = "enough_results",
+                "early stop"
+            );
+            stop.store(true, Ordering::Relaxed);
+        } else if tokio::time::Instant::now() >= deadline {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
-    outcomes
+
+    // 提前停止/deadline 后仍未取出的源：记为 skipped（不写健康、不算站点失败）。
+    {
+        let mut g = queue.lock().unwrap();
+        let mut st = job.state.lock().unwrap();
+        for s in g.drain(..) {
+            st.skipped += 1;
+            st.errors.push(web_book::SourceFailure {
+                source: s.book_source_url.clone(),
+                source_name: s.book_source_name.clone(),
+                error: "全局搜索预算耗尽（排队未及执行）".to_string(),
+                kind: "skipped".to_string(),
+            });
+            st.finished += 1;
+            st.pending = st.pending.saturating_sub(1);
+        }
+    }
+
+    if let Err(e) = source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
+    {
+        tracing::warn!(error = %e, "record source health after search failed");
+    }
+}
+
+/// 跑一个源：拿源级并发槽 → 单源预算内请求 → 分类超时/截断。
+///
+/// 排队时间不计入 `latency_ms`；`timed_out` 只标真实请求超时，与 Skipped 区分。
+pub(super) async fn search_one_source(
+    s: crate::entities::BookSource,
+    key: String,
+    deadline: tokio::time::Instant,
+    budget: Duration,
+    scope: crate::req::SearchScope,
+    book_pool: SqlitePool,
+    store: Arc<web_book::BookStore>,
+) -> SourceRun {
+    let comic = crate::req::is_comic_source_type(s.book_source_type);
+    let queued_at = Instant::now();
+    let slot = match crate::req::acquire_search_slot(comic, deadline, scope).await {
+        Ok(p) => p,
+        Err(e) => {
+            let waited = queued_at.elapsed().as_millis() as i64;
+            return SourceRun {
+                src: s,
+                outcome: TaskOutcome::Skipped(format!("{e}")),
+                latency_ms: waited,
+                attempted: false,
+            };
+        }
+    };
+    let started = Instant::now();
+    let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+    // 剩余不足 500ms 时发请求只会制造必然超时的假失败（超时虽按「未知」处理，
+    // 但会占用槽位与错误列表）；直接按预算耗尽归为 skipped。
+    if remain < Duration::from_millis(500) {
+        drop(slot);
+        return SourceRun {
+            src: s,
+            outcome: TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
+            latency_ms: started.elapsed().as_millis() as i64,
+            attempted: false,
+        };
+    }
+    let r = tokio::time::timeout(
+        remain.min(budget),
+        web_book::search_book(&s, &key, 1, Some(store.as_ref())),
+    )
+    .await;
+    // 搜索阶段的 `@put`（爱看写 bid）按 book_key 落库，供后续 info/toc 读回。
+    let changes = store.take_changes();
+    if !changes.is_empty() {
+        persist_book_changes(&book_pool, changes).await;
+    }
+    let latency_ms = started.elapsed().as_millis() as i64;
+    drop(slot);
+    let outcome = match r {
+        Ok(x) => TaskOutcome::Done(x),
+        Err(_) => {
+            if timeout_is_truncation(remain, budget) {
+                TaskOutcome::Truncated(format!(
+                    "全局搜索预算耗尽（排队后仅剩 {}ms，未完成请求）",
+                    remain.as_millis()
+                ))
+            } else {
+                TaskOutcome::Timeout(format!("搜索超时（单源 {}s 预算）", budget.as_secs()))
+            }
+        }
+    };
+    SourceRun {
+        src: s,
+        outcome,
+        latency_ms,
+        attempted: true,
+    }
 }

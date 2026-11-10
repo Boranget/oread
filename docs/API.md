@@ -994,7 +994,13 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 搜索产出证据（迁移 `0015`）：真实搜索（`usage=true`）除 `hit_count`（解析条数）外，还累计
   `kept_hit_count`（书名匹配命中条数）与 `yield_ok_count`（`kept_hits > 0` 的次数），
   用于搜索入队的「每秒有效结果」估计；体检/巡检不写这两列。`evidence_json` 同时暴露
-  `kept_hit_count` / `yield_ok_count` / `yield_rate`。设计见 [DESIGN_SEARCH.md](DESIGN_SEARCH.md)。
+  `kept_hit_count` / `yield_ok_count` / `yield_rate`，以及诊断标记 `rule_stale`
+  （真实搜索 ≥ 5 次且解析成功率不足一半；只提示，不改档位）。
+- 查询类证据（迁移 `0016`）：`source_query_stats` 按 `(source_url, query_class)` 记录
+  `search_count` / `yield_ok_count` / `kept_hit_count`，写入时按 14 天半衰期衰减。
+  `query_class` 由关键词启发式分为 `hot`（命中体检语料）/`normal`/`obscure`/`author`/`serial`，
+  只影响搜索入队顺序，不改变参与搜索的源集合与返回结果。
+  设计见 [DESIGN_SEARCH.md](DESIGN_SEARCH.md)。
 
 ### 4.11 `GET /api/sources/health`
 
@@ -1337,7 +1343,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `scope` | string | 否 | 回显生效范围：`curated` / `all` |
 | `phase` | string | 否 | 两段式阶段：仍有未完成源时为 `first`，全部完成（`done=true`）为 `final` |
 | `partial` | boolean | 否 | 是否为“部分结果”（`!done`）；与 `phase=first` 同义 |
-| `scheduled_sources` | integer | 否 | 已进入调度的源数（两段式下逐批累加），`scheduled_sources <= source_total` |
+| `scheduled_sources` | integer | 否 | 已进入调度（从优先队列取出）的源数；anytime 调度下逐源累加，`scheduled_sources <= source_total` |
 | `attempted_sources` | integer | 否 | 真正拿到并发槽并发出过至少一次请求的源数；排队到预算耗尽、未发出请求的**不计入**，`attempted_sources <= scheduled_sources` |
 | `pending_sources` | integer | 否 | **尚未排上**的源数，`= source_total - scheduled_sources`（不是“未完成数”） |
 | `source_ids_requested` | string[] | 否 | 解析后的请求 id（原样字符串、去空去重、保留输入顺序）；未传时为 `[]` |
@@ -1356,6 +1362,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - **前端接线（2026-11-03 复核）**：`api.searchStart(key, sourceIds)` 已把 `source_ids` 传给本接口；`Discover.svelte` 提供“全部/指定书源”范围切换，并用 `ignored_source_ids` 提示被忽略的源。此前“前端仍未传 `source_ids`”的记录作废。
   - 分页、去重与权重排序都使用 job 创建时的源快照（`source_ids` 过滤后的子集）；之后改书源不影响该 job。
   - **冷却源默认不进入 job**：不会发出请求，也不会出现在 `errors`；`skipped_cooldown` 只做展示。job 收尾时会把本次每源的探测结果批量写回健康表（成功清零、真实站点级失败累加），同一任务只写一次；**全局预算耗尽（`truncated`/`skipped`）不写健康**，避免把健康源误冷却/误隔离。
+  - **调度为 anytime**：所有候选源进入同一个优先队列，按「站点存活 × 查询类产出率 / 延迟」排序；每完成一个源就用本次结果重排剩余队列。单源预算动态取值 `clamp(剩余时间 / 剩余轮数 × 2, 2s, deadline_ms)`；已获得 ≥ 60 条书名匹配结果且已完成 ≥ min(24, 源数) 个源时停止**取新源**（在飞请求照常完成），剩余源记 `skipped`。
   - `deadline_ms` 只约束单个源；多个源共享 `HTTP_CONCURRENCY` 信号量，网络慢时整次搜索可能明显超过 `deadline_ms`。搜索对每个源只发 1 个请求，因此同一次 job 内按源上限（默认 8）不会触发排队；它主要约束「打开一本书」时的目录/正文/图片并发（同一源多请求），排队次数见 `/healthz` 的 `search.source_limit_waits`。
 
 ### 5.6 `GET /api/search/result`

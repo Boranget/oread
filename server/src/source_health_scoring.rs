@@ -196,6 +196,9 @@ pub(crate) fn apply_evaluation(
         "parse_rate": if row.search_count > 0 {
             (row.parse_ok_count as f64 / row.search_count as f64 * 1000.0).round() / 1000.0
         } else { 0.0 },
+        // 诊断标记（不改变档位）：真实搜索 ≥5 次但解析成功率不足一半，
+        // 说明「站点能连上、规则却长期解析不出东西」，该人工看规则或换域名。
+        "rule_stale": row.search_count >= 5 && row.parse_ok_count * 2 < row.search_count,
         "avg_ttfb_ms": row.avg_latency_ms,
         "p90_ttfb_ms": row.ttfb_ms_p90,
         "fail_site_count": row.fail_site_count,
@@ -248,6 +251,18 @@ pub async fn record_outcomes(
             && eval.tier != source_quality::TIER_PREFERRED
         {
             demoted.push(o.source_url.clone());
+        }
+        // 查询类证据与健康写回同一个事务：要么都记上，要么都不记。
+        // 只有真实搜索（usage=true）才写；超时是「未知」，已在调用方置 usage=false。
+        if o.usage {
+            crate::source_query_stats::record_in_tx(
+                &mut tx,
+                &o.source_url,
+                o.query_class,
+                o.kept_hits,
+                now,
+            )
+            .await?;
         }
         sqlx::query(
             "INSERT INTO source_health \

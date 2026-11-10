@@ -60,6 +60,7 @@ pub(super) async fn search_start(
         &s.shared,
         sources,
         &requested,
+        &key,
         q.scope(),
         include_cooled,
         CuratedMissingFallback::All,
@@ -117,6 +118,7 @@ pub(super) async fn search_start(
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
         plan.health,
+        plan.prior,
         effective,
     ));
     Ok(Json(json!({
@@ -310,12 +312,13 @@ pub(super) async fn search(
         &s.shared,
         sources,
         &requested,
+        &q.keyword(),
         q.scope(),
         include_cooled,
         CuratedMissingFallback::All,
     )
     .await;
-    let active = order_by_health(plan.active, &plan.health);
+    let active = order_by_health(plan.active, &plan.health, &plan.prior);
     let (full, _, _) = aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
@@ -401,12 +404,13 @@ pub(super) async fn search_aggregate(
         &s.shared,
         sources,
         &requested,
+        &q.keyword(),
         q.scope(),
         include_cooled,
         CuratedMissingFallback::All,
     )
     .await;
-    let active = order_by_health(plan.active, &plan.health);
+    let active = order_by_health(plan.active, &plan.health, &plan.prior);
     let (full, errors, title_filter) =
         aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
 

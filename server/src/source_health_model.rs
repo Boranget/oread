@@ -97,6 +97,8 @@ pub struct Outcome {
     pub parsed: bool,
     /// true = 真实搜索使用；false = 导入/巡检体检。
     pub usage: bool,
+    /// 本次查询的分类；只用于按 (源, 查询类) 归集产出证据。
+    pub query_class: crate::query_class::QueryClass,
     /// 静态规则完整度（0–1），用于评分。
     pub rule_complete: f32,
 }

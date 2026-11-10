@@ -20,6 +20,7 @@ fn outcome(url: &str, status: &'static str) -> Outcome {
         kept_hits: 0,
         parsed: status == STATUS_OK,
         usage: false,
+        query_class: crate::query_class::QueryClass::Normal,
         rule_complete: 1.0,
     }
 }
@@ -98,6 +99,7 @@ fn timeouts_do_not_pollute_avg_latency() {
         kept_hits: 1,
         parsed: true,
         usage: true,
+        query_class: crate::query_class::QueryClass::Normal,
         rule_complete: 1.0,
     };
     let timeout = Outcome {
@@ -109,6 +111,7 @@ fn timeouts_do_not_pollute_avg_latency() {
         kept_hits: 0,
         parsed: false,
         usage: false,
+        query_class: crate::query_class::QueryClass::Normal,
         rule_complete: 1.0,
     };
     let mut row = apply_outcome(None, &ok(1000), 1000, 86400);
@@ -135,6 +138,7 @@ fn yield_counts_only_kept_hits() {
         kept_hits: kept,
         parsed: true,
         usage,
+        query_class: crate::query_class::QueryClass::Normal,
         rule_complete: 1.0,
     };
     let row = apply_outcome(None, &hit(30, 0, true), 1000, 86400);
@@ -281,6 +285,17 @@ async fn test_pool() -> SqlitePool {
     .execute(&pool)
     .await
     .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS source_query_stats (\
+         source_url TEXT NOT NULL, query_class TEXT NOT NULL, \
+         search_count REAL NOT NULL DEFAULT 0, yield_ok_count REAL NOT NULL DEFAULT 0, \
+         kept_hit_count REAL NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, \
+         PRIMARY KEY (source_url, query_class))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     pool
 }
 
@@ -299,6 +314,7 @@ async fn db_record_cools_after_threshold_and_success_resets() {
                 kept_hits: 0,
                 parsed: false,
                 usage: false,
+                query_class: crate::query_class::QueryClass::Normal,
                 rule_complete: 1.0,
             }],
             86400,
@@ -323,6 +339,7 @@ async fn db_record_cools_after_threshold_and_success_resets() {
             kept_hits: 0,
             parsed: true,
             usage: false,
+            query_class: crate::query_class::QueryClass::Normal,
             rule_complete: 1.0,
         }],
         86400,
@@ -352,6 +369,7 @@ async fn db_engine_failure_does_not_cool() {
                 kept_hits: 0,
                 parsed: false,
                 usage: false,
+                query_class: crate::query_class::QueryClass::Normal,
                 rule_complete: 1.0,
             }],
             86400,
@@ -372,6 +390,7 @@ async fn db_engine_failure_does_not_cool() {
                 kept_hits: 0,
                 parsed: false,
                 usage: false,
+                query_class: crate::query_class::QueryClass::Normal,
                 rule_complete: 1.0,
             }],
             86400,
@@ -438,6 +457,7 @@ async fn import_transient_timeout_keeps_source_visible() {
             kept_hits: 0,
             parsed: false,
             usage: false,
+            query_class: crate::query_class::QueryClass::Normal,
             rule_complete: 1.0,
         }],
         86400,
@@ -474,6 +494,7 @@ async fn import_zero_hit_partial_keeps_source_visible() {
             kept_hits: 0,
             parsed: false,
             usage: true,
+            query_class: crate::query_class::QueryClass::Normal,
             rule_complete: 1.0,
         }],
         86400,
@@ -501,6 +522,7 @@ async fn explicit_site_failures_still_quarantine_at_threshold() {
                 kept_hits: 0,
                 parsed: false,
                 usage: false,
+                query_class: crate::query_class::QueryClass::Normal,
                 rule_complete: 1.0,
             }],
             86400,

@@ -6,7 +6,7 @@
 
 相关实现：[`server/src/routes/books_search_job.rs`](../server/src/routes/books_search_job.rs)、[`server/src/source_health_scoring.rs`](../server/src/source_health_scoring.rs)、[`server/src/source_bench_run.rs`](../server/src/source_bench_run.rs)、[`server/src/title_filter.rs`](../server/src/title_filter.rs)。
 
-## 1. 现状里的三个隐含错误
+## 1. 改造前的三个隐含错误
 
 ### 1.1 `hits` 不是「搜到了」
 
@@ -50,25 +50,25 @@ score(i, q) = EV(i, q) + c · sqrt(ln N / n_i)
 
 ## 3. 证据模型
 
-一张事实表，按 `(source_url, query_class)` 聚合。**只存原始观测，派生量不落库。**
+**站点级慢变量**留在 `source_health`（存活、延迟、全局产出率），**源 × 查询类快变量**存 `source_query_stats`：
 
-| 字段 | 说明 |
-|---|---|
-| `ts` | 观测时间 |
-| `origin` | `search` / `bench` / `patrol` |
-| `kind` | `ok` / `timeout` / `fail` / `partial` |
-| `latency_ms` | 只有成功请求进入延迟统计 |
-| `raw_hits` | 解析条数（现有 `hits`） |
-| `kept_hits` | 书名过滤后条数（新增，yield 的分母/分子都靠它） |
-| `query_class` | `hot` / `normal` / `obscure` / `author` / `serial` |
+| 表 | 粒度 | 字段 |
+|---|---|---|
+| `source_health` | 源 | `last_status`、`avg_latency_ms`（仅成功样本）、`ttfb_ms_p90`、`search_count`、`kept_hit_count`、`yield_ok_count`、`parse_ok_count` |
+| `source_query_stats` | 源 × `query_class` | `search_count`、`yield_ok_count`、`kept_hit_count`、`updated_at` |
 
-派生量：
+口径：
 
-- `P_alive`：站点级 EWMA，半衰期按源更新频率自适应（高频 7 天、低频 30 天）。
-- `E[latency]`：成功样本的 p50（吞吐估计）与 p90（尾部风险）。
-- `P_yield`：`kept_hits > 0` 的比例，按 `query_class` 分桶，带伪计数先验。
+- `kept_hits` = 书名过滤后条数（`title_filter::count_title_matches`），是 yield 的唯一分子来源；`hits` 只表示「解析成功」。
+- 只有真实搜索（`usage=true`）写这两张表。体检/巡检只更新可用性与延迟，不污染 yield。
+- `source_query_stats` 用**指数衰减**存储：写入时先按 `updated_at` 打折（半衰期 14 天）再累加，读路径不再算时间差。
+- 延迟只统计成功请求（最近 32 次成功样本环形均值），超时/失败不参与。
 
-> 现有的「最近 32 次成功样本环形均值」是过渡实现。环形窗口在低频源上样本不足，在高频源上又会记住三个月前的状态；最终应换成时间衰减。
+派生量（读时计算，不落库）：
+
+- `P_yield`：`(yield_ok + 4·global) / (search_count + 4)` 的分层平滑；`global` 是站点级 `smoothed_yield`（先验 0.30、强度 4）。
+- `E[latency]`：成功样本均值 + `ttfb_ms_p90` 作为尾部参考。
+- `rule_stale`：真实搜索 ≥ 5 次且解析成功率不足一半时置为诊断标记（只提示，不改档位）。
 
 ## 4. 查询分类
 
@@ -83,6 +83,8 @@ score(i, q) = EV(i, q) + c · sqrt(ln N / n_i)
 - 兜底 → `normal`
 
 分错类只影响顺序，不影响正确性，所以允许启发式；但必须有 `normal` 兜底。
+
+实现：`server/src/query_class.rs`。分类顺序为 `author > serial > hot > obscure > normal`，`obscure` 的阈值是归一化长度 ≤ 2 或 ≥ 12。分类只用于选择 `source_query_stats` 的分桶，不改变参与搜索的源集合。
 
 ## 5. 体检语料的定位
 
@@ -103,18 +105,23 @@ score(i, q) = EV(i, q) + c · sqrt(ln N / n_i)
 loop {
   取 score 最高的未跑源 → 占槽
   槽释放 → 用结果更新该源证据 → 重排剩余队列
-  已获得 kept ≥ 阈值 且 剩余源 EV 总和 < 阈值 → 早停
+  已获得 kept ≥ 阈值 且 已完成源数 ≥ 门槛 → 早停
   now > deadline → 停
 }
 ```
 
 配套：
 
-- 单源上限保留，但预算**动态分配**：`min(per_source_cap, 剩余时间 / 剩余高价值源数 × 2)`。
-- 分层 flush：`preferred` 跑完立刻写 job state，首屏先出，慢源后台补齐。
+- 单源上限保留，但预算**动态分配**：`clamp(剩余时间 / 剩余轮数 × 2, 2s, per_source_cap)`，`剩余轮数 = ceil(剩余源数 / 槽位)`。越接近 deadline，单源预算越短，保证还能再试一个源而不是卡在最后一个慢源上。
+- 早停：`finished ≥ min(24, 总源数)` 且 `kept_total ≥ 60`（两页）时停止**取新源**；已在飞的请求照常完成，结果照常入池。
+- 停止只影响取源：队列里没被取出的源记为 `skipped`，不写健康、不算站点失败；被 deadline 截断的请求记为 `truncated`，同样不写健康。
+- 分层 flush：每个源完成即写 job state，首屏先出，慢源后台补齐。
 - 超时语义不变：`timeout = 未知` → `partial` + `usage=false`，不累计失败、不冷却。
+- 排队等槽不计入单源预算；剩余不足 500ms 时不再发请求，直接记为 `skipped`。
 
 容量估算：136 源 / 16 并发 / 平均 1.5s ≈ 13s；平均 3s ≈ 25s。所以 40s 预算下「冷门查询跑完全部源」是可行的。漏召回主要来自静态排序 + 每源上限造成的尾部饥饿，不是预算不够。
+
+实现位置：`run_search_job` 用 `futures::stream::unfold` 拉取优先队列、`buffer_unordered` 维持并发；每个源完成回到主循环后调用 `resort_queue` 重排。`scheduled_sources` 在真正取源时累加，因此进度接口仍能区分「已排上 / 尚未排上」。
 
 ## 7. 状态机简化
 
@@ -129,24 +136,22 @@ loop {
 
 ## 8. 可观测性
 
-每次搜索输出一条 decision trace（debug 环 + 结构化日志）：
+每次搜索输出结构化日志（默认 `debug`）：
 
-```
-source, rank_in_queue, score_breakdown{p_alive, p_yield, latency, ucb},
-slot_wait_ms, latency_ms, kind, raw_hits, kept_hits, stopped_by
-```
+- `search_schedule`：`job_id`、`scope`、`query_class`、源数、槽位；早停时输出 `finished` / `kept_total` / `remaining`。
+- `search_source`：`source`、`scope`、`kind`（`ok`/`error`/`timeout`/`truncated`/`skipped`）、`timed_out`、`latency_ms`、`hits`、`kept_hits`。
 
-`/healthz` 增加聚合：按 `query_class` 的命中率、早停率、尾部超时率。
+`/healthz` 已暴露 `all_per_source_secs`；按 `query_class` 的命中率聚合仍是后续项（P4）。
 
 ## 9. 分阶段落地
 
-| 阶段 | 内容 | 指标门 |
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| P0 已完成 | 超时=未知、延迟只统计成功、8s/40s | — |
-| P1 | 记录 `kept_hits`；yield 证据；排序键改 `(P_alive, EV, latency)` | `all` 正主命中率 ≥ 60%，首屏 p90 < 2s |
-| P2 | `query_class` + 时间衰减 + UCB 探索（≤ 10% 槽位） | 冷门查询 0 结果率下降，热门查询不退化 |
-| P3 | anytime 调度 + 动态预算 + 早停 + 分层 flush | 平均总耗时 −30%，命中率不降 |
-| P4 | 语料降级为纯先验/诊断；`tier` 改派生；删迁移补丁 | 无新增「复活/校准」类迁移 |
+| P0 已完成 | 超时=未知、延迟只统计成功、8s/40s、预算拆分 | ✅ 已发布 |
+| P1 已完成 | 记录 `kept_hits`；yield 证据；排序键改 `(bucket, -EV)` | ✅ 已实现（迁移 0015） |
+| P2 已完成 | `query_class` + 14 天时间衰减 + 类内分层平滑 + UCB 探索乘子 | ✅ 已实现（迁移 0016） |
+| P3 已完成 | anytime 调度 + 动态预算 + 早停 + 逐源 flush | ✅ 已实现 |
+| P4 部分完成 | 体检降级为纯先验/诊断（已做）；`tier`/`quarantined` 改派生（未做） | ⏸ 见下 |
 
 ### P1 的具体口径
 
@@ -154,6 +159,31 @@ slot_wait_ms, latency_ms, kind, raw_hits, kept_hits, stopped_by
 - 平滑产出率：`y = (yield_ok + 0.3×4) / (search_count + 4)`（先验 0.3，强度 4 次观测）。
 - 优先级：`ev = y / max(latency, 250ms)`，入队键为 `(bucket, -ev)`；`bucket` 仍区分「可用 / 无观测 / 近期失败」。
 - 只有 `kept_hits` 参与 yield；`hits` 保留为「解析成功」证据，不参与排序。
+
+### P2 的具体口径
+
+- 类内产出率：`y_class = (yield_ok_class + 4·y_global) / (search_count_class + 4)`；类内证据积累到 4 次后与全局先验等权。
+- 探索乘子：`1 + 0.10·sqrt(ln(N+1) / (n_i+1))`，`N` 是该查询类的历史搜索总数、`n_i` 是该源在该类下的样本数。样本越多，加成越小。
+- 冷启动：完全没有真实搜索证据（`source_health.search_count = 0` 且类内样本为 0）时，用体检 `meta_json.hit_rate` 作为产出率先验；一旦有真实搜索立即让位。
+- 衰减：写入时按 `0.5^(Δ/14天)` 折扣旧计数再累加，避免三个月前的证据和昨天一样重。
+
+### P3 的具体口径
+
+- 单一优先队列 + `buffer_unordered`，每完成一个源就按最新证据重排，不再有 `preferred` 整批占槽。
+- 动态预算与早停阈值见第 6 节。
+- 停止只停「取新源」，不取消在飞请求；剩余源记 `skipped`，截断请求记 `truncated`，两者都不写健康。
+
+### P4 为什么只做了一半
+
+已做：体检命中率仅作冷启动先验（不再参与排序）、`rule_stale` 诊断标记。
+
+未做：把 `tier` / `score` / `quarantined` 从存储改为派生视图。原因：
+
+1. `tier` / `quarantined` 同时被 curated 重算、源账本（`source_ledger`）和人工干预使用，改成派生会改动多个写入方与历史数据；
+2. 当前设备不可达，无法用真实库验证迁移后的 curated/账本一致性；
+3. 收益是「改规则即生效」，而现有规则已经能通过 `apply_outcome` 平滑演进。
+
+因此这一步留到设备恢复、能在真实数据上做前后对比时再动。
 
 ## 10. 取舍与风险
 

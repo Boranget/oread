@@ -382,8 +382,16 @@ pub fn all_search_slots() -> usize {
     conf().all_concurrency
 }
 
+/// 该 scope 的源级并发槽总数（小说 + 漫画）。调度器用它决定同时在飞的源数。
+pub fn search_slots(scope: SearchScope) -> usize {
+    match scope {
+        SearchScope::All => conf().all_concurrency,
+        _ => conf().concurrency,
+    }
+}
+
 /// 漫画槽数量：并发的 1/4（至少 1 个）。默认 16 → 4 个。
-pub(super) fn comic_slot_count(slots: usize) -> usize {
+pub(crate) fn comic_slot_count(slots: usize) -> usize {
     (slots / 4).max(1)
 }
 

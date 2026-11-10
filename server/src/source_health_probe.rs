@@ -110,6 +110,7 @@ pub fn outcomes_from_probes(probes: &[Probe]) -> Vec<Outcome> {
             kept_hits: p.hits,
             parsed: p.status == STATUS_OK,
             usage: false,
+            query_class: crate::query_class::QueryClass::Normal,
             rule_complete: 1.0,
         })
         .collect()

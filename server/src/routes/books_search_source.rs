@@ -141,6 +141,8 @@ pub(crate) struct SearchSourcePlan {
     pub(crate) scope_filtered: usize,
     pub(crate) skipped_cooldown: usize,
     pub(crate) cooldown_total: usize,
+    /// 本次查询的排序先验（查询类 + 类内证据 + 体检冷启动先验）。
+    pub(crate) prior: crate::search_priority::SearchPrior,
 }
 
 /// 统一入队顺序：慢源 / 近期站点失败源垫底，预算紧张时优先把并发槽给可用源。
@@ -150,8 +152,9 @@ pub(crate) struct SearchSourcePlan {
 pub(crate) fn order_by_health(
     mut sources: Vec<crate::entities::BookSource>,
     health: &HashMap<String, source_health::HealthRow>,
+    prior: &crate::search_priority::SearchPrior,
 ) -> Vec<crate::entities::BookSource> {
-    sources.sort_by_key(|s| books_search_job::health_order_key(health.get(&s.book_source_url)));
+    sources.sort_by_key(|s| prior.priority(&s.book_source_url, health.get(&s.book_source_url)));
     sources
 }
 
@@ -167,6 +170,7 @@ pub(crate) async fn resolve_search_sources(
     pool: &SqlitePool,
     sources: Vec<crate::entities::BookSource>,
     requested: &[String],
+    key: &str,
     scope: crate::req::SearchScope,
     include_cooled: bool,
     curated_missing: CuratedMissingFallback,
@@ -178,6 +182,14 @@ pub(crate) async fn resolve_search_sources(
         tracing::warn!(error = %e, "load source health failed; search without cooldown filter");
         HashMap::new()
     });
+    // 查询类先验只影响入队顺序；加载失败时退化为空先验（等价于只看全局健康证据）。
+    let class = crate::query_class::QueryClass::classify(key);
+    let prior = crate::search_priority::SearchPrior::load(pool, class)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "load query prior failed; ordering by health only");
+            crate::search_priority::SearchPrior::empty(class)
+        });
     let searchable_all = searchable_sources(sources, &quarantined, &health);
     let explicit = !requested.is_empty();
     let curated = if explicit || scope == crate::req::SearchScope::Curated {
@@ -296,5 +308,6 @@ pub(crate) async fn resolve_search_sources(
         scope_filtered,
         skipped_cooldown,
         cooldown_total,
+        prior,
     }
 }

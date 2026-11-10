@@ -28,6 +28,7 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | `rule_engine*` | 规则解释器：CSS/XPath/JSONPath/`@js:`（boa）、替换与变量；JS 资源与 DOM 桥独立文件 |
 | `image_cache.rs` / `routes/image*` | 图片代理、墨水屏转码、进程内 LRU |
 | `source_health*` / `source_bench*` / `source_ledger*` | 书源健康度、体检任务、导入账本 |
+| `query_class.rs` / `source_query_stats.rs` / `search_priority.rs` | 搜索查询分类、按「源 × 查询类」的衰减产出证据、入队优先级（EV + UCB） |
 | `k_metrics*` | `/k` 请求日志、聚合与探针 |
 | `cache_metrics.rs` | 正文缓存命中/落库/淘汰计数（`/healthz` 暴露） |
 | `search_rank.rs` | 排序/配额策略（暂未接入生产路由，模块级 `dead_code`） |

@@ -858,6 +858,16 @@ async fn create_health_tables(pool: &SqlitePool) {
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS source_query_stats (\
+         source_url TEXT NOT NULL, query_class TEXT NOT NULL, \
+         search_count REAL NOT NULL DEFAULT 0, yield_ok_count REAL NOT NULL DEFAULT 0, \
+         kept_hit_count REAL NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, \
+         PRIMARY KEY (source_url, query_class))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[test]

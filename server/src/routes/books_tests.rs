@@ -4,6 +4,11 @@ use super::*;
 
 use sqlx::sqlite::SqlitePoolOptions;
 
+/// 单测用的空查询先验：等价于「只看全局健康证据」，不依赖数据库。
+fn test_prior() -> crate::search_priority::SearchPrior {
+    crate::search_priority::SearchPrior::empty(crate::query_class::QueryClass::Normal)
+}
+
 fn mk_content(url: &str, book: &str, idx: i64, body: &str) -> BookContent {
     BookContent {
         book_url: book.into(),
@@ -266,14 +271,18 @@ fn slow_and_failing_sources_queue_last() {
         s
     };
     let mut list = [mk("slow"), mk("fail"), mk("unknown"), mk("fast")];
-    list.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
+    list.sort_by_key(|s| test_prior().priority(&s.book_source_url, health.get(&s.book_source_url)));
     let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
     assert_eq!(
         names,
         vec!["fast", "slow", "unknown", "fail"],
         "快源先占槽：正常按延迟升序 → 无观测 → 失败源垫底"
     );
-    assert_eq!(health_order_key(None), (1, 0), "无健康行按无观测处理");
+    assert_eq!(
+        test_prior().priority("https://none.example", None),
+        (1, 0),
+        "无健康行按无观测处理"
+    );
 }
 
 // P1：同样延迟下，产出率（书名匹配命中）高的先入队；近期失败仍垫底。
@@ -326,7 +335,7 @@ fn health_order_prefers_yield_at_same_latency() {
         s
     };
     let mut list = [mk("barren"), mk("failed"), mk("fruitful")];
-    list.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
+    list.sort_by_key(|s| test_prior().priority(&s.book_source_url, health.get(&s.book_source_url)));
     let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
     assert_eq!(
         names,
@@ -359,7 +368,11 @@ fn all_search_entrypoints_share_health_ordering() {
         s.book_source_name = name.into();
         s
     };
-    let list = order_by_health(vec![mk("fail"), mk("unknown"), mk("fast")], &health);
+    let list = order_by_health(
+        vec![mk("fail"), mk("unknown"), mk("fast")],
+        &health,
+        &test_prior(),
+    );
     let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
     assert_eq!(names, vec!["fast", "unknown", "fail"]);
 }
@@ -974,6 +987,7 @@ async fn explicit_source_ids_skip_curated_and_searchable_gate_matches() {
         &pool,
         sources.clone(),
         &[],
+        "测试关键词",
         SearchScope::All,
         false,
         CuratedMissingFallback::All,
@@ -988,6 +1002,7 @@ async fn explicit_source_ids_skip_curated_and_searchable_gate_matches() {
         &pool,
         sources,
         &["http://observing".to_string()],
+        "测试关键词",
         SearchScope::Curated,
         false,
         CuratedMissingFallback::All,
@@ -1017,6 +1032,15 @@ async fn curated_missing_falls_back_to_preferred_for_kindle() {
     sqlx::query(
         "CREATE TABLE source_curated (source_url TEXT PRIMARY KEY, \
              curated INTEGER NOT NULL DEFAULT 0, meta_json TEXT)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE source_query_stats (source_url TEXT NOT NULL, query_class TEXT NOT NULL, \
+             search_count REAL NOT NULL DEFAULT 0, yield_ok_count REAL NOT NULL DEFAULT 0, \
+             kept_hit_count REAL NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (source_url, query_class))",
     )
     .execute(&pool)
     .await
@@ -1058,6 +1082,7 @@ async fn curated_missing_falls_back_to_preferred_for_kindle() {
         &pool,
         sources.clone(),
         &[],
+        "测试关键词",
         SearchScope::Curated,
         true,
         CuratedMissingFallback::All,
@@ -1072,6 +1097,7 @@ async fn curated_missing_falls_back_to_preferred_for_kindle() {
         &pool,
         sources,
         &[],
+        "测试关键词",
         SearchScope::Curated,
         true,
         CuratedMissingFallback::Preferred,
@@ -1097,11 +1123,21 @@ async fn preferred_empty_falls_back_to_all_and_skips_login_sources() {
     let mut login_only = src("需登录", "http://login", 1, true);
     login_only.login_url = Some("http://login/login".into());
     let sources = vec![src("正常源", "http://normal", 1, true), login_only];
+    sqlx::query(
+        "CREATE TABLE source_query_stats (source_url TEXT NOT NULL, query_class TEXT NOT NULL, \
+             search_count REAL NOT NULL DEFAULT 0, yield_ok_count REAL NOT NULL DEFAULT 0, \
+             kept_hit_count REAL NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (source_url, query_class))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let plan = resolve_search_sources(
         &pool,
         sources,
         &[],
+        "测试关键词",
         SearchScope::Curated,
         true,
         CuratedMissingFallback::Preferred,
@@ -1128,6 +1164,7 @@ async fn zero_sources_returns_empty_plan_without_panic() {
         &pool,
         Vec::new(),
         &[],
+        "测试关键词",
         SearchScope::Curated,
         false,
         CuratedMissingFallback::Preferred,
@@ -1220,41 +1257,62 @@ fn source_counters_satisfy_invariant() {
     );
 }
 
-// 排队到 deadline 仍未拿到槽：计入 scheduled/finished，但不算 attempted
+// 排队到 deadline 仍未拿到槽：源不会被真正执行，不能计入 attempted。
 #[tokio::test]
 async fn queued_but_never_executed_is_not_attempted() {
-    let job = test_job("queue", 0, 1);
     let past = tokio::time::Instant::now() - Duration::from_secs(1);
     // 排队阶段不会真正执行任务，这里给一个惰性池即可满足参数类型。
     let book_pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
     let store = Arc::new(web_book::BookStore::new());
-    let outcomes = run_search_batch(
-        &job,
-        vec![src("排队源", "http://queue.example", 1, true)],
-        "书",
+    let run = search_one_source(
+        src("排队源", "http://queue.example", 1, true),
+        "书".to_string(),
         past,
         Duration::from_millis(100),
-        &HashMap::new(),
         crate::req::SearchScope::Curated,
-        &book_pool,
-        &store,
+        book_pool,
+        store,
     )
     .await;
-    assert!(outcomes
-        .iter()
-        .all(|o| o.status != source_health::STATUS_OK));
-    assert_eq!(
-        job.state.lock().unwrap().attempted,
-        0,
-        "未拿到槽不算 attempted"
+    assert!(!run.attempted, "deadline 已过：源没有真正执行");
+    assert!(
+        matches!(run.outcome, TaskOutcome::Skipped(_)),
+        "未执行的源应归为 skipped，而不是站点失败"
     );
-    let view = job_view(&job);
-    assert_eq!(view.scheduled, 1);
-    assert_eq!(view.attempted, 0, "排队未执行不计入 attempted");
-    assert_eq!(view.finished, 1);
-    assert_eq!(view.pending, 0);
-    assert_eq!(view.skipped, 1, "预算耗尽未执行计入 skipped");
-    assert!(outcomes.is_empty(), "排队未执行的源不写健康记录");
+}
+
+// 动态单源预算：越接近 deadline 越短，但始终夹在 [2s, cap]。
+#[test]
+fn dynamic_budget_shrinks_near_deadline_and_stays_in_range() {
+    let cap = Duration::from_secs(8);
+    let far = tokio::time::Instant::now() + Duration::from_secs(40);
+    let near = tokio::time::Instant::now() + Duration::from_millis(500);
+    assert_eq!(
+        dynamic_budget(far, 16, 16, cap),
+        cap,
+        "预算充足且只剩一轮时给满单源上限"
+    );
+    assert_eq!(
+        dynamic_budget(near, 200, 16, cap),
+        Duration::from_secs(2),
+        "接近 deadline 时不再低于 2s 下限"
+    );
+    let mid = dynamic_budget(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        64,
+        16,
+        cap,
+    );
+    assert!(mid >= Duration::from_secs(2) && mid <= cap, "mid={mid:?}");
+}
+
+// 早停：结果够两页且跑过足够多源才停；源少时按实际源数放宽。
+#[test]
+fn early_stop_requires_enough_sources_and_results() {
+    assert!(!should_stop_early(60, 10, 100), "源跑得太少不早停");
+    assert!(!should_stop_early(10, 30, 100), "结果不足两页不早停");
+    assert!(should_stop_early(60, 24, 100));
+    assert!(should_stop_early(60, 5, 5), "源本来就少时按实际源数判定");
 }
 
 // 全局预算截断 vs 真实单源超时：留 1s 宽限，避免把“几乎跑满预算”的源误判成截断。

@@ -43,7 +43,7 @@ mod curated;
 use curated::*;
 
 // 路由层与 source_health 原先从 `source_bench::*` 取用的公开项。
-pub use corpus::{TYPE_COMIC, TYPE_NOVEL};
+pub use corpus::{meta_hit_rate, BUILTIN_CORPUS, TYPE_COMIC, TYPE_NOVEL};
 pub use curated::{
     curated_lists, curated_set, maybe_schedule_stale_bench, revalidate_curated_source,
 };
