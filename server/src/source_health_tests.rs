@@ -84,6 +84,42 @@ fn success_resets_failures_and_cooldown() {
     assert_eq!(row.last_ok_at, Some(4000));
 }
 
+// 超时不参与延迟统计：否则可用源的平均延迟会一路涨到预算值，
+// 所有源挤在同一延迟档，入队顺序退化成随机，好源被排到预算之外。
+#[test]
+fn timeouts_do_not_pollute_avg_latency() {
+    let ok = |lat: i64| Outcome {
+        source_url: "https://a.com".into(),
+        status: STATUS_OK,
+        latency_ms: lat,
+        error: None,
+        hits: 1,
+        parsed: true,
+        usage: true,
+        rule_complete: 1.0,
+    };
+    let timeout = Outcome {
+        source_url: "https://a.com".into(),
+        status: STATUS_PARTIAL,
+        latency_ms: 8000,
+        error: Some("搜索超时（单源 8s 预算）".into()),
+        hits: 0,
+        parsed: false,
+        usage: false,
+        rule_complete: 1.0,
+    };
+    let mut row = apply_outcome(None, &ok(1000), 1000, 86400);
+    assert_eq!(row.avg_latency_ms, Some(1000));
+    for i in 0..5 {
+        row = apply_outcome(Some(&row), &timeout, 2000 + i, 86400);
+    }
+    assert_eq!(row.avg_latency_ms, Some(1000), "超时不能抬高平均延迟");
+    // 环形样本只保留成功样本，均值仍反映真实延迟
+    row = apply_outcome(Some(&row), &ok(3000), 9000, 86400);
+    assert_eq!(row.avg_latency_ms, Some(2000));
+    assert_eq!(row.consecutive_failures, 0);
+}
+
 // 引擎失败（partial）不计失败、不清零、不冷却——这是与站点故障的关键区别
 #[test]
 fn engine_failures_do_not_cool() {

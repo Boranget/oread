@@ -232,7 +232,7 @@ fn pipeline_uses_single_total_budget_for_both_batches() {
     );
     assert_eq!(
         crate::req::search_total_budget(crate::req::SearchScope::All),
-        Duration::from_secs(25)
+        Duration::from_secs(40)
     );
 }
 

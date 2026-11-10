@@ -146,12 +146,12 @@ fn resolve_js_timeout_ms(raw: Option<u64>) -> u64 {
 /// 解析搜索的三个预算旋钮：返回 `(单源预算, curated 整批, all 整批)`。
 ///
 /// - `SEARCH_TIMEOUT_SECS`：curated 单源预算，默认 8s；
-/// - `SEARCH_ALL_TIMEOUT_SECS`：all 单源预算，默认 5s（未设时沿用 `SEARCH_TIMEOUT_SECS`）；
+/// - `SEARCH_ALL_TIMEOUT_SECS`：all 单源预算，默认 8s（未设时沿用 `SEARCH_TIMEOUT_SECS`）；
 /// - `SEARCH_CURATED_BUDGET_SECS` / `SEARCH_ALL_BUDGET_SECS`：按 scope 的整批预算；
 /// - `SEARCH_TOTAL_BUDGET_SECS`：两 scope 的整批预算统一覆盖值（优先级低于
 ///   上面两个按 scope 的变量）。
 ///
-/// 未设置任何整批变量时取 scope 默认（curated 6s / all 25s）。
+/// 未设置任何整批变量时取 scope 默认（curated 6s / all 40s）。
 /// 兼容旧部署：只显式设置了 `SEARCH_TIMEOUT_SECS` 时，整批预算回落到同值，
 /// 保持“两者同值”的历史语义。
 fn resolve_search_budgets(
@@ -178,14 +178,14 @@ fn resolve_search_budgets(
         .map(|v| v.clamp(2, 60))
         .or(total)
         .or(legacy)
-        .unwrap_or(25);
+        .unwrap_or(40);
     (per_source, curated, all)
 }
 
 /// `scope=all` 的单源预算：显式 `SEARCH_ALL_TIMEOUT_SECS` 优先；
-/// 否则沿用旧变量 `SEARCH_TIMEOUT_SECS`（兼容旧部署）；都没有时取默认 5s。
+/// 否则沿用旧变量 `SEARCH_TIMEOUT_SECS`（兼容旧部署）；都没有时取默认 8s。
 fn resolve_all_timeout_budget(all_raw: Option<u64>, timeout_raw: Option<u64>) -> u64 {
-    all_raw.or(timeout_raw).unwrap_or(5).clamp(5, 30)
+    all_raw.or(timeout_raw).unwrap_or(8).clamp(5, 30)
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -219,18 +219,21 @@ pub struct Config {
     /// 与整批总预算解耦（见 `search_curated_budget_secs` / `search_all_budget_secs`）。
     /// `scope=curated` 用它；`scope=all` 用 `search_all_timeout_secs`。
     pub search_timeout_secs: u64,
-    /// `scope=all` 的单源预算（秒，默认 5）。
+    /// `scope=all` 的单源预算（秒，默认 8，与 curated 相同）。
     ///
-    /// `all` 要覆盖上百个源，单源预算越长，16 个并发槽越容易被慢站占满，
-    /// 同预算下能跑到的源越少（实测 8s→5s：覆盖 20 → 90 个源）。
-    /// 快源通常 1–3s 返回，5s 足够；慢站被截断只记 partial，不会被打成站点故障。
+    /// 实测（149 源、16 槽、设备 4 核）：5s 会把「慢但能用」的源全部截断，
+    /// 承载结果的源经常拿不到命中；8s 才能让它们跑完（8s/40s 连续 4 次均命中，
+    /// 5s/25s 只有 1/4）。覆盖不足由整批预算解决，不要靠压单源预算换覆盖。
+    /// 超时只记 partial，不会被打成站点故障。
     pub search_all_timeout_secs: u64,
     /// `scope=curated` 的整批搜索总预算（秒，默认 6）。
     pub search_curated_budget_secs: u64,
-    /// `scope=all` 的整批搜索总预算（秒，默认 25）。
+    /// `scope=all` 的整批搜索总预算（秒，默认 40）。
     ///
-    /// 100+ 个源、16 槽、单源 5s 时，10s 只能跑到约 1/5 的源；25s 才能基本覆盖全量。
-    /// 两段式搜索边跑边出结果，总预算只影响“全部跑完”的时间，不拖首屏。
+    /// 覆盖能力 ≈ 并发槽 × 整批预算 ÷ 单源预算：132 个可搜索源、16 槽、单源 8s
+    /// 需要约 40s 才能基本跑完（实测 25s 只跑到 60–70 个源，30/35s 仍会漏掉
+    /// 排在 ~44 位的源）。这是**上限**不是固定等待：源少时任务提前结束，
+    /// 两段式搜索边跑边出结果，首屏不受影响。
     pub search_all_budget_secs: u64,
     /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
     /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
@@ -495,16 +498,16 @@ mod tests {
         );
     }
 
-    // 预算拆分：都不设置 → 单源 8s、整批 curated 6s / all 25s
+    // 预算拆分：都不设置 → curated 8s/6s，all 8s/40s
     #[test]
     fn default_search_budgets_are_split() {
-        assert_eq!(resolve_search_budgets(None, None, None, None), (8, 6, 25));
+        assert_eq!(resolve_search_budgets(None, None, None, None), (8, 6, 40));
     }
 
-    // `all` 的单源预算默认 5s；显式设置时夹取到 5..30
+    // `all` 的单源预算默认 8s；显式设置时夹取到 5..30
     #[test]
-    fn all_per_source_budget_defaults_to_five() {
-        assert_eq!(resolve_all_timeout_budget(None, None), 5);
+    fn all_per_source_budget_defaults_to_eight() {
+        assert_eq!(resolve_all_timeout_budget(None, None), 8);
         assert_eq!(resolve_all_timeout_budget(Some(9), None), 9);
         // 旧部署只设 SEARCH_TIMEOUT_SECS 时沿用它，避免行为突然变化
         assert_eq!(resolve_all_timeout_budget(None, Some(10)), 10);

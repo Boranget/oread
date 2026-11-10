@@ -143,7 +143,7 @@ echo "OK=$ok BAD=$bad"
 > 需给页缓存与图片缓存留余量。
 
 v0.3.9 代码默认：`HTTP_CONCURRENCY=16`（硬上限 16）、单源预算 `SEARCH_TIMEOUT_SECS=8`（curated）/
-`SEARCH_ALL_TIMEOUT_SECS=5`（all）、整批预算 `SEARCH_CURATED_BUDGET_SECS=6` / `SEARCH_ALL_BUDGET_SECS=25`、
+`SEARCH_ALL_TIMEOUT_SECS=8`（all）、整批预算 `SEARCH_CURATED_BUDGET_SECS=6` / `SEARCH_ALL_BUDGET_SECS=40`、
 `JS_TIMEOUT_MS=3000`、`KINDLE_VW=1072` / `KINDLE_VH=1268`。
 本版 16 并发实测 RSS ≈154 MB，换到 512 MB 设备需下调：
 
@@ -151,9 +151,9 @@ v0.3.9 代码默认：`HTTP_CONCURRENCY=16`（硬上限 16）、单源预算 `SE
 # /opt/boranlib/boranlib.env（建议值，待真机日志复核）
 BORANLIB_HTTP_CONCURRENCY=8          # 512 MB 首推 8；余量宽松可试 12，硬上限 16
 BORANLIB_SEARCH_TIMEOUT_SECS=8       # curated 单源预算
-BORANLIB_SEARCH_ALL_TIMEOUT_SECS=5   # all 单源预算；越短同预算覆盖的源越多
+BORANLIB_SEARCH_ALL_TIMEOUT_SECS=8   # all 单源预算；不要压到 5s（会截断慢但能用的源）
 BORANLIB_SEARCH_CURATED_BUDGET_SECS=6
-BORANLIB_SEARCH_ALL_BUDGET_SECS=25
+BORANLIB_SEARCH_ALL_BUDGET_SECS=40
 BORANLIB_JS_TIMEOUT_MS=3000
 BORANLIB_KINDLE_VW=1072
 BORANLIB_KINDLE_VH=1268
@@ -164,8 +164,11 @@ BORANLIB_KINDLE_VH=1268
   首条结果仍约 2.3 s，OOM 余量更大。
 - **整批预算必须显式写**：只设 `SEARCH_TIMEOUT_SECS` 时，v0.3.9 按旧语义把两个 scope 的整批预算
   一起回落到 8s（`resolve_search_budgets` 的 legacy 分支），会把 90% 源挡在门外。
-- **`all` 的覆盖能力由「整批预算 ÷ 单源预算 × 并发槽」决定**：8s/10s 在 100+ 源时只能跑到约 1/5
-  的源，`5s/25s` 才能基本覆盖全量。搜索超时只记 `partial`，不会再把源打成隔离。
+- **覆盖能力 ≈ 并发槽 × 整批预算 ÷ 单源预算**：132 个可搜索源、16 槽、单源 8s 需要约 40s
+  才能基本跑完。实测 25s 只跑到 60–70 个源、30/35s 仍会漏掉排在 ~44 位的源
+  （`8s/40s` 连续 4 次均命中，`5s/25s` 只有 1/4）。整批预算是上限，源少时提前结束。
+- 搜索超时只记 `partial`，不会再把源打成隔离；延迟均值只统计成功请求，
+  否则超时会把所有源的平均延迟拉到预算值，入队顺序退化。
 - 复核口径：`systemctl show boranlib -p MemoryCurrent`、`/healthz` 的 `rss_mb`/`concurrency`/`search` 块，
   以及 147 源聚合搜索的 `source_total`、`attempted_sources` 与「未执行」条数。
 

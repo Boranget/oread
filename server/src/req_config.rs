@@ -49,9 +49,9 @@ pub(super) const DEFAULT_CONF: HttpConf = HttpConf {
     all_concurrency: 16,
     timeout_secs: 15,
     search_timeout_secs: 8,
-    search_all_timeout_secs: 5,
+    search_all_timeout_secs: 8,
     search_curated_budget_secs: 6,
-    search_all_budget_secs: 25,
+    search_all_budget_secs: 40,
     source_concurrency_default: SOURCE_CONCURRENCY_DEFAULT,
     max_body_bytes: 5 * 1024 * 1024,
 };
@@ -59,7 +59,7 @@ pub(super) const DEFAULT_CONF: HttpConf = HttpConf {
 /// 搜索范围：决定参与源集合与总预算。
 ///
 /// - `All`（默认）：全量可搜索源。流水线调度后首条结果通常 0.5s 左右，
-///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 25s、单源 5s。
+///   相关性过滤会挡住垃圾结果；源级并发默认 16 槽，总预算 40s、单源 8s。
 /// - `Curated`（用户显式选择「精选」）：只跑体检精选源；curated 集合不存在时退化为全量，
 ///   总预算随 `All`；交集为空时退化为 preferred。显式 `source_ids` 会跳过该收缩。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl SearchScope {
     pub fn default_total_budget_secs(self) -> u64 {
         match self {
             Self::Curated => 6,
-            Self::All => 25,
+            Self::All => 40,
         }
     }
 }
