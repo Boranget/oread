@@ -106,6 +106,8 @@ pub fn outcomes_from_probes(probes: &[Probe]) -> Vec<Outcome> {
             latency_ms: p.latency_ms,
             error: p.error.clone(),
             hits: p.hits,
+            // 巡检只验证「请求能不能通」，不做书名匹配；usage=false 也不计入 yield。
+            kept_hits: p.hits,
             parsed: p.status == STATUS_OK,
             usage: false,
             rule_complete: 1.0,

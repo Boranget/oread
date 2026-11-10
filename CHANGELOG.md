@@ -7,6 +7,11 @@
 
 ### Added
 
+- 新增搜索调度设计文档 [docs/DESIGN_SEARCH.md](docs/DESIGN_SEARCH.md)：统一证据模型、
+  「每秒有效结果」优先级、查询分类与 anytime 调度，取代逐条打补丁的参数调整。
+- 书源健康新增搜索产出证据（迁移 `0015`）：`kept_hit_count`（书名匹配命中条数）与
+  `yield_ok_count`（`kept_hits > 0` 的搜索次数），只在真实搜索时累计。搜索入队改为按
+  「平滑产出率 / 成功请求平均延迟」排序：同样快时产出高的在前，近期失败源仍垫底。
 - 新增 `scripts/deploy.ps1` 一键部署（交叉编译 → 打包 → 上传 → SHA-256 校验 → 备份 →
   重启 → healthz 轮询 → 失败自动回滚），支持 `-DryRun` 离线预演；二进制用临时名 + rename
   原子替换，回滚前先停服务，避免 `Text file busy`。配套说明见 `docs/DEPLOY.md`。

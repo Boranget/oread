@@ -822,6 +822,8 @@ async fn create_health_tables(pool: &SqlitePool) {
          check_total INTEGER NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'observing', \
          score INTEGER NOT NULL DEFAULT 50, evidence_json TEXT, last_eval_at INTEGER, \
          search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+         kept_hit_count INTEGER NOT NULL DEFAULT 0, \
+         yield_ok_count INTEGER NOT NULL DEFAULT 0, \
          parse_ok_count INTEGER NOT NULL DEFAULT 0, \
          fail_site_count INTEGER NOT NULL DEFAULT 0, \
          fail_engine_count INTEGER NOT NULL DEFAULT 0, ttfb_ms_p90 INTEGER, \

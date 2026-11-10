@@ -249,11 +249,13 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
 }
 
 /// 同一批次内的入队顺序键（越小越先占并发槽）：
-/// - `0`：有延迟样本且最近一次不是站点失败 → 按 p90/均值延迟升序；
-/// - `1`：无观测数据（新导入/从未搜到过）→ 排在已知快源之后；
+/// - `0`：有延迟样本且最近一次不是站点失败 → 按「每秒有效结果」（`search_ev_ppm`）降序；
+/// - `1`：无观测数据（新导入/从未搜到过）→ 排在已知可用源之后；
 /// - `2`：最近一次是站点失败 → 垫底，让预算优先给可用源。
 ///
-/// 只调整顺序，不改变参与集合、预算与并发上限，因此不会减少「本来能在预算内完成」的源。
+/// 产出证据用 `kept_hits`（书名匹配后的命中），不是解析条数：一个源能返回
+/// 30 条无关结果，对当前查询仍然是 0 产出。只调整顺序，不改变参与集合、
+/// 预算与并发上限，因此不会减少「本来能在预算内完成」的源。
 pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64) {
     let Some(h) = h else {
         return (1, 0);
@@ -261,7 +263,8 @@ pub(super) fn health_order_key(h: Option<&source_health::HealthRow>) -> (u8, i64
     let latency = h.ttfb_ms_p90.or(h.avg_latency_ms);
     match (h.last_status == source_health::STATUS_FAIL, latency) {
         (true, l) => (2, l.unwrap_or(i64::MAX)),
-        (false, Some(ms)) => (0, ms),
+        // 取负值：EV 越大越靠前（`sort_by_key` 是升序）。
+        (false, Some(_)) => (0, -source_health::search_ev_ppm(h)),
         (false, None) => (1, 0),
     }
 }
@@ -438,12 +441,18 @@ pub(super) async fn run_search_batch(
     while let Some((src, outcome, latency_ms, attempted)) = pending.next().await {
         // 逐源耗时埋点（默认 debug 不输出；扫参时开 `RUST_LOG=search_source=debug`）。
         // 排队时间不计入 latency_ms，`timed_out` 只标真实请求超时，与 Skipped 区分。
-        let (kind, hits, timed_out) = match &outcome {
-            TaskOutcome::Done(Ok(b)) => ("ok", b.len() as i64, false),
-            TaskOutcome::Done(Err(_)) => ("error", 0, false),
-            TaskOutcome::Timeout(_) => ("timeout", 0, true),
-            TaskOutcome::Truncated(_) => ("truncated", 0, false),
-            TaskOutcome::Skipped(_) => ("skipped", 0, false),
+        // `hits` = 解析条数；`kept_hits` = 其中书名真匹配的条数（搜索产出率只用后者）。
+        let (kind, hits, kept_hits, timed_out) = match &outcome {
+            TaskOutcome::Done(Ok(b)) => (
+                "ok",
+                b.len() as i64,
+                crate::title_filter::count_title_matches(b, key),
+                false,
+            ),
+            TaskOutcome::Done(Err(_)) => ("error", 0, 0, false),
+            TaskOutcome::Timeout(_) => ("timeout", 0, 0, true),
+            TaskOutcome::Truncated(_) => ("truncated", 0, 0, false),
+            TaskOutcome::Skipped(_) => ("skipped", 0, 0, false),
         };
         tracing::debug!(
             target: "search_source",
@@ -453,6 +462,7 @@ pub(super) async fn run_search_batch(
             timed_out,
             latency_ms,
             hits,
+            kept_hits,
             "search source done"
         );
         let rule_complete = crate::source_quality::rule_completeness(&src);
@@ -462,7 +472,6 @@ pub(super) async fn run_search_batch(
         }
         match outcome {
             TaskOutcome::Done(Ok(mut books)) => {
-                let hits = books.len() as i64;
                 books.truncate(SEARCH_PER_SOURCE_MAX);
                 // 回显来源档位，便于排查“这条结果来自什么档的源”。
                 let src_tier = health
@@ -485,6 +494,7 @@ pub(super) async fn run_search_batch(
                     latency_ms,
                     error: None,
                     hits,
+                    kept_hits,
                     parsed: true,
                     usage: true,
                     rule_complete,
@@ -511,6 +521,7 @@ pub(super) async fn run_search_batch(
                     latency_ms,
                     error: Some(msg),
                     hits: 0,
+                    kept_hits: 0,
                     parsed: false,
                     usage,
                     rule_complete,
@@ -534,6 +545,7 @@ pub(super) async fn run_search_batch(
                     latency_ms,
                     error: Some(err),
                     hits: 0,
+                    kept_hits: 0,
                     parsed: false,
                     usage: false,
                     rule_complete,

@@ -43,6 +43,10 @@ pub fn apply_outcome(
     if o.usage {
         row.search_count = row.search_count.saturating_add(1);
         row.hit_count = row.hit_count.saturating_add(o.hits.max(0));
+        row.kept_hit_count = row.kept_hit_count.saturating_add(o.kept_hits.max(0));
+        if o.kept_hits > 0 {
+            row.yield_ok_count = row.yield_ok_count.saturating_add(1);
+        }
         if o.parsed {
             row.parse_ok_count = row.parse_ok_count.saturating_add(1);
         }
@@ -76,6 +80,33 @@ fn mean_latency(raw: &str) -> Option<i64> {
         return None;
     }
     Some(samples.iter().sum::<i64>() / samples.len() as i64)
+}
+
+/// 平滑产出率：`kept_hits > 0` 的搜索占比，带伪计数先验。
+///
+/// 先验 0.30（约三成搜索能出书名匹配）、强度 4 次观测：新源/低频源不会被
+/// 一两次未命中永久压底，高频源的真实产出率会迅速覆盖先验。
+pub fn smoothed_yield(row: &HealthRow) -> f64 {
+    const PRIOR: f64 = 0.30;
+    const STRENGTH: f64 = 4.0;
+    let ok = row.yield_ok_count.max(0) as f64;
+    let n = row.search_count.max(0) as f64;
+    (ok + PRIOR * STRENGTH) / (n + STRENGTH)
+}
+
+/// 期望「每秒有效结果」（ppm）：平滑产出率 / 成功请求的平均延迟（秒）。
+///
+/// 这是搜索入队的排序依据：同样快时产出高的在前；同样产出时快的在前。
+/// 只用成功请求的平均延迟（[`apply_outcome`] 保证超时不计入），
+/// 避免慢源被预算值污染后全体挤在同一档。
+pub fn search_ev_ppm(row: &HealthRow) -> i64 {
+    const MIN_LATENCY_MS: i64 = 250;
+    let latency = row
+        .avg_latency_ms
+        .or(row.ttfb_ms_p90)
+        .unwrap_or(MIN_LATENCY_MS)
+        .max(MIN_LATENCY_MS);
+    (smoothed_yield(row) * 1_000_000.0 / (latency as f64 / 1000.0)) as i64
 }
 
 /// TTFB 环形样本（最多 32 条）+ p90；只用于评分，不做长期存储。
@@ -153,6 +184,11 @@ pub(crate) fn apply_evaluation(
         "rule_completeness": (rule_complete * 100.0).round() / 100.0,
         "search_count": row.search_count,
         "hit_count": row.hit_count,
+        "kept_hit_count": row.kept_hit_count,
+        "yield_ok_count": row.yield_ok_count,
+        "yield_rate": if row.search_count > 0 {
+            (row.yield_ok_count as f64 / row.search_count as f64 * 1000.0).round() / 1000.0
+        } else { 0.0 },
         "hit_rate": if row.search_count > 0 {
             (row.hit_count as f64 / row.search_count as f64 * 1000.0).round() / 1000.0
         } else { 0.0 },
@@ -218,10 +254,11 @@ pub async fn record_outcomes(
              (source_url, last_checked_at, last_status, last_error, consecutive_failures, \
               last_ok_at, cooldown_until, avg_latency_ms, check_total, tier, score, \
               evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+              kept_hit_count, yield_ok_count, \
               fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
               promote_streak, demote_streak) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-              ?17, ?18, ?19, ?20, ?21, ?22) \
+              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
              ON CONFLICT(source_url) DO UPDATE SET \
               last_checked_at=excluded.last_checked_at, \
               last_status=excluded.last_status, \
@@ -234,6 +271,8 @@ pub async fn record_outcomes(
               tier=excluded.tier, score=excluded.score, \
               evidence_json=excluded.evidence_json, last_eval_at=excluded.last_eval_at, \
               search_count=excluded.search_count, hit_count=excluded.hit_count, \
+              kept_hit_count=excluded.kept_hit_count, \
+              yield_ok_count=excluded.yield_ok_count, \
               parse_ok_count=excluded.parse_ok_count, \
               fail_site_count=excluded.fail_site_count, \
               fail_engine_count=excluded.fail_engine_count, \
@@ -257,6 +296,8 @@ pub async fn record_outcomes(
         .bind(row.last_eval_at)
         .bind(row.search_count)
         .bind(row.hit_count)
+        .bind(row.kept_hit_count)
+        .bind(row.yield_ok_count)
         .bind(row.parse_ok_count)
         .bind(row.fail_site_count)
         .bind(row.fail_engine_count)
@@ -305,7 +346,8 @@ pub async fn record_evaluation(
     let row: Option<HealthRow> = sqlx::query_as(
         "SELECT source_url, last_checked_at, last_status, last_error, \
          consecutive_failures, last_ok_at, cooldown_until, avg_latency_ms, check_total, \
-         tier, score, evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+         tier, score, evidence_json, last_eval_at, search_count, hit_count, \
+         kept_hit_count, yield_ok_count, parse_ok_count, \
          fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
          promote_streak, demote_streak \
          FROM source_health WHERE source_url = ?",

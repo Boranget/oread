@@ -276,6 +276,65 @@ fn slow_and_failing_sources_queue_last() {
     assert_eq!(health_order_key(None), (1, 0), "无健康行按无观测处理");
 }
 
+// P1：同样延迟下，产出率（书名匹配命中）高的先入队；近期失败仍垫底。
+#[test]
+fn health_order_prefers_yield_at_same_latency() {
+    let mk_row = |url: &str, last: &str, avg: i64, ok: i64, n: i64| {
+        let mut h = source_health::HealthRow::default();
+        h.source_url = url.to_string();
+        h.last_status = last.to_string();
+        h.avg_latency_ms = Some(avg);
+        h.yield_ok_count = ok;
+        h.search_count = n;
+        h
+    };
+    let mut health = HashMap::new();
+    health.insert(
+        "https://barren.example".to_string(),
+        mk_row(
+            "https://barren.example",
+            source_health::STATUS_OK,
+            1000,
+            0,
+            20,
+        ),
+    );
+    health.insert(
+        "https://fruitful.example".to_string(),
+        mk_row(
+            "https://fruitful.example",
+            source_health::STATUS_OK,
+            1000,
+            15,
+            20,
+        ),
+    );
+    health.insert(
+        "https://failed.example".to_string(),
+        mk_row(
+            "https://failed.example",
+            source_health::STATUS_FAIL,
+            500,
+            20,
+            20,
+        ),
+    );
+    let mk = |name: &str| {
+        let mut s = crate::entities::BookSource::default();
+        s.book_source_url = format!("https://{name}.example");
+        s.book_source_name = name.into();
+        s
+    };
+    let mut list = [mk("barren"), mk("failed"), mk("fruitful")];
+    list.sort_by_key(|s| health_order_key(health.get(&s.book_source_url)));
+    let names: Vec<&str> = list.iter().map(|s| s.book_source_name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["fruitful", "barren", "failed"],
+        "同延迟按产出率降序；近期失败源即使产出高也垫底"
+    );
+}
+
 // legacy / aggregate / /k 也必须按健康顺序入队，否则同一关键词会因入口不同而结果不一致。
 #[test]
 fn all_search_entrypoints_share_health_ordering() {
@@ -971,6 +1030,8 @@ async fn curated_missing_falls_back_to_preferred_for_kindle() {
              tier TEXT NOT NULL DEFAULT 'observing', score INTEGER NOT NULL DEFAULT 50, \
              evidence_json TEXT, last_eval_at INTEGER, \
              search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+              kept_hit_count INTEGER NOT NULL DEFAULT 0, \
+              yield_ok_count INTEGER NOT NULL DEFAULT 0, \
              parse_ok_count INTEGER NOT NULL DEFAULT 0, \
              fail_site_count INTEGER NOT NULL DEFAULT 0, \
              fail_engine_count INTEGER NOT NULL DEFAULT 0, \

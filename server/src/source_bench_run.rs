@@ -794,8 +794,10 @@ pub(super) async fn record_bench_health(
                 latency_ms: r.avg_latency_ms,
                 error: None,
                 hits: r.hits,
+                // 体检的 hits 已经是语料标题匹配结果，与 kept 同口径。
+                kept_hits: r.hits,
                 parsed: true,
-                // 体检不是用户搜索：只更新可用性/延迟，不污染 hit_rate。
+                // 体检不是用户搜索：只更新可用性/延迟，不污染 hit_rate / yield。
                 usage: false,
                 rule_complete,
             }

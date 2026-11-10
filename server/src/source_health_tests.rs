@@ -17,6 +17,7 @@ fn outcome(url: &str, status: &'static str) -> Outcome {
         latency_ms: 12,
         error: None,
         hits: 0,
+        kept_hits: 0,
         parsed: status == STATUS_OK,
         usage: false,
         rule_complete: 1.0,
@@ -94,6 +95,7 @@ fn timeouts_do_not_pollute_avg_latency() {
         latency_ms: lat,
         error: None,
         hits: 1,
+        kept_hits: 1,
         parsed: true,
         usage: true,
         rule_complete: 1.0,
@@ -104,6 +106,7 @@ fn timeouts_do_not_pollute_avg_latency() {
         latency_ms: 8000,
         error: Some("搜索超时（单源 8s 预算）".into()),
         hits: 0,
+        kept_hits: 0,
         parsed: false,
         usage: false,
         rule_complete: 1.0,
@@ -118,6 +121,74 @@ fn timeouts_do_not_pollute_avg_latency() {
     row = apply_outcome(Some(&row), &ok(3000), 9000, 86400);
     assert_eq!(row.avg_latency_ms, Some(2000));
     assert_eq!(row.consecutive_failures, 0);
+}
+
+// 产出率只统计「书名真的匹配」的搜索：解析出 30 条无关结果仍是 0 产出。
+#[test]
+fn yield_counts_only_kept_hits() {
+    let hit = |hits: i64, kept: i64, usage: bool| Outcome {
+        source_url: "https://a.com".into(),
+        status: STATUS_OK,
+        latency_ms: 800,
+        error: None,
+        hits,
+        kept_hits: kept,
+        parsed: true,
+        usage,
+        rule_complete: 1.0,
+    };
+    let row = apply_outcome(None, &hit(30, 0, true), 1000, 86400);
+    assert_eq!(row.hit_count, 30);
+    assert_eq!(row.kept_hit_count, 0);
+    assert_eq!(row.yield_ok_count, 0, "解析成功但书名全不匹配 = 无产出");
+
+    let row = apply_outcome(Some(&row), &hit(30, 2, true), 2000, 86400);
+    assert_eq!(row.kept_hit_count, 2);
+    assert_eq!(row.yield_ok_count, 1);
+    assert_eq!(row.search_count, 2);
+
+    // 体检/巡检（usage=false）不写产出证据，避免热门语料抬高冷门查询的产出率。
+    let row = apply_outcome(Some(&row), &hit(24, 24, false), 3000, 86400);
+    assert_eq!(row.kept_hit_count, 2);
+    assert_eq!(row.yield_ok_count, 1);
+    assert_eq!(row.search_count, 2);
+}
+
+#[test]
+fn smoothed_yield_uses_prior_then_evidence() {
+    let mut row = HealthRow::default();
+    assert!((smoothed_yield(&row) - 0.30).abs() < 1e-9, "无证据时用先验");
+
+    row.search_count = 4;
+    row.yield_ok_count = 4;
+    assert!((smoothed_yield(&row) - 0.65).abs() < 1e-9);
+
+    row.search_count = 100;
+    row.yield_ok_count = 0;
+    assert!(smoothed_yield(&row) < 0.02, "大量未命中应压到先验以下");
+}
+
+#[test]
+fn search_ev_orders_by_yield_per_second() {
+    let mut fast_low = HealthRow::default();
+    fast_low.avg_latency_ms = Some(500);
+    fast_low.search_count = 20;
+    fast_low.yield_ok_count = 2;
+
+    let mut slow_high = HealthRow::default();
+    slow_high.avg_latency_ms = Some(2000);
+    slow_high.search_count = 20;
+    slow_high.yield_ok_count = 14;
+
+    // 快但几乎不出结果 vs 慢但常出结果：按「每秒有效结果」后者更高。
+    assert!(search_ev_ppm(&slow_high) > search_ev_ppm(&fast_low));
+
+    // 同样产出时，快的在前。
+    let mut fast_same = HealthRow::default();
+    fast_same.avg_latency_ms = Some(500);
+    fast_same.search_count = 20;
+    fast_same.yield_ok_count = 14;
+    assert!(search_ev_ppm(&fast_same) > search_ev_ppm(&slow_high));
 }
 
 // 引擎失败（partial）不计失败、不清零、不冷却——这是与站点故障的关键区别
@@ -198,6 +269,8 @@ async fn test_pool() -> SqlitePool {
          tier TEXT NOT NULL DEFAULT 'observing', score INTEGER NOT NULL DEFAULT 50, \
          evidence_json TEXT, last_eval_at INTEGER, \
          search_count INTEGER NOT NULL DEFAULT 0, hit_count INTEGER NOT NULL DEFAULT 0, \
+         kept_hit_count INTEGER NOT NULL DEFAULT 0, \
+         yield_ok_count INTEGER NOT NULL DEFAULT 0, \
          parse_ok_count INTEGER NOT NULL DEFAULT 0, \
          fail_site_count INTEGER NOT NULL DEFAULT 0, \
          fail_engine_count INTEGER NOT NULL DEFAULT 0, \
@@ -223,6 +296,7 @@ async fn db_record_cools_after_threshold_and_success_resets() {
                 latency_ms: 30,
                 error: Some("http status 404".into()),
                 hits: 0,
+                kept_hits: 0,
                 parsed: false,
                 usage: false,
                 rule_complete: 1.0,
@@ -246,6 +320,7 @@ async fn db_record_cools_after_threshold_and_success_resets() {
             latency_ms: 12,
             error: None,
             hits: 0,
+            kept_hits: 0,
             parsed: true,
             usage: false,
             rule_complete: 1.0,
@@ -274,6 +349,7 @@ async fn db_engine_failure_does_not_cool() {
                 latency_ms: 20,
                 error: None,
                 hits: 0,
+                kept_hits: 0,
                 parsed: false,
                 usage: false,
                 rule_complete: 1.0,
@@ -293,6 +369,7 @@ async fn db_engine_failure_does_not_cool() {
                 latency_ms: 20,
                 error: Some("selector miss".into()),
                 hits: 0,
+                kept_hits: 0,
                 parsed: false,
                 usage: false,
                 rule_complete: 1.0,
@@ -358,6 +435,7 @@ async fn import_transient_timeout_keeps_source_visible() {
             latency_ms: 10_000,
             error: Some("搜索超时（单源 10s 预算）".into()),
             hits: 0,
+            kept_hits: 0,
             parsed: false,
             usage: false,
             rule_complete: 1.0,
@@ -393,6 +471,7 @@ async fn import_zero_hit_partial_keeps_source_visible() {
             latency_ms: 40,
             error: Some("规则未产出结果".into()),
             hits: 0,
+            kept_hits: 0,
             parsed: false,
             usage: true,
             rule_complete: 1.0,
@@ -419,6 +498,7 @@ async fn explicit_site_failures_still_quarantine_at_threshold() {
                 latency_ms: 30,
                 error: Some("http status 503 Service Unavailable".into()),
                 hits: 0,
+                kept_hits: 0,
                 parsed: false,
                 usage: false,
                 rule_complete: 1.0,

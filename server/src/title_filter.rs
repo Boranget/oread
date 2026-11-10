@@ -99,6 +99,18 @@ fn record(stats: &TitleFilterStats) {
     DROPPED.fetch_add(stats.dropped as u64, Ordering::Relaxed);
 }
 
+/// 只计数、不过滤：返回书名包含关键词的条数。
+///
+/// 用于搜索产出统计（yield），不写 `/healthz` 的过滤累计值——
+/// 这里统计的是「源返回的原始结果里有多少条真的对上了书名」，
+/// 与响应边界的 `title_filter` 是两件事。
+pub fn count_title_matches(books: &[SearchBook], keyword: &str) -> i64 {
+    books
+        .iter()
+        .filter(|b| title_contains(keyword, b.name.as_deref().unwrap_or("")))
+        .count() as i64
+}
+
 /// 边界过滤：保留书名包含关键词的条目，返回保留结果与计数。
 /// 顺序、分数与 `seq` 均原样保留，调用方不应再重新排序。
 pub fn retain_title_matches(
@@ -193,5 +205,18 @@ mod tests {
         assert_eq!(stats.raw, 4);
         assert_eq!(stats.kept, 2);
         assert_eq!(stats.dropped, 2);
+    }
+
+    #[test]
+    fn count_title_matches_does_not_filter_or_record() {
+        let books = vec![book("《百年孤独》"), book("海贼王"), book("百年孤独 精装")];
+        assert_eq!(count_title_matches(&books, "百年孤独"), 2);
+        assert_eq!(count_title_matches(&books, "不存在的书"), 0);
+        // 纯标点关键词不做过滤，全部计入
+        assert_eq!(count_title_matches(&books, "《》·"), 3);
+        // 计数不改变 `/healthz` 的过滤累计值
+        let before = metrics();
+        let _ = count_title_matches(&books, "百年孤独");
+        assert_eq!(metrics(), before);
     }
 }

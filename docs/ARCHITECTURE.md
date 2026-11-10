@@ -31,6 +31,7 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | `k_metrics*` | `/k` 请求日志、聚合与探针 |
 | `cache_metrics.rs` | 正文缓存命中/落库/淘汰计数（`/healthz` 暴露） |
 | `search_rank.rs` | 排序/配额策略（暂未接入生产路由，模块级 `dead_code`） |
+| `title_filter.rs` | 服务端书名包含过滤；`count_title_matches` 供搜索产出统计 |
 
 ## 3. 一次正文请求
 

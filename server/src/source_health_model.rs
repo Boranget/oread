@@ -20,6 +20,9 @@ pub struct HealthRow {
     pub last_eval_at: Option<i64>,
     pub search_count: i64,
     pub hit_count: i64,
+    // ---- 搜索产出证据（0015）：书名匹配后的命中，才是「搜到了」----
+    pub kept_hit_count: i64,
+    pub yield_ok_count: i64,
     pub parse_ok_count: i64,
     pub fail_site_count: i64,
     pub fail_engine_count: i64,
@@ -47,6 +50,8 @@ impl Default for HealthRow {
             last_eval_at: None,
             search_count: 0,
             hit_count: 0,
+            kept_hit_count: 0,
+            yield_ok_count: 0,
             parse_ok_count: 0,
             fail_site_count: 0,
             fail_engine_count: 0,
@@ -83,8 +88,11 @@ pub struct Outcome {
     pub status: &'static str,
     pub latency_ms: i64,
     pub error: Option<String>,
-    /// 本次搜索返回的命中条数（体检时同样记录，但不算真实使用）。
+    /// 本次搜索解析出的条目数（书名过滤之前）；体检时同样记录，但不算真实使用。
     pub hits: i64,
+    /// 其中书名真的包含关键词的条数。只有它能证明「搜到了这本书」，
+    /// 是搜索产出率（yield）的分子；`usage=false` 时不参与统计。
+    pub kept_hits: i64,
     /// 规则解析是否成功（拿得到结构化结果）。
     pub parsed: bool,
     /// true = 真实搜索使用；false = 导入/巡检体检。
@@ -165,7 +173,8 @@ pub async fn load_map(pool: &SqlitePool) -> AppResult<HashMap<String, HealthRow>
     let rows: Vec<HealthRow> = sqlx::query_as(
         "SELECT source_url, last_checked_at, last_status, last_error, \
          consecutive_failures, last_ok_at, cooldown_until, avg_latency_ms, check_total, \
-         tier, score, evidence_json, last_eval_at, search_count, hit_count, parse_ok_count, \
+         tier, score, evidence_json, last_eval_at, search_count, hit_count, \
+         kept_hit_count, yield_ok_count, parse_ok_count, \
          fail_site_count, fail_engine_count, ttfb_ms_p90, ttfb_samples_json, \
          promote_streak, demote_streak \
          FROM source_health",
