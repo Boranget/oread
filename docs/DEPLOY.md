@@ -93,6 +93,31 @@ $env:OREAD_DEVICE = '192.168.1.191'
 
 不改 `boranlib.env`、不重装系统、不动 nginx 配置、不改网络接口。
 
+### 3.1 反向代理 gzip（手动，部署脚本不覆盖）
+
+设备上的 nginx 站点配置（如 `/etc/nginx/sites-available/boranlib`）建议开启 gzip。
+应用本身只给 `/k` 挂压缩层，网页端的 JS/CSS/JSON 由 nginx 压缩；Funnel 或慢链路下收益最大：
+
+```nginx
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 1024;
+gzip_types text/plain text/css text/javascript application/javascript
+           application/json application/xml text/xml image/svg+xml application/manifest+json;
+```
+
+改完先 `nginx -t`，再 `systemctl reload nginx`。验收：
+
+```bash
+curl -sI -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/assets/<主 JS> \
+  | grep -Ei 'content-encoding|vary|content-length'
+```
+
+应看到 `Content-Encoding: gzip` 与 `Vary: Accept-Encoding`。设备实测：
+主 JS 149KB → 49.8KB、Reader chunk 99.9KB → 37.9KB、Reader CSS 21.5KB → 3.5KB。
+
 ## 4. 回滚
 
 ### 自动回滚

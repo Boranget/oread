@@ -364,7 +364,10 @@ export const api = {
         author: seed.author,
         intro: seed.intro,
         cover_url: seed.coverUrl,
-      })}`
+      })}`,
+      // 详情只用于书名/作者等装饰信息：阅读器已改为不阻塞正文，
+      // 这里再用更短超时释放连接，避免域名链路抖动时占着浏览器连接 45s。
+      { timeout: 15000 }
     ),
   // 按链接打开：粘贴书源可匿名访问的详情页 URL，导入后返回 book_url 可直接进阅读页
   importByUrl: (sourceId, url) =>
@@ -477,7 +480,11 @@ export const api = {
       { timeout: 180000 }
     ),
   shelfStats: () => request('GET', '/bookshelf/stats'),
-  progress: (bookId) => request('GET', `/bookshelf/progress?book_id=${encodeURIComponent(bookId)}`),
+  // 进度是纯本地库查询；短超时即可，失败时阅读器会回退 localStorage。
+  progress: (bookId) =>
+    request('GET', `/bookshelf/progress?book_id=${encodeURIComponent(bookId)}`, undefined, {
+      timeout: 10000,
+    }),
   // keepalive=true 用于 pagehide / visibilitychange 时的兜底上报
   setProgress: (p, keepalive = false) => request('POST', '/bookshelf/progress', p, { keepalive }),
   groups: () => request('GET', '/bookshelf/groups'),

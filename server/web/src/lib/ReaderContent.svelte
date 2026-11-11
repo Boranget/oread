@@ -1,4 +1,6 @@
 <script>
+  import { onDestroy } from 'svelte';
+
   export let tocLoading = true;
   export let tocError = '';
   export let current = null;
@@ -47,6 +49,28 @@
 
   let el = null;
   $: if (el) bindScrollEl(el);
+
+  // 慢链路提示：加载超过 8s 仍未完成时明确告诉用户“还在等”，
+  // 避免把域名/Funnel 抖动误认为阅读器卡死。计时器只用于文案，不参与请求控制。
+  let slow = false;
+  let slowTimer = null;
+  $: loading = tocLoading || contentLoading;
+  $: if (loading) {
+    if (!slowTimer && typeof setTimeout !== 'undefined') {
+      slowTimer = setTimeout(() => {
+        slow = true;
+      }, 8000);
+    }
+  } else {
+    if (slowTimer) {
+      clearTimeout(slowTimer);
+      slowTimer = null;
+    }
+    slow = false;
+  }
+  onDestroy(() => {
+    if (slowTimer) clearTimeout(slowTimer);
+  });
 </script>
 
   <div
@@ -65,6 +89,7 @@
         <div class="spinner"></div>
         <p>正在打开书籍…</p>
         <p class="rd-muted">首次加载目录可能需要几秒</p>
+        {#if slow}<p class="rd-muted">网络较慢，仍在等待书源响应…</p>{/if}
       </div>
     {:else if tocError}
       <div class="rd-state">
@@ -103,7 +128,10 @@
         {:else if current}
           <h1 class="rd-chapter-title">{displayTitle}</h1>
           {#if contentLoading}
-            <div class="rd-state">加载正文…</div>
+            <div class="rd-state">
+              加载正文…
+              {#if slow}<p class="rd-muted">网络较慢，仍在等待书源响应…</p>{/if}
+            </div>
           {:else if chapterEmpty}
             <div class="rd-state rd-empty" role="status">
               <p class="rd-empty-title">{emptyTitle}</p>

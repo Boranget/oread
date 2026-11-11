@@ -312,6 +312,17 @@
       tocLoading = false;
       return;
     }
+    // 详情是可选装饰：单独发起，失败/变慢都不阻塞目录与正文。
+    // 之前把它和目录放在同一个 Promise.all 里，域名链路抖动时一个 45s 超时
+    // 会让整页一直停在“正在打开书籍”，正文迟迟不出现。
+    api
+      .bookInfo(book.sourceId, book.bookUrl, seed)
+      .then((b) => {
+        info = b;
+      })
+      .catch(() => {});
+    // 进度与目录互不依赖，同时发起；目录返回后通常进度也已就绪。
+    const progP = api.progress(book.bookUrl).catch(() => progress.readLocal());
     try {
       api
         .addToShelf({
@@ -322,22 +333,13 @@
           cover: seed.coverUrl,
         })
         .catch(() => {});
-      const [b, toc] = await Promise.all([
-        api.bookInfo(book.sourceId, book.bookUrl, seed).catch(() => null),
-        api.toc(book.sourceId, book.bookUrl, seed),
-      ]);
-      info = b;
+      const toc = await api.toc(book.sourceId, book.bookUrl, seed);
       chapters = (toc || []).slice().sort((x, y) => x.index - y.index);
       if (!chapters.length) {
         tocError = '目录为空：书源可能未返回章节，或目录规则失效。';
         return;
       }
-      let prog = null;
-      try {
-        prog = await api.progress(book.bookUrl);
-      } catch {
-        prog = progress.readLocal();
-      }
+      let prog = await progP;
       if (!prog || (prog.chapter_index === 0 && prog.position === 0)) {
         prog = progress.readLocal() || prog || { chapter_index: 0, position: 0 };
       }
