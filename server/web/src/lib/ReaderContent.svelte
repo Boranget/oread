@@ -48,7 +48,14 @@
   export let nextPage = () => {};
 
   let el = null;
-  $: if (el) bindScrollEl(el);
+  // 只在滚动容器真正变化时回传。bindScrollEl 是父组件传入的函数 prop，
+  // 函数 prop 在 Svelte 里每次 $set 都会被判定为“已变化”，若这里无条件调用，
+  // 会形成 子更新→回传 el→父更新→重新 $set→子更新 的死循环，导致整页调度器卡死。
+  let boundEl = null;
+  $: if (el && el !== boundEl) {
+    boundEl = el;
+    bindScrollEl(el);
+  }
 
   // 慢链路提示：加载超过 8s 仍未完成时明确告诉用户“还在等”，
   // 避免把域名/Funnel 抖动误认为阅读器卡死。计时器只用于文案，不参与请求控制。

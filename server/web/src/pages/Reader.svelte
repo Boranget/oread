@@ -113,6 +113,11 @@
   let flipDir = 0;
 
   let scrollEl = null;
+  // 用稳定的函数引用传给 ReaderContent。模板里写内联箭头会在每次父更新时
+  // 重新创建函数 prop，和子组件的 $: bindScrollEl(el) 组合成更新回环。
+  function bindScrollEl(el) {
+    scrollEl = el;
+  }
 
   let flipTimer = null;
   let resizeTimer = null;
@@ -850,7 +855,7 @@
     {autoOn}
     {autoSpeed}
     {toast}
-    bindScrollEl={(el) => (scrollEl = el)}
+    bindScrollEl={bindScrollEl}
     onScroll={progress.onScroll}
     onReaderClick={gestures.onClick}
     onTouchStart={gestures.onTouchStart}
