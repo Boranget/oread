@@ -136,6 +136,31 @@ pub fn classify(err: &Error) -> FailureKind {
     }
 }
 
+/// 失败文案是否属于「超时」（单源预算用尽或底层请求超时）。
+pub fn is_timeout_message(msg: &str) -> bool {
+    msg.contains("超时")
+}
+
+/// 搜索失败的三元归类：`(健康状态, 错误 kind, 是否计入搜索统计)`。
+///
+/// - **超时**：`partial` + 不计统计。16 路并发 + 单源预算下超时是「未知」，
+///   既不能累计连续失败（会 24h 冷却/隔离），也不能算一次 0 命中
+///   （否则冷门关键词搜两轮就把正常源打成隔离）。
+/// - **站点故障**（连接失败/HTTP 非成功）：`fail` + 计入，这是明确的站点问题。
+/// - **引擎故障**（选择器/JSONPath/JS）：`partial` + 计入，留证据但不判死站点。
+///
+/// 两段式 job 与 legacy/`/k` 的批量路径共用这一口径，避免同一站点在不同入口
+/// 得到不同的健康判定。
+pub fn classify_search_failure(msg: &str, engine: bool) -> (&'static str, &'static str, bool) {
+    if is_timeout_message(msg) {
+        (super::STATUS_PARTIAL, "timeout", false)
+    } else if engine {
+        (super::STATUS_PARTIAL, "engine", true)
+    } else {
+        (super::STATUS_FAIL, "site", true)
+    }
+}
+
 /// 构造一个“站点不可达”错误（用于搜索超时等外部判定）。仅单测使用。
 #[allow(dead_code)]
 pub fn site_error(msg: impl Into<String>) -> Error {

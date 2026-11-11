@@ -319,7 +319,16 @@ pub(super) async fn search(
     )
     .await;
     let active = order_by_health(plan.active, &plan.health, &plan.prior);
-    let (full, _, _) = aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
+    let (full, _, _) = aggregated(
+        &s.shared,
+        s.cfg.source_cooldown_secs,
+        &crate::source_quality::TierConfig::from_config(&s.cfg),
+        &active,
+        &q.keyword(),
+        include_cooled,
+        plan.scope,
+    )
+    .await;
     Ok(Json(paginate(full, page, q.page_size)))
 }
 
@@ -329,6 +338,9 @@ pub(super) async fn search(
 /// 缓存里存的是**未做书名过滤**的原始聚合结果；过滤在返回调用方之前统一执行，
 /// 因此缓存不会因为关键词归一化差异而串味，客户端拿到的也始终是同一套边界规则。
 pub(crate) async fn aggregated(
+    pool: &sqlx::SqlitePool,
+    cooldown_secs: u64,
+    tier_cfg: &crate::source_quality::TierConfig,
     sources: &[crate::entities::BookSource],
     key: &str,
     include_cooled: bool,
@@ -358,7 +370,17 @@ pub(crate) async fn aggregated(
     let (raw_books, errors) = match hit {
         Some(v) => v,
         None => {
-            let outcome = web_book::search_all_with_errors_scoped(sources, key, 1, scope).await;
+            let (outcome, evidence) =
+                web_book::search_all_scoped_evidenced(sources, key, 1, scope).await;
+            // 只有真实搜索（缓存未命中）才写证据：命中 60s 缓存不重复计一次「搜索」。
+            // 这样 legacy `/api/search`、`/api/search/aggregate` 与 `/k/search` 与两段式
+            // job 共用同一份健康/产出证据，不再「只读不写」。
+            if let Err(e) =
+                crate::source_health::record_outcomes(pool, &evidence, cooldown_secs, tier_cfg)
+                    .await
+            {
+                tracing::warn!(error = %e, "record source health after aggregate search failed");
+            }
             let mut books = outcome.books;
             books.truncate(AGG_MAX_BOOKS);
             let errors = outcome.errors;
@@ -411,8 +433,16 @@ pub(super) async fn search_aggregate(
     )
     .await;
     let active = order_by_health(plan.active, &plan.health, &plan.prior);
-    let (full, errors, title_filter) =
-        aggregated(&active, &q.keyword(), include_cooled, plan.scope).await;
+    let (full, errors, title_filter) = aggregated(
+        &s.shared,
+        s.cfg.source_cooldown_secs,
+        &crate::source_quality::TierConfig::from_config(&s.cfg),
+        &active,
+        &q.keyword(),
+        include_cooled,
+        plan.scope,
+    )
+    .await;
 
     let total = full.len();
     let skip = ((page as usize) - 1) * page_size;

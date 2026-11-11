@@ -248,33 +248,8 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
     view
 }
 
-/// 该失败文案是否属于“超时”（单源预算用尽或底层请求超时）。
-///
-/// 超时在聚合搜索里是**不确定**证据：同一个源在体检（低并发）下可能很快。
-/// 因此它只记 `partial`，不参与连续失败/冷却判定。
-pub(super) fn is_timeout_message(msg: &str) -> bool {
-    msg.contains("超时")
-}
-
-/// 搜索失败的三元归类：`(健康状态, 错误 kind, 是否计入搜索统计)`。
-///
-/// - **超时**：`partial` + 不计统计。16 路并发 + 单源预算下超时是「未知」，
-///   既不能累计连续失败（会 24h 冷却/隔离），也不能算一次 0 命中
-///   （否则冷门关键词搜两轮就把正常源打成隔离）。
-/// - **站点故障**（连接失败/HTTP 非成功）：`fail` + 计入，这是明确的站点问题。
-/// - **引擎故障**（选择器/JSONPath/JS）：`partial` + 计入，留证据但不判死站点。
-pub(super) fn classify_search_failure(
-    msg: &str,
-    engine: bool,
-) -> (&'static str, &'static str, bool) {
-    if is_timeout_message(msg) {
-        (source_health::STATUS_PARTIAL, "timeout", false)
-    } else if engine {
-        (source_health::STATUS_PARTIAL, "engine", true)
-    } else {
-        (source_health::STATUS_FAIL, "site", true)
-    }
-}
+// 失败口径与批量路径共用同一实现，避免同一站点在不同入口得到不同健康判定。
+pub(super) use crate::source_health::classify_search_failure;
 
 /// 全局预算是否“明显不足”单源预算。
 ///

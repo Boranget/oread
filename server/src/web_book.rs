@@ -252,8 +252,9 @@ pub use web_book_images::{chapter_images, chapter_images_book, ChapterImages, MA
 pub use web_book_info::{book_info, book_info_book, parse_book_info_html};
 pub(crate) use web_book_rank::{dedupe_and_sort_with, RankFreeze};
 pub use web_book_rank::{
-    search_all, search_all_with_errors, search_all_with_errors_budgeted,
-    search_all_with_errors_scoped, ExploreCategory, SearchOutcome, SourceFailure,
+    search_all, search_all_scoped_evidenced, search_all_with_errors,
+    search_all_with_errors_budgeted, search_all_with_errors_scoped, ExploreCategory, SearchOutcome,
+    SourceFailure,
 };
 pub use web_book_search::{explore, search, search_book};
 pub use web_book_toc::{chapter_list, chapter_list_book};

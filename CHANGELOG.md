@@ -30,6 +30,11 @@
   API（legacy、两段式、聚合）在返回前按同一规则丢弃书名不含关键词的条目。
   只比对书名，不做繁简转换；过滤在去重排序之后执行，不影响打分、精选与源健康。
   响应新增 `title_filter` 计数，`/healthz` 暴露进程内累计值。
+- 批量搜索入口（`/api/search`、`/api/search/aggregate`、`/k/search`）在 60s 缓存未命中时
+  也写 `source_health` 与 `source_query_stats` 产出证据，口径与两段式 job 一致：
+  只有真实发出请求的源才写，超时记「未知」（`partial` + 不计产出），全局预算截断不写健康，
+  命中缓存不重复计数。此前这些入口只读证据，从 Kindle 或旧 API 发起的搜索永远不参与优先级排序。
+  批量入口仍是一次性聚合，不套用 anytime 逐源重排/早停。
 
 ### Fixed
 

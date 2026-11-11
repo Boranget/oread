@@ -123,6 +123,12 @@ loop {
 
 实现位置：`run_search_job` 用 `futures::stream::unfold` 拉取优先队列、`buffer_unordered` 维持并发；每个源完成回到主循环后调用 `resort_queue` 重排。`scheduled_sources` 在真正取源时累加，因此进度接口仍能区分「已排上 / 尚未排上」。
 
+### 6.1 批量入口为什么不走 anytime
+
+`/api/search`、`/api/search/aggregate` 与 `/k/search` 共用 `aggregated()`（60s 缓存 + 本地分页），语义是**一次返回完整聚合结果**：翻页要基于同一份快照，不能因为早停让第 2 页比第 1 页少。因此这条路径保留 `join_all` 式的一次性并发，不接 anytime 调度，冷启动 `scope=all` 会跑满整批预算。
+
+但**证据口径必须与 job 一致**：缓存未命中时，`search_all_scoped_evidenced` 会把逐源结果一并返回，`aggregated()` 再调用 `record_outcomes` 写 `source_health` 与 `source_query_stats`。规则与第 6 节相同——只有真实发出请求的源才写；超时 = 未知（`partial` + `usage=false`）；`truncated`/`skipped` 不写健康；命中 60s 缓存不重复计一次搜索。这样从 Kindle 或旧 API 发起的搜索也会积累优先级证据，不会永远「只读不写」。
+
 ## 7. 状态机简化
 
 存储层只保留原始证据 + 人工干预（`manual_block` / `manual_pin`）。`tier` / `score` / `quarantined` / `cooling` 改为**派生视图**：

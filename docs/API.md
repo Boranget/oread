@@ -268,10 +268,12 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 `GET /api/search` 与 `GET /api/search/aggregate` 的分页实现（2026-11-02 20:0x 复核，源码已更新）：
 
-1. 两个入口共用 `aggregated()`：只向书源抓取**第 1 页**（`search_all_with_errors(sources, key, 1)`），合并、去重、按权重排序，截断到 400 本，并写入 60s 缓存。
+1. 两个入口共用 `aggregated()`：只向书源抓取**第 1 页**（`search_all_scoped_evidenced(sources, key, 1, scope)`），合并、去重、按权重排序，截断到 400 本，并写入 60s 缓存。
 2. 再对这份完整结果执行 `skip((page-1)*page_size).take(page_size)`。
 
 因此 `page>=2` 不再重复抓取书源第 N 页，跨页不会重复或遗漏；但可翻到的内容上限是“各源第 1 页去重后的前 400 本”。`total` 只在这份结果内可信（见 5.2）。
+
+`/api/search`、`/api/search/aggregate` 与 `/k/search` 共用这条路径。**缓存未命中时**，每个真实发出请求的源会同时写入 `source_health` 与 `source_query_stats`（与两段式 job 同一口径：`kept_hits` 才是产出证据，超时 = 未知、不计产出，全局预算截断 = 不写健康）；命中 60s 缓存则不重复计一次搜索。批量入口仍是一次性聚合，**不套用**两段式的 anytime 逐源重排/早停（避免改变“一次返回完整结果”的语义）。
 
 ### 2.4 聚合搜索的有序性与去重
 
@@ -279,6 +281,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 排序：书源 `weight` 降序 → `custom_order` 升序 → `book_url` 升序（[web_book.rs](../server/src/web_book.rs#L316-L331)）。
 - 参与搜索的书源条件：`enabled == true && rule_search != null && search_url != null`。
 - 单源失败不使整体失败；`/api/search` 静默丢弃失败，`/api/search/aggregate` 与 `/api/search/result` 在 `errors` 中返回。
+- 搜索产出证据（`source_health` / `source_query_stats`）由真实搜索写入：两段式 job 按源完成即写；`/api/search`、`/api/search/aggregate`、`/k/search` 在 60s 缓存未命中时一次性写入。命中缓存、`truncated`/`skipped` 与超时都不算一次有效产出。
 - 两段式搜索（5.5/5.6）沿用同一套 `dedupe_and_sort` 与 400 本截断；参与源为 **job 创建时的启用快照**（若传 `source_ids`，则是按该参数过滤后的子集），之后改书源不影响该 job；分页与去重都基于这份快照。
 
 ### 2.5 时间字段格式与时区
@@ -1172,6 +1175,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：缺 `key`/`q` → `200 []`（已实测；不再 400）；`401`；上游抓取失败被**静默丢弃**（不会 400/500，可能返回空数组）。
 - 行为/坑：
   - 分页基于 60s 缓存的完整聚合结果（见 2.3），`page>=2` 稳定；但只能翻到各源第 1 页去重后的前 400 本。
+  - 缓存未命中时会写源健康与查询类产出证据（与两段式 job 同口径）；同一 `key` 60s 内再次请求命中缓存，不重复计数。
   - 去重 + 排序见 2.4。
   - 搜索参与源：`enabled && rule_search && search_url`；`enabled_explore` 不参与搜索。
 
@@ -1226,6 +1230,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 未命中：并发搜索所有源**第 1 页** → 去重排序 → `truncate(400)` → 仅当非空才写缓存。
   - 空结果不缓存，因此“冷查询”每次都会打全部源。
   - 缓存全局共享，不区分用户（结果与用户无关）。
+  - 缓存未命中时写 `source_health` / `source_query_stats` 产出证据；命中缓存不重复计数。批量入口不启用 anytime 早停，冷启动 `scope=all` 会跑满整批预算。
   - 分页稳定：同一 `key` 60s 内翻页不重不漏；超过 TTL 后重新抓取，`total` 可能变化。
   - `total` 不是全站总数，只是“本次聚合的可用结果数（≤400）”。
 
@@ -3086,6 +3091,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `/k/read` | `book`、`source` | `ch`、`p`（章内页码，1 起）、`fs`、`vw`、`vh`、`vmh` |
 | `/k/search` | — | `key`、`fs`、`sp`、`scope`（显式 `all`/`expanded`/`enhanced` 走全量，其余 curated）、`include_cooled`、`vw`、`vh`、`vmh` |
 
+- `/k/search` 与 `/api/search`、`/api/search/aggregate` 共用同一份 60s 聚合缓存与书名过滤；缓存未命中时同样写源健康/查询类产出证据，命中缓存不重复计数。`scope=all` 的冷启动仍按整批预算跑满（无 anytime 早停）。
 - `fs`：字号档位 1..4；缺参回落 Cookie `k_fs`，再缺省 2。
 - `vw` / `vh`：视口宽/高（CSS px）。`vh` **优先读 Cookie `k_vh`**（版本 `k_vv` 与当前 `CALIB_VER` 一致且在 480–2400 内才采用），否则用请求参数；`vw` 用请求参数。缺参回落环境默认 `KINDLE_VW=1072` / `KINDLE_VH=1268`；显式 `vw` 时页面锁 `width={vw}`。
 - `vmh`：**试验开关**（400–2400，缺省关闭）。给出时 viewport meta 变成 `width=…,height=<vmh>,initial-scale=1,maximum-scale=1,user-scalable=0`，并写 Cookie `k_vmh`（30 天，后续不带参数也沿用）。**清除开关**：`?vmh=0`（或 `vmh=off`）删除该 Cookie（`max-age=0`），本次不输出 `height=`，页面正常渲染不跳转；解析顺序是「先参数、再决定写/删/沿用」，因此带 `vmh=0` 时不会沿用旧 Cookie；非法值（如 `300`）忽略参数、沿用 Cookie，不写也不删。用于在真机对比「带 height 的 meta」与「不带」两种表现——若老引擎认 `height=`，布局视口会变矮，整页平移与右侧竖条应同时消失。探针 `meta_h`/`vw_meta_height` 回读该 meta 的 `height=` 值（没有则 `-`），用于确认是否生效。

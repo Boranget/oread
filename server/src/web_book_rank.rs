@@ -266,17 +266,35 @@ pub async fn search_all_with_errors_budgeted(
         crate::req::SearchScope::Curated,
     )
     .await
+    .0
 }
 
 /// 按 scope 使用与 `/api/search/start` 相同的单源/整批预算与并发池：
-/// `curated` 8s/6s、`all` 5s/25s。legacy `/api/search` 走这里，
-/// 保证同一关键词在同一源集合下拿到的结果集合与两段式一致。
+/// `curated` 8s/6s、`all` 8s/40s。
 pub async fn search_all_with_errors_scoped(
     sources: &[BookSource],
     key: &str,
     page: i32,
     scope: crate::req::SearchScope,
 ) -> SearchOutcome {
+    search_all_scoped_evidenced(sources, key, page, scope)
+        .await
+        .0
+}
+
+/// 同 [`search_all_with_errors_scoped`]，但把逐源结果一并返回。
+///
+/// legacy `/api/search`、`/api/search/aggregate` 与 `/k/search` 需要一次性聚合
+/// （60s 缓存 + 可翻页），不能套用两段式 job 的 anytime 调度；但**证据口径必须
+/// 与 job 一致**：只有真实发出请求的源才写健康/产出，超时 = 未知（partial +
+/// 不计产出），全局预算截断 = 不写健康。否则从 Kindle 或旧 API 发起的搜索
+/// 会永远「只读不写」，优先级证据永远长不大。
+pub async fn search_all_scoped_evidenced(
+    sources: &[BookSource],
+    key: &str,
+    page: i32,
+    scope: crate::req::SearchScope,
+) -> (SearchOutcome, Vec<crate::source_health::Outcome>) {
     search_all_budgeted_scoped(
         sources,
         key,
@@ -295,8 +313,9 @@ pub(super) async fn search_all_budgeted_scoped(
     per_source: std::time::Duration,
     total: std::time::Duration,
     scope: crate::req::SearchScope,
-) -> SearchOutcome {
+) -> (SearchOutcome, Vec<crate::source_health::Outcome>) {
     let deadline = tokio::time::Instant::now() + total;
+    let query_class = crate::query_class::QueryClass::classify(key);
     let mut tasks = Vec::new();
     for s in sources {
         if !crate::entities::is_searchable_source(s) {
@@ -304,20 +323,34 @@ pub(super) async fn search_all_budgeted_scoped(
         }
         let src = s.clone();
         let comic = crate::req::is_comic_source_type(src.book_source_type);
+        let rule_complete = crate::source_quality::rule_completeness(&src);
         let fut = async move {
             // 先排队拿源级并发槽（不计入单源预算），再开始计时。
-            let _slot = crate::req::acquire_search_slot(comic, deadline, scope).await?;
+            let _slot = match crate::req::acquire_search_slot(comic, deadline, scope).await {
+                Ok(p) => p,
+                Err(e) => return (src, rule_complete, Err(e), 0, false),
+            };
             let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remain.is_zero() {
-                anyhow::bail!("全局搜索预算耗尽（排队未及执行）");
+                return (
+                    src,
+                    rule_complete,
+                    Err(anyhow::anyhow!("全局搜索预算耗尽（排队未及执行）")),
+                    0,
+                    false,
+                );
             }
-            match tokio::time::timeout(remain.min(per_source), search(&src, key, page)).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "搜索超时（单源 {}s 预算）",
-                    per_source.as_secs()
-                )),
-            }
+            let started = tokio::time::Instant::now();
+            let r =
+                match tokio::time::timeout(remain.min(per_source), search(&src, key, page)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "搜索超时（单源 {}s 预算）",
+                        per_source.as_secs()
+                    )),
+                };
+            let latency_ms = started.elapsed().as_millis() as i64;
+            (src, rule_complete, r, latency_ms, true)
         };
         tasks.push((s.clone(), fut));
     }
@@ -328,18 +361,61 @@ pub(super) async fn search_all_budgeted_scoped(
     )
     .await;
     let mut outcome = SearchOutcome::default();
-    for (src, r) in results {
+    let mut evidence = Vec::new();
+    for (_outer, (src, rule_complete, r, latency_ms, attempted)) in results {
         match r {
-            Ok(mut books) => outcome.books.append(&mut books),
+            Ok(mut books) => {
+                let hits = books.len() as i64;
+                let kept_hits = crate::title_filter::count_title_matches(&books, key);
+                if attempted {
+                    evidence.push(crate::source_health::Outcome {
+                        source_url: src.book_source_url.clone(),
+                        status: crate::source_health::STATUS_OK,
+                        latency_ms,
+                        error: None,
+                        hits,
+                        kept_hits,
+                        parsed: true,
+                        usage: true,
+                        query_class,
+                        rule_complete,
+                    });
+                }
+                outcome.books.append(&mut books);
+            }
             Err(e) => {
                 let msg = e.to_string();
-                let kind = if msg.starts_with("全局搜索预算耗尽") {
+                let truncated = msg.starts_with("全局搜索预算耗尽");
+                let engine = matches!(
+                    crate::source_health::classify(&e),
+                    crate::source_health::FailureKind::Engine
+                );
+                let kind = if truncated {
                     "truncated"
-                } else if msg.starts_with("搜索超时") {
+                } else if crate::source_health::is_timeout_message(&msg) {
                     "timeout"
+                } else if engine {
+                    "engine"
                 } else {
                     "site"
                 };
+                // 预算截断/排队未执行不是源的问题，不写健康。
+                if attempted && !truncated {
+                    let (status, _, usage) =
+                        crate::source_health::classify_search_failure(&msg, engine);
+                    evidence.push(crate::source_health::Outcome {
+                        source_url: src.book_source_url.clone(),
+                        status,
+                        latency_ms,
+                        error: Some(msg.clone()),
+                        hits: 0,
+                        kept_hits: 0,
+                        parsed: false,
+                        usage,
+                        query_class,
+                        rule_complete,
+                    });
+                }
                 outcome.errors.push(SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
@@ -350,7 +426,7 @@ pub(super) async fn search_all_budgeted_scoped(
         }
     }
     outcome.books = dedupe_and_sort(outcome.books, sources, key);
-    outcome
+    (outcome, evidence)
 }
 
 pub async fn search_all(sources: &[BookSource], key: &str, page: i32) -> Vec<SearchBook> {

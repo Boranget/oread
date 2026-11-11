@@ -1390,6 +1390,18 @@ async fn aggregated_filters_title_matches_and_refilters_on_cache_hit() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations/shared")
+        .run(&pool)
+        .await
+        .unwrap();
+    let tier_cfg =
+        crate::source_quality::TierConfig::from_config(&crate::config::Config::from_env());
+
     let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = srv.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1422,6 +1434,9 @@ async fn aggregated_filters_title_matches_and_refilters_on_cache_hit() {
 
     for round in 0..2 {
         let (books, errors, stats) = aggregated(
+            &pool,
+            86400,
+            &tier_cfg,
             &[s.clone()],
             "百年孤独",
             false,
@@ -1438,6 +1453,30 @@ async fn aggregated_filters_title_matches_and_refilters_on_cache_hit() {
         assert_eq!(stats.kept, 1, "round {round}: kept 是过滤后候选");
         assert_eq!(stats.dropped, 1, "round {round}: 书名不含关键词的被丢弃");
     }
+
+    // 批量入口也要写证据，但只写真实搜索：第二轮命中 60s 缓存，不得重复计数。
+    let health: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT search_count, hit_count, kept_hit_count, yield_ok_count \
+         FROM source_health WHERE source_url = ?",
+    )
+    .bind(s.book_source_url.clone())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        health,
+        (1, 2, 1, 1),
+        "批量入口应写一次搜索证据：2 条解析、1 条书名命中"
+    );
+    let qstats: (f64, f64, f64) = sqlx::query_as(
+        "SELECT search_count, yield_ok_count, kept_hit_count \
+         FROM source_query_stats WHERE source_url = ?",
+    )
+    .bind(s.book_source_url.clone())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(qstats, (1.0, 1.0, 1.0), "查询类证据同样只记一次");
 }
 
 fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
