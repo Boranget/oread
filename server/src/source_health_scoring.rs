@@ -311,9 +311,11 @@ pub async fn record_outcomes(
         .bind(row.last_eval_at)
         .bind(row.search_count)
         .bind(row.hit_count)
+        // 顺序必须与上面的列名一致：parse_ok_count / kept_hit_count / yield_ok_count。
+        // 这三列类型相同，错位不会报错，只会静默写错数据（曾把 yield 率变成解析成功率）。
+        .bind(row.parse_ok_count)
         .bind(row.kept_hit_count)
         .bind(row.yield_ok_count)
-        .bind(row.parse_ok_count)
         .bind(row.fail_site_count)
         .bind(row.fail_engine_count)
         .bind(row.ttfb_ms_p90)

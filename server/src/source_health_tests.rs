@@ -547,3 +547,67 @@ async fn explicit_site_failures_still_quarantine_at_threshold() {
         "达到阈值仍应隔离"
     );
 }
+
+// 回归：search_count / hit_count / parse_ok_count / kept_hit_count / yield_ok_count
+// 五列必须原样落库。它们类型相同，UPSERT 的列名与 bind 顺序错位不会报错，
+// 只会静默把 kept 写成 yield、把 yield 写成 parse（线上曾因此把产出率变成解析成功率）。
+#[tokio::test]
+async fn db_roundtrip_keeps_search_yield_columns_aligned() {
+    let pool = test_pool().await;
+    record_outcomes(
+        &pool,
+        &[Outcome {
+            source_url: "https://yield.example".into(),
+            status: STATUS_OK,
+            latency_ms: 120,
+            error: None,
+            hits: 30,
+            kept_hits: 7,
+            parsed: true,
+            usage: true,
+            query_class: crate::query_class::QueryClass::Normal,
+            rule_complete: 1.0,
+        }],
+        86400,
+        &test_tier_cfg(),
+    )
+    .await
+    .unwrap();
+
+    let map = load_map(&pool).await.unwrap();
+    let row = map.get("https://yield.example").unwrap();
+    assert_eq!(row.search_count, 1);
+    assert_eq!(row.hit_count, 30);
+    assert_eq!(row.parse_ok_count, 1, "解析成功次数");
+    assert_eq!(row.kept_hit_count, 7, "书名匹配条数之和");
+    assert_eq!(row.yield_ok_count, 1, "有产出的搜索次数");
+
+    // 第二次：解析成功但书名全不匹配，只增加 search_count / hit_count / parse_ok_count。
+    record_outcomes(
+        &pool,
+        &[Outcome {
+            source_url: "https://yield.example".into(),
+            status: STATUS_OK,
+            latency_ms: 120,
+            error: None,
+            hits: 12,
+            kept_hits: 0,
+            parsed: true,
+            usage: true,
+            query_class: crate::query_class::QueryClass::Normal,
+            rule_complete: 1.0,
+        }],
+        86400,
+        &test_tier_cfg(),
+    )
+    .await
+    .unwrap();
+
+    let map = load_map(&pool).await.unwrap();
+    let row = map.get("https://yield.example").unwrap();
+    assert_eq!(row.search_count, 2);
+    assert_eq!(row.hit_count, 42);
+    assert_eq!(row.parse_ok_count, 2);
+    assert_eq!(row.kept_hit_count, 7);
+    assert_eq!(row.yield_ok_count, 1);
+}
