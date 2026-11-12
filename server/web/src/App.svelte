@@ -46,14 +46,76 @@
     const id = e && e.detail;
     if (id && TABS.some((t) => t.id === id)) selectTab(id);
   }
+
+  // ---- 渲染期错误兜底 ----
+  // Svelte 的 flush() 抛错后不会复位调度标志，之后所有状态更新都不再执行，
+  // 页面会表现成“永远加载中”。所以这里用原生 DOM 直接挂一条可见提示，
+  // 不依赖 Svelte 渲染：即使调度器已经卡死，用户仍有“重新加载”的出口。
+  let fatalEl = null;
+  function showFatalBanner(detail) {
+    if (fatalEl || typeof document === 'undefined') return;
+    const bar = document.createElement('div');
+    bar.setAttribute('role', 'alert');
+    bar.style.cssText =
+      'position:fixed;left:0;right:0;top:0;z-index:2147483647;display:flex;' +
+      'gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px;' +
+      'background:#7a1f1f;color:#fff;font:13px/1.5 system-ui,sans-serif;' +
+      'box-shadow:0 2px 10px rgba(0,0,0,.35)';
+    const text = document.createElement('span');
+    text.style.cssText = 'flex:1;min-width:220px;word-break:break-word';
+    text.textContent = `页面出现未处理错误，可能已停止更新：${detail}`;
+    const reload = document.createElement('button');
+    reload.textContent = '重新加载';
+    reload.style.cssText =
+      'padding:6px 12px;border:1px solid #fff;border-radius:6px;' +
+      'background:transparent;color:#fff;cursor:pointer';
+    reload.addEventListener('click', () => location.reload());
+    const close = document.createElement('button');
+    close.textContent = '关闭';
+    close.style.cssText =
+      'padding:6px 12px;border:1px solid rgba(255,255,255,.6);border-radius:6px;' +
+      'background:transparent;color:#fff;cursor:pointer';
+    close.addEventListener('click', () => {
+      bar.remove();
+      fatalEl = null;
+    });
+    bar.append(text, reload, close);
+    document.body.appendChild(bar);
+    fatalEl = bar;
+  }
+
+  function errorDetail(e) {
+    if (!e) return '未知错误';
+    if (e.message) return String(e.message);
+    if (e.reason) return String(e.reason.message || e.reason);
+    return String(e);
+  }
+
+  function onWindowError(e) {
+    // 资源加载失败（img/script）没有 message，由对应组件自己处理，不弹全局条
+    if (!e || !e.message) return;
+    const at = e.filename ? ` (${e.filename}:${e.lineno || 0})` : '';
+    showFatalBanner(errorDetail(e) + at);
+  }
+
+  function onWindowRejection(e) {
+    showFatalBanner(errorDetail(e.reason));
+  }
+
   onMount(() => {
     window.addEventListener('oread:tab', onTabRequest);
+    window.addEventListener('error', onWindowError);
+    window.addEventListener('unhandledrejection', onWindowRejection);
     if (getToken()) {
       loggedIn = true;
       role = getRole();
       syncTheme();
     }
-    return () => window.removeEventListener('oread:tab', onTabRequest);
+    return () => {
+      window.removeEventListener('oread:tab', onTabRequest);
+      window.removeEventListener('error', onWindowError);
+      window.removeEventListener('unhandledrejection', onWindowRejection);
+    };
   });
 
   function onLogin(r) {

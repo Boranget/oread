@@ -28,7 +28,10 @@
   export let autoSpeed = 3;
   export let toast = '';
 
-  export let bindScrollEl = () => {};
+  // 滚动容器通过 Svelte 原生双向绑定交给父组件（bind:scrollEl）。
+  // 不要改回函数 prop：函数 prop 在 Svelte 里每次 $set 都被判定为“已变化”，
+  // 子组件在响应式语句里调用它就会和父组件形成更新回环。
+  export let scrollEl = null;
   export let onScroll = () => {};
   export let onReaderClick = () => {};
   export let onTouchStart = () => {};
@@ -46,16 +49,6 @@
   export let stopAuto = () => {};
   export let prevPage = () => {};
   export let nextPage = () => {};
-
-  let el = null;
-  // 只在滚动容器真正变化时回传。bindScrollEl 是父组件传入的函数 prop，
-  // 函数 prop 在 Svelte 里每次 $set 都会被判定为“已变化”，若这里无条件调用，
-  // 会形成 子更新→回传 el→父更新→重新 $set→子更新 的死循环，导致整页调度器卡死。
-  let boundEl = null;
-  $: if (el && el !== boundEl) {
-    boundEl = el;
-    bindScrollEl(el);
-  }
 
   // 慢链路提示：加载超过 8s 仍未完成时明确告诉用户“还在等”，
   // 避免把域名/Funnel 抖动误认为阅读器卡死。计时器只用于文案，不参与请求控制。
@@ -83,7 +76,7 @@
   <div
     class="rd-scroll"
     class:mode-paged={isPaged}
-    bind:this={el}
+    bind:this={scrollEl}
     on:scroll={onScroll}
     on:click={onReaderClick}
     on:touchstart={onTouchStart}
