@@ -17,12 +17,8 @@ pub(super) fn agg_cache() -> &'static Mutex<Vec<AggEntry>> {
 pub(super) fn prune_cache(g: &mut Vec<AggEntry>) {
     g.retain(|e| e.at.elapsed().as_secs() < AGG_TTL_SECS);
     while g.len() > AGG_MAX_QUERIES {
-        // 淘汰最旧的查询
-        if let Some((idx, _)) = g
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.at.elapsed().as_millis())
-        {
+        // 淘汰最旧的查询：Instant 越小越早，不能用 elapsed 取 min（那会淘汰最新的）。
+        if let Some((idx, _)) = g.iter().enumerate().min_by_key(|(_, e)| e.at) {
             g.remove(idx);
         } else {
             break;

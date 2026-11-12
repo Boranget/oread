@@ -175,12 +175,18 @@ pub(super) async fn search(
             }
             list.push_str("</table>");
             if t_pages > 1 {
-                // 翻页必须带上实际生效的 scope，否则第二页会退回缺省的 curated。
+                // 翻页必须带上实际生效的 scope 与 include_cooled：否则第二页会退回缺省
+                // curated / 排除冷却源，源集合与缓存键都变了，等于重新搜一遍且结果可能不同。
                 let base = format!(
-                    "/k/search?key={}&fs={}&scope={}",
+                    "/k/search?key={}&fs={}&scope={}{}",
                     qenc(&key),
                     fs,
-                    plan.scope.as_str()
+                    plan.scope.as_str(),
+                    if include_cooled {
+                        "&include_cooled=1"
+                    } else {
+                        ""
+                    }
                 );
                 let prev = if sp > 1 {
                     Some((with_vp(&format!("{base}&sp={}", sp - 1), vp), "上一页"))
@@ -196,7 +202,18 @@ pub(super) async fn search(
             }
         }
         if upgrade_link {
-            let href = with_fs(&format!("/k/search?key={}&scope=all", qenc(&key)), fs);
+            let href = with_fs(
+                &format!(
+                    "/k/search?key={}&scope=all{}",
+                    qenc(&key),
+                    if include_cooled {
+                        "&include_cooled=1"
+                    } else {
+                        ""
+                    }
+                ),
+                fs,
+            );
             list.push_str(&format!(
                 "<div style=\"padding:12px 36px\">\
                  <a href=\"{href}\" style=\"display:inline-block;height:56px;line-height:56px;\

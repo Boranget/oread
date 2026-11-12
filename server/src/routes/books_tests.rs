@@ -1959,6 +1959,27 @@ fn per_user_prune_keeps_recent_completed_jobs() {
 }
 
 #[test]
+fn agg_cache_evicts_oldest_query_not_newest() {
+    let now = std::time::Instant::now();
+    // q0 最旧、qN 最新；超过上限时应该淘汰 q0，而不是刚写入的 qN。
+    let mut cache: Vec<AggEntry> = (0..=AGG_MAX_QUERIES)
+        .map(|i| AggEntry {
+            key: format!("q{i}"),
+            at: now - std::time::Duration::from_secs((AGG_MAX_QUERIES - i) as u64),
+            books: vec![],
+            errors: vec![],
+        })
+        .collect();
+    prune_cache(&mut cache);
+    assert_eq!(cache.len(), AGG_MAX_QUERIES);
+    assert!(!cache.iter().any(|e| e.key == "q0"), "最旧查询应被淘汰");
+    assert!(
+        cache.iter().any(|e| e.key == format!("q{AGG_MAX_QUERIES}")),
+        "最新查询必须保留，否则翻页永远命中不了缓存"
+    );
+}
+
+#[test]
 fn result_response_exposes_status_and_cancel_counts() {
     let job = test_job_for(1, "j-cancelled", 0, 2);
     let mut meta = job.meta();
