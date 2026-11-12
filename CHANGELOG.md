@@ -49,6 +49,9 @@
 
 ### Fixed
 
+- 修复 `scripts/deploy.ps1` 在 PowerShell 5.1 下因构建工具正常写入 stderr（vite 的
+  a11y 警告、cargo 的 `Finished` 提示）而误判失败、中断部署的问题：外部命令统一合并
+  stderr，只以退出码判断成败。
 - 修复打开书籍后阅读器永久停在「正在加载阅读器…」/「正在打开书籍…」的问题：
   `ReaderContent` 通过函数 prop 把滚动容器回传给父组件，父组件每次更新又用内联箭头
   重新传入该函数（Svelte 对函数 prop 总是判定为“已变化”），形成

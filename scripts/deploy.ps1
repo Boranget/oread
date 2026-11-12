@@ -88,7 +88,16 @@ function Info([string]$message) { Write-Host "[deploy] $message" -ForegroundColo
 function Ok([string]$message) { Write-Host "[deploy] $message" -ForegroundColor Green }
 
 function Invoke-External([string]$exe, [string[]]$arguments, [string]$what) {
-    & $exe @arguments
+    # PowerShell 5.1 在 $ErrorActionPreference='Stop' 下会把原生命令写到 stderr 的正常警告
+    # 当成终止错误（vite 的 a11y 警告、cargo 的 Finished 提示都会触发）。这里临时降级并
+    # 合并 stderr，成败只认退出码，避免构建明明成功却中断部署。
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $exe @arguments 2>&1 | ForEach-Object { Write-Host $_ }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
     if ($LASTEXITCODE -ne 0) {
         Fail "$what 失败（exit=$LASTEXITCODE）：$exe $($arguments -join ' ')"
     }
