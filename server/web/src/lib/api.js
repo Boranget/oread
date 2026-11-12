@@ -348,6 +348,17 @@ export const api = {
       undefined,
       { timeout: 15000, signal }
     ),
+  // 搜索任务管理：列表（内存实时进度 + 数据库历史）/ 取消 / 移除
+  searchJobs: (signal) =>
+    request('GET', '/search/jobs', undefined, { timeout: 15000, signal }),
+  searchJobCancel: (jobId) =>
+    request('POST', `/search/jobs/cancel?${buildQuery({ job_id: jobId })}`, undefined, {
+      timeout: 15000,
+    }),
+  searchJobDelete: (jobId) =>
+    request('DELETE', `/search/jobs?${buildQuery({ job_id: jobId })}`, undefined, {
+      timeout: 15000,
+    }),
   // 发现分类：source 传书源 ID（book_source_url）
   exploreCategories: (source, page = 1) =>
     request('GET', `/explore/categories?${buildQuery({ source, page })}`),

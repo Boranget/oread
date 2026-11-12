@@ -71,6 +71,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let shared = db::init_shared(&cfg).await?;
     // 迁移已通过：清除失败标记，恢复正常启动速度。
     db_guard::clear_startup_failure(&cfg);
+    // 上次进程遗留的搜索任务不会再有进度：标为 interrupted，重新登录后仍可查看/移除。
+    routes::books::mark_interrupted_search_jobs(&shared).await;
     // 首次启动自动创建管理员账号（凭据来自 ADMIN_USER/ADMIN_PASS）
     auth::bootstrap_admin(&shared, &cfg).await?;
 

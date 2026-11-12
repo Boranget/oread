@@ -3,7 +3,7 @@
 use super::*;
 
 /// 单个书源的失败信息（聚合搜索时单源失败不影响整体）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceFailure {
     pub source: String,
     pub source_name: String,

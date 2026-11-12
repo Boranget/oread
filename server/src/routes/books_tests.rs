@@ -433,6 +433,10 @@ fn stream_job(books: Vec<SearchBook>, pending: usize) -> SearchJob {
         source_mode: "curated".into(),
         scope_filtered: 0,
         curated_total: 0,
+        cancel: Arc::new(tokio::sync::Notify::new()),
+        cancelled: AtomicBool::new(false),
+        status: Mutex::new("running".into()),
+        finished_unix_ms: AtomicU64::new(0),
         state: Mutex::new(SearchJobState {
             books,
             pending,
@@ -913,6 +917,10 @@ fn job_view_dedupes_by_weight_and_reports_progress() {
         source_mode: "curated".into(),
         scope_filtered: 0,
         curated_total: 0,
+        cancel: Arc::new(tokio::sync::Notify::new()),
+        cancelled: AtomicBool::new(false),
+        status: Mutex::new("running".into()),
+        finished_unix_ms: AtomicU64::new(0),
         state: Mutex::new(SearchJobState {
             books: vec![a, b],
             errors: vec![],
@@ -1480,14 +1488,19 @@ async fn aggregated_filters_title_matches_and_refilters_on_cache_hit() {
 }
 
 fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
+    test_job_for(7, id, age_secs, pending)
+}
+
+fn test_job_for(uid: i64, id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
     Arc::new(SearchJob {
         id: id.into(),
-        uid: 7,
+        uid,
         key: "k".into(),
         at: Instant::now()
             .checked_sub(Duration::from_secs(age_secs))
             .unwrap(),
-        created_unix_ms: 0,
+        // 用年龄反推创建时刻：让「按创建时间淘汰」的测试可判定。
+        created_unix_ms: 1_000_000u64.saturating_sub(age_secs.saturating_mul(1000)),
         sources: Vec::new(),
         source_total: pending,
         scope: crate::req::SearchScope::Curated,
@@ -1497,6 +1510,11 @@ fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
         source_mode: "curated".into(),
         scope_filtered: 0,
         curated_total: 0,
+        cancel: Arc::new(tokio::sync::Notify::new()),
+        cancelled: AtomicBool::new(false),
+        // 测试里用 pending 推导状态：0 = 已完成，>0 = 运行中。
+        status: Mutex::new(if pending == 0 { "done" } else { "running" }.into()),
+        finished_unix_ms: AtomicU64::new(0),
         state: Mutex::new(SearchJobState {
             pending,
             ..Default::default()
@@ -1507,8 +1525,16 @@ fn test_job(id: &str, age_secs: u64, pending: usize) -> Arc<SearchJob> {
 /// 已完成的旧任务超过上限时，只淘汰已完成的最旧任务；进行中的新 job 必须保留。
 #[test]
 fn prune_jobs_evicts_completed_but_keeps_active() {
+    // 每个用户一个已完成任务：避免单用户保留上限先于全局上限生效。
     let mut list: Vec<Arc<SearchJob>> = (0..SEARCH_JOB_MAX)
-        .map(|i| test_job(&format!("done{i}"), (SEARCH_JOB_MAX - i) as u64, 0))
+        .map(|i| {
+            test_job_for(
+                i as i64,
+                &format!("done{i}"),
+                (SEARCH_JOB_MAX - i) as u64,
+                0,
+            )
+        })
         .collect();
     // 新 job 仍在进行中（pending=5）
     let active = test_job("active", 0, 5);
@@ -1817,4 +1843,144 @@ async fn search_result_rejects_other_users_job() {
         .await
         .expect("任务创建者应可读");
     assert_eq!(ok.into_response().status(), axum::http::StatusCode::OK);
+}
+
+// ---------------- 搜索任务管理（内存 + 数据库） ----------------
+
+/// 只建 0017 迁移涉及的表：直接执行真实迁移文件，避免测试里再抄一份 schema。
+async fn jobs_pool() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for stmt in include_str!("../../migrations/shared/0017_search_jobs.sql").split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            sqlx::query(s).execute(&pool).await.unwrap();
+        }
+    }
+    pool
+}
+
+#[tokio::test]
+async fn search_job_db_roundtrip_keeps_snapshot_and_isolates_users() {
+    let pool = jobs_pool().await;
+    let job = test_job_for(42, "job-db", 0, 2);
+    persist_started(&pool, &job).await.unwrap();
+
+    let row = db_get(&pool, 42, "job-db")
+        .await
+        .unwrap()
+        .expect("running 行");
+    assert_eq!(row.status, "running");
+    assert_eq!(row.keyword, "k");
+    // 跨用户不可见：与“不存在”同一结果，避免任务存在性泄露。
+    assert!(db_get(&pool, 43, "job-db").await.unwrap().is_none());
+
+    let view = JobView {
+        books: vec![mk_book("剑来".into(), "https://x/1".into())],
+        errors: vec![],
+        done: true,
+        finished: 2,
+        pending: 0,
+        scheduled: 2,
+        attempted: 2,
+        skipped: 0,
+        cancelled: 0,
+    };
+    let mut meta = job.meta();
+    meta.status = "done".into();
+    meta.finished_unix_ms = 123;
+    persist_finished(&pool, &meta, &view).await.unwrap();
+
+    let row = db_get(&pool, 42, "job-db").await.unwrap().unwrap();
+    assert_eq!(row.status, "done");
+    assert!(row.snapshot_json.is_some());
+    let restored = row_view(&row);
+    assert_eq!(restored.books.len(), 1, "快照应可恢复结果");
+    assert_eq!(restored.books[0].book_url, "https://x/1");
+    assert!(restored.done);
+
+    let list = db_list(&pool, 42, 50).await.unwrap();
+    assert_eq!(list.len(), 1);
+
+    assert!(db_delete(&pool, 42, "job-db").await.unwrap());
+    assert!(db_get(&pool, 42, "job-db").await.unwrap().is_none());
+    assert!(!db_delete(&pool, 42, "job-db").await.unwrap());
+}
+
+#[tokio::test]
+async fn mark_interrupted_only_touches_running_rows() {
+    let pool = jobs_pool().await;
+    persist_started(&pool, &test_job_for(7, "running-1", 0, 3))
+        .await
+        .unwrap();
+    persist_started(&pool, &test_job_for(7, "running-2", 0, 1))
+        .await
+        .unwrap();
+    // 先收尾一个任务，确认不会被重启清理误改。
+    let done_job = test_job_for(7, "done-1", 0, 0);
+    persist_started(&pool, &done_job).await.unwrap();
+    let done_view = JobView {
+        books: vec![],
+        errors: vec![],
+        done: true,
+        finished: 0,
+        pending: 0,
+        scheduled: 0,
+        attempted: 0,
+        skipped: 0,
+        cancelled: 0,
+    };
+    let mut done_meta = done_job.meta();
+    done_meta.status = "done".into();
+    persist_finished(&pool, &done_meta, &done_view)
+        .await
+        .unwrap();
+
+    assert_eq!(mark_interrupted(&pool).await.unwrap(), 2);
+    let running = db_get(&pool, 7, "running-1").await.unwrap().unwrap();
+    assert_eq!(running.status, "interrupted");
+    assert_eq!(running.pending, 0);
+    let done = db_get(&pool, 7, "done-1").await.unwrap().unwrap();
+    assert_eq!(done.status, "done");
+}
+
+#[test]
+fn per_user_prune_keeps_recent_completed_jobs() {
+    let mut list: Vec<Arc<SearchJob>> = (0..SEARCH_JOB_MAX_PER_USER + 5)
+        .map(|i| test_job_for(9, &format!("done{i}"), i as u64, 0))
+        .collect();
+    prune_jobs(&mut list);
+    assert_eq!(list.len(), SEARCH_JOB_MAX_PER_USER);
+    assert!(list.iter().any(|j| j.id == "done0"), "最新任务必须保留");
+    assert!(!list.iter().any(|j| j.id == "done24"), "最旧任务被淘汰");
+}
+
+#[test]
+fn result_response_exposes_status_and_cancel_counts() {
+    let job = test_job_for(1, "j-cancelled", 0, 2);
+    let mut meta = job.meta();
+    meta.key = "剑来".into();
+    meta.status = "cancelled".into();
+    meta.finished_unix_ms = 42;
+    let view = JobView {
+        books: vec![mk_book("剑来".into(), "https://x/1".into())],
+        errors: vec![],
+        done: true,
+        finished: 1,
+        pending: 0,
+        scheduled: 1,
+        attempted: 1,
+        skipped: 0,
+        cancelled: 1,
+    };
+    let v = build_result_response(&meta, view, 1, 30, None);
+    assert_eq!(v["status"], "cancelled");
+    assert_eq!(v["done"], true);
+    assert_eq!(v["cancelled_sources"], 1);
+    assert_eq!(v["pending_sources"], 0, "任务结束后不再提示未排上的源");
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["finished_at"], 42);
 }

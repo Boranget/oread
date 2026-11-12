@@ -69,6 +69,20 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
   font-size: 14px;
 }
 .nav .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+/* 发现 tab 上的运行中任务数：不依赖 JS 计算宽度，纯文本徽标 */
+.nav .tab-badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  vertical-align: top;
+}
 .nav .right { padding: 8px; }
 
 /* 卡片与网格 */

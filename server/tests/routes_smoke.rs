@@ -480,6 +480,7 @@ async fn search_job_lifecycle_without_sources() {
     assert_eq!(started["source_total"], 0, "没有书源: {started}");
 
     let resp = app
+        .clone()
         .oneshot(authed_get(
             &format!("/api/search/result?job_id={job_id}&page=1"),
             &token,
@@ -492,6 +493,69 @@ async fn search_job_lifecycle_without_sources() {
         result["books"].as_array().map(Vec::len),
         Some(0),
         "空源搜索应返回空结果: {result}"
+    );
+    assert_eq!(result["status"], "done", "空源任务应立即结束: {result}");
+
+    // 任务列表：内存 + 数据库合并后应能看到刚结束的任务。
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/search/jobs", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let jobs = body_json(resp).await;
+    assert!(
+        jobs["jobs"].as_array().is_some_and(|a| a
+            .iter()
+            .any(|j| j["job_id"] == job_id.as_str() && j["status"] == "done")),
+        "任务列表应包含刚结束的任务: {jobs}"
+    );
+
+    // 已完成任务取消是幂等的（不报错、不改变状态）。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            &format!("/api/search/jobs/cancel?job_id={job_id}"),
+            "",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["already_finished"], true);
+
+    // 移除后：列表与结果接口都不再返回（内存与数据库同时删除）。
+    let resp = app
+        .clone()
+        .oneshot(authed_delete(
+            &format!("/api/search/jobs?job_id={job_id}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["removed"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/search/result?job_id={job_id}&page=1"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(authed_get("/api/search/jobs", &token))
+        .await
+        .unwrap();
+    let jobs = body_json(resp).await;
+    assert!(
+        jobs["jobs"]
+            .as_array()
+            .is_none_or(|a| a.iter().all(|j| j["job_id"] != job_id.as_str())),
+        "移除后列表不应再包含任务: {jobs}"
     );
 
     let _ = std::fs::remove_dir_all(dir);

@@ -5,6 +5,11 @@
   import Discover from './pages/Discover.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
   import { syncTheme, applyTheme } from './lib/theme.js';
+  import {
+    searchJobs,
+    startSearchJobsPolling,
+    stopSearchJobsPolling,
+  } from './lib/searchJobsStore.js';
 
   let loggedIn = false;
   let role = 'user';
@@ -110,6 +115,8 @@
       loggedIn = true;
       role = getRole();
       syncTheme();
+      // 任务列表与登录态解耦：关掉页面/重新登录后仍能看到后端仍在跑的任务。
+      startSearchJobsPolling();
     }
     return () => {
       window.removeEventListener('oread:tab', onTabRequest);
@@ -123,6 +130,7 @@
     role = r || getRole();
     tab = 'bookshelf';
     syncTheme();
+    startSearchJobsPolling();
   }
   function onLogout() {
     clearToken();
@@ -131,6 +139,7 @@
     reader = null;
     tab = 'bookshelf';
     applyTheme('light');
+    stopSearchJobsPolling();
   }
 
   function selectTab(id) {
@@ -252,7 +261,12 @@
     <div class="brand">Boranlib</div>
     <div class="tabs">
       {#each TABS as t}
-        <div class="tab" class:active={tab === t.id} on:click={() => selectTab(t.id)}>{t.label}</div>
+        <div class="tab" class:active={tab === t.id} on:click={() => selectTab(t.id)}>
+          {t.label}{#if t.id === 'discover' && $searchJobs.active > 0}<span
+            class="tab-badge"
+            aria-label={`${$searchJobs.active} 个搜索任务运行中`}
+          >{$searchJobs.active}</span>{/if}
+        </div>
       {/each}
     </div>
     <div class="right">

@@ -50,6 +50,14 @@ pub(super) async fn search_start(
     if key.is_empty() {
         return Err(AppError::BadRequest("key（或别名 q）不能为空".into()));
     }
+    // 单用户并发上限：每个任务持有整份书源快照 + 结果缓冲，放任并发会打爆低配设备内存。
+    // 前端任务面板可取消旧任务，因此这里直接拒绝而不是排队（避免“点了没反应”）。
+    if active_jobs_for_user(u.id) >= SEARCH_JOB_MAX_ACTIVE_PER_USER {
+        return Err(AppError::BadRequest(format!(
+            "同时运行的搜索任务已达 {} 个，请先在「搜索任务」里取消不需要的任务",
+            SEARCH_JOB_MAX_ACTIVE_PER_USER
+        )));
+    }
     let mut sources = load_sources(&s.shared).await?;
     crate::routes::sources::sort_sources(&mut sources);
     // 精选防腐化：距上次体检超过 72h 时，后台重跑一次（不阻塞本次搜索）。
@@ -89,7 +97,15 @@ pub(super) async fn search_start(
             pending: source_total,
             ..Default::default()
         }),
+        cancel: Arc::new(tokio::sync::Notify::new()),
+        cancelled: AtomicBool::new(false),
+        status: Mutex::new("running".to_string()),
+        finished_unix_ms: AtomicU64::new(0),
     });
+    // 先落库 running 行：即便进程随后崩溃，用户重新登录也能看到「已中断」的任务。
+    if let Err(e) = persist_started(&s.shared, &job).await {
+        tracing::warn!(target: "search_job", job_id = %job.id, error = %e, "persist search job failed");
+    }
     {
         let mut g = job_registry().lock().unwrap();
         prune_jobs(&mut g);
@@ -150,65 +166,52 @@ pub(super) async fn search_start(
     })))
 }
 
-pub(super) async fn search_result(
-    State(_s): State<AppState>,
-    u: AuthUser,
-    Query(q): Query<JobResultQ>,
-) -> AppResult<Json<serde_json::Value>> {
-    let job = {
-        let mut g = job_registry().lock().unwrap();
-        prune_jobs(&mut g);
-        let found = g.iter().find(|j| j.id == q.job_id).cloned();
-        if found.is_none() {
-            let known: Vec<&str> = g.iter().map(|j| j.id.as_str()).collect();
-            tracing::warn!(
-                target: "search_job",
-                job_id = %q.job_id,
-                known_jobs = g.len(),
-                known_ids = ?known,
-                reason = "not_registered_or_pruned",
-                "search result 404"
-            );
-        }
-        found
-    };
-    let job = job.ok_or_else(|| AppError::NotFound("搜索任务不存在或已过期（60s TTL）".into()))?;
-    // 归属校验：别人的 job_id 与不存在保持同样的 404，避免泄露任务是否存在。
-    if job.uid != u.id {
-        tracing::warn!(
-            target: "search_job",
-            job_id = %q.job_id,
-            owner = job.uid,
-            requester = u.id,
-            reason = "uid_mismatch",
-            "search result 404"
-        );
-        return Err(AppError::NotFound(
-            "搜索任务不存在或已过期（60s TTL）".into(),
-        ));
-    }
-    let page = q.page.unwrap_or(1).max(1);
-    let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
-    // 游标 / 翻页请求 → 冻结快照；page=1 的普通轮询仍读实时结果（首屏持续更新）。
-    let cursor = q.cursor.as_deref().and_then(parse_cursor);
-    let paginated = q.cursor.is_some() || page > 1;
-    let view = if paginated {
-        frozen_job_view(&job)
+/// 任务不存在（或不属于当前用户）的统一文案：不区分两种情况，避免泄露任务是否存在。
+pub(super) const JOB_NOT_FOUND: &str = "搜索任务不存在或已过期";
+
+/// 结果响应组装：内存任务与数据库快照共用同一份字段与分页口径。
+///
+/// 关键点：数据库快照里的 `books` 仍带 `rank_bucket/rank_seq`，因此恢复后的任务
+/// 可以直接复用同一套游标翻页，不重不漏。
+pub(super) fn build_result_response(
+    meta: &JobMeta,
+    view: JobView,
+    page: i32,
+    page_size: usize,
+    cursor: Option<(u8, u64)>,
+) -> serde_json::Value {
+    let JobView {
+        books: raw_books,
+        errors,
+        done,
+        finished,
+        pending,
+        scheduled,
+        attempted,
+        skipped,
+        cancelled,
+        ..
+    } = view;
+    // 取消/中断后仍会残留“未调度”的源；任务已结束就不再提示还有源要排。
+    let pending_scheduled = if done {
+        0
     } else {
-        job_view(&job)
+        meta.source_total.saturating_sub(scheduled)
     };
-    let done = view.done;
-    let finished = view.finished;
-    let pending = view.pending;
-    let scheduled = view.scheduled;
-    let attempted = view.attempted;
-    let skipped = view.skipped;
-    // 未排上的源（两批同时调度后通常为 0）
-    let pending_scheduled = job.source_total.saturating_sub(scheduled);
+    // 收尾窗口：pending 已归零但任务还没执行到写 status 的那一步（0 源任务尤其明显）。
+    // 对外按“没有剩余工作”的真实状态回显，避免前端看到 done=true 却仍是 running。
+    let status = if meta.status == "running" && done {
+        if cancelled > 0 {
+            "cancelled"
+        } else {
+            "done"
+        }
+    } else {
+        meta.status.as_str()
+    };
     // 客户端响应边界：只保留书名包含关键词的条目。
     // 过滤发生在去重/排序之后，不改变打分、精选与源健康（健康统计用源原始命中数）。
-    let (full, title_filter) = crate::title_filter::retain_title_matches(view.books, &job.key);
-    let errors = view.errors;
+    let (full, title_filter) = crate::title_filter::retain_title_matches(raw_books, &meta.key);
 
     let total = full.len();
     let strong_total = full
@@ -252,7 +255,7 @@ pub(super) async fn search_result(
     // 真实失败与“全局预算未完成”分开计数：后者不写健康、不算站点故障。
     let source_failed = errors.iter().filter(|e| !is_budget_skip(&e.kind)).count();
     let source_skipped = skipped;
-    Ok(Json(json!({
+    json!({
         "books": books,
         "errors": errors,
         "page": page,
@@ -265,6 +268,10 @@ pub(super) async fn search_result(
         // 下一页游标：`bucket:seq`；传回 `cursor=` 即从该位置继续，翻页不重不漏。
         "next_cursor": next_cursor,
         "done": done,
+        // 任务状态：running / done / cancelled / interrupted（重启后由数据库恢复）。
+        "status": status,
+        "interrupted": status == "interrupted",
+        "cancelled_sources": cancelled,
         // 相关性分层：strong=书名命中，author=只命中作者，partial=只命中片段（可能相关）。
         "strong_total": strong_total,
         "author_total": author_total,
@@ -278,21 +285,318 @@ pub(super) async fn search_result(
         "scheduled_sources": scheduled,
         "attempted_sources": attempted,
         "pending_sources": pending_scheduled,
-        "scope": job.scope.as_str(),
-        "source_mode": job.source_mode.as_str(),
-        "scope_filtered": job.scope_filtered,
+        "scope": meta.scope.as_str(),
+        "source_mode": meta.source_mode,
+        "scope_filtered": meta.scope_filtered,
         "finished": finished,
         "pending": pending,
-        "source_total": job.source_total,
+        "source_total": meta.source_total,
         "source_failed": source_failed,
         "source_skipped": source_skipped,
-        "deadline_ms": crate::req::search_budget_for(job.scope).as_millis() as u64,
-        "total_budget_ms": crate::req::search_total_budget(job.scope).as_millis() as u64,
-        "coverage": job.coverage.as_str(),
-        "curated_total": job.curated_total,
+        "deadline_ms": crate::req::search_budget_for(meta.scope).as_millis() as u64,
+        "total_budget_ms": crate::req::search_total_budget(meta.scope).as_millis() as u64,
+        "coverage": meta.coverage,
+        "curated_total": meta.curated_total,
         // 冷却统计随 job 固化，轮询期间不会变化
+        "skipped_cooldown": meta.skipped_cooldown,
+        "cooldown_total": meta.cooldown_total,
+        "created_at": meta.created_unix_ms,
+        "finished_at": (meta.finished_unix_ms > 0).then_some(meta.finished_unix_ms),
+    })
+}
+
+pub(super) async fn search_result(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<JobResultQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
+    // 游标 / 翻页请求 → 冻结快照；page=1 的普通轮询仍读实时结果（首屏持续更新）。
+    let cursor = q.cursor.as_deref().and_then(parse_cursor);
+    let paginated = q.cursor.is_some() || page > 1;
+
+    if let Some(job) = find_job(&q.job_id) {
+        // 归属校验：别人的 job_id 与不存在保持同样的 404，避免泄露任务是否存在。
+        if job.uid != u.id {
+            tracing::warn!(
+                target: "search_job",
+                job_id = %q.job_id,
+                owner = job.uid,
+                requester = u.id,
+                reason = "uid_mismatch",
+                "search result 404"
+            );
+            return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+        }
+        let view = if paginated {
+            frozen_job_view(&job)
+        } else {
+            job_view(&job)
+        };
+        let meta = job.meta();
+        return Ok(Json(build_result_response(
+            &meta, view, page, page_size, cursor,
+        )));
+    }
+
+    // 内存未命中（超过内存保留期 / 进程重启）：回退数据库快照。
+    let row = db_get(&s.shared, u.id, &q.job_id).await?;
+    let Some(row) = row else {
+        tracing::warn!(
+            target: "search_job",
+            job_id = %q.job_id,
+            requester = u.id,
+            reason = "not_in_memory_or_db",
+            "search result 404"
+        );
+        return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+    };
+    let mut meta = row_meta(&row);
+    let mut view = row_view(&row);
+    if meta.status == "running" {
+        // 内存里没有、数据库却仍是 running：只可能是进程重启前的遗留行
+        // （启动清理失败）或内存硬上限淘汰。按中断处理，避免前端永远轮询。
+        meta.status = "interrupted".into();
+        view.done = true;
+    }
+    Ok(Json(build_result_response(
+        &meta, view, page, page_size, cursor,
+    )))
+}
+
+/// 数据库行 → 结果元数据（字段口径与内存任务一致）。
+pub(super) fn row_meta(row: &SearchJobRow) -> JobMeta {
+    JobMeta {
+        id: row.id.clone(),
+        uid: row.uid,
+        key: row.keyword.clone(),
+        scope: crate::req::SearchScope::parse(Some(&row.scope)),
+        source_mode: row.source_mode.clone(),
+        coverage: row.coverage.clone(),
+        curated_total: row.curated_total.max(0) as usize,
+        source_total: row.source_total.max(0) as usize,
+        scope_filtered: row.scope_filtered.max(0) as usize,
+        skipped_cooldown: row.skipped_cooldown.max(0) as usize,
+        cooldown_total: row.cooldown_total.max(0) as usize,
+        status: row.status.clone(),
+        created_unix_ms: row.created_at.max(0) as u64,
+        finished_unix_ms: row.finished_at.unwrap_or(0).max(0) as u64,
+    }
+}
+
+/// 数据库行 → 结果视图；快照缺失（运行中/被中断）时返回空结果。
+pub(super) fn row_view(row: &SearchJobRow) -> JobView {
+    let snap = row
+        .snapshot_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<JobSnapshot>(s).ok())
+        .unwrap_or_default();
+    let finished = row.finished.max(0) as usize;
+    let cancelled = row.cancelled.max(0) as usize;
+    let source_total = row.source_total.max(0) as usize;
+    JobView {
+        books: snap.books,
+        errors: snap.errors,
+        done: row.status != "running",
+        finished,
+        pending: row.pending.max(0) as usize,
+        // 数据库不保存调度细节；结果接口只在任务结束时回退到这里，
+        // 因此把已处理源视为已排上，避免出现“还有源没排上”的误导。
+        scheduled: (finished + cancelled).min(source_total),
+        attempted: finished,
+        skipped: row.skipped.max(0) as usize,
+        cancelled,
+    }
+}
+
+/// 结果快照的存储格式（`search_jobs.snapshot_json`）。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct JobSnapshot {
+    #[serde(default)]
+    pub(super) books: Vec<SearchBook>,
+    #[serde(default)]
+    pub(super) errors: Vec<web_book::SourceFailure>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct JobIdQ {
+    pub(super) job_id: String,
+}
+
+/// 任务列表：内存（实时进度）+ 数据库（历史/重启后）合并，按创建时间倒序。
+pub(super) async fn search_jobs(
+    State(s): State<AppState>,
+    u: AuthUser,
+) -> AppResult<Json<serde_json::Value>> {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for job in user_jobs(u.id) {
+        seen.insert(job.id.clone());
+        items.push(memory_job_summary(&job));
+    }
+    let rows = db_list(&s.shared, u.id, SEARCH_JOB_DB_KEEP).await?;
+    for row in &rows {
+        if !seen.insert(row.id.clone()) {
+            continue;
+        }
+        items.push(db_job_summary(row));
+    }
+    items.sort_by_key(|v| {
+        std::cmp::Reverse(
+            v.get("created_at")
+                .and_then(|x| x.as_u64())
+                .unwrap_or_default(),
+        )
+    });
+    let active = items
+        .iter()
+        .filter(|v| v.get("status").and_then(|x| x.as_str()) == Some("running"))
+        .count();
+    Ok(Json(json!({
+        "jobs": items,
+        "active": active,
+        "limit": SEARCH_JOB_DB_KEEP,
+    })))
+}
+
+/// 内存任务摘要（进度实时，来自 job 状态）。
+pub(super) fn memory_job_summary(job: &SearchJob) -> serde_json::Value {
+    let (finished, pending, skipped, cancelled, failed) = {
+        let st = job.state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.finished,
+            st.pending,
+            st.skipped,
+            st.cancelled,
+            st.errors
+                .iter()
+                .filter(|e| !is_budget_skip(&e.kind))
+                .count(),
+        )
+    };
+    let finished_at = job.finished_unix_ms.load(Ordering::Relaxed);
+    // 与结果接口同一口径：pending 归零即视为结束（收尾写 status 前的窗口）。
+    let raw_status = job.status_str();
+    let status = if job.is_running() && pending == 0 {
+        if cancelled > 0 {
+            "cancelled"
+        } else {
+            "done"
+        }
+    } else {
+        raw_status.as_str()
+    };
+    json!({
+        "job_id": job.id,
+        "keyword": job.key,
+        "status": status,
+        "interrupted": status == "interrupted",
+        "scope": job.scope.as_str(),
+        "coverage": job.coverage,
+        "source_mode": job.source_mode,
+        "source_total": job.source_total,
+        "finished": finished,
+        "pending": pending,
+        "skipped": skipped,
+        "cancelled": cancelled,
+        "failed": failed,
+        "curated_total": job.curated_total,
         "skipped_cooldown": job.skipped_cooldown,
         "cooldown_total": job.cooldown_total,
+        "created_at": job.created_unix_ms,
+        "finished_at": (finished_at > 0).then_some(finished_at),
+        "origin": "memory",
+    })
+}
+
+/// 数据库任务摘要（进程重启/内存过期后仍可见）。
+///
+/// 能走到这里的 running 行一定不在内存注册表里（内存任务会先去重），
+/// 说明是重启遗留/被硬上限淘汰的僵尸任务，按 interrupted 展示，避免“永远运行中”。
+pub(super) fn db_job_summary(row: &SearchJobRow) -> serde_json::Value {
+    let status = if row.status == "running" {
+        "interrupted"
+    } else {
+        row.status.as_str()
+    };
+    json!({
+        "job_id": row.id,
+        "keyword": row.keyword,
+        "status": status,
+        "interrupted": status == "interrupted",
+        "scope": row.scope,
+        "coverage": row.coverage,
+        "source_mode": row.source_mode,
+        "source_total": row.source_total.max(0),
+        "finished": row.finished.max(0),
+        "pending": if row.status == "running" { 0 } else { row.pending.max(0) },
+        "skipped": row.skipped.max(0),
+        "cancelled": row.cancelled.max(0),
+        "failed": row.failed.max(0),
+        "curated_total": row.curated_total.max(0),
+        "skipped_cooldown": row.skipped_cooldown.max(0),
+        "cooldown_total": row.cooldown_total.max(0),
+        "created_at": row.created_at.max(0),
+        "finished_at": row.finished_at,
+        "origin": "db",
+    })
+}
+
+/// 取消运行中的任务：置标志并唤醒调度循环；已结束的任务幂等返回当前状态。
+pub(super) async fn search_job_cancel(
+    State(_s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<JobIdQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let Some(job) = find_job(&q.job_id) else {
+        return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+    };
+    if job.uid != u.id {
+        return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+    }
+    if !job.is_running() {
+        return Ok(Json(json!({
+            "job_id": job.id,
+            "status": job.status_str(),
+            "already_finished": true,
+        })));
+    }
+    job.cancelled.store(true, Ordering::SeqCst);
+    // 用 notify_one 而不是 notify_waiters：调度循环每轮才创建 notified()，
+    // notify_one 会留一个 permit，保证「刚设置标志、恰好没在等待」也能立刻生效。
+    job.cancel.notify_one();
+    tracing::info!(target: "search_job", job_id = %job.id, uid = u.id, "cancel requested");
+    Ok(Json(json!({
+        "job_id": job.id,
+        "status": "cancelling",
+        "already_finished": false,
+    })))
+}
+
+/// 移除任务（内存 + 数据库）。运行中的任务必须先取消，避免“删了还在后台跑”。
+pub(super) async fn search_job_delete(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<JobIdQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    if let Some(job) = find_job(&q.job_id) {
+        if job.uid != u.id {
+            return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+        }
+        if job.is_running() {
+            return Err(AppError::BadRequest("任务仍在运行，请先取消再移除".into()));
+        }
+    }
+    let removed_mem = remove_job(&q.job_id, u.id);
+    let removed_db = db_delete(&s.shared, u.id, &q.job_id).await?;
+    if !removed_mem && !removed_db {
+        return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
+    }
+    tracing::info!(target: "search_job", job_id = %q.job_id, uid = u.id, "remove search job");
+    Ok(Json(json!({
+        "job_id": q.job_id,
+        "removed": true,
     })))
 }
 

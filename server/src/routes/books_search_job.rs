@@ -34,15 +34,21 @@ pub(super) fn prune_cache(g: &mut Vec<AggEntry>) {
 /// job 存活 60s。
 /// 已完成任务保留上限 32；进行中任务另有 64 的硬上限，避免把仍在轮询的 job 误杀成 404。
 pub(super) const SEARCH_JOB_TTL_SECS: u64 = 60;
-pub(super) const SEARCH_JOB_MAX: usize = 32;
+/// 已完成任务在内存保留 10 分钟；更久之后由数据库快照接管（仍可在「搜索任务」里查看）。
+pub(super) const SEARCH_JOB_DONE_TTL_SECS: u64 = 600;
+pub(super) const SEARCH_JOB_MAX: usize = 64;
 pub(super) const SEARCH_JOB_MAX_ACTIVE: usize = 64;
+/// 每个用户保留的已完成任务数（更旧的由数据库快照接管，内存不长期占用）。
+pub(super) const SEARCH_JOB_MAX_PER_USER: usize = 20;
+/// 单用户同时运行上限：搜索会克隆整份书源快照，1000 源时单任务可达数十 MB，
+/// 不限制会让“多点几次搜索”直接把小设备内存打满。
+pub(super) const SEARCH_JOB_MAX_ACTIVE_PER_USER: usize = 8;
 pub(super) const SEARCH_PER_SOURCE_MAX: usize = 200;
 
 pub(super) struct SearchJob {
     pub(super) id: String,
     /// 创建者用户 id：结果接口只允许本人读取，跨用户查询一律 404。
     pub(super) uid: i64,
-    #[allow(dead_code)]
     pub(super) key: String,
     pub(super) at: Instant,
     /// 创建时刻（Unix 毫秒），仅用于日志定位“为什么 1 秒内 404”
@@ -65,6 +71,65 @@ pub(super) struct SearchJob {
     /// 当前精选集合大小（curated_total）
     pub(super) curated_total: usize,
     pub(super) state: Mutex<SearchJobState>,
+    /// 取消信号：`notify_one()` 唤醒调度循环，立即停止取新源并丢弃在飞请求。
+    pub(super) cancel: Arc<tokio::sync::Notify>,
+    pub(super) cancelled: AtomicBool,
+    /// running / done / cancelled；中断态只存在于数据库（进程重启后由列表接口标注）。
+    pub(super) status: Mutex<String>,
+    /// 结束时刻（Unix 毫秒，0 = 仍在运行）。
+    pub(super) finished_unix_ms: AtomicU64,
+}
+
+impl SearchJob {
+    pub(super) fn status_str(&self) -> String {
+        self.status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.status_str() == "running"
+    }
+
+    pub(super) fn meta(&self) -> JobMeta {
+        JobMeta {
+            id: self.id.clone(),
+            uid: self.uid,
+            key: self.key.clone(),
+            scope: self.scope,
+            source_mode: self.source_mode.clone(),
+            coverage: self.coverage.clone(),
+            curated_total: self.curated_total,
+            source_total: self.source_total,
+            scope_filtered: self.scope_filtered,
+            skipped_cooldown: self.skipped_cooldown,
+            cooldown_total: self.cooldown_total,
+            status: self.status_str(),
+            created_unix_ms: self.created_unix_ms,
+            finished_unix_ms: self.finished_unix_ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// 结果接口需要的任务元数据：内存任务与数据库快照共用同一份响应组装。
+#[derive(Debug, Clone)]
+pub(super) struct JobMeta {
+    pub(super) id: String,
+    pub(super) uid: i64,
+    pub(super) key: String,
+    pub(super) scope: crate::req::SearchScope,
+    pub(super) source_mode: String,
+    pub(super) coverage: String,
+    pub(super) curated_total: usize,
+    pub(super) source_total: usize,
+    /// 精选收缩排除掉的可搜索源数量（显式源为 0）。
+    pub(super) scope_filtered: usize,
+    pub(super) skipped_cooldown: usize,
+    pub(super) cooldown_total: usize,
+    pub(super) status: String,
+    pub(super) created_unix_ms: u64,
+    pub(super) finished_unix_ms: u64,
 }
 
 pub(super) fn unix_ms() -> u64 {
@@ -88,6 +153,8 @@ pub(super) struct SearchJobState {
     pub(super) attempted: usize,
     /// 因全局预算耗尽而未执行/未完成的源数（不写健康状态）
     pub(super) skipped: usize,
+    /// 因用户取消而未执行/被中断的源数（不写健康状态）
+    pub(super) cancelled: usize,
     /// job 内的稳定排序/快照：首次翻页后冻结，保证同一会话不重不漏。
     pub(super) rank: web_book::RankFreeze,
 }
@@ -102,14 +169,17 @@ pub(super) fn job_pending(j: &Arc<SearchJob>) -> Option<usize> {
 }
 
 pub(super) fn prune_jobs(list: &mut Vec<Arc<SearchJob>>) {
-    list.retain(|j| j.at.elapsed().as_secs() < SEARCH_JOB_TTL_SECS);
+    // 运行中的任务不做时间淘汰：它们最多受整批预算约束（配置上限 60s）。
+    // 只有异常卡死（任务 panic/取消信号丢失）时才用硬上限兜底，避免永久占内存。
+    list.retain(|j| j.is_running() || j.at.elapsed().as_secs() < SEARCH_JOB_DONE_TTL_SECS);
+    list.retain(|j| !j.is_running() || j.at.elapsed().as_secs() < SEARCH_JOB_TTL_SECS * 5);
     // 第一优先：淘汰“已完成且最旧”的任务。进行中的任务不参与淘汰，
     // 否则并发 start/轮询下，刚创建的 job 会被后来的 start 顶掉并 404。
     while list.len() > SEARCH_JOB_MAX {
         let victim = list
             .iter()
             .enumerate()
-            .filter(|(_, j)| job_pending(j) == Some(0))
+            .filter(|(_, j)| !j.is_running())
             .max_by_key(|(_, j)| j.at.elapsed().as_millis())
             .map(|(i, _)| i);
         let Some(i) = victim else { break };
@@ -125,6 +195,8 @@ pub(super) fn prune_jobs(list: &mut Vec<Arc<SearchJob>>) {
         );
         list.remove(i);
     }
+    // 单用户保留上限：避免一个用户的历史任务把全局列表挤满。
+    prune_per_user(list);
     // 仅当进行中的任务超过硬上限时才淘汰活跃任务（兜底防内存膨胀）。
     while list.len() > SEARCH_JOB_MAX_ACTIVE {
         let Some((i, j)) = list
@@ -148,6 +220,61 @@ pub(super) fn prune_jobs(list: &mut Vec<Arc<SearchJob>>) {
     }
 }
 
+/// 每个用户最多保留 [`SEARCH_JOB_MAX_PER_USER`] 个已完成任务（运行中的不淘汰）。
+fn prune_per_user(list: &mut Vec<Arc<SearchJob>>) {
+    let mut by_user: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, j) in list.iter().enumerate() {
+        by_user.entry(j.uid).or_default().push(i);
+    }
+    let mut drop_idx: Vec<usize> = Vec::new();
+    for idxs in by_user.values() {
+        let mut done: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|i| !list[*i].is_running())
+            .collect();
+        if done.len() <= SEARCH_JOB_MAX_PER_USER {
+            continue;
+        }
+        done.sort_by_key(|i| std::cmp::Reverse(list[*i].created_unix_ms));
+        drop_idx.extend(done.into_iter().skip(SEARCH_JOB_MAX_PER_USER));
+    }
+    drop_idx.sort_unstable_by(|a, b| b.cmp(a));
+    for i in drop_idx {
+        list.remove(i);
+    }
+}
+
+/// 当前用户的内存任务（运行中 + 最近完成），按创建时间倒序。
+pub(super) fn user_jobs(uid: i64) -> Vec<Arc<SearchJob>> {
+    let mut g = job_registry().lock().unwrap_or_else(|p| p.into_inner());
+    prune_jobs(&mut g);
+    let mut list: Vec<Arc<SearchJob>> = g.iter().filter(|j| j.uid == uid).cloned().collect();
+    list.sort_by_key(|j| std::cmp::Reverse(j.created_unix_ms));
+    list
+}
+
+pub(super) fn find_job(id: &str) -> Option<Arc<SearchJob>> {
+    let mut g = job_registry().lock().unwrap_or_else(|p| p.into_inner());
+    prune_jobs(&mut g);
+    g.iter().find(|j| j.id == id).cloned()
+}
+
+/// 从内存注册表移除；返回是否真的移除了。
+pub(super) fn remove_job(id: &str, uid: i64) -> bool {
+    let mut g = job_registry().lock().unwrap_or_else(|p| p.into_inner());
+    let before = g.len();
+    g.retain(|j| !(j.id == id && j.uid == uid));
+    g.len() != before
+}
+
+/// 该用户当前运行中的任务数（start 前做单用户并发限制）。
+pub(super) fn active_jobs_for_user(uid: i64) -> usize {
+    let mut g = job_registry().lock().unwrap_or_else(|p| p.into_inner());
+    prune_jobs(&mut g);
+    g.iter().filter(|j| j.uid == uid && j.is_running()).count()
+}
+
 pub(super) fn next_job_id() -> String {
     static SEQ: AtomicI64 = AtomicI64::new(0);
     format!(
@@ -167,6 +294,8 @@ pub(super) struct JobView {
     pub(super) attempted: usize,
     /// 因全局预算耗尽而“未执行/未完成”的源数（不写入健康状态）。
     pub(super) skipped: usize,
+    /// 因用户取消而未执行/被中断的源数（不写入健康状态）。
+    pub(super) cancelled: usize,
 }
 
 /// 正在运行的搜索任务数：后台体检用它判断是否该让路（见 `source_bench`）。
@@ -207,6 +336,7 @@ pub(super) fn job_view(job: &SearchJob) -> JobView {
     let scheduled = st.scheduled;
     let attempted = st.attempted;
     let skipped = st.skipped;
+    let cancelled = st.cancelled;
     drop(st);
     full.truncate(AGG_MAX_BOOKS);
     JobView {
@@ -218,6 +348,7 @@ pub(super) fn job_view(job: &SearchJob) -> JobView {
         scheduled,
         attempted,
         skipped,
+        cancelled,
     }
 }
 
@@ -236,6 +367,7 @@ pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
                 scheduled: st.scheduled,
                 attempted: st.attempted,
                 skipped: st.skipped,
+                cancelled: st.cancelled,
             };
             return view;
         }
@@ -421,7 +553,23 @@ pub(super) async fn run_search_job(
     // `unfold` 的闭包返回非 Unpin 的 async block，`next()` 需要显式钉住整个流。
     futures::pin_mut!(inflight);
 
-    while let Some(run) = inflight.next().await {
+    // 用户取消：`biased` 让取消信号优先于新结果，一旦命中立刻停止取新源，
+    // 直接丢弃 buffer_unordered 里的在飞请求（它们不再写健康/结果）。
+    let mut cancelled_by_user = false;
+    loop {
+        if job.cancelled.load(Ordering::Relaxed) {
+            cancelled_by_user = true;
+            break;
+        }
+        let next = tokio::select! {
+            biased;
+            _ = job.cancel.notified() => {
+                cancelled_by_user = true;
+                break;
+            }
+            next = inflight.next() => next,
+        };
+        let Some(run) = next else { break };
         let SourceRun {
             src,
             outcome,
@@ -604,8 +752,25 @@ pub(super) async fn run_search_job(
         }
     }
 
-    // 提前停止/deadline 后仍未取出的源：记为 skipped（不写健康、不算站点失败）。
-    {
+    if cancelled_by_user {
+        // 取消：清空排队 + 丢弃在飞请求。未完成的源计入 `cancelled`（既不写健康、
+        // 也不算站点失败），已完成源的结果保留，用户仍可查看。
+        queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let mut st = job.state.lock().unwrap_or_else(|p| p.into_inner());
+        let left = st.pending;
+        st.cancelled += left;
+        st.pending = 0;
+        let finished = st.finished;
+        drop(st);
+        tracing::info!(
+            target: "search_job",
+            job_id = %job.id,
+            cancelled_sources = left,
+            finished,
+            "search job cancelled by user"
+        );
+    } else {
+        // 提前停止/deadline 后仍未取出的源：记为 skipped（不写健康、不算站点失败）。
         let mut g = queue.lock().unwrap();
         let mut st = job.state.lock().unwrap();
         for s in g.drain(..) {
@@ -624,6 +789,31 @@ pub(super) async fn run_search_job(
     if let Err(e) = source_health::record_outcomes(&pool, &outcomes, cooldown_secs, &tier_cfg).await
     {
         tracing::warn!(error = %e, "record source health after search failed");
+    }
+    let status = if cancelled_by_user {
+        "cancelled"
+    } else {
+        "done"
+    };
+    finish_job(&job, &pool, status).await;
+}
+
+/// 任务收尾：固化状态/结束时刻，并把最终快照写入数据库。
+///
+/// 内存注册表只在进程存活期内有效（运行中 + 最近完成），数据库快照让
+/// 「关掉前端 → 重新登录」甚至「后端重启」之后仍能列出任务并查看已得结果。
+async fn finish_job(job: &Arc<SearchJob>, pool: &SqlitePool, status: &str) {
+    *job.status.lock().unwrap_or_else(|p| p.into_inner()) = status.to_string();
+    job.finished_unix_ms.store(unix_ms(), Ordering::Relaxed);
+    let view = job_view(job);
+    let meta = job.meta();
+    if let Err(e) = super::books_search_store::persist_finished(pool, &meta, &view).await {
+        tracing::warn!(
+            target: "search_job",
+            job_id = %job.id,
+            error = %e,
+            "persist search job snapshot failed"
+        );
     }
 }
 

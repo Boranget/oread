@@ -61,12 +61,15 @@ GET /api/book/content
 - **正文缓存**：存在用户库 `book_content`，键 `(url, origin)`，带 TTL 与管线指纹 `cache_version`；空正文不落库；超上限按 `accessed_at` 升序淘汰。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文缓存分开预算。
 - **规则缓存**：`<data_dir>/cache/rule/`，仅 `cache.getFile/putFile` 可写。
+- **搜索任务（`shared.db`.`search_jobs`）**：两段式搜索的元数据与最终快照。运行期进度以进程内注册表（`books_search_job`）为准；任务收尾时把 `books/errors` 写入 `snapshot_json`。内存只保留运行中 + 最近 20 个已完成任务（完成后再留 10 分钟），数据库保留每用户最近 50 个。`/api/search/result` 内存未命中时回退数据库快照，游标翻页继续复用 `rank_bucket/rank_seq`。进程启动时把上次遗留的 `running` 行标为 `interrupted`，避免前端永远轮询一个不会动的任务。
+- **搜索取消语义**：`/api/search/jobs/cancel` 置取消标志并 `notify_one()` 唤醒调度循环；立即停止取新源、丢弃在飞请求，未完成的源计入 `cancelled`（不写源健康、不算站点失败），已完成结果保留。运行中的任务必须先取消才能移除。
 
 ## 5. 前端（SPA）
 
 - Svelte 4 + Vite，产物 `server/web/dist`，由 `ServeDir` 托管；`src/App.svelte` 负责登录态与 tab 路由。
 - 首屏只静态引入 Login/Bookshelf/Discover；Reader、ComicReader 与统计/书源/替换/设置页均 `import()` 懒加载，失败有可见错误与重试。
-- 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`readerHtml/images/stats/auto/progress/gestures/math`、`readingPrefs`、`theme` 等，均有 `node --test` 单测。
+- 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`readerHtml/images/stats/auto/progress/gestures/math`、`searchJobsModel`（任务状态/进度/时间纯函数）、`readingPrefs`、`theme` 等，均有 `node --test` 单测。
+- 搜索任务共享状态在 `lib/searchJobsStore.js`：App 登录后轮询 `/api/search/jobs`（有运行中任务 2.5s、空闲 15s），退出时停止并清空；Discover 的 `SearchJobsPanel` 只读取 store，支持取消、移除与「查看结果」重新挂载（运行中继续轮询，已结束直接读快照）。
 - 组件间共享 DOM 引用或双向状态用 Svelte 原生 `bind:`（如 `bind:scrollEl`），**不要**用函数 prop 在子组件 `$:` 里回传：函数 prop 每次 `$set` 都会被判定为“已变化”，容易形成「子更新 → 回传 → 父更新 → 重新 `$set` → 子更新」的更新回环；`bind:` 由编译器生成 `updating_*` 标志，结构上阻断反向回写。
 - 渲染期异常兜底：`App.svelte` 监听 `error` / `unhandledrejection`，用原生 DOM 挂出可关闭的提示条与「重新加载」按钮。Svelte 的 `flush()` 抛错后调度器不会复位，之后所有状态更新都不再执行，因此不能依赖 Svelte 自身状态来提示错误。
 - 阅读偏好与 eink 主题走 CSS 变量；墨水屏样式门禁见 [EINK_STYLE.md](EINK_STYLE.md)。

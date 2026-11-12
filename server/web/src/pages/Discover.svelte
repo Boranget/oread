@@ -5,6 +5,13 @@
   import DiscoverHistory from '../lib/DiscoverHistory.svelte';
   import DiscoverScopePicker from '../lib/DiscoverScopePicker.svelte';
   import DiscoverResults from '../lib/DiscoverResults.svelte';
+  import SearchJobsPanel from '../lib/SearchJobsPanel.svelte';
+  import {
+    searchJobs,
+    cancelSearchJob,
+    removeSearchJob,
+    refreshSearchJobs,
+  } from '../lib/searchJobsStore.js';
 
   const dispatch = createEventDispatcher();
   let mode = 'search'; // search | explore | import
@@ -29,7 +36,12 @@
   let searching = false;
   let searchDone = false;
   let jobExpired = false;
+  let jobStatus = ''; // 后端回显：running / done / cancelled / interrupted
   let paging = false;
+
+  // 任务面板：busyId 防止取消/移除按钮重复点击
+  let jobsBusyId = '';
+  let jobsError = '';
 
   // 等待秒数 / 完成用时
   let searchElapsed = 0;
@@ -113,6 +125,8 @@
 
   onMount(async () => {
     loadHistory();
+    // App 级已在轮询；进入发现页时立即刷新一次，避免看到过期状态。
+    refreshSearchJobs();
     try {
       sources = await api.sources();
       sourcesReady = true;
@@ -206,6 +220,7 @@
         : finishedSources;
     pendingSources = Number.isFinite(pending) ? pending : Math.max(0, sourceTotal - finishedSources);
     searchDone = !!r.done;
+    jobStatus = String(r.status || (searchDone ? 'done' : 'running'));
     deadlineMs = Number(r.deadline_ms) || deadlineMs;
     const rawFailed = Array.isArray(r.errors) ? r.errors : [];
     const budgetSkipped = (e) => e.kind === 'skipped' || e.kind === 'truncated';
@@ -238,6 +253,13 @@
     pollFailures = 0;
     cancelPolling();
     stopSearchClock();
+    if (jobStatus === 'cancelled') {
+      notice = '搜索已取消，已保留取消前的结果。';
+    } else if (jobStatus === 'interrupted') {
+      notice = '任务在服务重启时中断，这里只显示已保存的结果。';
+    }
+    // 任务结束后立即同步任务面板（状态/徽标/可移除）。
+    refreshSearchJobs();
   }
 
   function handleExpired() {
@@ -248,6 +270,7 @@
     jobExpired = true;
     page = resultsPage || 1; // 结果仍停留在旧页，页码同步回退，避免“第 2 页显示第 1 页内容”
     stopSearchClock();
+    refreshSearchJobs();
   }
 
   async function fetchPage(seq, pageNo) {
@@ -296,6 +319,8 @@
       return;
     }
     const requestedIds = sourceScope === 'custom' ? pickedSourceIds.slice() : [];
+    // 新搜索不再取消旧任务：旧任务在后端继续跑，并出现在「搜索任务」里可管理。
+    const previousRunning = searching && !!jobId;
     const seq = ++jobSeq;
     retrySeq += 1; // 作废仍在进行的失败源重试
     cancelPolling();
@@ -328,8 +353,12 @@
     skippedSources = [];
     skippedCount = 0;
     pollFailures = 0;
+    jobStatus = '';
+    jobsError = '';
     error = '';
-    notice = '';
+    notice = previousRunning
+      ? '上一个搜索仍在后台运行，可在「搜索任务」中查看进度或取消。'
+      : '';
     requestSourceCount = requestedIds.length;
     ignoredSourceIds = [];
     rememberKey(q);
@@ -463,6 +492,134 @@
       }
     } finally {
       if (seq === retrySeq) retrying = false;
+    }
+  }
+
+  // ---- 搜索任务面板：查看 / 取消 / 移除 ----
+
+  // 重新挂载一个任务：运行中则继续轮询，已结束则直接取快照。
+  function attachJob(job) {
+    if (!job || !job.job_id) return;
+    jobSeq += 1;
+    retrySeq += 1;
+    cancelPolling();
+    clearInterval(searchTimer);
+    searchTimer = null;
+    mode = 'search';
+    key = job.keyword || '';
+    lastSearchKey = job.keyword || '';
+    lastSearchScopeIds = [];
+    resultScopeMode = job.scope === 'curated' ? 'curated' : 'all';
+    resultRequested = 0;
+    requestedScope = job.scope === 'curated' ? 'curated' : 'all';
+    searchScope = requestedScope;
+    searchCoverage = job.coverage || (requestedScope === 'curated' ? 'curated' : 'expanded');
+    sourceMode = job.source_mode || '';
+    curatedTotal = Number(job.curated_total) || curatedTotal;
+    scopeFiltered = 0;
+    requestSourceCount = 0;
+    ignoredSourceIds = [];
+    sourceTotal = Number(job.source_total) || 0;
+    finishedSources = Number(job.finished) || 0;
+    pendingSources = Number(job.pending) || 0;
+    failedCount = Number(job.failed) || 0;
+    failedSources = [];
+    skippedCount = Number(job.skipped) || 0;
+    skippedSources = [];
+    jobId = job.job_id;
+    jobExpired = false;
+    jobStatus = String(job.status || '');
+    page = 1;
+    resultsPage = 1;
+    results = [];
+    total = 0;
+    hasMore = false;
+    searched = true;
+    starting = false;
+    searchDone = job.status !== 'running';
+    searching = job.status === 'running';
+    paging = false;
+    pollFailures = 0;
+    retryExtra = [];
+    retryNote = '';
+    retrying = false;
+    error = '';
+    notice = '';
+    // 运行中的任务按创建时间还原已运行时长；已结束的用起止时间算总耗时。
+    searchStartedAt = searching ? Number(job.created_at) || Date.now() : 0;
+    searchElapsed = searchStartedAt
+      ? Math.max(0, Math.floor((Date.now() - searchStartedAt) / 1000))
+      : 0;
+    searchDuration = 0;
+    if (searching) {
+      searchTimer = setInterval(() => {
+        searchElapsed = Math.floor((Date.now() - searchStartedAt) / 1000);
+      }, 1000);
+    } else if (job.created_at && job.finished_at) {
+      searchDuration = Math.max(
+        1,
+        Math.round((Number(job.finished_at) - Number(job.created_at)) / 1000)
+      );
+    }
+    fetchPage(jobSeq, 1);
+  }
+
+  async function cancelJob(job) {
+    if (!job || jobsBusyId) return;
+    jobsBusyId = job.job_id;
+    jobsError = '';
+    try {
+      await cancelSearchJob(job.job_id);
+      // 正在查看的任务：立刻取一次最终状态（后端会把 status 写成 cancelled）。
+      if (job.job_id === jobId) {
+        await fetchPage(jobSeq, page);
+      }
+    } catch (e) {
+      jobsError = describeFailure(e, '取消搜索任务');
+    } finally {
+      jobsBusyId = '';
+    }
+  }
+
+  async function removeJob(job) {
+    if (!job || jobsBusyId) return;
+    jobsBusyId = job.job_id;
+    jobsError = '';
+    try {
+      await removeSearchJob(job.job_id);
+      // 移除的正是当前查看的任务：清空结果区，避免继续显示已删除任务。
+      if (job.job_id === jobId) {
+        jobSeq += 1;
+        cancelPolling();
+        clearInterval(searchTimer);
+        searchTimer = null;
+        jobId = '';
+        jobStatus = '';
+        searched = false;
+        searching = false;
+        starting = false;
+        searchDone = false;
+        jobExpired = false;
+        paging = false;
+        results = [];
+        total = 0;
+        hasMore = false;
+        failedSources = [];
+        failedCount = 0;
+        skippedSources = [];
+        skippedCount = 0;
+        notice = '';
+        error = '';
+        page = 1;
+        resultsPage = 1;
+        searchElapsed = 0;
+        searchDuration = 0;
+        searchStartedAt = 0;
+      }
+    } catch (e) {
+      jobsError = describeFailure(e, '移除搜索任务');
+    } finally {
+      jobsBusyId = '';
     }
   }
 
@@ -684,6 +841,16 @@
     <input placeholder="输入书名 / 作者" bind:value={key} on:keydown={(e) => e.key === 'Enter' && doSearch()} />
     <button on:click={doSearch} disabled={starting || (sourceScope === 'custom' && !pickedSourceIds.length)}>搜索</button>
   </div>
+
+  <SearchJobsPanel
+    jobs={$searchJobs.jobs}
+    active={$searchJobs.active}
+    error={$searchJobs.error || jobsError}
+    busyId={jobsBusyId}
+    on:cancel={(e) => cancelJob(e.detail)}
+    on:remove={(e) => removeJob(e.detail)}
+    on:view={(e) => attachJob(e.detail)}
+  />
 
   <DiscoverHistory busy={starting || searching} on:pick={(e) => useHistory(e.detail)} />
 

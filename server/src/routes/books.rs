@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/search/aggregate", get(search_aggregate))
         .route("/api/search/start", get(search_start))
         .route("/api/search/result", get(search_result))
+        .route(
+            "/api/search/jobs",
+            get(search_jobs).delete(search_job_delete),
+        )
+        .route("/api/search/jobs/cancel", post(search_job_cancel))
         .route("/api/explore", get(explore))
         .route("/api/explore/categories", get(explore_categories))
         .route("/api/book/info", get(book_info))
@@ -168,6 +173,9 @@ pub(super) const AGG_MAX_BOOKS: usize = 400;
 #[path = "books_search_job.rs"]
 mod books_search_job;
 use books_search_job::*;
+#[path = "books_search_store.rs"]
+mod books_search_store;
+use books_search_store::*;
 #[path = "books_search_source.rs"]
 mod books_search_source;
 use books_search_source::*;
@@ -193,6 +201,20 @@ pub(crate) use books_store::{
     book_store_for, load_book_meta, load_cached_chapters, load_cached_content,
     persist_book_changes, save_book_meta, save_chapters, save_content_cached,
 };
+
+/// 启动时把上次进程遗留的 running 搜索任务标为 interrupted。
+///
+/// 任务本身随进程结束，但用户重新登录后仍能在「搜索任务」里看到它，而不是一行
+/// 永远不动的 running。失败只记日志：清理是尽力而为，不能阻止服务启动。
+pub async fn mark_interrupted_search_jobs(pool: &SqlitePool) {
+    match books_search_store::mark_interrupted(pool).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(count = n, "marked interrupted search jobs");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "mark interrupted search jobs failed"),
+    }
+}
 
 #[allow(clippy::field_reassign_with_default)] // 测试里按字段逐个构造对象，与生产默认值的差异一目了然。
 #[cfg(test)]
