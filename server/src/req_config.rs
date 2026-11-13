@@ -39,6 +39,8 @@ pub(super) struct HttpConf {
     /// 整批搜索总预算：curated / all 两档。
     pub(super) search_curated_budget_secs: u64,
     pub(super) search_all_budget_secs: u64,
+    /// 后台搜索任务的结果体积上限（字节）：唯一的任务终止预算。
+    pub(super) search_result_max_bytes: usize,
     /// 书源未声明 `concurrentRate` 时的每源在飞上限。
     pub(super) source_concurrency_default: usize,
     pub(super) max_body_bytes: usize,
@@ -52,6 +54,7 @@ pub(super) const DEFAULT_CONF: HttpConf = HttpConf {
     search_all_timeout_secs: 8,
     search_curated_budget_secs: 6,
     search_all_budget_secs: 40,
+    search_result_max_bytes: 4 * 1024 * 1024,
     source_concurrency_default: SOURCE_CONCURRENCY_DEFAULT,
     max_body_bytes: 5 * 1024 * 1024,
 };
@@ -116,6 +119,7 @@ pub fn init(cfg: &Config) {
         search_all_timeout_secs: cfg.search_all_timeout_secs,
         search_curated_budget_secs: cfg.search_curated_budget_secs,
         search_all_budget_secs: cfg.search_all_budget_secs,
+        search_result_max_bytes: cfg.search_result_max_bytes,
         source_concurrency_default: cfg.source_concurrency_default,
         max_body_bytes: cfg.http_max_body_bytes,
     });
@@ -167,6 +171,13 @@ pub fn search_total_budget(scope: SearchScope) -> Duration {
         SearchScope::All => conf().search_all_budget_secs,
     };
     Duration::from_secs(secs)
+}
+
+/// 后台搜索任务的结果体积上限（字节）：唯一的任务终止预算。
+///
+/// 任务不再按时间收尾——跑多少源、出多少条都不设限，只看落库结果有多大。
+pub fn search_result_max_bytes() -> usize {
+    conf().search_result_max_bytes
 }
 
 /// 解析书源级超时：空/0/负数 → `None`（调用方回退全局 `HTTP_TIMEOUT_SECS`）；
@@ -424,5 +435,28 @@ pub async fn acquire_search_slot(
         Ok(Ok(p)) => Ok(p),
         Ok(Err(_)) => Err(anyhow!("search semaphore closed")),
         Err(_) => Err(anyhow!("全局搜索预算耗尽（排队未及执行）")),
+    }
+}
+
+/// 拿一个“源级”搜索槽，不设等待上限（后台任务用）。
+///
+/// 后台搜索没有整批时间预算，等槽不应该变成隐性截断；取消通过丢弃 future 生效
+/// （调度循环收到取消信号后会丢掉整个在飞流，排队中的源随之释放）。
+fn search_slot_pool(comic: bool, scope: SearchScope) -> &'static Arc<Semaphore> {
+    match (scope, comic) {
+        (SearchScope::Curated, true) => comic_search_slots(),
+        (SearchScope::Curated, false) => novel_search_slots(),
+        (SearchScope::All, true) => comic_search_slots_all(),
+        (SearchScope::All, false) => novel_search_slots_all(),
+    }
+}
+
+pub async fn acquire_search_slot_now(
+    comic: bool,
+    scope: SearchScope,
+) -> anyhow::Result<tokio::sync::SemaphorePermit<'static>> {
+    match search_slot_pool(comic, scope).acquire().await {
+        Ok(p) => Ok(p),
+        Err(_) => Err(anyhow!("search semaphore closed")),
     }
 }

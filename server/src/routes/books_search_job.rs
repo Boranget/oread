@@ -1,4 +1,11 @@
 //! books 路由的 search_job 部分（move-only 从 books.rs 拆出）。
+//!
+//! 调度模型：**工作量驱动**，不是时间驱动。
+//! - 单源预算固定（`search_budget_for`），超时只记「未知」，不判死站点；
+//! - 去掉整批时间预算：跑多少源、出多少条都不设上限；
+//! - 唯一的任务终止条件是**结果体积**（`search_result_max_bytes`），
+//!   到顶后停止取新源，已发出的请求照常收尾；
+//! - 结果边搜边落库（`books_search_books`），内存只保留计数。
 
 use super::*;
 
@@ -27,19 +34,21 @@ pub(super) fn prune_cache(g: &mut Vec<AggEntry>) {
 }
 
 // ---------- 两段式聚合搜索：先返回已完成源，轮询补齐 ----------
-/// job 存活 60s。
-/// 已完成任务保留上限 32；进行中任务另有 64 的硬上限，避免把仍在轮询的 job 误杀成 404。
+/// 运行中任务的存活上限（仅内存淘汰兜底；正常任务由结果体积收尾）。
 pub(super) const SEARCH_JOB_TTL_SECS: u64 = 60;
-/// 已完成任务在内存保留 10 分钟；更久之后由数据库快照接管（仍可在「搜索任务」里查看）。
+/// 已完成任务在内存保留 10 分钟；更久之后由数据库行表接管（仍可在「搜索任务」里查看）。
 pub(super) const SEARCH_JOB_DONE_TTL_SECS: u64 = 600;
 pub(super) const SEARCH_JOB_MAX: usize = 64;
 pub(super) const SEARCH_JOB_MAX_ACTIVE: usize = 64;
-/// 每个用户保留的已完成任务数（更旧的由数据库快照接管，内存不长期占用）。
+/// 每个用户保留的已完成任务数（更旧的由数据库接管，内存不长期占用）。
 pub(super) const SEARCH_JOB_MAX_PER_USER: usize = 20;
-/// 单用户同时运行上限：搜索会克隆整份书源快照，1000 源时单任务可达数十 MB，
-/// 不限制会让“多点几次搜索”直接把小设备内存打满。
+/// 单用户同时运行上限：任务会推进整份书源快照的调度，不限制会让“多点几次搜索”
+/// 把设备的并发槽和磁盘写带宽打满。
 pub(super) const SEARCH_JOB_MAX_ACTIVE_PER_USER: usize = 8;
+/// 单个源单次返回的最多结果数：防止一个异常源一次撑爆结果体积预算。
 pub(super) const SEARCH_PER_SOURCE_MAX: usize = 200;
+/// 内存中保留的错误明细上限：超出只累计计数，避免错误列表随源数增长。
+pub(super) const SEARCH_ERRORS_MAX: usize = 200;
 
 pub(super) struct SearchJob {
     pub(super) id: String,
@@ -49,10 +58,8 @@ pub(super) struct SearchJob {
     pub(super) at: Instant,
     /// 创建时刻（Unix 毫秒），仅用于日志定位“为什么 1 秒内 404”
     pub(super) created_unix_ms: u64,
-    /// 启用中的书源快照：用于去重/按权重排序，保证与 aggregate 的排序规则一致
-    pub(super) sources: Vec<crate::entities::BookSource>,
     pub(super) source_total: usize,
-    /// 本次搜索范围（curated / all），用于结果接口回显与预算/并发选择。
+    /// 本次搜索范围（curated / all），用于结果接口回显与并发选择。
     pub(super) scope: crate::req::SearchScope,
     /// 因冷却被跳过的源数（本次请求）
     pub(super) skipped_cooldown: usize,
@@ -66,6 +73,7 @@ pub(super) struct SearchJob {
     pub(super) scope_filtered: usize,
     /// 当前精选集合大小（curated_total）
     pub(super) curated_total: usize,
+    /// 运行期计数。结果本体在 `search_job_books`，这里不保存书。
     pub(super) state: Mutex<SearchJobState>,
     /// 取消信号：`notify_one()` 唤醒调度循环，立即停止取新源并丢弃在飞请求。
     pub(super) cancel: Arc<tokio::sync::Notify>,
@@ -108,7 +116,7 @@ impl SearchJob {
     }
 }
 
-/// 结果接口需要的任务元数据：内存任务与数据库快照共用同一份响应组装。
+/// 结果接口需要的任务元数据：内存任务与数据库行共用同一份响应组装。
 #[derive(Debug, Clone)]
 pub(crate) struct JobMeta {
     pub(crate) id: String,
@@ -128,31 +136,30 @@ pub(crate) struct JobMeta {
     pub(crate) finished_unix_ms: u64,
 }
 
-/// `/k` 搜索中页需要的轻量进度：不克隆/排序结果，避免每次自动刷新都扫一遍书。
-pub(crate) struct JobProgress {
-    pub(crate) key: String,
-    pub(crate) source_total: usize,
+/// 任务级计数：轮询、分页、`/k` 进度都只读这些，不再扫结果表或克隆全部书。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JobCounters {
+    pub(crate) errors: Vec<web_book::SourceFailure>,
+    /// 真实失败数（不含 skipped/truncated），错误明细被截断后仍然准确。
+    pub(crate) failed: usize,
     pub(crate) finished: usize,
     pub(crate) pending: usize,
+    pub(crate) scheduled: usize,
+    pub(crate) attempted: usize,
     pub(crate) skipped: usize,
     pub(crate) cancelled: usize,
-    pub(crate) failed: usize,
+    /// 已落库的结果条数（去重后、书名匹配后）
+    pub(crate) result_count: usize,
+    /// 通过相关性门槛的候选条数（书名过滤前）
+    pub(crate) raw_count: usize,
+    pub(crate) result_bytes: i64,
+    /// completed / max_bytes / cancelled
+    pub(crate) stop_reason: String,
 }
 
-pub(super) fn job_progress(job: &SearchJob) -> JobProgress {
-    let st = job.state.lock().unwrap_or_else(|p| p.into_inner());
-    JobProgress {
-        key: job.key.clone(),
-        source_total: job.source_total,
-        finished: st.finished,
-        pending: st.pending,
-        skipped: st.skipped,
-        cancelled: st.cancelled,
-        failed: st
-            .errors
-            .iter()
-            .filter(|e| !matches!(e.kind.as_str(), "truncated" | "skipped"))
-            .count(),
+impl JobCounters {
+    pub(crate) fn done(&self) -> bool {
+        self.pending == 0
     }
 }
 
@@ -165,8 +172,8 @@ pub(super) fn unix_ms() -> u64 {
 
 #[derive(Default)]
 pub(super) struct SearchJobState {
-    pub(super) books: Vec<SearchBook>,
     pub(super) errors: Vec<web_book::SourceFailure>,
+    pub(super) failed: usize,
     /// 已处理完的源数（含成功/失败/排队未及执行）
     pub(super) finished: usize,
     /// 尚未处理完的源数（legacy 语义；与 `scheduled` 不同）
@@ -175,12 +182,26 @@ pub(super) struct SearchJobState {
     pub(super) scheduled: usize,
     /// 真正拿到并发槽并发出过至少一次请求的源数
     pub(super) attempted: usize,
-    /// 因全局预算耗尽而未执行/未完成的源数（不写健康状态）
+    /// 未执行/未完成的源数（取消或结果体积到顶；不写健康状态）
     pub(super) skipped: usize,
     /// 因用户取消而未执行/被中断的源数（不写健康状态）
     pub(super) cancelled: usize,
-    /// job 内的稳定排序/快照：首次翻页后冻结，保证同一会话不重不漏。
-    pub(super) rank: web_book::RankFreeze,
+    pub(super) result_count: usize,
+    pub(super) raw_count: usize,
+    pub(super) result_bytes: i64,
+    pub(super) stop_reason: String,
+}
+
+impl SearchJobState {
+    /// 记一条错误：明细最多 [`SEARCH_ERRORS_MAX`] 条，计数始终准确。
+    fn push_error(&mut self, e: web_book::SourceFailure) {
+        if !matches!(e.kind.as_str(), "truncated" | "skipped") {
+            self.failed += 1;
+        }
+        if self.errors.len() < SEARCH_ERRORS_MAX {
+            self.errors.push(e);
+        }
+    }
 }
 
 pub(super) fn job_registry() -> &'static Mutex<Vec<Arc<SearchJob>>> {
@@ -193,8 +214,8 @@ pub(super) fn job_pending(j: &Arc<SearchJob>) -> Option<usize> {
 }
 
 pub(super) fn prune_jobs(list: &mut Vec<Arc<SearchJob>>) {
-    // 运行中的任务不做时间淘汰：它们最多受整批预算约束（配置上限 60s）。
-    // 只有异常卡死（任务 panic/取消信号丢失）时才用硬上限兜底，避免永久占内存。
+    // 运行中的任务不做时间淘汰：源集合有限、每源有单源预算，任务一定会结束。
+    // 这里的硬上限只兜底异常卡死（任务 panic / 取消信号丢失），避免永久占内存。
     list.retain(|j| j.is_running() || j.at.elapsed().as_secs() < SEARCH_JOB_DONE_TTL_SECS);
     list.retain(|j| !j.is_running() || j.at.elapsed().as_secs() < SEARCH_JOB_TTL_SECS * 5);
     // 第一优先：淘汰“已完成且最旧”的任务。进行中的任务不参与淘汰，
@@ -308,20 +329,6 @@ pub(super) fn next_job_id() -> String {
     )
 }
 
-pub(crate) struct JobView {
-    pub(crate) books: Vec<SearchBook>,
-    pub(crate) errors: Vec<web_book::SourceFailure>,
-    pub(crate) done: bool,
-    pub(crate) finished: usize,
-    pub(crate) pending: usize,
-    pub(crate) scheduled: usize,
-    pub(crate) attempted: usize,
-    /// 因全局预算耗尽而“未执行/未完成”的源数（不写入健康状态）。
-    pub(crate) skipped: usize,
-    /// 因用户取消而未执行/被中断的源数（不写入健康状态）。
-    pub(crate) cancelled: usize,
-}
-
 /// 正在运行的搜索任务数：后台体检用它判断是否该让路（见 `source_bench`）。
 static ACTIVE_SEARCH_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -345,82 +352,24 @@ pub(crate) fn searches_active() -> bool {
     ACTIVE_SEARCH_JOBS.load(Ordering::Relaxed) > 0
 }
 
-/// 读取视图：合并已完成源的结果 → 去重排序 → 截断（与 aggregate 同一套规则）。
-///
-/// 排序使用 job 内的稳定 `(bucket, seq)`：同一条结果首次入池后位置固定，
-/// 后到的源只会追加到桶内尾部，不会挤动已经翻过的页。
-pub(super) fn job_view(job: &SearchJob) -> JobView {
-    let mut st = job.state.lock().unwrap();
-    let books = st.books.clone();
-    let mut full =
-        web_book::dedupe_and_sort_with(books, &job.sources, &job.key, Some(&mut st.rank));
-    let errors = st.errors.clone();
-    let finished = st.finished;
-    let pending = st.pending;
-    let scheduled = st.scheduled;
-    let attempted = st.attempted;
-    let skipped = st.skipped;
-    let cancelled = st.cancelled;
-    drop(st);
-    full.truncate(AGG_MAX_BOOKS);
-    JobView {
-        books: full,
-        errors,
-        done: pending == 0,
-        finished,
-        pending,
-        scheduled,
-        attempted,
-        skipped,
-        cancelled,
+/// 当前任务计数快照（内存任务用）。
+pub(super) fn job_counters(job: &SearchJob) -> JobCounters {
+    let st = job.state.lock().unwrap_or_else(|p| p.into_inner());
+    JobCounters {
+        errors: st.errors.clone(),
+        failed: st.failed,
+        finished: st.finished,
+        pending: st.pending,
+        scheduled: st.scheduled,
+        attempted: st.attempted,
+        skipped: st.skipped,
+        cancelled: st.cancelled,
+        result_count: st.result_count,
+        raw_count: st.raw_count,
+        result_bytes: st.result_bytes,
+        stop_reason: st.stop_reason.clone(),
     }
 }
-
-/// 冻结快照读取：首次翻页（cursor / page>1）时把当前有序结果固化，
-/// 后续页全部从同一份快照取，保证同一搜索会话翻页不重不漏。
-pub(super) fn frozen_job_view(job: &SearchJob) -> JobView {
-    {
-        let st = job.state.lock().unwrap();
-        if let Some(snap) = st.rank.snapshot.clone() {
-            let view = JobView {
-                books: snap,
-                errors: st.errors.clone(),
-                done: st.pending == 0,
-                finished: st.finished,
-                pending: st.pending,
-                scheduled: st.scheduled,
-                attempted: st.attempted,
-                skipped: st.skipped,
-                cancelled: st.cancelled,
-            };
-            return view;
-        }
-    }
-    let view = job_view(job);
-    let mut st = job.state.lock().unwrap();
-    if st.rank.snapshot.is_none() {
-        st.rank.snapshot = Some(view.books.clone());
-    }
-    view
-}
-
-// 失败口径与批量路径共用同一实现，避免同一站点在不同入口得到不同健康判定。
-pub(super) use crate::source_health::classify_search_failure;
-
-/// 全局预算是否“明显不足”单源预算。
-///
-/// 留 1s 宽限：剩余 7.2s / 单源 8s 仍按真实单源超时处理，
-/// 避免把“几乎跑满单源预算”的站点误判成预算截断而漏掉站点故障。
-pub(super) fn timeout_is_truncation(remain: Duration, budget: Duration) -> bool {
-    remain.saturating_add(Duration::from_secs(1)) < budget
-}
-
-/// 早停门槛：已经拿到两页以上的书名匹配结果，且至少跑过一批源，才提前收工。
-///
-/// 宁可多跑几个源，也不要在冷门查询上因为「前几个源恰好命中」而错过正主：
-/// 阈值取一页（30）的两倍，并要求至少 24 个源已完成。
-const EARLY_STOP_KEPT: i64 = 60;
-const EARLY_STOP_MIN_FINISHED: usize = 24;
 
 /// 单个源的一次执行结果（尚未写入 job 状态）。
 pub(super) struct SourceRun {
@@ -434,32 +383,8 @@ pub(super) enum TaskOutcome {
     Done(anyhow::Result<Vec<crate::entities::SearchBook>>),
     /// 用满单源预算仍超时：记为「未知」（partial + 不计产出），不判死站点
     Timeout(String),
-    /// 全局 deadline 提前截断（剩余预算明显不足单源预算）：不算站点失败
-    Truncated(String),
-    /// 排队到全局 deadline 仍未拿到并发槽，或剩余预算已不足以发请求
+    /// 排队/发请求前就被放弃（取消或结果体积到顶）：不算站点失败
     Skipped(String),
-}
-
-/// 动态单源预算：剩余时间按「还剩几轮并发」摊，最多给 2 份，夹在 [2s, cap]。
-///
-/// 固定 8s 上限在尾部会让慢源吃掉整批预算；这里让越接近 deadline 的请求
-/// 拿到越短的预算，保证「还能再试一个源」而不是「卡在最后一个源上超时」。
-pub(super) fn dynamic_budget(
-    deadline: tokio::time::Instant,
-    remaining_sources: usize,
-    slots: usize,
-    cap: Duration,
-) -> Duration {
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let slots = slots.max(1);
-    let waves_left = remaining_sources.max(1).div_ceil(slots).max(1) as u32;
-    let share = left / waves_left;
-    let floor = Duration::from_secs(2).min(cap);
-    (share * 2).clamp(floor, cap)
-}
-
-pub(super) fn should_stop_early(kept_total: i64, finished: usize, total: usize) -> bool {
-    finished >= EARLY_STOP_MIN_FINISHED.min(total) && kept_total >= EARLY_STOP_KEPT
 }
 
 fn sort_queue(
@@ -481,11 +406,11 @@ fn resort_queue(
 
 /// 一次搜索的 anytime 调度：单一优先队列，每完成一个源就按最新证据重排。
 ///
-/// 与旧的两批 `join!` 相比：
-/// - 不再让 `preferred` 整批占住槽位，慢的优选源不会挡住高产出普通源；
-/// - 每完成一个源就把结果折进证据，后续源的顺序反映本次搜索的实际产出；
-/// - 槽位空出即取当前最优的源，不需要等整轮跑完；
-/// - 达到早停门槛或 deadline 时停止**取新源**，已在飞的请求照常完成。
+/// 与时间驱动的区别：
+/// - 没有整批 deadline，也不再有“接近 deadline 缩短单源预算”；
+/// - 不再因为“已经够多结果”提前收工，源多就一定跑完；
+/// - 每完成一个源就把结果写进 `search_job_books`，内存不随结果增长；
+/// - 唯一终止预算是结果体积：`result_bytes >= max_bytes` 时停止取新源。
 #[allow(clippy::too_many_arguments)] // 搜索任务上下文（job/源/关键词/池/预算/取消）。
 pub(super) async fn run_search_job(
     job: Arc<SearchJob>,
@@ -502,10 +427,8 @@ pub(super) async fn run_search_job(
 ) {
     // 后台体检通过 `searches_active()` 感知用户搜索，先让路再跑。
     let _active = SearchActiveGuard::new();
-    let per_source_cap = crate::req::search_budget_for(scope);
-    let total_budget = crate::req::search_total_budget(scope);
-    // 排队等槽不计入单源预算，但整次搜索仍受此上限约束。
-    let deadline = tokio::time::Instant::now() + total_budget;
+    let per_source = crate::req::search_budget_for(scope);
+    let max_bytes = crate::req::search_result_max_bytes().max(1) as i64;
     let slots = crate::req::search_slots(scope).max(1);
 
     let mut queue: Vec<crate::entities::BookSource> = sources;
@@ -517,6 +440,7 @@ pub(super) async fn run_search_job(
         // 这样进度接口仍能显示「已排上 / 尚未排上」，而不是一开始就全量排上。
         st.pending = source_total;
     }
+
     tracing::debug!(
         target: "search_schedule",
         job_id = %job.id,
@@ -524,13 +448,13 @@ pub(super) async fn run_search_job(
         query_class = prior.class.as_str(),
         sources = source_total,
         slots,
+        max_bytes,
         "anytime search start"
     );
 
     let queue = Arc::new(Mutex::new(queue));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut outcomes: Vec<source_health::Outcome> = Vec::new();
-    let mut kept_total: i64 = 0;
 
     // 队列里只放「还没开始跑」的源；已开始的由 buffer_unordered 管理。
     // unfold 每次只在有槽位时被拉取，因此拿到的 `left` 就是当下的剩余源数。
@@ -550,14 +474,14 @@ pub(super) async fn run_search_job(
                     if g.is_empty() {
                         None
                     } else {
-                        Some((g.remove(0), g.len()))
+                        Some(g.remove(0))
                     }
                 };
                 if next.is_some() {
                     // 只有真正从队列取出（交给 buffer_unordered）才算「已排上」。
                     job.state.lock().unwrap().scheduled += 1;
                 }
-                next.map(|(src, left)| ((src, left), q))
+                next.map(|src| (src, q))
             }
         })
     };
@@ -566,12 +490,11 @@ pub(super) async fn run_search_job(
     // 否则等漫画槽的小说任务会占住 stream 槽位，拖慢小说源。
     let stream_slots = slots + crate::req::comic_slot_count(slots);
     let inflight = src_stream
-        .map(|(src, left)| {
+        .map(|src| {
             let key = key.clone();
             let bp = book_pool.clone();
             let st = store.clone();
-            let budget = dynamic_budget(deadline, left + 1, slots, per_source_cap);
-            async move { search_one_source(src, key, deadline, budget, scope, bp, st).await }
+            async move { search_one_source(src, key, per_source, scope, bp, st).await }
         })
         .buffer_unordered(stream_slots);
     // `unfold` 的闭包返回非 Unpin 的 async block，`next()` 需要显式钉住整个流。
@@ -601,7 +524,6 @@ pub(super) async fn run_search_job(
             attempted,
         } = run;
         // 逐源耗时埋点（默认 debug 不输出；扫参时开 `RUST_LOG=search_source=debug`）。
-        // 排队时间不计入 latency_ms，`timed_out` 只标真实请求超时，与 Skipped 区分。
         // `hits` = 解析条数；`kept_hits` = 其中书名真匹配的条数（搜索产出率只用后者）。
         let (kind, hits, kept_hits, timed_out) = match &outcome {
             TaskOutcome::Done(Ok(b)) => (
@@ -612,7 +534,6 @@ pub(super) async fn run_search_job(
             ),
             TaskOutcome::Done(Err(_)) => ("error", 0, 0, false),
             TaskOutcome::Timeout(_) => ("timeout", 0, 0, true),
-            TaskOutcome::Truncated(_) => ("truncated", 0, 0, false),
             TaskOutcome::Skipped(_) => ("skipped", 0, 0, false),
         };
         tracing::debug!(
@@ -628,10 +549,10 @@ pub(super) async fn run_search_job(
         );
         let rule_complete = crate::source_quality::rule_completeness(&src);
         let mut recorded: Option<source_health::Outcome> = None;
-        let mut st = job.state.lock().unwrap();
-        if attempted {
-            st.attempted += 1;
-        }
+        let mut wrote: Option<super::books_search_books::BatchWrite> = None;
+        let mut new_error: Option<web_book::SourceFailure> = None;
+        let mut skipped_now = false;
+
         match outcome {
             TaskOutcome::Done(Ok(mut books)) => {
                 books.truncate(SEARCH_PER_SOURCE_MAX);
@@ -649,7 +570,21 @@ pub(super) async fn run_search_job(
                     b.tier = Some(src_tier.clone());
                     b.score = Some(src_score);
                 }
-                st.books.append(&mut books);
+                // 边搜边落库：一个源一个事务。写库失败只记日志，不中断整次搜索。
+                match super::books_search_books::insert_batch(
+                    &pool, &job.id, &key, src.weight, books,
+                )
+                .await
+                {
+                    Ok(w) => wrote = Some(w),
+                    Err(e) => tracing::warn!(
+                        target: "search_job",
+                        job_id = %job.id,
+                        source = %src.book_source_url,
+                        error = %e,
+                        "persist search batch failed"
+                    ),
+                }
                 recorded = Some(source_health::Outcome {
                     source_url: src.book_source_url.clone(),
                     status: source_health::STATUS_OK,
@@ -665,14 +600,14 @@ pub(super) async fn run_search_job(
             }
             TaskOutcome::Done(Err(e)) => {
                 let msg = format!("{e}");
-                // 超时是「未知」而非「站点已死」：16 路并发 + 单源预算下，超时更多是
-                // 本机排队放大。与 truncated/skipped 同口径：不累计失败、不冷却、不写命中统计。
+                // 超时是「未知」而非「站点已死」：并发 + 单源预算下，超时更多是
+                // 本机排队放大。与其他未完成分支同口径：不累计失败、不冷却。
                 let engine = matches!(
                     source_health::classify(&e),
                     source_health::FailureKind::Engine
                 );
-                let (status, kind, usage) = classify_search_failure(&msg, engine);
-                st.errors.push(web_book::SourceFailure {
+                let (status, kind, usage) = source_health::classify_search_failure(&msg, engine);
+                new_error = Some(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: msg.clone(),
@@ -697,7 +632,7 @@ pub(super) async fn run_search_job(
                 // - usage=false（不把未完成的请求算成一次 0 命中，否则冷门关键词
                 //   搜两轮就会把大量正常源打成隔离）。
                 // 站点是否真的坏由体检/巡检（更低并发、独立预算）判定。
-                st.errors.push(web_book::SourceFailure {
+                new_error = Some(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: err.clone(),
@@ -716,21 +651,10 @@ pub(super) async fn run_search_job(
                     rule_complete,
                 });
             }
-            TaskOutcome::Truncated(err) => {
-                // 全局预算截断：请求可能已发出但没跑完，不是站点故障。
-                // 不写健康记录，避免连续 3 次预算截断把健康源打成隔离/冷却。
-                st.skipped += 1;
-                st.errors.push(web_book::SourceFailure {
-                    source: src.book_source_url.clone(),
-                    source_name: src.book_source_name.clone(),
-                    error: err,
-                    kind: "truncated".to_string(),
-                });
-            }
             TaskOutcome::Skipped(err) => {
-                // 源根本没被查询（排队耗尽），不能按源站故障冷却，只记录到本次 errors。
-                st.skipped += 1;
-                st.errors.push(web_book::SourceFailure {
+                // 源根本没被查询（取消/体积到顶），不能按源站故障冷却，只记录到本次。
+                skipped_now = true;
+                new_error = Some(web_book::SourceFailure {
                     source: src.book_source_url.clone(),
                     source_name: src.book_source_name.clone(),
                     error: err,
@@ -738,12 +662,35 @@ pub(super) async fn run_search_job(
                 });
             }
         }
-        st.finished += 1;
-        st.pending = st.pending.saturating_sub(1);
-        let finished = st.finished;
-        drop(st);
 
-        // 在线更新证据：本次结果立即影响后续源的顺序。落库仍在收尾统一做。
+        let (finished, bytes, stop_now) = {
+            let mut st = job.state.lock().unwrap_or_else(|p| p.into_inner());
+            if attempted {
+                st.attempted += 1;
+            }
+            if skipped_now {
+                st.skipped += 1;
+            }
+            if let Some(w) = wrote {
+                st.result_count += w.added;
+                st.raw_count += w.candidates;
+                st.result_bytes += w.bytes_added;
+            }
+            if let Some(e) = new_error {
+                st.push_error(e);
+            }
+            st.finished += 1;
+            st.pending = st.pending.saturating_sub(1);
+            let bytes = st.result_bytes;
+            // 唯一的终止预算：结果体积到顶。已发出的请求照常收尾，不再取新源。
+            let stop_now = bytes >= max_bytes;
+            if stop_now {
+                st.stop_reason = "max_bytes".to_string();
+            }
+            (st.finished, bytes, stop_now)
+        };
+
+        // 在线更新证据：本次结果立即影响后续源的顺序。落库在批次写入时已完成。
         if let Some(o) = recorded {
             if o.usage {
                 prior.observe(&o.source_url, o.kept_hits);
@@ -757,21 +704,19 @@ pub(super) async fn run_search_job(
             }
             outcomes.push(o);
         }
-        kept_total += kept_hits;
         resort_queue(&queue, &health, &prior);
 
-        if should_stop_early(kept_total, finished, source_total) {
+        if stop_now {
             tracing::debug!(
                 target: "search_schedule",
                 job_id = %job.id,
                 finished,
-                kept_total,
+                bytes,
+                max_bytes,
                 remaining = queue.lock().unwrap().len(),
-                reason = "enough_results",
-                "early stop"
+                reason = "result_size",
+                "stop taking new sources"
             );
-            stop.store(true, Ordering::Relaxed);
-        } else if tokio::time::Instant::now() >= deadline {
             stop.store(true, Ordering::Relaxed);
         }
     }
@@ -784,6 +729,7 @@ pub(super) async fn run_search_job(
         let left = st.pending;
         st.cancelled += left;
         st.pending = 0;
+        st.stop_reason = "cancelled".to_string();
         let finished = st.finished;
         drop(st);
         tracing::info!(
@@ -794,19 +740,22 @@ pub(super) async fn run_search_job(
             "search job cancelled by user"
         );
     } else {
-        // 提前停止/deadline 后仍未取出的源：记为 skipped（不写健康、不算站点失败）。
+        // 结果体积到顶后仍未取出的源：记为 skipped（不写健康、不算站点失败）。
         let mut g = queue.lock().unwrap();
-        let mut st = job.state.lock().unwrap();
+        let mut st = job.state.lock().unwrap_or_else(|p| p.into_inner());
         for s in g.drain(..) {
             st.skipped += 1;
-            st.errors.push(web_book::SourceFailure {
+            st.push_error(web_book::SourceFailure {
                 source: s.book_source_url.clone(),
                 source_name: s.book_source_name.clone(),
-                error: "全局搜索预算耗尽（排队未及执行）".to_string(),
+                error: "结果体积达到上限，未执行".to_string(),
                 kind: "skipped".to_string(),
             });
             st.finished += 1;
             st.pending = st.pending.saturating_sub(1);
+        }
+        if st.stop_reason.is_empty() {
+            st.stop_reason = "completed".to_string();
         }
     }
 
@@ -822,32 +771,30 @@ pub(super) async fn run_search_job(
     finish_job(&job, &pool, status).await;
 }
 
-/// 任务收尾：固化状态/结束时刻，并把最终快照写入数据库。
+/// 任务收尾：固化状态/结束时刻/计数，并把停止原因与错误明细写进数据库。
 ///
-/// 内存注册表只在进程存活期内有效（运行中 + 最近完成），数据库快照让
-/// 「关掉前端 → 重新登录」甚至「后端重启」之后仍能列出任务并查看已得结果。
+/// 结果本体早已按源增量写入 `search_job_books`，这里不再写大快照。
 async fn finish_job(job: &Arc<SearchJob>, pool: &SqlitePool, status: &str) {
     *job.status.lock().unwrap_or_else(|p| p.into_inner()) = status.to_string();
     job.finished_unix_ms.store(unix_ms(), Ordering::Relaxed);
-    let view = job_view(job);
+    let counters = job_counters(job);
     let meta = job.meta();
-    if let Err(e) = super::books_search_store::persist_finished(pool, &meta, &view).await {
+    if let Err(e) = super::books_search_store::persist_finished(pool, &meta, &counters).await {
         tracing::warn!(
             target: "search_job",
             job_id = %job.id,
             error = %e,
-            "persist search job snapshot failed"
+            "persist search job counters failed"
         );
     }
 }
 
-/// 跑一个源：拿源级并发槽 → 单源预算内请求 → 分类超时/截断。
+/// 跑一个源：拿源级并发槽 → 单源预算内请求 → 分类超时。
 ///
 /// 排队时间不计入 `latency_ms`；`timed_out` 只标真实请求超时，与 Skipped 区分。
 pub(super) async fn search_one_source(
     s: crate::entities::BookSource,
     key: String,
-    deadline: tokio::time::Instant,
     budget: Duration,
     scope: crate::req::SearchScope,
     book_pool: SqlitePool,
@@ -855,7 +802,8 @@ pub(super) async fn search_one_source(
 ) -> SourceRun {
     let comic = crate::req::is_comic_source_type(s.book_source_type);
     let queued_at = Instant::now();
-    let slot = match crate::req::acquire_search_slot(comic, deadline, scope).await {
+    // 后台任务没有整批 deadline：等槽不设上限，取消由丢弃 future 生效。
+    let slot = match crate::req::acquire_search_slot_now(comic, scope).await {
         Ok(p) => p,
         Err(e) => {
             let waited = queued_at.elapsed().as_millis() as i64;
@@ -868,20 +816,8 @@ pub(super) async fn search_one_source(
         }
     };
     let started = Instant::now();
-    let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
-    // 剩余不足 500ms 时发请求只会制造必然超时的假失败（超时虽按「未知」处理，
-    // 但会占用槽位与错误列表）；直接按预算耗尽归为 skipped。
-    if remain < Duration::from_millis(500) {
-        drop(slot);
-        return SourceRun {
-            src: s,
-            outcome: TaskOutcome::Skipped("全局搜索预算耗尽（排队未及执行）".to_string()),
-            latency_ms: started.elapsed().as_millis() as i64,
-            attempted: false,
-        };
-    }
     let r = tokio::time::timeout(
-        remain.min(budget),
+        budget,
         web_book::search_book(&s, &key, 1, Some(store.as_ref())),
     )
     .await;
@@ -894,16 +830,7 @@ pub(super) async fn search_one_source(
     drop(slot);
     let outcome = match r {
         Ok(x) => TaskOutcome::Done(x),
-        Err(_) => {
-            if timeout_is_truncation(remain, budget) {
-                TaskOutcome::Truncated(format!(
-                    "全局搜索预算耗尽（排队后仅剩 {}ms，未完成请求）",
-                    remain.as_millis()
-                ))
-            } else {
-                TaskOutcome::Timeout(format!("搜索超时（单源 {}s 预算）", budget.as_secs()))
-            }
-        }
+        Err(_) => TaskOutcome::Timeout(format!("搜索超时（单源 {}s 预算）", budget.as_secs())),
     };
     SourceRun {
         src: s,

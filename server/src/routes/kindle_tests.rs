@@ -16,16 +16,36 @@ fn k_scope_defaults_to_curated() {
 /// 搜索中页：自动刷新、进度计数、任务/冷却参数都要保留。
 #[tokio::test]
 async fn search_progress_page_refreshes_and_keeps_job_context() {
-    let p = crate::routes::books::JobProgress {
-        key: "诡秘之主".into(),
-        source_total: 12,
-        finished: 3,
-        pending: 9,
-        skipped: 1,
-        cancelled: 0,
-        failed: 1,
+    use crate::routes::books::{JobCounters, JobLookup, JobMeta};
+
+    let lookup = JobLookup {
+        meta: JobMeta {
+            id: "job-1".into(),
+            uid: 1,
+            key: "诡秘之主".into(),
+            scope: crate::req::SearchScope::Curated,
+            source_mode: "curated".into(),
+            coverage: "curated".into(),
+            curated_total: 0,
+            source_total: 12,
+            scope_filtered: 0,
+            skipped_cooldown: 0,
+            cooldown_total: 0,
+            status: "running".into(),
+            created_unix_ms: 0,
+            finished_unix_ms: 0,
+        },
+        counters: JobCounters {
+            finished: 3,
+            pending: 9,
+            skipped: 1,
+            failed: 1,
+            ..Default::default()
+        },
+        legacy_books: None,
+        running: true,
     };
-    let res = progress_page("job-1", &p, true, 2, false, vp());
+    let res = progress_page("job-1", &lookup, true, 2, false, vp());
     let body = axum::body::to_bytes(res.into_body(), 1024 * 1024)
         .await
         .unwrap();

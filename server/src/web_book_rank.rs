@@ -28,18 +28,6 @@ pub struct ExploreCategory {
     pub url: String,
 }
 
-/// 单次搜索会话的稳定排序状态（仅 `/api/search/result` 使用）：
-/// - `order`：去重键 → 首次入池时确定的 `(bucket, seq)`，之后不再变化；
-/// - `next_seq`：单调递增的入池序号；
-/// - `snapshot`：一旦用户开始翻页（cursor / page>1），冻结整份有序结果，
-///   后续页都从同一份快照读取，保证同一会话翻页不重不漏。
-#[derive(Default)]
-pub(crate) struct RankFreeze {
-    pub order: HashMap<String, (u8, u64)>,
-    pub next_seq: u64,
-    pub snapshot: Option<Vec<SearchBook>>,
-}
-
 /// 去重键：归一化书名 + 归一化作者；书名为空时退化为 book_url。
 pub(crate) fn dedupe_key(b: &SearchBook) -> String {
     let name = b.name.as_deref().unwrap_or("").trim().to_lowercase();
@@ -59,8 +47,6 @@ pub(super) struct RankedBook {
     pub(super) custom_order: i64,
     /// 命中该书的源：`(url, 展示名)`，按 url 去重。
     pub(super) origins: Vec<(String, String)>,
-    pub(super) bucket: u8,
-    pub(super) seq: u64,
 }
 
 impl RankedBook {
@@ -80,14 +66,10 @@ impl RankedBook {
 ///   强命中（exact/prefix/contains/approx）≥ `STRONG_MIN_RESULTS` 时，
 ///   只命中片段的 partial 被折叠掉，避免首屏只剩“可能相关”。
 /// - `query` 为空（发现/探索页）：保持旧的"纯源权重"排序，不做相关性过滤。
-///
-/// `freeze` 为 `Some` 时用于 job 分页：条目首次入池即固定 `(bucket, seq)`，
-/// 后到结果不会挤动已翻过的页。
 pub(crate) fn dedupe_and_sort_with(
     books: Vec<SearchBook>,
     sources: &[BookSource],
     query: &str,
-    freeze: Option<&mut RankFreeze>,
 ) -> Vec<SearchBook> {
     let order: HashMap<&str, (i64, i64)> = sources
         .iter()
@@ -141,8 +123,6 @@ pub(crate) fn dedupe_and_sort_with(
                         weight: w,
                         custom_order: o,
                         origins,
-                        bucket: 0,
-                        seq: 0,
                     };
                 }
             }
@@ -159,39 +139,13 @@ pub(crate) fn dedupe_and_sort_with(
                     weight: w,
                     custom_order: o,
                     origins,
-                    bucket: 0,
-                    seq: 0,
                 });
             }
         }
     }
 
-    let mut frozen = false;
-    if let Some(f) = freeze {
-        frozen = true;
-        for e in ranked.iter_mut() {
-            let key = dedupe_key(&e.book);
-            let (bucket, seq) = match f.order.get(&key).copied() {
-                Some(v) => v,
-                None => {
-                    let seq = f.next_seq;
-                    f.next_seq += 1;
-                    let b = crate::search_rank::bucket(e.score());
-                    f.order.insert(key, (b, seq));
-                    (b, seq)
-                }
-            };
-            e.bucket = bucket;
-            e.seq = seq;
-            e.book.rank_bucket = Some(bucket);
-            e.book.rank_seq = Some(seq);
-        }
-    }
-
-    // 排序：job 分页用固定 (bucket, seq)，其余用分数 + 权重 + 顺序 + url。
-    if frozen {
-        ranked.sort_by(|a, b| b.bucket.cmp(&a.bucket).then(a.seq.cmp(&b.seq)));
-    } else if !q.is_empty() {
+    // 排序：分数 + 权重 + 顺序 + url。
+    if !q.is_empty() {
         ranked.sort_by(|a, b| {
             b.score()
                 .cmp(&a.score())
@@ -241,7 +195,7 @@ pub(crate) fn dedupe_and_sort(
     sources: &[BookSource],
     query: &str,
 ) -> Vec<SearchBook> {
-    dedupe_and_sort_with(books, sources, query, None)
+    dedupe_and_sort_with(books, sources, query)
 }
 
 /// 多源搜索：并发请求所有启用书源；单源失败只记录错误，不影响整体。

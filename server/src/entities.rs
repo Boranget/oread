@@ -357,8 +357,13 @@ pub struct SearchBook {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relevance: Option<String>,
     /// 稳定排序桶（仅 job 分页使用）：翻页游标 `(rank_bucket, rank_seq)`。
+    /// 新任务改用 `rank_score`，此字段只为兼容旧快照保留。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_bucket: Option<u8>,
+    /// 稳定排序分（仅 job 分页使用）：首次落库时算一次、之后不再变化。
+    /// 翻页游标 `(rank_score, rank_seq)`，配合 `score DESC, seq ASC`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_score: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_seq: Option<u64>,
 }

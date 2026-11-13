@@ -32,12 +32,20 @@ pub(super) struct SearchJobRow {
     pub(super) created_at: i64,
     pub(super) finished_at: Option<i64>,
     pub(super) snapshot_json: Option<String>,
+    // ---- 增量结果行（0018）：运行期只读这些计数，不再读大快照 ----
+    pub(super) raw_count: i64,
+    pub(super) result_count: i64,
+    pub(super) result_bytes: i64,
+    pub(super) frozen_seq: Option<i64>,
+    pub(super) stop_reason: String,
+    pub(super) errors_json: Option<String>,
 }
 
 const JOB_COLUMNS: &str = "id, uid, keyword, scope, source_mode, coverage, status, \
      source_total, finished, pending, skipped, cancelled, failed, curated_total, \
      scope_filtered, skipped_cooldown, cooldown_total, created_at, updated_at, \
-     finished_at, snapshot_json";
+     finished_at, snapshot_json, raw_count, result_count, result_bytes, \
+     frozen_seq, stop_reason, errors_json";
 
 /// 单用户数据库保留的任务数（含运行中；更旧的自动删除）。
 pub(super) const SEARCH_JOB_DB_KEEP: i64 = 50;
@@ -69,39 +77,43 @@ pub(super) async fn persist_started(pool: &SqlitePool, job: &SearchJob) -> sqlx:
     Ok(())
 }
 
-/// 任务收尾：写最终状态、进度计数与结果快照，并按单用户上限裁剪历史行。
+/// 任务收尾：写最终状态、进度计数与停止原因，并按单用户上限裁剪历史行。
+///
+/// 结果本体早已按源增量写进 `search_job_books`，这里不再写 `snapshot_json`
+/// （旧任务仍可读旧快照，新任务以行表为准）。
 pub(super) async fn persist_finished(
     pool: &SqlitePool,
     meta: &JobMeta,
-    view: &JobView,
+    counters: &JobCounters,
 ) -> sqlx::Result<()> {
     let now = unix_ms() as i64;
-    let failed = view
+    let failed = counters
         .errors
         .iter()
         .filter(|e| !is_budget_skip(&e.kind))
         .count() as i64;
-    let snapshot = serde_json::json!({
-        "books": view.books,
-        "errors": view.errors,
-    });
+    let errors_json = if counters.errors.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&counters.errors).ok()
+    };
     sqlx::query(
         "UPDATE search_jobs SET status = ?2, finished = ?3, pending = ?4, skipped = ?5, \
          cancelled = ?6, failed = ?7, source_total = ?8, updated_at = ?9, finished_at = ?10, \
-         snapshot_json = ?11 \
-         WHERE id = ?1",
+         stop_reason = ?11, errors_json = ?12 WHERE id = ?1",
     )
     .bind(&meta.id)
     .bind(&meta.status)
-    .bind(view.finished as i64)
-    .bind(view.pending as i64)
-    .bind(view.skipped as i64)
-    .bind(view.cancelled as i64)
+    .bind(counters.finished as i64)
+    .bind(counters.pending as i64)
+    .bind(counters.skipped as i64)
+    .bind(counters.cancelled as i64)
     .bind(failed)
     .bind(meta.source_total as i64)
     .bind(now)
     .bind(now)
-    .bind(snapshot.to_string())
+    .bind(&counters.stop_reason)
+    .bind(errors_json)
     .execute(pool)
     .await?;
     trim_user(pool, meta.uid, SEARCH_JOB_DB_KEEP).await?;
@@ -138,8 +150,9 @@ pub(super) async fn db_get(
         .await
 }
 
-/// 删除一条任务行；返回是否真的删除。
+/// 删除一条任务行及其结果行；返回是否真的删除了任务。
 pub(super) async fn db_delete(pool: &SqlitePool, uid: i64, id: &str) -> sqlx::Result<bool> {
+    super::books_search_books::delete_books(pool, id).await?;
     let r = sqlx::query("DELETE FROM search_jobs WHERE uid = ?1 AND id = ?2")
         .bind(uid)
         .bind(id)
@@ -161,7 +174,7 @@ pub(super) async fn mark_interrupted(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(r.rows_affected())
 }
 
-/// 单用户历史裁剪：只保留最近 `keep` 条。
+/// 单用户历史裁剪：只保留最近 `keep` 条，并清理被裁掉任务的结果行。
 pub(super) async fn trim_user(pool: &SqlitePool, uid: i64, keep: i64) -> sqlx::Result<()> {
     sqlx::query(
         "DELETE FROM search_jobs WHERE uid = ?1 AND id NOT IN \
@@ -171,5 +184,7 @@ pub(super) async fn trim_user(pool: &SqlitePool, uid: i64, keep: i64) -> sqlx::R
     .bind(keep.max(1))
     .execute(pool)
     .await?;
+    // 行表没有外键级联：显式清理孤儿，避免删了任务却留着结果占磁盘。
+    super::books_search_books::delete_orphans(pool).await?;
     Ok(())
 }

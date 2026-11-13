@@ -6,15 +6,17 @@
 
 use super::*;
 
+use crate::entities::SearchBook;
 use crate::routes::books::{
-    filtered_job_books, load_job_lookup, start_kindle_search_job, JobLookup, JobMeta, JobProgress,
-    JobView,
+    advance_freeze, count, filtered_books, freeze, load_job_lookup, load_page_at,
+    start_kindle_search_job, JobLookup, JobMeta,
 };
 
 /// 搜索中页的自动刷新间隔（秒）。
 const SEARCH_REFRESH_SECS: u64 = 2;
 
-fn include_cooled_of(raw: Option<&str>) -> bool {
+/// 宽松布尔：`1`/`true`/`yes`/`on` 视为真（`include_cooled` / `more` 共用）。
+fn flag_of(raw: Option<&str>) -> bool {
     matches!(
         raw.map(str::trim),
         Some("1" | "true" | "yes" | "on" | "TRUE" | "True")
@@ -109,7 +111,7 @@ pub(super) async fn search(
     if key.is_empty() {
         return search_home(fs, explicit, vp);
     }
-    let include_cooled = include_cooled_of(q.include_cooled.as_deref());
+    let include_cooled = flag_of(q.include_cooled.as_deref());
     match start_kindle_search_job(
         &s,
         u.id,
@@ -154,21 +156,16 @@ async fn job_page(
     explicit: bool,
     vp: Vp,
 ) -> Response {
-    let include_cooled = include_cooled_of(q.include_cooled.as_deref());
+    let include_cooled = flag_of(q.include_cooled.as_deref());
     match load_job_lookup(shared, uid, job_id).await {
-        Ok(Some(JobLookup::Running(p))) => {
-            progress_page(job_id, &p, include_cooled, fs, explicit, vp)
+        Ok(Some(lookup)) => {
+            // 首屏：已经有结果就先出结果页，后台继续搜索（运行中带「显示更多结果」）。
+            if lookup.counters.result_count > 0 || !lookup.running {
+                result_page(shared, job_id, &lookup, include_cooled, q, fs, explicit, vp).await
+            } else {
+                progress_page(job_id, &lookup, include_cooled, fs, explicit, vp)
+            }
         }
-        Ok(Some(JobLookup::Finished(done))) => result_page(
-            job_id,
-            &done.meta,
-            &done.view,
-            include_cooled,
-            q,
-            fs,
-            explicit,
-            vp,
-        ),
         Ok(None) => expired_page(fs, explicit, vp),
         Err(e) => err_to_page(e),
     }
@@ -190,49 +187,51 @@ fn expired_page(fs: usize, explicit: bool, vp: Vp) -> Response {
 
 pub(super) fn progress_page(
     job_id: &str,
-    p: &JobProgress,
+    lookup: &JobLookup,
     include_cooled: bool,
     fs: usize,
     explicit: bool,
     vp: Vp,
 ) -> Response {
+    let meta = &lookup.meta;
+    let c = &lookup.counters;
     let top = top_bar(
         "搜索",
         None,
-        &search_nav(&p.key, Some(job_id), include_cooled, fs, vp),
+        &search_nav(&meta.key, Some(job_id), include_cooled, fs, vp),
         vp,
     );
-    let body = if p.source_total == 0 {
+    let body = if meta.source_total == 0 {
         format!(
             "<div style=\"padding:20px 36px 12px\">\
              <p style=\"font-size:28px;line-height:44px\">正在搜索「{key}」…</p>\
              <p style=\"font-size:24px;line-height:36px;color:#555;margin-top:12px\">当前没有可搜索的源，请先在书源设置中导入并启用。</p>\
              <p style=\"margin-top:24px\">{back}</p></div>",
-            key = esc(&p.key),
+            key = esc(&meta.key),
             back = outline_button(&qlink("/k/search", fs, vp), "重新搜索")
         )
     } else {
-        let done = p.finished.min(p.source_total);
-        let mut detail = format!("已完成 {done} / {total} 个源", total = p.source_total);
-        if p.pending > 0 {
-            detail.push_str(&format!("，进行中 {} 个", p.pending));
+        let done = c.finished.min(meta.source_total);
+        let mut detail = format!("已完成 {done} / {total} 个源", total = meta.source_total);
+        if c.pending > 0 {
+            detail.push_str(&format!("，进行中 {} 个", c.pending));
         }
-        if p.failed > 0 {
-            detail.push_str(&format!("，失败 {} 个", p.failed));
+        if c.failed > 0 {
+            detail.push_str(&format!("，失败 {} 个", c.failed));
         }
-        if p.skipped > 0 {
-            detail.push_str(&format!("，跳过 {} 个", p.skipped));
+        if c.skipped > 0 {
+            detail.push_str(&format!("，跳过 {} 个", c.skipped));
         }
-        if p.cancelled > 0 {
-            detail.push_str(&format!("，已取消 {} 个", p.cancelled));
+        if c.cancelled > 0 {
+            detail.push_str(&format!("，已取消 {} 个", c.cancelled));
         }
         format!(
             "<div style=\"padding:20px 36px 12px\">\
              <p style=\"font-size:28px;line-height:44px\">正在搜索「{key}」…</p>\
              <p style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">{detail}</p>\
-             <p style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">页面每 {secs} 秒自动刷新，完成后显示结果。</p>\
+             <p style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">页面每 {secs} 秒自动刷新，有结果后立即显示。</p>\
              <p style=\"margin-top:24px\">{back}</p></div>",
-            key = esc(&p.key),
+            key = esc(&meta.key),
             detail = esc(&detail),
             secs = SEARCH_REFRESH_SECS,
             back = outline_button(&qlink("/k/search", fs, vp), "重新搜索")
@@ -278,16 +277,18 @@ fn fallback_note(meta: &JobMeta) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn result_page(
+async fn result_page(
+    shared: &SqlitePool,
     job_id: &str,
-    meta: &JobMeta,
-    view: &JobView,
+    lookup: &JobLookup,
     include_cooled: bool,
     q: &SearchQ,
     fs: usize,
     explicit: bool,
     vp: Vp,
 ) -> Response {
+    let meta = &lookup.meta;
+    let c = &lookup.counters;
     let key = meta.key.as_str();
     let top = top_bar(
         "搜索",
@@ -295,14 +296,46 @@ fn result_page(
         &search_nav(key, Some(job_id), include_cooled, fs, vp),
         vp,
     );
-    let books = filtered_job_books(meta, view);
-    let strong_total = books
-        .iter()
-        .filter(|b| b.relevance.as_deref() == Some("strong"))
-        .count();
+
+    // 运行中只展示「首屏边界」内的结果：首次渲染冻结，`more=1` 主动推进；
+    // 任务结束后改用最终全集（不再有边界）。
+    let more = flag_of(q.more.as_deref());
+    let frozen = if lookup.running && lookup.legacy_books.is_none() {
+        let r = if more {
+            advance_freeze(shared, job_id).await
+        } else {
+            freeze(shared, job_id).await
+        };
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => return err_to_page(e.into()),
+        }
+    } else {
+        None
+    };
+
+    // 旧任务：快照里带完整书单；新任务：按边界从行表读取。
+    let legacy_all = lookup
+        .legacy_books
+        .as_ref()
+        .map(|books| filtered_books(meta, books.clone()));
+    let total = match &legacy_all {
+        Some(books) => books.len(),
+        None => match count(shared, job_id, frozen).await {
+            Ok(n) => n.max(0) as usize,
+            Err(e) => return err_to_page(e.into()),
+        },
+    };
 
     let mut notes: Vec<String> = Vec::new();
     if meta.source_total > 0 {
+        if lookup.running {
+            notes.push(format!(
+                "仍在搜索（已完成 {} / {} 个源），以下是已找到的结果，后台会继续补充。",
+                c.finished.min(meta.source_total),
+                meta.source_total
+            ));
+        }
         match meta.status.as_str() {
             "cancelled" => notes.push("已取消搜索，以下为已得到的结果。".to_string()),
             "interrupted" => {
@@ -310,17 +343,21 @@ fn result_page(
             }
             _ => {}
         }
-        if view.skipped > 0 {
-            notes.push(format!("有 {} 个源因搜索预算耗尽未完成。", view.skipped));
+        if c.skipped > 0 {
+            if c.stop_reason == "max_bytes" {
+                notes.push(format!("结果体积已达上限，有 {} 个源未执行。", c.skipped));
+            } else {
+                notes.push(format!("有 {} 个源未执行。", c.skipped));
+            }
         }
         if let Some(note) = fallback_note(meta) {
             notes.push(note);
         }
     }
-    // 结果不足（0 条或 strong < 5）时给「用全部源搜索」的主动升级入口，不是默认路径。
+    // 结果不足（0 条或 < STRONG_MIN）时给「用全部源搜索」的主动升级入口，不是默认路径。
     let upgrade_link = meta.source_total > 0
         && meta.scope == crate::req::SearchScope::Curated
-        && (books.is_empty() || strong_total < crate::search_rank::STRONG_MIN_RESULTS);
+        && total < crate::search_rank::STRONG_MIN_RESULTS;
     // 状态提示 / 回退说明 / 升级按钮各占一行：按额外行数扣减每页条数，避免被贴底栏盖住。
     let per_page = search_page_size_extra(vp, notes.len() + usize::from(upgrade_link));
 
@@ -334,20 +371,26 @@ fn result_page(
             "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">\
              当前没有可搜索的源，请先在书源设置中导入并启用。</p>",
         );
-    } else if books.is_empty() {
+    } else if total == 0 {
         list.push_str(
             "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
         );
     } else {
-        let t_pages = books.len().div_ceil(per_page).max(1);
+        let t_pages = total.div_ceil(per_page).max(1);
         let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
         let start = (sp - 1) * per_page;
-        let end = (start + per_page).min(books.len());
+        let page_books: Vec<SearchBook> = match &legacy_all {
+            Some(books) => books.iter().skip(start).take(per_page).cloned().collect(),
+            None => match load_page_at(shared, job_id, frozen, start, per_page).await {
+                Ok(v) => v,
+                Err(e) => return err_to_page(e.into()),
+            },
+        };
         list.push_str(&format!(
             "<table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\">",
             iw = vp.page_w()
         ));
-        for b in &books[start..end] {
+        for b in &page_books {
             let src = b.origin.clone().unwrap_or_default();
             let href = qlink(
                 &format!("/k/toc?book={}&source={}", qenc(&b.book_url), qenc(&src)),
@@ -356,8 +399,7 @@ fn result_page(
             );
             let name = b.name.as_deref().unwrap_or("未命名");
             let first = name.chars().next().unwrap_or('书');
-            // 沿用现有副标题位置（字号/颜色不变）：多源共识显示「N 个源」，
-            // partial 档追加「可能相关」，不与正名结果混在一起。
+            // 沿用现有副标题位置（字号/颜色不变）：多源共识显示「N 个源」。
             let mut sub = format!(
                 "{} · {}",
                 b.author.as_deref().unwrap_or("未知作者"),
@@ -365,9 +407,6 @@ fn result_page(
             );
             if b.origins.len() > 1 {
                 sub.push_str(&format!(" · {} 个源", b.origins.len()));
-            }
-            if b.relevance.as_deref() == Some("partial") {
-                sub.push_str(" · 可能相关");
             }
             list.push_str(&format!(
                 "<tr><td style=\"padding:0\">\
@@ -386,14 +425,15 @@ fn result_page(
             ));
         }
         list.push_str("</table>");
+
+        // 翻页只带 job：结果来自任务（首屏边界或最终全集），不重新搜索。
+        let base = format!(
+            "/k/search?job={}&fs={}{}",
+            qenc(job_id),
+            fs,
+            cooled_suffix(include_cooled)
+        );
         if t_pages > 1 {
-            // 翻页只带 job：结果来自任务快照，不再重新解析源集合/重新搜索。
-            let base = format!(
-                "/k/search?job={}&fs={}{}",
-                qenc(job_id),
-                fs,
-                cooled_suffix(include_cooled)
-            );
             let prev = if sp > 1 {
                 Some((with_vp(&format!("{base}&sp={}", sp - 1), vp), "上一页"))
             } else {
@@ -405,6 +445,16 @@ fn result_page(
                 None
             };
             pager = pager_bar(prev, next, vp);
+        }
+        // 运行中：把后台新入库的结果纳入当前集合，然后重新渲染本页。
+        if lookup.running {
+            let href = with_vp(&format!("{base}&sp={sp}&more=1"), vp);
+            list.push_str(&format!(
+                "<div style=\"padding:12px 36px;text-align:center\">\
+                 <a href=\"{href}\" style=\"display:inline-block;height:56px;line-height:56px;\
+                 padding:0 24px;border:1px solid #000;font-size:24px;color:#000\">显示更多结果</a></div>",
+                href = esc(&href)
+            ));
         }
     }
     if upgrade_link {

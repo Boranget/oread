@@ -111,8 +111,9 @@ pub struct JobResultQ {
     pub(super) job_id: String,
     pub(super) page: Option<i32>,
     pub(super) page_size: Option<usize>,
-    /// 稳定翻页游标：上一页返回的 `next_cursor`（`bucket:seq`）；
-    /// 传 `start` 表示从头开始并立刻冻结快照。缺省时退回旧的 offset 分页。
+    /// 稳定翻页游标：上一页返回的 `next_cursor`。
+    /// 新任务为 `score:seq`，旧任务（有 `snapshot_json`）为 `bucket:seq`；
+    /// 带游标或 `page > 1` 时冻结首屏边界，缺省时第 1 页持续读实时结果。
     pub(super) cursor: Option<String>,
 }
 #[derive(Deserialize)]
@@ -173,6 +174,8 @@ pub(super) const AGG_MAX_BOOKS: usize = 400;
 #[path = "books_search_job.rs"]
 mod books_search_job;
 use books_search_job::*;
+#[path = "books_search_books.rs"]
+mod books_search_books;
 #[path = "books_search_store.rs"]
 mod books_search_store;
 use books_search_store::*;
@@ -193,10 +196,11 @@ mod books_store;
 use books_store::*;
 
 pub(crate) use books_search_api::{
-    filtered_job_books, load_job_lookup, start_kindle_search_job, JobLookup,
+    filtered_books, load_job_lookup, start_kindle_search_job, JobLookup,
 };
+pub(crate) use books_search_books::{advance_freeze, count, freeze, load_page_at};
 pub(crate) use books_search_job::searches_active;
-pub(crate) use books_search_job::{JobMeta, JobProgress, JobView};
+pub(crate) use books_search_job::{JobCounters, JobMeta};
 pub(crate) use books_search_source::{
     is_searchable_source, order_by_health, resolve_search_sources, CuratedMissingFallback,
 };

@@ -28,7 +28,7 @@ pub(super) fn is_budget_skip(kind: &str) -> bool {
     matches!(kind, "truncated" | "skipped")
 }
 
-/// 解析翻页游标：`bucket:seq`；`start` 表示“从头开始”（配合冻结快照）。
+/// 解析翻页游标：`score:seq`（旧任务为 `bucket:seq`）；`start` 表示“从头开始”。
 pub(super) fn parse_cursor(raw: &str) -> Option<(u8, u64)> {
     let t = raw.trim();
     if t.eq_ignore_ascii_case("start") {
@@ -40,7 +40,7 @@ pub(super) fn parse_cursor(raw: &str) -> Option<(u8, u64)> {
 
 /// 该条目是否严格位于游标之后（与 `search_rank::Cursor::item_after` 同义）。
 pub(super) fn book_after_cursor(b: &SearchBook, (cb, cs): (u8, u64)) -> bool {
-    match (b.rank_bucket, b.rank_seq) {
+    match (b.rank_score.or(b.rank_bucket), b.rank_seq) {
         (Some(bb), Some(ss)) => bb < cb || (bb == cb && ss > cs),
         // 缺稳定序号的条目无法定位，宁可多显示也不丢。
         _ => true,
@@ -48,9 +48,10 @@ pub(super) fn book_after_cursor(b: &SearchBook, (cb, cs): (u8, u64)) -> bool {
 }
 
 pub(super) fn cursor_of(b: &SearchBook) -> Option<String> {
-    b.rank_bucket
+    b.rank_score
+        .or(b.rank_bucket)
         .zip(b.rank_seq)
-        .map(|(bucket, seq)| format!("{bucket}:{seq}"))
+        .map(|(score, seq)| format!("{score}:{seq}"))
 }
 
 /// 创建任务后的内部句柄：`search_start` 需要回显源过滤结果，`/k` 只需要 job_id。
@@ -116,7 +117,6 @@ pub(super) async fn create_search_job(
         key: key.clone(),
         at: Instant::now(),
         created_unix_ms: unix_ms(),
-        sources: enabled.clone(),
         source_total,
         scope: effective,
         skipped_cooldown: plan.skipped_cooldown,
@@ -210,9 +210,8 @@ pub(super) async fn search_start(
         "scope_filtered": plan.scope_filtered,
         "curated_total": plan.curated_total,
         "source_total": source_total,
-        // deadline_ms 保持旧语义：本次 scope 的单源预算；整批预算单独给出。
+        // deadline_ms 保持旧语义：本次 scope 的单源预算。
         "deadline_ms": crate::req::search_budget_for(effective).as_millis() as u64,
-        "total_budget_ms": crate::req::search_total_budget(effective).as_millis() as u64,
         // 首轮快照：还没调度任何源。
         "phase": search_phase(source_total),
         "partial": source_total > 0,
@@ -259,38 +258,64 @@ pub(crate) async fn start_kindle_search_job(
 /// 任务不存在（或不属于当前用户）的统一文案：不区分两种情况，避免泄露任务是否存在。
 pub(super) const JOB_NOT_FOUND: &str = "搜索任务不存在或已过期";
 
-/// 结果响应组装：内存任务与数据库快照共用同一份字段与分页口径。
+/// 快照集合的翻页：游标优先，否则按页码。
 ///
-/// 关键点：数据库快照里的 `books` 仍带 `rank_bucket/rank_seq`，因此恢复后的任务
-/// 可以直接复用同一套游标翻页，不重不漏。
+/// 只用于内存任务（旧路径）与旧任务的 `snapshot_json`；新任务走
+/// [`build_rows_response`]，在数据库里按 `(score, seq)` keyset 翻页。
+fn page_slice(
+    full: Vec<SearchBook>,
+    page: i32,
+    page_size: usize,
+    cursor: Option<(u8, u64)>,
+) -> (Vec<SearchBook>, bool, Option<String>) {
+    let total = full.len();
+    match cursor {
+        Some(after) => {
+            let eligible: Vec<SearchBook> = full
+                .into_iter()
+                .filter(|b| book_after_cursor(b, after))
+                .collect();
+            let has_more = eligible.len() > page_size;
+            let page_books: Vec<SearchBook> = eligible.into_iter().take(page_size).collect();
+            let next = has_more
+                .then(|| page_books.last().and_then(cursor_of))
+                .flatten();
+            (page_books, has_more, next)
+        }
+        None => {
+            let skip = ((page as usize).saturating_sub(1)) * page_size;
+            let page_books: Vec<SearchBook> = full.into_iter().skip(skip).take(page_size).collect();
+            let has_more = skip + page_books.len() < total;
+            let next = has_more
+                .then(|| page_books.last().and_then(cursor_of))
+                .flatten();
+            (page_books, has_more, next)
+        }
+    }
+}
+
+/// 结果响应组装（legacy 快照任务）。
+///
+/// 旧任务的 `snapshot_json` 里带完整书单与 `bucket/seq` 游标，恢复后仍能按同一套
+/// 口径翻页。新任务不写快照，走 [`build_rows_response`] 从行表分页读取。
 pub(super) fn build_result_response(
     meta: &JobMeta,
-    view: JobView,
+    counters: &JobCounters,
+    raw_books: Vec<SearchBook>,
     page: i32,
     page_size: usize,
     cursor: Option<(u8, u64)>,
 ) -> serde_json::Value {
-    let JobView {
-        books: raw_books,
-        errors,
-        done,
-        finished,
-        pending,
-        scheduled,
-        attempted,
-        skipped,
-        cancelled,
-        ..
-    } = view;
+    let done = counters.done() || meta.status != "running";
     // 取消/中断后仍会残留“未调度”的源；任务已结束就不再提示还有源要排。
     let pending_scheduled = if done {
         0
     } else {
-        meta.source_total.saturating_sub(scheduled)
+        meta.source_total.saturating_sub(counters.scheduled)
     };
     // 收尾窗口：pending 已归零但任务还没执行到写 status 的那一步（0 源任务尤其明显）。
     // 对外按“没有剩余工作”的真实状态回显，避免前端看到 done=true 却仍是 running。
-    let status = effective_status(meta, done, cancelled);
+    let status = effective_status(meta, done, counters.cancelled);
     // 客户端响应边界：只保留书名包含关键词的条目。
     // 过滤发生在去重/排序之后，不改变打分、精选与源健康（健康统计用源原始命中数）。
     let (full, title_filter) = crate::title_filter::retain_title_matches(raw_books, &meta.key);
@@ -309,37 +334,16 @@ pub(super) fn build_result_response(
         .filter(|b| b.relevance.as_deref() == Some("partial"))
         .count();
     let partial_folded = strong_total >= crate::search_rank::STRONG_MIN_RESULTS;
-    let (books, has_more, next_cursor) = match cursor {
-        Some(after) => {
-            let eligible: Vec<SearchBook> = full
-                .iter()
-                .filter(|b| book_after_cursor(b, after))
-                .cloned()
-                .collect();
-            let has_more = eligible.len() > page_size;
-            let page_books: Vec<SearchBook> = eligible.into_iter().take(page_size).collect();
-            let next = has_more
-                .then(|| page_books.last().and_then(cursor_of))
-                .flatten();
-            (page_books, has_more, next)
-        }
-        None => {
-            let skip = ((page as usize) - 1) * page_size;
-            let page_books: Vec<SearchBook> =
-                full.iter().skip(skip).take(page_size).cloned().collect();
-            let has_more = skip + page_books.len() < total;
-            let next = has_more
-                .then(|| page_books.last().and_then(cursor_of))
-                .flatten();
-            (page_books, has_more, next)
-        }
-    };
-    // 真实失败与“全局预算未完成”分开计数：后者不写健康、不算站点故障。
-    let source_failed = errors.iter().filter(|e| !is_budget_skip(&e.kind)).count();
-    let source_skipped = skipped;
+    let (books, has_more, next_cursor) = page_slice(full, page, page_size, cursor);
+    // 真实失败与“未执行”（结果体积到顶/取消）分开计数：后者不写健康、不算站点故障。
+    let source_failed = counters
+        .errors
+        .iter()
+        .filter(|e| !is_budget_skip(&e.kind))
+        .count();
     json!({
         "books": books,
-        "errors": errors,
+        "errors": &counters.errors,
         "page": page,
         "page_size": page_size,
         "total": total,
@@ -353,7 +357,7 @@ pub(super) fn build_result_response(
         // 任务状态：running / done / cancelled / interrupted（重启后由数据库恢复）。
         "status": status,
         "interrupted": status == "interrupted",
-        "cancelled_sources": cancelled,
+        "cancelled_sources": counters.cancelled,
         // 相关性分层：strong=书名命中，author=只命中作者，partial=只命中片段（可能相关）。
         "strong_total": strong_total,
         "author_total": author_total,
@@ -362,21 +366,22 @@ pub(super) fn build_result_response(
         "partial_folded": partial_folded,
         // 两段式进度：scheduled=已进入调度，attempted=真正发过请求；
         // pending_sources=尚未排上的源（source_total - scheduled），done 仍以“全部处理完”为准。
-        "phase": search_phase(pending),
+        "phase": search_phase(counters.pending),
         "partial": !done,
-        "scheduled_sources": scheduled,
-        "attempted_sources": attempted,
+        "scheduled_sources": counters.scheduled,
+        "attempted_sources": counters.attempted,
         "pending_sources": pending_scheduled,
         "scope": meta.scope.as_str(),
         "source_mode": meta.source_mode,
         "scope_filtered": meta.scope_filtered,
-        "finished": finished,
-        "pending": pending,
+        "finished": counters.finished,
+        "pending": counters.pending,
         "source_total": meta.source_total,
         "source_failed": source_failed,
-        "source_skipped": source_skipped,
+        "source_skipped": counters.skipped,
         "deadline_ms": crate::req::search_budget_for(meta.scope).as_millis() as u64,
-        "total_budget_ms": crate::req::search_total_budget(meta.scope).as_millis() as u64,
+        "result_bytes": counters.result_bytes,
+        "stop_reason": counters.stop_reason,
         "coverage": meta.coverage,
         "curated_total": meta.curated_total,
         // 冷却统计随 job 固化，轮询期间不会变化
@@ -387,6 +392,99 @@ pub(super) fn build_result_response(
     })
 }
 
+/// 结果响应组装（新任务）：计数来自任务状态，书单按 `(score, seq)` 从行表分页读取。
+///
+/// `frozen` 是首屏边界：`Some(n)` 时只看 `seq < n`（n = 边界前的已入库条数），
+/// 后台新增结果不会挤动已翻过的页。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn build_rows_response(
+    pool: &SqlitePool,
+    meta: &JobMeta,
+    counters: &JobCounters,
+    frozen: Option<i64>,
+    page: i32,
+    page_size: usize,
+    cursor: Option<(u8, u64)>,
+) -> AppResult<serde_json::Value> {
+    let done = counters.done() || meta.status != "running";
+    let pending_scheduled = if done {
+        0
+    } else {
+        meta.source_total.saturating_sub(counters.scheduled)
+    };
+    let status = effective_status(meta, done, counters.cancelled);
+    let total = super::books_search_books::count(pool, &meta.id, frozen).await? as usize;
+
+    let (books, has_more) = match cursor {
+        Some(after) => {
+            super::books_search_books::load_page(pool, &meta.id, frozen, Some(after), page_size)
+                .await?
+        }
+        None if page > 1 => {
+            // 兼容按页码翻页的旧客户端：集合已冻结、不再增长，此处偏移不会漂移。
+            let skip = ((page as usize).saturating_sub(1)) * page_size;
+            let page_books =
+                super::books_search_books::load_page_at(pool, &meta.id, frozen, skip, page_size)
+                    .await?;
+            let has_more = skip + page_books.len() < total;
+            (page_books, has_more)
+        }
+        None => {
+            super::books_search_books::load_page(pool, &meta.id, frozen, None, page_size).await?
+        }
+    };
+    let next_cursor = has_more.then(|| books.last().and_then(cursor_of)).flatten();
+    let source_failed = counters
+        .errors
+        .iter()
+        .filter(|e| !is_budget_skip(&e.kind))
+        .count();
+    // 落库时已做过书名过滤与相关性门槛：留下来的都是书名命中的 `strong` 档。
+    // raw 仍记录过滤前候选数，便于诊断“源返回了很多但都被书名挡掉”。
+    let title_filter = crate::title_filter::TitleFilterStats::new(counters.raw_count, total);
+    Ok(json!({
+        "books": books,
+        "errors": &counters.errors,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "title_filter": title_filter,
+        "has_more": has_more,
+        // 下一页游标：`score:seq`；传回 `cursor=` 即从该位置继续，翻页不重不漏。
+        "next_cursor": next_cursor,
+        "done": done,
+        "status": status,
+        "interrupted": status == "interrupted",
+        "cancelled_sources": counters.cancelled,
+        "strong_total": total,
+        "author_total": 0,
+        "partial_total": 0,
+        "partial_folded": false,
+        "phase": search_phase(counters.pending),
+        "partial": !done,
+        "scheduled_sources": counters.scheduled,
+        "attempted_sources": counters.attempted,
+        "pending_sources": pending_scheduled,
+        "scope": meta.scope.as_str(),
+        "source_mode": meta.source_mode,
+        "scope_filtered": meta.scope_filtered,
+        "finished": counters.finished,
+        "pending": counters.pending,
+        "source_total": meta.source_total,
+        "source_failed": source_failed,
+        "source_skipped": counters.skipped,
+        "deadline_ms": crate::req::search_budget_for(meta.scope).as_millis() as u64,
+        "result_bytes": counters.result_bytes,
+        "stop_reason": counters.stop_reason,
+        "coverage": meta.coverage,
+        "curated_total": meta.curated_total,
+        "skipped_cooldown": meta.skipped_cooldown,
+        "cooldown_total": meta.cooldown_total,
+        "created_at": meta.created_unix_ms,
+        "finished_at": (meta.finished_unix_ms > 0).then_some(meta.finished_unix_ms),
+    }))
+}
+
 pub(super) async fn search_result(
     State(s): State<AppState>,
     u: AuthUser,
@@ -394,8 +492,9 @@ pub(super) async fn search_result(
 ) -> AppResult<Json<serde_json::Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 200);
-    // 游标 / 翻页请求 → 冻结快照；page=1 的普通轮询仍读实时结果（首屏持续更新）。
     let cursor = q.cursor.as_deref().and_then(parse_cursor);
+    // 翻页请求要求集合稳定：第一次翻页/带游标时冻结首屏边界。
+    // page=1 的普通轮询仍读实时结果（首屏持续更新）。
     let paginated = q.cursor.is_some() || page > 1;
 
     if let Some(job) = find_job(&q.job_id) {
@@ -411,18 +510,20 @@ pub(super) async fn search_result(
             );
             return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
         }
-        let view = if paginated {
-            frozen_job_view(&job)
-        } else {
-            job_view(&job)
-        };
         let meta = job.meta();
-        return Ok(Json(build_result_response(
-            &meta, view, page, page_size, cursor,
-        )));
+        let counters = job_counters(&job);
+        let frozen = if paginated {
+            Some(super::books_search_books::freeze(&s.shared, &job.id).await?)
+        } else {
+            None
+        };
+        let body =
+            build_rows_response(&s.shared, &meta, &counters, frozen, page, page_size, cursor)
+                .await?;
+        return Ok(Json(body));
     }
 
-    // 内存未命中（超过内存保留期 / 进程重启）：回退数据库快照。
+    // 内存未命中（超过内存保留期 / 进程重启）：回退数据库。
     let row = db_get(&s.shared, u.id, &q.job_id).await?;
     let Some(row) = row else {
         tracing::warn!(
@@ -435,37 +536,45 @@ pub(super) async fn search_result(
         return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
     };
     let mut meta = row_meta(&row);
-    let mut view = row_view(&row);
     if meta.status == "running" {
         // 内存里没有、数据库却仍是 running：只可能是进程重启前的遗留行
         // （启动清理失败）或内存硬上限淘汰。按中断处理，避免前端永远轮询。
         meta.status = "interrupted".into();
-        view.done = true;
     }
-    Ok(Json(build_result_response(
-        &meta, view, page, page_size, cursor,
-    )))
+    let counters = row_counters(&row, row.snapshot_json.as_deref());
+    // 旧任务（有 snapshot_json）：沿用快照翻页；新任务：从结果行分页读取。
+    let body = match &row.snapshot_json {
+        Some(snapshot) => {
+            let books = snapshot_books(snapshot);
+            build_result_response(&meta, &counters, books, page, page_size, cursor)
+        }
+        None => {
+            let frozen = match row.frozen_seq {
+                Some(f) => Some(f),
+                None if paginated => {
+                    Some(super::books_search_books::freeze(&s.shared, &row.id).await?)
+                }
+                None => None,
+            };
+            build_rows_response(&s.shared, &meta, &counters, frozen, page, page_size, cursor)
+                .await?
+        }
+    };
+    Ok(Json(body))
 }
 
-/// 已结束任务的完整快照（装箱，避免与轻量进度变体尺寸悬殊）。
-pub(crate) struct FinishedJob {
+/// `/k` 的任务读取结果：运行中与已结束共用同一份元数据 + 计数。
+pub(crate) struct JobLookup {
     pub(crate) meta: JobMeta,
-    pub(crate) view: JobView,
+    pub(crate) counters: JobCounters,
+    /// 旧任务（`snapshot_json`）的完整书单；新任务为 `None`，按行表分页读取。
+    pub(crate) legacy_books: Option<Vec<SearchBook>>,
+    /// 仍在运行：`counters.result_count > 0` 时 `/k` 先出结果（首屏）。
+    pub(crate) running: bool,
 }
 
-/// `/k` 的任务读取结果。
-pub(crate) enum JobLookup {
-    /// 仍在跑：只带轻量进度，不克隆/排序结果。
-    Running(JobProgress),
-    /// 已结束：完整元数据 + 结果快照。
-    Finished(Box<FinishedJob>),
-}
-
-/// `/k` 的任务读取：内存优先，过期后回退数据库快照；跨用户与不存在都返回 `None`
+/// `/k` 的任务读取：内存优先，过期后回退数据库；跨用户与不存在都返回 `None`
 /// （调用方统一给出「任务不存在或已过期」）。
-///
-/// 内存任务始终读实时结果（`job_view`），不使用可能被 SPA 提前冻结的部分快照：
-/// `/k` 只在任务结束后渲染结果，实时视图已是最终结果，且不会受其他入口影响。
 pub(crate) async fn load_job_lookup(
     pool: &SqlitePool,
     uid: i64,
@@ -484,23 +593,18 @@ pub(crate) async fn load_job_lookup(
             return Ok(None);
         }
         let mut meta = job.meta();
-        if meta.status == "running" {
+        let counters = job_counters(&job);
+        let running = meta.status == "running" && counters.pending > 0;
+        if !running {
             // pending 归零但 status 还没写：按结束处理，避免 /k 永远显示“搜索中”。
-            if job_pending(&job) != Some(0) {
-                return Ok(Some(JobLookup::Running(job_progress(&job))));
-            }
-            let view = job_view(&job);
-            meta.status = effective_status(&meta, view.done, view.cancelled);
-            return Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
-                meta,
-                view,
-            }))));
+            meta.status = effective_status(&meta, counters.done(), counters.cancelled);
         }
-        let view = job_view(&job);
-        return Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
+        return Ok(Some(JobLookup {
             meta,
-            view,
-        }))));
+            counters,
+            legacy_books: None,
+            running,
+        }));
     }
 
     let Some(row) = db_get(pool, uid, job_id).await? else {
@@ -514,21 +618,30 @@ pub(crate) async fn load_job_lookup(
         return Ok(None);
     };
     let mut meta = row_meta(&row);
-    let mut view = row_view(&row);
     if meta.status == "running" {
         // 内存里没有、数据库却仍是 running：进程重启遗留或内存淘汰，按中断处理。
         meta.status = "interrupted".into();
-        view.done = true;
     }
-    Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
+    let counters = row_counters(&row, row.snapshot_json.as_deref());
+    let legacy_books = row.snapshot_json.as_deref().map(snapshot_books);
+    Ok(Some(JobLookup {
         meta,
-        view,
-    }))))
+        counters,
+        legacy_books,
+        running: false,
+    }))
 }
 
-/// 结果快照 → 书名过滤后的完整列表（`/k` 本地分页用）。
-pub(crate) fn filtered_job_books(meta: &JobMeta, view: &JobView) -> Vec<SearchBook> {
-    crate::title_filter::retain_title_matches(view.books.clone(), &meta.key).0
+/// 结果快照 → 书名过滤后的完整列表（旧任务 `/k` 本地分页用）。
+pub(crate) fn filtered_books(meta: &JobMeta, books: Vec<SearchBook>) -> Vec<SearchBook> {
+    crate::title_filter::retain_title_matches(books, &meta.key).0
+}
+
+/// 解析 `snapshot_json` 里的书单；解析失败按空结果处理（旧数据尽力展示）。
+pub(super) fn snapshot_books(snapshot: &str) -> Vec<SearchBook> {
+    serde_json::from_str::<JobSnapshot>(snapshot)
+        .map(|s| s.books)
+        .unwrap_or_default()
 }
 
 /// 数据库行 → 结果元数据（字段口径与内存任务一致）。
@@ -551,28 +664,40 @@ pub(super) fn row_meta(row: &SearchJobRow) -> JobMeta {
     }
 }
 
-/// 数据库行 → 结果视图；快照缺失（运行中/被中断）时返回空结果。
-pub(super) fn row_view(row: &SearchJobRow) -> JobView {
-    let snap = row
-        .snapshot_json
+/// 数据库行 → 任务计数。
+///
+/// 旧任务的错误明细在 `snapshot_json.errors`，新任务在 `errors_json`；两处都读不到时
+/// 只保留计数（`failed` 来自列，始终准确）。
+pub(super) fn row_counters(row: &SearchJobRow, snapshot: Option<&str>) -> JobCounters {
+    let errors = row
+        .errors_json
         .as_deref()
-        .and_then(|s| serde_json::from_str::<JobSnapshot>(s).ok())
+        .and_then(|s| serde_json::from_str::<Vec<web_book::SourceFailure>>(s).ok())
+        .or_else(|| {
+            snapshot.and_then(|s| {
+                serde_json::from_str::<JobSnapshot>(s)
+                    .ok()
+                    .map(|x| x.errors)
+            })
+        })
         .unwrap_or_default();
     let finished = row.finished.max(0) as usize;
     let cancelled = row.cancelled.max(0) as usize;
     let source_total = row.source_total.max(0) as usize;
-    JobView {
-        books: snap.books,
-        errors: snap.errors,
-        done: row.status != "running",
+    JobCounters {
+        errors,
+        failed: row.failed.max(0) as usize,
         finished,
         pending: row.pending.max(0) as usize,
-        // 数据库不保存调度细节；结果接口只在任务结束时回退到这里，
-        // 因此把已处理源视为已排上，避免出现“还有源没排上”的误导。
+        // 数据库不保存调度细节：已处理源视为已排上，避免“还有源没排上”的误导。
         scheduled: (finished + cancelled).min(source_total),
         attempted: finished,
         skipped: row.skipped.max(0) as usize,
         cancelled,
+        result_count: row.result_count.max(0) as usize,
+        raw_count: row.raw_count.max(0) as usize,
+        result_bytes: row.result_bytes,
+        stop_reason: row.stop_reason.clone(),
     }
 }
 
@@ -628,7 +753,7 @@ pub(super) async fn search_jobs(
 
 /// 内存任务摘要（进度实时，来自 job 状态）。
 pub(super) fn memory_job_summary(job: &SearchJob) -> serde_json::Value {
-    let (finished, pending, skipped, cancelled, failed) = {
+    let (finished, pending, skipped, cancelled, failed, result_count, result_bytes, stop_reason) = {
         let st = job.state.lock().unwrap_or_else(|p| p.into_inner());
         (
             st.finished,
@@ -639,6 +764,9 @@ pub(super) fn memory_job_summary(job: &SearchJob) -> serde_json::Value {
                 .iter()
                 .filter(|e| !is_budget_skip(&e.kind))
                 .count(),
+            st.result_count,
+            st.result_bytes,
+            st.stop_reason.clone(),
         )
     };
     let finished_at = job.finished_unix_ms.load(Ordering::Relaxed);
@@ -667,6 +795,9 @@ pub(super) fn memory_job_summary(job: &SearchJob) -> serde_json::Value {
         "skipped": skipped,
         "cancelled": cancelled,
         "failed": failed,
+        "result_count": result_count,
+        "result_bytes": result_bytes,
+        "stop_reason": stop_reason,
         "curated_total": job.curated_total,
         "skipped_cooldown": job.skipped_cooldown,
         "cooldown_total": job.cooldown_total,
@@ -700,6 +831,9 @@ pub(super) fn db_job_summary(row: &SearchJobRow) -> serde_json::Value {
         "skipped": row.skipped.max(0),
         "cancelled": row.cancelled.max(0),
         "failed": row.failed.max(0),
+        "result_count": row.result_count.max(0),
+        "result_bytes": row.result_bytes.max(0),
+        "stop_reason": row.stop_reason,
         "curated_total": row.curated_total.max(0),
         "skipped_cooldown": row.skipped_cooldown.max(0),
         "cooldown_total": row.cooldown_total.max(0),
@@ -740,7 +874,7 @@ pub(super) async fn search_job_cancel(
     })))
 }
 
-/// 移除任务（内存 + 数据库）。运行中的任务必须先取消，避免“删了还在后台跑”。
+/// 移除任务（内存 + 数据库）。运行中的任务先取消并等它收尾，避免“删了还在后台写”。
 pub(super) async fn search_job_delete(
     State(s): State<AppState>,
     u: AuthUser,
@@ -751,7 +885,17 @@ pub(super) async fn search_job_delete(
             return Err(AppError::NotFound(JOB_NOT_FOUND.into()));
         }
         if job.is_running() {
-            return Err(AppError::BadRequest("任务仍在运行，请先取消再移除".into()));
+            // 直接删行会让后台任务继续往已删的任务写结果：先取消，等它把在飞请求
+            // 收尾并写完计数（正常 < 单源预算）。收尾超时则拒绝，让用户稍后再删。
+            job.cancelled.store(true, Ordering::SeqCst);
+            job.cancel.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while job.is_running() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if job.is_running() {
+                return Err(AppError::BadRequest("任务正在收尾，请稍后重试移除".into()));
+            }
         }
     }
     let removed_mem = remove_job(&q.job_id, u.id);

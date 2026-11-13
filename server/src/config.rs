@@ -230,11 +230,16 @@ pub struct Config {
     pub search_curated_budget_secs: u64,
     /// `scope=all` 的整批搜索总预算（秒，默认 40）。
     ///
-    /// 覆盖能力 ≈ 并发槽 × 整批预算 ÷ 单源预算：132 个可搜索源、16 槽、单源 8s
-    /// 需要约 40s 才能基本跑完（实测 25s 只跑到 60–70 个源，30/35s 仍会漏掉
-    /// 排在 ~44 位的源）。这是**上限**不是固定等待：源少时任务提前结束，
-    /// 两段式搜索边跑边出结果，首屏不受影响。
+    /// 只用于**同步聚合入口**（`/api/search`、`/api/search/aggregate`）：
+    /// 一个 HTTP 请求必须在可预期时间内返回，那里保留整批超时是对的。
+    /// 后台搜索任务不看它——任务按结果体积收尾，见 `search_result_max_bytes`。
     pub search_all_budget_secs: u64,
+    /// 单个搜索任务的结果上限（字节，默认 4 MiB）。
+    ///
+    /// 后台任务不再有「整批时间预算」：跑多少个源、返回多少条都不设上限，
+    /// 唯一约束是落库结果的体积。超过即停止取新源，已发出的请求照常收尾。
+    /// 字节数按 `search_job_books.book_json` 的实际长度累计。
+    pub search_result_max_bytes: usize,
     /// `scope=all`（加强搜索）的源级并发槽：用户显式设置 `HTTP_CONCURRENCY` 时取
     /// `min(配置, 16)`，未显式设置时用 16（设备实测值）。
     pub search_all_slots: usize,
@@ -372,6 +377,9 @@ impl Config {
             search_all_timeout_secs,
             search_curated_budget_secs,
             search_all_budget_secs,
+            search_result_max_bytes: env_u64("SEARCH_RESULT_MAX_MB", 4).clamp(1, 64) as usize
+                * 1024
+                * 1024,
             http_max_body_bytes: env_u64("HTTP_MAX_BODY_MB", 5).clamp(1, 32) as usize * 1024 * 1024,
             image_cache_mb: env_u64("IMAGE_CACHE_MB", 64).clamp(4, 256),
             image_max_body_bytes: env_u64("IMAGE_MAX_BODY_MB", 8).clamp(1, 32) as usize

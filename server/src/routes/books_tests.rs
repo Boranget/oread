@@ -381,26 +381,30 @@ fn all_search_entrypoints_share_health_ordering() {
 // 否则连续 3 次超时就会把源硬隔离，源池越搜越小，最后所有搜索都是 0 结果。
 #[test]
 fn search_timeout_is_partial_and_not_counted() {
-    let (status, kind, usage) = classify_search_failure("搜索超时（单源 5s 预算）", false);
+    let (status, kind, usage) =
+        source_health::classify_search_failure("搜索超时（单源 5s 预算）", false);
     assert_eq!(status, source_health::STATUS_PARTIAL);
     assert_eq!(kind, "timeout");
     assert!(!usage, "未完成的请求不能算一次 0 命中");
 
     // 底层请求超时（含在 Done(Err) 里的文案）同样按超时处理
-    let (status, kind, usage) =
-        classify_search_failure("请求超时（15s 预算）: https://x.example/search", false);
+    let (status, kind, usage) = source_health::classify_search_failure(
+        "请求超时（15s 预算）: https://x.example/search",
+        false,
+    );
     assert_eq!(status, source_health::STATUS_PARTIAL);
     assert_eq!(kind, "timeout");
     assert!(!usage);
 
     // 明确的站点故障仍然计入失败，避免真死站永远留在池子里
-    let (status, kind, usage) = classify_search_failure("连接失败: https://x.example", false);
+    let (status, kind, usage) =
+        source_health::classify_search_failure("连接失败: https://x.example", false);
     assert_eq!(status, source_health::STATUS_FAIL);
     assert_eq!(kind, "site");
     assert!(usage);
 
     // 引擎故障记 partial 但计入统计：留证据，不判死站点
-    let (status, kind, usage) = classify_search_failure("选择器解析失败", true);
+    let (status, kind, usage) = source_health::classify_search_failure("选择器解析失败", true);
     assert_eq!(status, source_health::STATUS_PARTIAL);
     assert_eq!(kind, "engine");
     assert!(usage);
@@ -415,109 +419,91 @@ fn mk_book(name: String, url: String) -> SearchBook {
     b
 }
 
-fn stream_job(books: Vec<SearchBook>, pending: usize) -> SearchJob {
-    let mut s = crate::entities::BookSource::default();
-    s.book_source_url = "http://s".into();
-    SearchJob {
-        id: "j-stream".into(),
-        uid: 1,
-        key: "剑来".into(),
-        at: Instant::now(),
-        created_unix_ms: 0,
-        sources: vec![s],
-        source_total: 2,
-        scope: crate::req::SearchScope::Curated,
-        skipped_cooldown: 0,
-        cooldown_total: 0,
-        coverage: "curated".into(),
-        source_mode: "curated".into(),
-        scope_filtered: 0,
-        curated_total: 0,
-        cancel: Arc::new(tokio::sync::Notify::new()),
-        cancelled: AtomicBool::new(false),
-        status: Mutex::new("running".into()),
-        finished_unix_ms: AtomicU64::new(0),
-        state: Mutex::new(SearchJobState {
-            books,
-            pending,
-            ..Default::default()
-        }),
-    }
-}
+// 行表分页：搜索进行中逐页读取，游标不重不漏；迟到结果只从游标之后补进后续页。
+#[tokio::test]
+async fn cursor_pagination_no_dup_no_gap_while_streaming() {
+    let pool = jobs_pool().await;
+    let job = test_job_for(1, "j-stream", 0, 2);
+    persist_started(&pool, &job).await.unwrap();
+    let mk = |i: usize| mk_book(format!("剑来{i}"), format!("u{i}"));
 
-// 搜索进行中连翻 3 页：游标不重不漏；迟到结果只有在游标之后才会补进后续页。
-#[test]
-fn cursor_pagination_no_dup_no_gap_while_streaming() {
-    let initial: Vec<SearchBook> = (0..10)
-        .map(|i| mk_book(format!("剑来{i}"), format!("u{i}")))
-        .collect();
-    let job = stream_job(initial, 3);
-    let view = job_view(&job);
-    let page1: Vec<SearchBook> = view.books.iter().take(3).cloned().collect();
-    let mut seen: Vec<String> = page1.iter().map(|b| b.book_url.clone()).collect();
-    let mut cursor = page1.last().and_then(cursor_of);
+    let first: Vec<SearchBook> = (0..10).map(mk).collect();
+    books_search_books::insert_batch(&pool, &job.id, "剑来", 0, first)
+        .await
+        .unwrap();
 
-    // 模拟“搜索还没结束，新结果陆续到达”
-    {
-        let mut st = job.state.lock().unwrap();
-        for i in 10..18 {
-            st.books
-                .push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
-        }
-    }
-    while let Some(cur) = cursor.clone() {
-        let after = parse_cursor(&cur).expect("游标可解析");
-        let view = job_view(&job);
-        let page: Vec<SearchBook> = view
-            .books
-            .iter()
-            .filter(|b| book_after_cursor(b, after))
-            .take(3)
-            .cloned()
-            .collect();
-        if page.is_empty() {
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (page, has_more) = books_search_books::load_page(&pool, &job.id, None, cursor, 3)
+            .await
+            .unwrap();
+        seen.extend(page.iter().map(|b| b.book_url.clone()));
+        cursor = page
+            .last()
+            .and_then(cursor_of)
+            .and_then(|c| parse_cursor(&c));
+        if !has_more {
             break;
         }
+    }
+    assert_eq!(seen.len(), 10, "首轮应覆盖全部已入库结果");
+
+    // 模拟“搜索还没结束，新结果陆续到达”。
+    let more: Vec<SearchBook> = (10..18).map(mk).collect();
+    books_search_books::insert_batch(&pool, &job.id, "剑来", 0, more)
+        .await
+        .unwrap();
+
+    while let Some(after) = cursor {
+        let (page, has_more) = books_search_books::load_page(&pool, &job.id, None, Some(after), 3)
+            .await
+            .unwrap();
         seen.extend(page.iter().map(|b| b.book_url.clone()));
-        cursor = page.last().and_then(cursor_of);
+        cursor = page
+            .last()
+            .and_then(cursor_of)
+            .and_then(|c| parse_cursor(&c));
+        if !has_more {
+            break;
+        }
     }
 
-    let final_view = job_view(&job);
-    let all: HashSet<String> = final_view
-        .books
-        .iter()
-        .map(|b| b.book_url.clone())
-        .collect();
+    let all: HashSet<String> = seen.iter().cloned().collect();
     assert_eq!(seen.len(), all.len(), "逐条不重复");
-    for u in &all {
-        assert_eq!(
-            seen.iter().filter(|x| *x == u).count(),
-            1,
-            "{u} 应恰好出现一次"
-        );
-    }
     assert_eq!(seen.len(), 18, "首屏 + 后续页应覆盖全部 18 条");
 }
 
-// 首次翻页后冻结快照：后续迟到结果不再改变同一会话的页内容。
-#[test]
-fn frozen_snapshot_keeps_pages_stable() {
-    let books: Vec<SearchBook> = (0..6)
-        .map(|i| mk_book(format!("剑来{i}"), format!("u{i}")))
-        .collect();
-    let job = stream_job(books, 2);
-    let frozen = frozen_job_view(&job);
-    assert_eq!(frozen.books.len(), 6);
-    {
-        let mut st = job.state.lock().unwrap();
-        for i in 6..10 {
-            st.books
-                .push(mk_book(format!("剑来篇{i}"), format!("u{i}")));
-        }
-    }
-    let again = frozen_job_view(&job);
-    assert_eq!(again.books.len(), 6, "快照冻结后不再吸收新结果");
-    assert_eq!(job_view(&job).books.len(), 10, "实时视图仍可看到新结果");
+// 首次翻页后冻结首屏边界：后台新入库的结果不会挤动已翻过的页。
+#[tokio::test]
+async fn frozen_boundary_keeps_pages_stable() {
+    let pool = jobs_pool().await;
+    let job = test_job_for(1, "j-frozen", 0, 2);
+    persist_started(&pool, &job).await.unwrap();
+    let mk = |i: usize| mk_book(format!("剑来{i}"), format!("u{i}"));
+
+    books_search_books::insert_batch(&pool, &job.id, "剑来", 0, (0..6).map(mk).collect())
+        .await
+        .unwrap();
+    let frozen = books_search_books::freeze(&pool, &job.id).await.unwrap();
+    assert_eq!(frozen, 6, "边界 = 已入库条数");
+
+    books_search_books::insert_batch(&pool, &job.id, "剑来", 0, (6..10).map(mk).collect())
+        .await
+        .unwrap();
+    let (page, _) = books_search_books::load_page(&pool, &job.id, Some(frozen), None, 30)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 6, "边界冻结后不再吸收新结果");
+    let (live, _) = books_search_books::load_page(&pool, &job.id, None, None, 30)
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 10, "不传边界时仍可看到全部结果");
+
+    let advanced = books_search_books::advance_freeze(&pool, &job.id)
+        .await
+        .unwrap();
+    assert_eq!(advanced, 10, "「显示更多结果」推进到当前最大序号");
 }
 
 // 回归：enabled=0 与 quarantined 都不能进入搜索池（source_total / origin 的源头）。
@@ -881,69 +867,49 @@ async fn clear_cache_by_book_and_by_user() {
     assert_eq!(left2, 0);
 }
 
-// 两段式搜索的读视图：已完成源先可读、去重按权重、done 由 pending 决定
-#[test]
-fn job_view_dedupes_by_weight_and_reports_progress() {
-    let mut hi = crate::entities::BookSource::default();
-    hi.book_source_url = "http://hi".into();
-    hi.weight = 10;
-    let mut lo = crate::entities::BookSource::default();
-    lo.book_source_url = "http://lo".into();
-    lo.weight = 0;
+// 行表去重：同书多源只合并来源，分数与序号保持首次入库时的值。
+#[tokio::test]
+async fn result_rows_dedupe_by_book_and_keep_first_score() {
+    use crate::web_book::dedupe_key;
 
-    let mut a = SearchBook::default();
-    a.book_url = "http://hi/1".into();
-    a.origin = Some("http://hi".into());
-    a.name = Some("剑来".into());
-    a.author = Some("烽火戏诸侯".into());
-    let mut b = SearchBook::default();
-    b.book_url = "http://lo/1".into();
-    b.origin = Some("http://lo".into());
-    b.name = Some("剑来".into());
-    b.author = Some("烽火戏诸侯".into());
+    let pool = jobs_pool().await;
+    let job = test_job_for(1, "j-dedupe", 0, 2);
+    persist_started(&pool, &job).await.unwrap();
 
-    let job = SearchJob {
-        id: "j-test".into(),
-        uid: 1,
-        key: "剑来".into(),
-        at: Instant::now(),
-        created_unix_ms: 0,
-        sources: vec![hi, lo],
-        source_total: 2,
-        scope: crate::req::SearchScope::Curated,
-        skipped_cooldown: 0,
-        cooldown_total: 0,
-        coverage: "curated".into(),
-        source_mode: "curated".into(),
-        scope_filtered: 0,
-        curated_total: 0,
-        cancel: Arc::new(tokio::sync::Notify::new()),
-        cancelled: AtomicBool::new(false),
-        status: Mutex::new("running".into()),
-        finished_unix_ms: AtomicU64::new(0),
-        state: Mutex::new(SearchJobState {
-            books: vec![a, b],
-            errors: vec![],
-            finished: 1,
-            pending: 1,
-            ..Default::default()
-        }),
-    };
-    let view = job_view(&job);
-    assert_eq!(view.books.len(), 1, "同名同作者应去重为一条");
-    assert_eq!(
-        view.books[0].origin.as_deref(),
-        Some("http://hi"),
-        "权重高的源应排在前面"
-    );
-    assert!(view.errors.is_empty());
-    assert_eq!((view.finished, view.pending), (1, 1));
-    assert!(!view.done, "还有源未完成时 done 必须为 false");
+    let mut lo = SearchBook::default();
+    lo.book_url = "http://lo/1".into();
+    lo.origin = Some("http://lo".into());
+    lo.origin_name = Some("低权重源".into());
+    lo.name = Some("剑来".into());
+    lo.author = Some("烽火戏诸侯".into());
+    let mut hi = lo.clone();
+    hi.book_url = "http://hi/1".into();
+    hi.origin = Some("http://hi".into());
+    hi.origin_name = Some("高权重源".into());
+    assert_eq!(dedupe_key(&lo), dedupe_key(&hi), "同名同作者是同一本书");
 
-    job.state.lock().unwrap().pending = 0;
-    let view = job_view(&job);
-    assert!(view.done);
-    assert_eq!(view.pending, 0);
+    // 低权重源先入库：分数按首次入库时的 1 个来源计算。
+    books_search_books::insert_batch(&pool, &job.id, "剑来", 0, vec![lo])
+        .await
+        .unwrap();
+    let (first, _) = books_search_books::load_page(&pool, &job.id, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let first_score = first[0].rank_score;
+    assert_eq!(first[0].origins, vec!["低权重源"]);
+
+    // 高权重源后到：只补来源，不重算分数、不新增行。
+    let w = books_search_books::insert_batch(&pool, &job.id, "剑来", 10, vec![hi])
+        .await
+        .unwrap();
+    assert_eq!(w.added, 0, "同书不应新增行");
+    let (merged, _) = books_search_books::load_page(&pool, &job.id, None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].rank_score, first_score, "分数首次入库后不再改变");
+    assert_eq!(merged[0].origins, vec!["低权重源", "高权重源"]);
 }
 
 // curated：只保留体检精选集合；集合为空时退回全量（退化路径，避免 0 命中）
@@ -1227,15 +1193,15 @@ fn phase_follows_pending() {
     assert_eq!(search_phase(3), "first");
     assert_eq!(search_phase(0), "final");
     let job = test_job("phase", 0, 3);
-    let view = job_view(&job);
-    assert!(!view.done);
-    assert_eq!(view.pending, 3);
-    assert_eq!(search_phase(view.pending), "first");
-    assert_eq!(view.finished, 0, "没有任何源完成时 finished=0");
+    let c = job_counters(&job);
+    assert!(!c.done());
+    assert_eq!(c.pending, 3);
+    assert_eq!(search_phase(c.pending), "first");
+    assert_eq!(c.finished, 0, "没有任何源完成时 finished=0");
     job.state.lock().unwrap().pending = 0;
-    let view = job_view(&job);
-    assert!(view.done);
-    assert_eq!(search_phase(view.pending), "final");
+    let c = job_counters(&job);
+    assert!(c.done());
+    assert_eq!(search_phase(c.pending), "final");
 }
 
 // 计数器算术关系：attempted <= scheduled <= source_total；pending = total - scheduled
@@ -1249,89 +1215,14 @@ fn source_counters_satisfy_invariant() {
         st.finished = 2;
         st.pending = 1;
     }
-    let view = job_view(&job);
-    assert!(
-        view.attempted <= view.scheduled,
-        "attempted 不能大于 scheduled"
-    );
-    assert!(
-        view.scheduled <= job.source_total,
-        "scheduled 不能大于 total"
-    );
+    let c = job_counters(&job);
+    assert!(c.attempted <= c.scheduled, "attempted 不能大于 scheduled");
+    assert!(c.scheduled <= job.source_total, "scheduled 不能大于 total");
     assert_eq!(
-        job.source_total - view.scheduled,
+        job.source_total - c.scheduled,
         1,
         "pending_sources = total - scheduled"
     );
-}
-
-// 排队到 deadline 仍未拿到槽：源不会被真正执行，不能计入 attempted。
-#[tokio::test]
-async fn queued_but_never_executed_is_not_attempted() {
-    let past = tokio::time::Instant::now() - Duration::from_secs(1);
-    // 排队阶段不会真正执行任务，这里给一个惰性池即可满足参数类型。
-    let book_pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
-    let store = Arc::new(web_book::BookStore::new());
-    let run = search_one_source(
-        src("排队源", "http://queue.example", 1, true),
-        "书".to_string(),
-        past,
-        Duration::from_millis(100),
-        crate::req::SearchScope::Curated,
-        book_pool,
-        store,
-    )
-    .await;
-    assert!(!run.attempted, "deadline 已过：源没有真正执行");
-    assert!(
-        matches!(run.outcome, TaskOutcome::Skipped(_)),
-        "未执行的源应归为 skipped，而不是站点失败"
-    );
-}
-
-// 动态单源预算：越接近 deadline 越短，但始终夹在 [2s, cap]。
-#[test]
-fn dynamic_budget_shrinks_near_deadline_and_stays_in_range() {
-    let cap = Duration::from_secs(8);
-    let far = tokio::time::Instant::now() + Duration::from_secs(40);
-    let near = tokio::time::Instant::now() + Duration::from_millis(500);
-    assert_eq!(
-        dynamic_budget(far, 16, 16, cap),
-        cap,
-        "预算充足且只剩一轮时给满单源上限"
-    );
-    assert_eq!(
-        dynamic_budget(near, 200, 16, cap),
-        Duration::from_secs(2),
-        "接近 deadline 时不再低于 2s 下限"
-    );
-    let mid = dynamic_budget(
-        tokio::time::Instant::now() + Duration::from_secs(10),
-        64,
-        16,
-        cap,
-    );
-    assert!(mid >= Duration::from_secs(2) && mid <= cap, "mid={mid:?}");
-}
-
-// 早停：结果够两页且跑过足够多源才停；源少时按实际源数放宽。
-#[test]
-fn early_stop_requires_enough_sources_and_results() {
-    assert!(!should_stop_early(60, 10, 100), "源跑得太少不早停");
-    assert!(!should_stop_early(10, 30, 100), "结果不足两页不早停");
-    assert!(should_stop_early(60, 24, 100));
-    assert!(should_stop_early(60, 5, 5), "源本来就少时按实际源数判定");
-}
-
-// 全局预算截断 vs 真实单源超时：留 1s 宽限，避免把“几乎跑满预算”的源误判成截断。
-#[test]
-fn global_budget_truncation_has_one_second_grace() {
-    let budget = Duration::from_secs(8);
-    assert!(timeout_is_truncation(Duration::from_secs(3), budget));
-    assert!(timeout_is_truncation(Duration::from_millis(6500), budget));
-    // 剩余 7s：+1s 宽限刚好等于单源预算 → 仍算真实超时
-    assert!(!timeout_is_truncation(Duration::from_secs(7), budget));
-    assert!(!timeout_is_truncation(budget, budget));
 }
 
 #[test]
@@ -1501,7 +1392,6 @@ fn test_job_for(uid: i64, id: &str, age_secs: u64, pending: usize) -> Arc<Search
             .unwrap(),
         // 用年龄反推创建时刻：让「按创建时间淘汰」的测试可判定。
         created_unix_ms: 1_000_000u64.saturating_sub(age_secs.saturating_mul(1000)),
-        sources: Vec::new(),
         source_total: pending,
         scope: crate::req::SearchScope::Curated,
         skipped_cooldown: 0,
@@ -1684,39 +1574,51 @@ fn search_source_ids_filter_and_report_ignored() {
 // 作者/简介不参与；过滤计数进 title_filter，全部被过滤时返回空数组而非报错。
 #[tokio::test]
 async fn search_result_filters_by_title_at_response_boundary() {
+    let pool = jobs_pool().await;
     let mut job = test_job("title-filter", 0, 0);
-    {
-        let j = Arc::get_mut(&mut job).unwrap();
-        j.key = "百年孤独".into();
-        let mut st = j.state.lock().unwrap();
-        st.books = vec![
+    Arc::get_mut(&mut job).unwrap().key = "百年孤独".into();
+    persist_started(&pool, &job).await.unwrap();
+    // 落库时已做相关性门槛 + 书名包含过滤：只留下书名命中的条目。
+    let w = books_search_books::insert_batch(
+        &pool,
+        &job.id,
+        "百年孤独",
+        0,
+        vec![
             SearchBook {
                 name: Some("《百年孤独》".into()),
                 book_url: "https://x/1".into(),
                 origin: Some("https://s/1".into()),
                 ..Default::default()
             },
-            // 只命中查询片段：排序阶段保留（partial），书名过滤阶段丢弃
+            // 只命中查询片段：相关性通过，但书名不含完整关键词，落库前被丢弃
             SearchBook {
                 name: Some("百年争战".into()),
                 book_url: "https://x/2".into(),
                 origin: Some("https://s/1".into()),
                 ..Default::default()
             },
-            // 相关性为 0，在排序阶段就被丢弃，不计入 title_filter.raw
+            // 相关性为 0：在门槛阶段就被丢弃，不计入 raw
             SearchBook {
                 name: Some("海贼王".into()),
                 book_url: "https://x/3".into(),
                 origin: Some("https://s/1".into()),
                 ..Default::default()
             },
-        ];
+        ],
+    )
+    .await
+    .unwrap();
+    {
+        let mut st = job.state.lock().unwrap();
+        st.result_count = w.added;
+        st.raw_count = w.candidates;
     }
     job_registry().lock().unwrap().push(job);
 
     let state = || {
         State(AppState {
-            shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            shared: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -1752,23 +1654,34 @@ async fn search_result_filters_by_title_at_response_boundary() {
 // 全部被过滤时正常返回空列表（200），不报错。
 #[tokio::test]
 async fn search_result_all_filtered_returns_empty_list() {
+    let pool = jobs_pool().await;
     let mut job = test_job("all-filtered", 0, 0);
-    {
-        let j = Arc::get_mut(&mut job).unwrap();
-        j.key = "百年孤独".into();
-        let mut st = j.state.lock().unwrap();
-        st.books = vec![SearchBook {
+    Arc::get_mut(&mut job).unwrap().key = "百年孤独".into();
+    persist_started(&pool, &job).await.unwrap();
+    let w = books_search_books::insert_batch(
+        &pool,
+        &job.id,
+        "百年孤独",
+        0,
+        vec![SearchBook {
             name: Some("百年争战".into()),
             book_url: "https://x/2".into(),
             origin: Some("https://s/1".into()),
             ..Default::default()
-        }];
+        }],
+    )
+    .await
+    .unwrap();
+    {
+        let mut st = job.state.lock().unwrap();
+        st.result_count = w.added;
+        st.raw_count = w.candidates;
     }
     job_registry().lock().unwrap().push(job);
 
     let state = || {
         State(AppState {
-            shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            shared: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -1802,11 +1715,12 @@ async fn search_result_rejects_other_users_job() {
     use axum::response::IntoResponse;
 
     // test_job 默认 uid=7；先注入一条真实存在的任务。
+    let pool = jobs_pool().await;
     let job = test_job("owned-by-7", 0, 0);
     job_registry().lock().unwrap().push(job);
     let state = || {
         State(AppState {
-            shared: sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            shared: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -1847,24 +1761,29 @@ async fn search_result_rejects_other_users_job() {
 
 // ---------------- 搜索任务管理（内存 + 数据库） ----------------
 
-/// 只建 0017 迁移涉及的表：直接执行真实迁移文件，避免测试里再抄一份 schema。
+/// 只建搜索任务相关迁移涉及的表：直接执行真实迁移文件，避免测试里再抄一份 schema。
 async fn jobs_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    for stmt in include_str!("../../migrations/shared/0017_search_jobs.sql").split(';') {
-        let s = stmt.trim();
-        if !s.is_empty() {
-            sqlx::query(s).execute(&pool).await.unwrap();
+    for sql in [
+        include_str!("../../migrations/shared/0017_search_jobs.sql"),
+        include_str!("../../migrations/shared/0018_search_job_books.sql"),
+    ] {
+        for stmt in sql.split(';') {
+            let s = stmt.trim();
+            if !s.is_empty() {
+                sqlx::query(s).execute(&pool).await.unwrap();
+            }
         }
     }
     pool
 }
 
 #[tokio::test]
-async fn search_job_db_roundtrip_keeps_snapshot_and_isolates_users() {
+async fn search_job_db_roundtrip_keeps_rows_and_isolates_users() {
     let pool = jobs_pool().await;
     let job = test_job_for(42, "job-db", 0, 2);
     persist_started(&pool, &job).await.unwrap();
@@ -1878,71 +1797,95 @@ async fn search_job_db_roundtrip_keeps_snapshot_and_isolates_users() {
     // 跨用户不可见：与“不存在”同一结果，避免任务存在性泄露。
     assert!(db_get(&pool, 43, "job-db").await.unwrap().is_none());
 
-    let view = JobView {
-        books: vec![mk_book("剑来".into(), "https://x/1".into())],
-        errors: vec![],
-        done: true,
+    // 结果边搜边落库：不再写整份 snapshot_json。
+    let w = books_search_books::insert_batch(
+        &pool,
+        &job.id,
+        "k",
+        0,
+        vec![mk_book("k".into(), "https://x/1".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(w.added, 1);
+    let mut meta = job.meta();
+    meta.status = "done".into();
+    meta.finished_unix_ms = 123;
+    let counters = JobCounters {
         finished: 2,
         pending: 0,
         scheduled: 2,
         attempted: 2,
-        skipped: 0,
-        cancelled: 0,
+        result_count: w.added,
+        raw_count: w.candidates,
+        result_bytes: w.bytes_added,
+        ..Default::default()
     };
-    let mut meta = job.meta();
-    meta.status = "done".into();
-    meta.finished_unix_ms = 123;
-    persist_finished(&pool, &meta, &view).await.unwrap();
+    persist_finished(&pool, &meta, &counters).await.unwrap();
 
     let row = db_get(&pool, 42, "job-db").await.unwrap().unwrap();
     assert_eq!(row.status, "done");
-    assert!(row.snapshot_json.is_some());
-    let restored = row_view(&row);
-    assert_eq!(restored.books.len(), 1, "快照应可恢复结果");
-    assert_eq!(restored.books[0].book_url, "https://x/1");
-    assert!(restored.done);
+    assert!(row.snapshot_json.is_none(), "新任务不再写整份快照");
+    assert_eq!(row.result_count, 1);
+    assert_eq!(row.raw_count, 1);
+    // 结果行可恢复。
+    let (books, _) = books_search_books::load_page(&pool, "job-db", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(books.len(), 1);
+    assert_eq!(books[0].book_url, "https://x/1");
 
     let list = db_list(&pool, 42, 50).await.unwrap();
     assert_eq!(list.len(), 1);
 
+    // 删除任务必须同时删结果行（行表无外键级联）。
     assert!(db_delete(&pool, 42, "job-db").await.unwrap());
     assert!(db_get(&pool, 42, "job-db").await.unwrap().is_none());
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM search_job_books WHERE job_id = 'job-db'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "结果行应随任务一起删除");
     assert!(!db_delete(&pool, 42, "job-db").await.unwrap());
 }
 
 #[tokio::test]
-async fn load_job_lookup_falls_back_to_db_snapshot() {
+async fn load_job_lookup_falls_back_to_db_rows() {
     let pool = jobs_pool().await;
     let job = test_job_for(42, "job-lookup-db", 0, 0);
     persist_started(&pool, &job).await.unwrap();
-    let view = JobView {
-        books: vec![mk_book("剑来".into(), "https://x/1".into())],
-        errors: vec![],
-        done: true,
-        finished: 0,
-        pending: 0,
-        scheduled: 0,
-        attempted: 0,
-        skipped: 0,
-        cancelled: 0,
-    };
+    let w = books_search_books::insert_batch(
+        &pool,
+        &job.id,
+        "k",
+        0,
+        vec![mk_book("k".into(), "https://x/1".into())],
+    )
+    .await
+    .unwrap();
     let mut meta = job.meta();
     meta.status = "done".into();
-    persist_finished(&pool, &meta, &view).await.unwrap();
+    let counters = JobCounters {
+        result_count: w.added,
+        raw_count: w.candidates,
+        ..Default::default()
+    };
+    persist_finished(&pool, &meta, &counters).await.unwrap();
 
-    // 内存里没有这个任务（模拟进程重启 / 内存淘汰）：必须从数据库快照恢复。
-    match load_job_lookup(&pool, 42, "job-lookup-db")
+    // 内存里没有这个任务（模拟进程重启 / 内存淘汰）：必须从数据库恢复。
+    let lookup = load_job_lookup(&pool, 42, "job-lookup-db")
         .await
         .unwrap()
-        .expect("数据库快照")
-    {
-        JobLookup::Finished(done) => {
-            assert_eq!(done.meta.status, "done");
-            assert_eq!(done.view.books.len(), 1);
-            assert_eq!(done.view.books[0].book_url, "https://x/1");
-        }
-        JobLookup::Running(_) => panic!("已结束任务不应按 running 返回"),
-    }
+        .expect("数据库任务行");
+    assert_eq!(lookup.meta.status, "done");
+    assert!(!lookup.running, "已结束任务不应按 running 返回");
+    assert_eq!(lookup.counters.result_count, 1);
+    assert!(lookup.legacy_books.is_none(), "新任务没有旧快照");
+    let (books, _) = books_search_books::load_page(&pool, "job-lookup-db", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(books[0].book_url, "https://x/1");
     // 跨用户与不存在同一结果。
     assert!(load_job_lookup(&pool, 43, "job-lookup-db")
         .await
@@ -1962,20 +1905,9 @@ async fn mark_interrupted_only_touches_running_rows() {
     // 先收尾一个任务，确认不会被重启清理误改。
     let done_job = test_job_for(7, "done-1", 0, 0);
     persist_started(&pool, &done_job).await.unwrap();
-    let done_view = JobView {
-        books: vec![],
-        errors: vec![],
-        done: true,
-        finished: 0,
-        pending: 0,
-        scheduled: 0,
-        attempted: 0,
-        skipped: 0,
-        cancelled: 0,
-    };
     let mut done_meta = done_job.meta();
     done_meta.status = "done".into();
-    persist_finished(&pool, &done_meta, &done_view)
+    persist_finished(&pool, &done_meta, &JobCounters::default())
         .await
         .unwrap();
 
@@ -2026,18 +1958,18 @@ fn result_response_exposes_status_and_cancel_counts() {
     meta.key = "剑来".into();
     meta.status = "cancelled".into();
     meta.finished_unix_ms = 42;
-    let view = JobView {
-        books: vec![mk_book("剑来".into(), "https://x/1".into())],
-        errors: vec![],
-        done: true,
+    let counters = JobCounters {
         finished: 1,
         pending: 0,
         scheduled: 1,
         attempted: 1,
-        skipped: 0,
         cancelled: 1,
+        result_count: 1,
+        raw_count: 1,
+        ..Default::default()
     };
-    let v = build_result_response(&meta, view, 1, 30, None);
+    let books = vec![mk_book("剑来".into(), "https://x/1".into())];
+    let v = build_result_response(&meta, &counters, books, 1, 30, None);
     assert_eq!(v["status"], "cancelled");
     assert_eq!(v["done"], true);
     assert_eq!(v["cancelled_sources"], 1);

@@ -173,6 +173,8 @@ pub struct SearchQ {
     pub(super) sp: Option<i64>,
     /// 已创建的后台搜索任务：有值时渲染进度/结果，不再重新发起搜索。
     pub(super) job: Option<String>,
+    /// 结果页「显示更多结果」：推进首屏边界，把后台新入库的结果纳入当前集合。
+    pub(super) more: Option<String>,
     /// 搜索范围：`/k` 缺省 curated（首屏与预算更省）；显式 `?scope=all` 才走全量
     /// （由结果页的「用全部源搜索」链接升级）。
     pub(super) scope: Option<String>,
