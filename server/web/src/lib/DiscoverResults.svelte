@@ -143,7 +143,7 @@
       {:else if jobExpired}
         &nbsp;· 任务已过期，结果可能不完整
       {:else if sourceTotal}
-        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if skippedCount}（预算未完成 {skippedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
+        &nbsp;· 已完成 {completedSources} / 共 {sourceTotal} 个源{#if failedCount}（失败 {failedCount}）{/if}{#if skippedCount}（未执行 {skippedCount}）{/if}{#if searchDuration}&nbsp;· 用时 {searchDuration}s{/if}
       {/if}
       {#if sourceMode === 'curated' || (!sourceMode && requestedScope === 'curated')}
         &nbsp;· 精选源{#if scopeFiltered}（另有 {scopeFiltered} 个可搜索源未参与）{/if}
@@ -208,7 +208,7 @@
 {#if skippedCount || skippedSources.length}
   <details class="warn-box">
     <summary class="warn-title">
-      {skippedCount || skippedSources.length} 个书源因搜索总预算耗尽未完成{#if searching}（其余仍在搜索）{:else}，不算站点故障{/if}
+      {skippedCount || skippedSources.length} 个书源未执行{#if searching}（其余仍在搜索）{:else}（结果体积达到上限或未及执行），不算站点故障{/if}
     </summary>
     <div class="warn-items">
       {#each skippedSources as f}
@@ -274,7 +274,7 @@
     {#if failedSources.length || failedCount}
       <div class="empty">没有拿到结果，且有 {failedCount || failedSources.length} 个书源失败，原因见上方。<br />换关键词、稍后重试，或到「书源管理」检查这些书源。</div>
     {:else if skippedSources.length || skippedCount}
-      <div class="empty">没有拿到结果，且有 {skippedCount || skippedSources.length} 个源因搜索总预算耗尽未完成（不算站点故障）。<br />重试或稍后再搜即可。</div>
+      <div class="empty">没有拿到结果，且有 {skippedCount || skippedSources.length} 个源未执行（结果体积达到上限或未及执行，不算站点故障）。<br />重试或稍后再搜即可。</div>
     {:else if !jobExpired && !error}
       {#if sourceTotal === 0 || (sourcesReady && searchableCount === 0)}
         <div class="empty">当前还没有可用的书源，请先到「书源管理」导入并启用书源。<br /><button class="ghost" on:click={() => dispatch('goSources')}>去书源管理</button></div>

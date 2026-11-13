@@ -47,7 +47,7 @@ function num(v) {
  * 进度：已处理源 = 已完成 + 取消。
  *
  * 取消时后端把剩余源计入 cancelled（finished 不变），因此两者相加才是“已处理”。
- * skipped（预算耗尽）在收尾时也会累加 finished，不需要单独相加。
+ * skipped（结果体积到顶/未及执行）在收尾时也会累加 finished，不需要单独相加。
  */
 export function jobProgress(job) {
   const total = num(job && job.source_total);
@@ -68,7 +68,7 @@ export function jobProgressText(job) {
   if (failed > 0) parts.push(`失败 ${failed}`);
   if (cancelled > 0) parts.push(`取消 ${cancelled}`);
   const skipped = num(job && job.skipped);
-  if (skipped > 0) parts.push(`预算跳过 ${skipped}`);
+  if (skipped > 0) parts.push(`未执行 ${skipped}`);
   return parts.join(' · ');
 }
 

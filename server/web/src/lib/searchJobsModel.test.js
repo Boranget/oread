@@ -82,9 +82,9 @@ test('progress never exceeds 100% or goes negative', () => {
   assert.equal(jobProgress({ status: 'done', source_total: 0 }).percent, 100);
 });
 
-test('progress text reports failures and budget skips', () => {
-  assert.equal(jobProgressText(running), '30/100 源 · 失败 2 · 预算跳过 1');
-  assert.equal(jobProgressText(done), '100/100 源 · 失败 2 · 预算跳过 3');
+test('progress text reports failures and skipped sources', () => {
+  assert.equal(jobProgressText(running), '30/100 源 · 失败 2 · 未执行 1');
+  assert.equal(jobProgressText(done), '100/100 源 · 失败 2 · 未执行 3');
   const cancelled = { ...running, status: 'cancelled', finished: 30, cancelled: 70, failed: 0, skipped: 0 };
   assert.equal(jobProgressText(cancelled), '30/100 源 · 取消 70');
   assert.equal(jobProgressText({ status: 'done', source_total: 0 }), '没有可搜索的书源');

@@ -51,6 +51,9 @@
 
   // 分页 / 统计（均来自 /api/search/result，不再本地累加）
   let page = 1;
+  // keyset 游标栈：cursors[n] = 取第 n 页要带的 cursor（第 1 页为空，读实时结果）。
+  // 后端按 (score, seq) 翻页，游标由上一页的 next_cursor 给出，禁止前端自算偏移。
+  let cursors = [];
   const PER_PAGE = 30;
   let hasMore = false;
   let total = 0;
@@ -77,7 +80,7 @@
   let curatedTotal = 0;
   let failedCount = 0;
   let failedSources = []; // [{ name, reason }]
-  let skippedCount = 0; // 全局预算耗尽导致未执行/未完成的源
+  let skippedCount = 0; // 结果体积到顶/取消导致未执行、未完成的源
   let skippedSources = []; // [{ name, reason }]
   let resultsPage = 1; // 当前卡片实际对应的页码，过期时回退显示
 
@@ -120,7 +123,7 @@
   // 书架状态（用于“已加入”标记）
   let shelfIds = new Set();
 
-  // 已完成源 = 已结束 - 失败 - 预算未完成（两者也计入 finished）
+  // 已完成源 = 已结束 - 失败 - 未执行（两者也计入 finished）
   $: completedSources = Math.max(0, finishedSources - failedCount - skippedCount);
 
   onMount(async () => {
@@ -204,11 +207,17 @@
     }, delay);
   }
 
-  function applyResult(r) {
+  function applyResult(r, pageNo = page) {
     // 同一 job 同一页的最新快照：轮询期间只替换数组内容，不清空，避免闪回空态
     // 失败源重试的新增结果按 book_url 去重后附在列表尾部，翻页时也会重新附加
     results = dedupeByUrl((r.books || []).concat(retryExtra));
-    resultsPage = page;
+    resultsPage = pageNo;
+    // 记录下一页游标；没有更多时清掉残留，避免回到旧游标。
+    if (r.has_more && r.next_cursor) {
+      cursors[pageNo + 1] = r.next_cursor;
+    } else {
+      cursors.splice(pageNo + 1);
+    }
     total = Number.isFinite(Number(r.total)) ? Number(r.total) : results.length;
     hasMore = !!r.has_more;
     sourceTotal = Number(r.source_total) || sourceTotal;
@@ -275,14 +284,21 @@
 
   async function fetchPage(seq, pageNo) {
     if (seq !== jobSeq || !jobId) return;
+    const cursor = pageNo > 1 ? cursors[pageNo] : undefined;
+    if (pageNo > 1 && !cursor) return;
     cancelPolling();
     const ctrl = new AbortController();
     inflight = { ctrl, seq, page: pageNo };
     try {
-      const r = await api.searchResult(jobId, pageNo, PER_PAGE, ctrl.signal);
+      const r = await api.searchResult(jobId, {
+        page: pageNo,
+        pageSize: PER_PAGE,
+        cursor,
+        signal: ctrl.signal,
+      });
       if (seq !== jobSeq || pageNo !== page) return;
       pollFailures = 0;
-      applyResult(r);
+      applyResult(r, pageNo);
       if (searchDone) {
         finishJob();
         return;
@@ -336,6 +352,7 @@
     retryExtra = [];
     page = 1;
     resultsPage = 1;
+    cursors = [];
     results = []; // 新 job 属于新查询，清空旧结果
     total = 0;
     hasMore = false;
@@ -436,10 +453,37 @@
       if (seq !== retrySeq) return;
       const jid = String(r.job_id || '');
       if (!jid) throw new Error('后端未返回 job_id');
-      let p = 1;
-      let pages = 0;
-      while (seq === retrySeq) {
-        const rr = await api.searchResult(jid, p, PER_PAGE);
+      // 先轮询首屏直到结束（首屏不传 cursor：运行中持续更新）；
+      // 结束后再用 keyset 游标补后续页，最多再取 4 页，避免异常源拖住界面。
+      let rr = await api.searchResult(jid, { pageSize: PER_PAGE });
+      while (seq === retrySeq && !rr.done) {
+        collected = collected.concat((rr.books || []).map((b) => ({ ...b, retry: true })));
+        lastErrors = Array.isArray(rr.errors)
+          ? rr.errors.map((e) => ({
+              name: e.source_name || e.source || '未知书源',
+              reason: describeSourceError(e.error),
+              url: e.source || '',
+              kind: e.kind || 'site',
+            }))
+          : [];
+        await new Promise((res) => setTimeout(res, 500));
+        if (seq !== retrySeq) return;
+        rr = await api.searchResult(jid, { pageSize: PER_PAGE });
+      }
+      if (seq !== retrySeq) return;
+      collected = collected.concat((rr.books || []).map((b) => ({ ...b, retry: true })));
+      lastErrors = Array.isArray(rr.errors)
+        ? rr.errors.map((e) => ({
+            name: e.source_name || e.source || '未知书源',
+            reason: describeSourceError(e.error),
+            url: e.source || '',
+            kind: e.kind || 'site',
+          }))
+        : [];
+      let pages = 1;
+      let cursor = rr.next_cursor;
+      while (seq === retrySeq && rr.has_more && cursor && pages < 5) {
+        rr = await api.searchResult(jid, { pageSize: PER_PAGE, cursor });
         if (seq !== retrySeq) return;
         collected = collected.concat((rr.books || []).map((b) => ({ ...b, retry: true })));
         lastErrors = Array.isArray(rr.errors)
@@ -450,16 +494,8 @@
               kind: e.kind || 'site',
             }))
           : [];
+        cursor = rr.next_cursor;
         pages += 1;
-        if (rr.done) {
-          // 失败源也可能返回多页；最多再取 4 页，避免异常源拖住界面
-          if (rr.has_more && pages < 5) {
-            p += 1;
-            continue;
-          }
-          break;
-        }
-        await new Promise((res) => setTimeout(res, 500));
       }
       if (seq !== retrySeq) return;
       const seen = new Set(results.map((b) => b.book_url));
@@ -531,6 +567,7 @@
     jobStatus = String(job.status || '');
     page = 1;
     resultsPage = 1;
+    cursors = [];
     results = [];
     total = 0;
     hasMore = false;
@@ -612,6 +649,7 @@
         error = '';
         page = 1;
         resultsPage = 1;
+        cursors = [];
         searchElapsed = 0;
         searchDuration = 0;
         searchStartedAt = 0;
@@ -623,10 +661,11 @@
     }
   }
 
-  // 翻页复用同一个 job_id，不新建 job
+  // 翻页复用同一个 job_id，不新建 job；用上一页返回的 keyset 游标取下一页。
   async function changePage(target) {
     if (!jobId || jobExpired || paging || target < 1) return;
     if (target > page && !hasMore) return;
+    if (target > 1 && !cursors[target]) return;
     const prevPage = page;
     page = target;
     paging = true;
@@ -637,9 +676,13 @@
     }
     const seq = jobSeq;
     try {
-      const r = await api.searchResult(jobId, target, PER_PAGE);
+      const r = await api.searchResult(jobId, {
+        page: target,
+        pageSize: PER_PAGE,
+        cursor: cursors[target],
+      });
       if (seq !== jobSeq || target !== page) return;
-      applyResult(r);
+      applyResult(r, target);
     } catch (e) {
       if (seq !== jobSeq) return;
       if (e && e.status === 404) {
@@ -700,6 +743,7 @@
     searched = false;
     error = '';
     page = 1;
+    cursors = [];
     requestSourceCount = 0;
     ignoredSourceIds = [];
   }

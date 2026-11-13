@@ -341,10 +341,17 @@ export const api = {
       undefined,
       { timeout: 20000 }
     ),
-  searchResult: (jobId, page = 1, pageSize = 30, signal) =>
+  // 翻页用 keyset 游标：`cursor` 来自上一页的 `next_cursor`，不要自己拼 OFFSET。
+  // 只有第一页（首屏）不传 cursor，轮询时持续读实时结果。
+  searchResult: (jobId, { page = 1, pageSize = 30, cursor, signal } = {}) =>
     request(
       'GET',
-      `/search/result?${buildQuery({ job_id: jobId, page, page_size: pageSize })}`,
+      `/search/result?${buildQuery({
+        job_id: jobId,
+        page,
+        page_size: pageSize,
+        cursor: cursor || undefined,
+      })}`,
       undefined,
       { timeout: 15000, signal }
     ),
