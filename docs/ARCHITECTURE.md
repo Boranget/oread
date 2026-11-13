@@ -77,6 +77,7 @@ GET /api/book/content
 ## 6. `/k` 与 SPA 的边界
 
 - `/k`、`/k/toc`、`/k/read`、`/k/search`、`/k/login`、`/k/logout`、`/k/_selftest` 是服务端渲染的 HTML（`table` 布局、ES5 友好），**不含业务 JS**。
+- `/k/search?key=...` 只创建后台搜索任务并 303 到 `/k/search?job=...`：运行中渲染带 `<meta http-equiv="refresh">` 的进度页（2 秒），完成后从任务快照本地分页。翻页链接只带 `job`，与 SPA 共用同一套 `search_jobs` 元数据、调度和证据；离开页面任务继续跑，进程重启后仍可读数据库快照。
 - 仅有三类诊断脚本按需注入：错误兜底 `K_GUARD_JS`、视口标定 `K_VP_JS`、自报探针 `K_PROBE_JS`；它们只打点，不改变阅读行为。
 - Kindle/Silk UA 访问 `/` 会被 303 到 `/k`；`/k` 埋点写 `DATA_DIR/logs/k-metrics-*.jsonl`。
 

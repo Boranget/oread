@@ -135,6 +135,19 @@ pub(super) fn page(title: &str, fs: usize, body: &str, vp: Vp) -> Response {
     page_css(title, fs, body, "", vp)
 }
 
+/// 带 `<meta http-equiv="refresh">` 的页面：`/k` 搜索中页用它做无 JS 轮询。
+/// 只刷新当前 URL，不改变查询参数，因此不会重复创建任务。
+pub(super) fn page_refresh(title: &str, fs: usize, body: &str, vp: Vp, secs: u64) -> Response {
+    let html = page_html_css(title, fs, body, "", vp);
+    let meta = format!("<meta http-equiv=\"refresh\" content=\"{secs}\">");
+    let html = html.replacen("<head>", &format!("<head>{meta}"), 1);
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(axum::body::Body::from(html))
+        .expect("html response")
+}
+
 pub(super) fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> Response {
     let html = page_html_css(title, fs, body, extra_css, vp);
     axum::http::Response::builder()

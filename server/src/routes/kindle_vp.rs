@@ -108,14 +108,11 @@ pub(super) const fn para_gap_px(line: usize) -> usize {
 pub(super) fn toc_page_size(vp: Vp) -> usize {
     ((vp.nav_h().saturating_sub(BAR_H)) / 72).clamp(1, K_TOC_PAGE / K_TOC_COLS) * K_TOC_COLS
 }
-/// 搜索结果每页条数 = （正文区 − 表单 88 − 翻页条 64）/ 112；有回退说明/升级按钮时再少一条。
-pub(super) fn search_page_size(vp: Vp, extra_row: bool) -> usize {
+/// 搜索结果每页条数 = （正文区 − 表单 88 − 翻页条 64）/ 112；
+/// `extra_rows` 是状态提示/回退说明/升级按钮额外占用的行数。
+pub(super) fn search_page_size_extra(vp: Vp, extra_rows: usize) -> usize {
     let base = ((vp.nav_h().saturating_sub(BAR_H + 88)) / 112).clamp(1, K_SEARCH_PAGE);
-    if extra_row {
-        base.saturating_sub(1).max(1)
-    } else {
-        base
-    }
+    base.saturating_sub(extra_rows).max(1)
 }
 /// 目录每页章节数上限：两列各 15 行 × 72px = 1080（实际行数按可用高实算）
 pub(super) const K_TOC_PAGE: usize = 30;

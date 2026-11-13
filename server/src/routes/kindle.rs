@@ -50,7 +50,7 @@ use crate::routes::books::{
 use crate::routes::bookshelf::{record_progress, SHELF_LIST_SQL};
 use crate::routes::image;
 use crate::routes::replace;
-use crate::routes::sources::{load_source, load_sources};
+use crate::routes::sources::load_source;
 use crate::routes::AppState;
 use crate::web_book;
 
@@ -171,8 +171,10 @@ pub struct SearchQ {
     pub(super) key: Option<String>,
     pub(super) fs: Option<i64>,
     pub(super) sp: Option<i64>,
-    /// 搜索范围：`/k` 缺省 curated（服务端渲染必须等整批，KPW3 首屏要快）；
-    /// 显式 `?scope=all` 才走全量（由页面上的「用全部源搜索」链接升级）。
+    /// 已创建的后台搜索任务：有值时渲染进度/结果，不再重新发起搜索。
+    pub(super) job: Option<String>,
+    /// 搜索范围：`/k` 缺省 curated（首屏与预算更省）；显式 `?scope=all` 才走全量
+    /// （由结果页的「用全部源搜索」链接升级）。
     pub(super) scope: Option<String>,
     /// 是否包含冷却中的源：缺省 0；验收/对拍时可显式 1。
     pub(super) include_cooled: Option<String>,

@@ -13,6 +13,38 @@ fn k_scope_defaults_to_curated() {
     assert_eq!(k_scope(Some("ENHANCED")), crate::req::SearchScope::All);
 }
 
+/// 搜索中页：自动刷新、进度计数、任务/冷却参数都要保留。
+#[tokio::test]
+async fn search_progress_page_refreshes_and_keeps_job_context() {
+    let p = crate::routes::books::JobProgress {
+        key: "诡秘之主".into(),
+        source_total: 12,
+        finished: 3,
+        pending: 9,
+        skipped: 1,
+        cancelled: 0,
+        failed: 1,
+    };
+    let res = progress_page("job-1", &p, true, 2, false, vp());
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("http-equiv=\"refresh\""),
+        "进度页必须自动刷新: {html}"
+    );
+    assert!(html.contains("已完成 3 / 12 个源"), "缺少进度: {html}");
+    assert!(html.contains("进行中 9 个"), "缺少进行中: {html}");
+    assert!(html.contains("失败 1 个"), "缺少失败数: {html}");
+    assert!(html.contains("跳过 1 个"), "缺少跳过数: {html}");
+    assert!(html.contains("job=job-1"), "链接必须保留任务: {html}");
+    assert!(
+        html.contains("include_cooled=1"),
+        "链接必须保留冷却参数: {html}"
+    );
+}
+
 /// 默认 KPW3 视口（1072×1268）：所有历史几何断言都以它为基准。
 fn vp() -> Vp {
     Vp::default()
@@ -583,11 +615,11 @@ fn list_pages_fit_inside_stage_at_reference_viewports() {
     let v = vp();
     assert_eq!((v.nav_h(), v.shelf_layout()), (1195, (10, 112)));
     assert_eq!(toc_page_size(v), 30);
-    assert_eq!(search_page_size(v, false), 9);
+    assert_eq!(search_page_size_extra(v, 0), 9);
     let s = vps(1024, 1200);
     assert_eq!((s.nav_h(), s.shelf_layout()), (1127, (10, 106)));
     assert_eq!(toc_page_size(s), 28);
-    assert_eq!(search_page_size(s, false), 8);
+    assert_eq!(search_page_size_extra(s, 0), 8);
     for vp in [v, s] {
         let (pp, rh) = vp.shelf_layout();
         assert!(pp * rh + BAR_H <= vp.nav_h(), "书架列表溢出正文区");
@@ -597,13 +629,24 @@ fn list_pages_fit_inside_stage_at_reference_viewports() {
         );
         let t = toc_page_size(vp);
         assert!(t / K_TOC_COLS * 72 + BAR_H <= vp.nav_h(), "目录溢出");
-        let q = search_page_size(vp, false);
+        let q = search_page_size_extra(vp, 0);
         assert!(q * 112 + BAR_H + 88 <= vp.nav_h(), "搜索结果溢出");
     }
     // 极矮视口：行高触底后减少每页本数，绝不溢出
     let tiny = vps(1072, 600);
     let (pp, rh) = tiny.shelf_layout();
     assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
+}
+
+/// 搜索页状态提示/回退说明/升级按钮各占一行：每多一行就少放一条结果，且至少保留 1 条。
+#[test]
+fn search_page_size_extra_reserves_note_rows() {
+    let v = vp();
+    let base = search_page_size_extra(v, 0);
+    assert_eq!(base, 9);
+    assert_eq!(search_page_size_extra(v, 1), base - 1);
+    assert_eq!(search_page_size_extra(v, 2), base - 2);
+    assert_eq!(search_page_size_extra(v, 99), 1, "不能扣到 0 条");
 }
 
 /// 一屏一页：文档高 = 请求带回的运行时可用高，正文区写死「文档高 − 顶栏 − 底栏」并

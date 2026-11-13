@@ -125,9 +125,11 @@ loop {
 
 ### 6.1 批量入口为什么不走 anytime
 
-`/api/search`、`/api/search/aggregate` 与 `/k/search` 共用 `aggregated()`（60s 缓存 + 本地分页），语义是**一次返回完整聚合结果**：翻页要基于同一份快照，不能因为早停让第 2 页比第 1 页少。因此这条路径保留 `join_all` 式的一次性并发，不接 anytime 调度，冷启动 `scope=all` 会跑满整批预算。
+`/api/search` 与 `/api/search/aggregate` 仍共用 `aggregated()`（60s 缓存 + 本地分页），语义是**一次返回完整聚合结果**：翻页要基于同一份快照，不能因为早停让第 2 页比第 1 页少。因此这条路径保留 `join_all` 式的一次性并发，不接 anytime 调度，冷启动 `scope=all` 会跑满整批预算。
 
-但**证据口径必须与 job 一致**：缓存未命中时，`search_all_scoped_evidenced` 会把逐源结果一并返回，`aggregated()` 再调用 `record_outcomes` 写 `source_health` 与 `source_query_stats`。规则与第 6 节相同——只有真实发出请求的源才写；超时 = 未知（`partial` + `usage=false`）；`truncated`/`skipped` 不写健康；命中 60s 缓存不重复计一次搜索。这样从 Kindle 或旧 API 发起的搜索也会积累优先级证据，不会永远「只读不写」。
+`/k/search` 已改为**创建后台搜索任务**（与两段式 job 共用 `create_search_job` / `run_search_job`）：首请求只落库并 303 到 `/k/search?job=...`，运行中每 2 秒刷新进度页，完成后从任务快照本地分页；翻页只带 `job`，不再重新解析源集合、不重新搜索，也不受 60s 聚合缓存过期、源健康变化或进程重启影响。
+
+但**证据口径必须与 job 一致**：缓存未命中时，`search_all_scoped_evidenced` 会把逐源结果一并返回，`aggregated()` 再调用 `record_outcomes` 写 `source_health` 与 `source_query_stats`。规则与第 6 节相同——只有真实发出请求的源才写；超时 = 未知（`partial` + `usage=false`）；`truncated`/`skipped` 不写健康；命中 60s 缓存不重复计一次搜索。这样从旧 API 发起的搜索也会积累优先级证据，不会永远「只读不写」。
 
 边界：整批预算约束的是「取新源」与单源 HTTP 等待，**不取消已在飞的同步解析**。极端大页面下响应会略超预算（实测 40s 预算 / 43s；冷启动后首个重查询偶见 50–60s+）。两段式 job 也有同样的尾部，但它逐源 flush，用户会更早看到结果；批量入口只能整份返回，因此超时尾部更明显。要彻底消除需要把解析移出可取消的异步路径（`spawn_blocking` + 丢弃结果）或限制单页解析规模，属于独立改动。
 

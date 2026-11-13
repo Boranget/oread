@@ -10,6 +10,19 @@ pub(super) fn search_phase(pending: usize) -> &'static str {
     }
 }
 
+/// 对外状态：收尾窗口（pending 归零、status 还没写）按真实结束态回显。
+pub(super) fn effective_status(meta: &JobMeta, done: bool, cancelled: usize) -> String {
+    if meta.status == "running" && done {
+        if cancelled > 0 {
+            "cancelled".to_string()
+        } else {
+            "done".to_string()
+        }
+    } else {
+        meta.status.clone()
+    }
+}
+
 /// 是否属于“全局预算耗尽”导致的未完成（不写健康、不算站点失败）。
 pub(super) fn is_budget_skip(kind: &str) -> bool {
     matches!(kind, "truncated" | "skipped")
@@ -40,19 +53,40 @@ pub(super) fn cursor_of(b: &SearchBook) -> Option<String> {
         .map(|(bucket, seq)| format!("{bucket}:{seq}"))
 }
 
-pub(super) async fn search_start(
-    State(s): State<AppState>,
-    u: AuthUser,
-    db: UserDb,
-    Query(q): Query<SearchQ>,
-) -> AppResult<Json<serde_json::Value>> {
-    let key = q.keyword();
-    if key.is_empty() {
-        return Err(AppError::BadRequest("key（或别名 q）不能为空".into()));
-    }
+/// 创建任务后的内部句柄：`search_start` 需要回显源过滤结果，`/k` 只需要 job_id。
+pub(super) struct StartedSearchJob {
+    pub(super) job: Arc<SearchJob>,
+    pub(super) plan: SearchSourcePlan,
+}
+
+/// 任务创建参数：把「搜什么、用哪些源、怎么退化」打包，避免入口函数参数过长。
+pub(super) struct SearchJobRequest {
+    pub(super) key: String,
+    pub(super) scope: crate::req::SearchScope,
+    pub(super) include_cooled: bool,
+    pub(super) requested: Vec<String>,
+    pub(super) curated_missing: CuratedMissingFallback,
+}
+
+/// 统一的任务创建入口：`/api/search/start` 与 `/k/search` 共用同一套源过滤、
+/// 并发上限、落库与后台调度。`curated_missing` 保留两个入口的退化差异：
+/// `/api` 退全量、`/k` 退 preferred（保住 KPW3 首屏耗时）。
+pub(super) async fn create_search_job(
+    s: &AppState,
+    uid: i64,
+    user_db: &SqlitePool,
+    req: SearchJobRequest,
+) -> AppResult<StartedSearchJob> {
+    let SearchJobRequest {
+        key,
+        scope,
+        include_cooled,
+        requested,
+        curated_missing,
+    } = req;
     // 单用户并发上限：每个任务持有整份书源快照 + 结果缓冲，放任并发会打爆低配设备内存。
     // 前端任务面板可取消旧任务，因此这里直接拒绝而不是排队（避免“点了没反应”）。
-    if active_jobs_for_user(u.id) >= SEARCH_JOB_MAX_ACTIVE_PER_USER {
+    if active_jobs_for_user(uid) >= SEARCH_JOB_MAX_ACTIVE_PER_USER {
         return Err(AppError::BadRequest(format!(
             "同时运行的搜索任务已达 {} 个，请先在「搜索任务」里取消不需要的任务",
             SEARCH_JOB_MAX_ACTIVE_PER_USER
@@ -62,16 +96,14 @@ pub(super) async fn search_start(
     crate::routes::sources::sort_sources(&mut sources);
     // 精选防腐化：距上次体检超过 72h 时，后台重跑一次（不阻塞本次搜索）。
     crate::source_bench::maybe_schedule_stale_bench(s.shared.clone(), &s.cfg);
-    let requested = parse_source_ids(q.source_ids.as_deref());
-    let include_cooled = truthy(q.include_cooled.as_deref());
     let plan = resolve_search_sources(
         &s.shared,
         sources,
         &requested,
         &key,
-        q.scope(),
+        scope,
         include_cooled,
-        CuratedMissingFallback::All,
+        curated_missing,
     )
     .await;
     let enabled = plan.active.clone();
@@ -80,7 +112,7 @@ pub(super) async fn search_start(
     let id = next_job_id();
     let job = Arc::new(SearchJob {
         id: id.clone(),
-        uid: u.id,
+        uid,
         key: key.clone(),
         at: Instant::now(),
         created_unix_ms: unix_ms(),
@@ -114,6 +146,7 @@ pub(super) async fn search_start(
             target: "search_job",
             job_id = %job.id,
             created_unix_ms = job.created_unix_ms,
+            candidate_total = plan.source_total,
             source_total = job.source_total,
             scope = job.scope.as_str(),
             source_mode = job.source_mode.as_str(),
@@ -125,20 +158,52 @@ pub(super) async fn search_start(
         );
     }
     tokio::spawn(run_search_job(
-        job,
+        job.clone(),
         enabled,
         key,
         s.shared.clone(),
-        db.0.clone(),
+        user_db.clone(),
         Arc::new(web_book::BookStore::new()),
         s.cfg.source_cooldown_secs,
         crate::source_quality::TierConfig::from_config(&s.cfg),
-        plan.health,
-        plan.prior,
+        plan.health.clone(),
+        plan.prior.clone(),
         effective,
     ));
+    Ok(StartedSearchJob { job, plan })
+}
+
+pub(super) async fn search_start(
+    State(s): State<AppState>,
+    u: AuthUser,
+    db: UserDb,
+    Query(q): Query<SearchQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let key = q.keyword();
+    if key.is_empty() {
+        return Err(AppError::BadRequest("key（或别名 q）不能为空".into()));
+    }
+    let requested = parse_source_ids(q.source_ids.as_deref());
+    let include_cooled = truthy(q.include_cooled.as_deref());
+    let started = create_search_job(
+        &s,
+        u.id,
+        &db.0,
+        SearchJobRequest {
+            key,
+            scope: q.scope(),
+            include_cooled,
+            requested,
+            curated_missing: CuratedMissingFallback::All,
+        },
+    )
+    .await?;
+    let job = &started.job;
+    let plan = &started.plan;
+    let source_total = job.source_total;
+    let effective = job.scope;
     Ok(Json(json!({
-        "job_id": id,
+        "job_id": &job.id,
         "scope": effective.as_str(),
         "coverage": plan.coverage,
         "source_mode": plan.source_mode,
@@ -155,8 +220,8 @@ pub(super) async fn search_start(
         "attempted_sources": 0,
         "pending_sources": source_total,
         // 契约：显式回显过滤结果，区分「用户指定」与「被 scope 过滤」
-        "source_ids_requested": plan.requested,
-        "ignored_source_ids": plan.ignored,
+        "source_ids_requested": &plan.requested,
+        "ignored_source_ids": &plan.ignored,
         "warning": (!plan.ignored.is_empty())
             .then(|| format!("已忽略无效书源 id：{}", plan.ignored.join(", "))),
         // 冷却：默认跳过冷却中的源；include_cooled=1 时全部参与
@@ -164,6 +229,31 @@ pub(super) async fn search_start(
         "skipped_cooldown": plan.skipped_cooldown,
         "cooldown_total": plan.cooldown_total,
     })))
+}
+
+/// `/k` 的入口：只返回 job_id，由调用方 303 到进度/结果页。
+pub(crate) async fn start_kindle_search_job(
+    s: &AppState,
+    uid: i64,
+    user_db: &SqlitePool,
+    key: String,
+    scope: crate::req::SearchScope,
+    include_cooled: bool,
+) -> AppResult<String> {
+    let started = create_search_job(
+        s,
+        uid,
+        user_db,
+        SearchJobRequest {
+            key,
+            scope,
+            include_cooled,
+            requested: Vec::new(),
+            curated_missing: CuratedMissingFallback::Preferred,
+        },
+    )
+    .await?;
+    Ok(started.job.id.clone())
 }
 
 /// 任务不存在（或不属于当前用户）的统一文案：不区分两种情况，避免泄露任务是否存在。
@@ -200,15 +290,7 @@ pub(super) fn build_result_response(
     };
     // 收尾窗口：pending 已归零但任务还没执行到写 status 的那一步（0 源任务尤其明显）。
     // 对外按“没有剩余工作”的真实状态回显，避免前端看到 done=true 却仍是 running。
-    let status = if meta.status == "running" && done {
-        if cancelled > 0 {
-            "cancelled"
-        } else {
-            "done"
-        }
-    } else {
-        meta.status.as_str()
-    };
+    let status = effective_status(meta, done, cancelled);
     // 客户端响应边界：只保留书名包含关键词的条目。
     // 过滤发生在去重/排序之后，不改变打分、精选与源健康（健康统计用源原始命中数）。
     let (full, title_filter) = crate::title_filter::retain_title_matches(raw_books, &meta.key);
@@ -363,6 +445,90 @@ pub(super) async fn search_result(
     Ok(Json(build_result_response(
         &meta, view, page, page_size, cursor,
     )))
+}
+
+/// 已结束任务的完整快照（装箱，避免与轻量进度变体尺寸悬殊）。
+pub(crate) struct FinishedJob {
+    pub(crate) meta: JobMeta,
+    pub(crate) view: JobView,
+}
+
+/// `/k` 的任务读取结果。
+pub(crate) enum JobLookup {
+    /// 仍在跑：只带轻量进度，不克隆/排序结果。
+    Running(JobProgress),
+    /// 已结束：完整元数据 + 结果快照。
+    Finished(Box<FinishedJob>),
+}
+
+/// `/k` 的任务读取：内存优先，过期后回退数据库快照；跨用户与不存在都返回 `None`
+/// （调用方统一给出「任务不存在或已过期」）。
+///
+/// 内存任务始终读实时结果（`job_view`），不使用可能被 SPA 提前冻结的部分快照：
+/// `/k` 只在任务结束后渲染结果，实时视图已是最终结果，且不会受其他入口影响。
+pub(crate) async fn load_job_lookup(
+    pool: &SqlitePool,
+    uid: i64,
+    job_id: &str,
+) -> AppResult<Option<JobLookup>> {
+    if let Some(job) = find_job(job_id) {
+        if job.uid != uid {
+            tracing::warn!(
+                target: "search_job",
+                job_id = %job_id,
+                owner = job.uid,
+                requester = uid,
+                reason = "uid_mismatch",
+                "search job lookup 404"
+            );
+            return Ok(None);
+        }
+        let mut meta = job.meta();
+        if meta.status == "running" {
+            // pending 归零但 status 还没写：按结束处理，避免 /k 永远显示“搜索中”。
+            if job_pending(&job) != Some(0) {
+                return Ok(Some(JobLookup::Running(job_progress(&job))));
+            }
+            let view = job_view(&job);
+            meta.status = effective_status(&meta, view.done, view.cancelled);
+            return Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
+                meta,
+                view,
+            }))));
+        }
+        let view = job_view(&job);
+        return Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
+            meta,
+            view,
+        }))));
+    }
+
+    let Some(row) = db_get(pool, uid, job_id).await? else {
+        tracing::warn!(
+            target: "search_job",
+            job_id = %job_id,
+            requester = uid,
+            reason = "not_in_memory_or_db",
+            "search job lookup 404"
+        );
+        return Ok(None);
+    };
+    let mut meta = row_meta(&row);
+    let mut view = row_view(&row);
+    if meta.status == "running" {
+        // 内存里没有、数据库却仍是 running：进程重启遗留或内存淘汰，按中断处理。
+        meta.status = "interrupted".into();
+        view.done = true;
+    }
+    Ok(Some(JobLookup::Finished(Box::new(FinishedJob {
+        meta,
+        view,
+    }))))
+}
+
+/// 结果快照 → 书名过滤后的完整列表（`/k` 本地分页用）。
+pub(crate) fn filtered_job_books(meta: &JobMeta, view: &JobView) -> Vec<SearchBook> {
+    crate::title_filter::retain_title_matches(view.books.clone(), &meta.key).0
 }
 
 /// 数据库行 → 结果元数据（字段口径与内存任务一致）。

@@ -1911,6 +1911,46 @@ async fn search_job_db_roundtrip_keeps_snapshot_and_isolates_users() {
 }
 
 #[tokio::test]
+async fn load_job_lookup_falls_back_to_db_snapshot() {
+    let pool = jobs_pool().await;
+    let job = test_job_for(42, "job-lookup-db", 0, 0);
+    persist_started(&pool, &job).await.unwrap();
+    let view = JobView {
+        books: vec![mk_book("剑来".into(), "https://x/1".into())],
+        errors: vec![],
+        done: true,
+        finished: 0,
+        pending: 0,
+        scheduled: 0,
+        attempted: 0,
+        skipped: 0,
+        cancelled: 0,
+    };
+    let mut meta = job.meta();
+    meta.status = "done".into();
+    persist_finished(&pool, &meta, &view).await.unwrap();
+
+    // 内存里没有这个任务（模拟进程重启 / 内存淘汰）：必须从数据库快照恢复。
+    match load_job_lookup(&pool, 42, "job-lookup-db")
+        .await
+        .unwrap()
+        .expect("数据库快照")
+    {
+        JobLookup::Finished(done) => {
+            assert_eq!(done.meta.status, "done");
+            assert_eq!(done.view.books.len(), 1);
+            assert_eq!(done.view.books[0].book_url, "https://x/1");
+        }
+        JobLookup::Running(_) => panic!("已结束任务不应按 running 返回"),
+    }
+    // 跨用户与不存在同一结果。
+    assert!(load_job_lookup(&pool, 43, "job-lookup-db")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn mark_interrupted_only_touches_running_rows() {
     let pool = jobs_pool().await;
     persist_started(&pool, &test_job_for(7, "running-1", 0, 3))

@@ -597,6 +597,120 @@ async fn kindle_redirects_to_login_without_session() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `/k` 搜索必须走后台任务：首请求 303 到 `job=`，任务页从快照渲染，
+/// 完成后不再自动刷新，且翻页/字号链接都保留 job，避免每次翻页重新搜索。
+#[tokio::test]
+async fn kindle_search_creates_job_and_renders_snapshot() {
+    let (app, _pool, dir) = test_app("kindle-search-job").await;
+    let username = "ksearch";
+    register(&app, username).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/k/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "username={username}&password=secret123"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .expect("登录应写入 k_session")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(cookie.starts_with("k_session="), "cookie: {cookie}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/k/search?key=abc")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("搜索应 303 到任务页")
+        .to_string();
+    assert!(
+        location.starts_with("/k/search?job="),
+        "首请求应创建任务: {location}"
+    );
+
+    // 空库没有可搜索的源：任务立即完成，任务页应直接渲染快照结论。
+    let mut last = String::new();
+    let mut rendered = false;
+    for _ in 0..20 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        last = String::from_utf8_lossy(&bytes).to_string();
+        if last.contains("当前没有可搜索的源") {
+            rendered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(rendered, "任务页未渲染结果快照: {last}");
+    assert!(
+        !last.contains("http-equiv=\"refresh\""),
+        "任务完成后不应继续自动刷新"
+    );
+    assert!(last.contains("job="), "任务页链接必须保留 job 参数: {last}");
+
+    // 不存在的任务必须走共享库查询并给出明确文案（而不是数据库错误页）。
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/k/search?job=missing-job")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(
+        html.contains("搜索任务不存在或已过期"),
+        "不存在的任务应给出过期文案: {html}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 目录/正文冒烟用的固定抓取实现：不联网，按 URL 返回 fixture HTML。
 struct MockFetcher {
     /// 正文 URL（/c1）被真实抓取的次数，用于验证 single-flight 合并。

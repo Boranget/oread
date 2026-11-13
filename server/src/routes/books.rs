@@ -192,8 +192,11 @@ use books_content::*;
 mod books_store;
 use books_store::*;
 
-pub(crate) use books_search_api::aggregated;
+pub(crate) use books_search_api::{
+    filtered_job_books, load_job_lookup, start_kindle_search_job, JobLookup,
+};
 pub(crate) use books_search_job::searches_active;
+pub(crate) use books_search_job::{JobMeta, JobProgress, JobView};
 pub(crate) use books_search_source::{
     is_searchable_source, order_by_health, resolve_search_sources, CuratedMissingFallback,
 };

@@ -110,22 +110,50 @@ impl SearchJob {
 
 /// 结果接口需要的任务元数据：内存任务与数据库快照共用同一份响应组装。
 #[derive(Debug, Clone)]
-pub(super) struct JobMeta {
-    pub(super) id: String,
-    pub(super) uid: i64,
-    pub(super) key: String,
-    pub(super) scope: crate::req::SearchScope,
-    pub(super) source_mode: String,
-    pub(super) coverage: String,
-    pub(super) curated_total: usize,
-    pub(super) source_total: usize,
+pub(crate) struct JobMeta {
+    pub(crate) id: String,
+    pub(crate) uid: i64,
+    pub(crate) key: String,
+    pub(crate) scope: crate::req::SearchScope,
+    pub(crate) source_mode: String,
+    pub(crate) coverage: String,
+    pub(crate) curated_total: usize,
+    pub(crate) source_total: usize,
     /// 精选收缩排除掉的可搜索源数量（显式源为 0）。
-    pub(super) scope_filtered: usize,
-    pub(super) skipped_cooldown: usize,
-    pub(super) cooldown_total: usize,
-    pub(super) status: String,
-    pub(super) created_unix_ms: u64,
-    pub(super) finished_unix_ms: u64,
+    pub(crate) scope_filtered: usize,
+    pub(crate) skipped_cooldown: usize,
+    pub(crate) cooldown_total: usize,
+    pub(crate) status: String,
+    pub(crate) created_unix_ms: u64,
+    pub(crate) finished_unix_ms: u64,
+}
+
+/// `/k` 搜索中页需要的轻量进度：不克隆/排序结果，避免每次自动刷新都扫一遍书。
+pub(crate) struct JobProgress {
+    pub(crate) key: String,
+    pub(crate) source_total: usize,
+    pub(crate) finished: usize,
+    pub(crate) pending: usize,
+    pub(crate) skipped: usize,
+    pub(crate) cancelled: usize,
+    pub(crate) failed: usize,
+}
+
+pub(super) fn job_progress(job: &SearchJob) -> JobProgress {
+    let st = job.state.lock().unwrap_or_else(|p| p.into_inner());
+    JobProgress {
+        key: job.key.clone(),
+        source_total: job.source_total,
+        finished: st.finished,
+        pending: st.pending,
+        skipped: st.skipped,
+        cancelled: st.cancelled,
+        failed: st
+            .errors
+            .iter()
+            .filter(|e| !matches!(e.kind.as_str(), "truncated" | "skipped"))
+            .count(),
+    }
 }
 
 pub(super) fn unix_ms() -> u64 {
@@ -280,18 +308,18 @@ pub(super) fn next_job_id() -> String {
     )
 }
 
-pub(super) struct JobView {
-    pub(super) books: Vec<SearchBook>,
-    pub(super) errors: Vec<web_book::SourceFailure>,
-    pub(super) done: bool,
-    pub(super) finished: usize,
-    pub(super) pending: usize,
-    pub(super) scheduled: usize,
-    pub(super) attempted: usize,
+pub(crate) struct JobView {
+    pub(crate) books: Vec<SearchBook>,
+    pub(crate) errors: Vec<web_book::SourceFailure>,
+    pub(crate) done: bool,
+    pub(crate) finished: usize,
+    pub(crate) pending: usize,
+    pub(crate) scheduled: usize,
+    pub(crate) attempted: usize,
     /// 因全局预算耗尽而“未执行/未完成”的源数（不写入健康状态）。
-    pub(super) skipped: usize,
+    pub(crate) skipped: usize,
     /// 因用户取消而未执行/被中断的源数（不写入健康状态）。
-    pub(super) cancelled: usize,
+    pub(crate) cancelled: usize,
 }
 
 /// 正在运行的搜索任务数：后台体检用它判断是否该让路（见 `source_bench`）。
