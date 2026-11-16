@@ -139,8 +139,9 @@ pub(super) const K_FS_COOKIE: &str = "k_fs";
 ///   宽：缺 `vw` 时取 `documentElement.clientWidth`（首屏 meta 是 `width=device-width`，
 ///       即设备真实 CSS 宽），取不到再退 `innerWidth`；KPW3 量出 1072，与旧行为一致。
 ///
-/// 已有 `vw`/`vh` 参数时按「480–2400 内才采用」校验，合法则原样保留，非法则用实测值覆盖。
-/// `load` 后把同一组参数补到页内所有链接，翻页不再二次重载。同机型反复进入结果一致。
+/// `vw` 已带合法值（480–2400）时原样保留，否则用实测宽度补齐；`vh` 永远以本次实测为准
+/// （只作链接传输，不当用户偏好）。`load` 后把同一组参数补到页内所有链接，翻页不再二次重载。
+/// 同机型反复进入结果一致。
 pub(super) const K_VP_JS: &str = "(function(){try{\
 var d=document.documentElement,ih=window.innerHeight||0,iw=window.innerWidth||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
