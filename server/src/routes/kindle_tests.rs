@@ -386,7 +386,7 @@ fn viewport_is_fixed_and_page_is_self_contained() {
     );
     assert!(
         html.contains("document.links") && html.contains("a.setAttribute('href'"),
-        "load 后必须把同一 vh 补到所有站内链接"
+        "load 后必须把同一 vw/vh 补到所有站内链接"
     );
     // 不落任何持久化：Cookie / sessionStorage / localStorage 一律不出现
     assert!(!html.contains("document.cookie"), "不得用 Cookie 缓存高度");
@@ -517,6 +517,39 @@ fn viewport_is_fixed_and_page_is_self_contained() {
     );
     assert!(!html.contains("<link"), "不允许子资源");
     assert!(!html.contains("<img"), "不允许子资源");
+}
+
+/// 宽度与高度同等对待：缺 `vw` 时用设备真实 CSS 宽（`clientWidth`）实测，
+/// 一次 replace 同时补齐 `vw`/`vh`；越界值不采用，已有合法参数原样保留。
+#[test]
+fn vp_js_measures_width_once_with_range_guard() {
+    let js = K_VP_JS;
+    assert!(js.contains("clientWidth"), "宽度必须实测：{js}");
+    assert!(
+        js.contains("innerWidth"),
+        "clientWidth 取不到时退 innerWidth：{js}"
+    );
+    assert!(
+        js.contains("vw='+vw"),
+        "实测宽度要写回 URL 与站内链接：{js}"
+    );
+    assert!(
+        js.contains("parseInt(cv,10)>=480&&parseInt(cv,10)<=2400"),
+        "已有 vw 越界（480–2400 之外）不得采用：{js}"
+    );
+    assert!(
+        js.contains("W>=480&&W<=2400"),
+        "实测宽度越界时不下发（服务端也会回落默认）：{js}"
+    );
+    // 参数只保留一份：解析时把 vw/vh 摘出来，replace 时按 vw→vh 重新拼
+    assert!(
+        js.contains("k=='vw'") && js.contains("k=='vh'"),
+        "解析时必须把 vw/vh 从原 query 中摘出：{js}"
+    );
+    assert!(
+        js.contains("if(hw&&hv)continue"),
+        "链接已带 vw/vh 时不得重复追加：{js}"
+    );
 }
 
 /// 入口门禁只看 HTTP UA：真机 Kindle/3.0+ 命中；页面内 JS 的 534.26+ 不命中。
@@ -702,16 +735,17 @@ fn read_page_locks_one_screen_without_scrollbar_hacks() {
         "不得保留任何滚动条隐藏规则：{html_css}"
     );
     // 运行时视口脚本：outerHeight 为主、availHeight 上限保护、innerHeight 兜底；
-    // 不写 Cookie / sessionStorage；把 vh 写回 URL 并补到页内链接。
+    // 宽度缺参时取 clientWidth；不写 Cookie / sessionStorage；把 vw/vh 写回 URL 并补到页内链接。
     let vpjs = K_VP_JS;
     assert!(vpjs.contains("(window.outerHeight||0)-1"), "{vpjs}");
     assert!(vpjs.contains("screen||{}"), "{vpjs}");
     assert!(vpjs.contains("availHeight"), "{vpjs}");
     assert!(vpjs.contains("innerHeight"), "{vpjs}");
+    assert!(vpjs.contains("clientWidth"), "宽度必须实测：{vpjs}");
     assert!(!vpjs.contains("cookie"), "不得写 Cookie：{vpjs}");
     assert!(!vpjs.contains("sessionStorage"), "不得持久化高度：{vpjs}");
     assert!(vpjs.contains("location.replace"), "{vpjs}");
-    assert!(vpjs.contains("document.links"), "链接要补 vh：{vpjs}");
+    assert!(vpjs.contains("document.links"), "链接要补 vw/vh：{vpjs}");
     // 底栏：相对 body 贴底 + 内建 12px 安全区，高度随运行时高派生（不写死）
     let bar = fixed_bar("", vp());
     assert!(

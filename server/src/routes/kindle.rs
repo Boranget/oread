@@ -67,12 +67,16 @@ const NAV_H: usize = 72;
 const BAR_H: usize = 64;
 /// 底栏内部的底部安全留白（12px）：底栏总高 = 64 内容 + 12 安全区，避免文字贴屏幕底。
 const SAFE_BOTTOM: usize = 12;
-/// **版面高不写死**（v0.3.22）：每次进页面由 `K_VP_JS` 在浏览器里现算可用高，写成
-/// `?vh=<px>` 随请求带回，服务端 `layout_h()` 直接用这个运行时值排版/切片。
-/// 可信度顺序：`outerHeight − 1`（真机 1232 → 1231）为主，`screen.availHeight` 做上限
+/// **版面尺寸不写死**（v0.3.22）：每次进页面由 `K_VP_JS` 在浏览器里现算，写成
+/// `?vw=<宽>&vh=<高>` 随请求带回，服务端 `layout_h()` / `page_w()` 直接用这两个运行时值
+/// 排版与切片。
+/// 高度可信度：`outerHeight − 1`（真机 1232 → 1231）为主，`screen.availHeight` 做上限
 /// 保护，两者都取不到才退 `innerHeight`；`clientHeight/innerHeight=1268` 只作机型识别，
-/// 不当画布高。不落 Cookie、不写 sessionStorage，同机型每次重算结果一致。
-/// 首屏（链接未带 `vh`）用 `Config.kindle_vh` 的默认值渲染一次，脚本在 `<head>` 里
+/// 不当画布高。
+/// 宽度可信度：请求已带合法 `vw` 就用它；否则取 `documentElement.clientWidth`
+/// （首屏 meta 为 `width=device-width`，即设备真实 CSS 宽；KPW3 量出 1072），再退 `innerWidth`。
+/// 不落 Cookie、不写 sessionStorage，同机型每次重算结果一致。
+/// 首屏（链接未带参数）用 `Config.kindle_vw/vh` 的默认值渲染一次，脚本在 `<head>` 里
 /// 立刻 `location.replace` 到实测值，用户看不到错误版面。
 ///
 /// 阅读页顶栏高：56px。够大（≥48 触控热区，整格可点），又比列表页的 73px 顶栏少 17px，

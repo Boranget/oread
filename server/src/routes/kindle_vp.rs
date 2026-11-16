@@ -129,33 +129,43 @@ pub(super) const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 pub(super) const K_FS_COOKIE: &str = "k_fs";
 
-/// 运行时视口高脚本（ES5，注入 `<head>`，首帧前生效；不落 Cookie、不写 sessionStorage）。
+/// 运行时视口脚本（ES5，注入 `<head>`，首帧前生效；不落 Cookie、不写 sessionStorage）。
 ///
-/// 每次进页面现算可用高，再把 `vh=<算出值>` 带回 URL：
+/// 每次进页面现算视口，再把 `vw=<宽>&vh=<高>` 带回 URL（缺哪个补哪个，最多 replace 一次）：
 ///
-///   1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）；
-///   2. `screen.availHeight` 做上限保护；
-///   3. 两者都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
+///   高：1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）；
+///       2. `screen.availHeight` 做上限保护；
+///       3. 两者都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
+///   宽：缺 `vw` 时取 `documentElement.clientWidth`（首屏 meta 是 `width=device-width`，
+///       即设备真实 CSS 宽），取不到再退 `innerWidth`；KPW3 量出 1072，与旧行为一致。
 ///
-/// 首次进入（链接没带 `vh`）用默认值渲染一次，脚本在 `<head>` 里立刻 `location.replace`；
-/// `load` 后把同一 `vh` 补到页内所有链接，翻页不再二次重载。同机型反复进入结果一致。
+/// 已有 `vw`/`vh` 参数时按「480–2400 内才采用」校验，合法则原样保留，非法则用实测值覆盖。
+/// `load` 后把同一组参数补到页内所有链接，翻页不再二次重载。同机型反复进入结果一致。
 pub(super) const K_VP_JS: &str = "(function(){try{\
-var d=document.documentElement,ih=window.innerHeight||0,sh=window.screen||{};\
+var d=document.documentElement,ih=window.innerHeight||0,iw=window.innerWidth||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
 var H=(window.outerHeight||0)-1,AH=(sh.availHeight||0);\
 if(!(H>200))H=AH;\
 if(AH>200)H=mn(H,AH);\
 if(!(H>200))H=ih;\
 if(!(H>200))H=(d&&d.clientHeight>0)?d.clientHeight:ih;\
-var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],cur=null;\
+var W=(d&&d.clientWidth>0)?d.clientWidth:iw;\
+var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],cv=null,ch=null;\
 for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
-if(k=='vh')cur=p[i].substring(3);if(p[i]&&k!='vh')o.push(p[i]);}\
+if(k=='vw')cv=p[i].substring(3);else if(k=='vh')ch=p[i].substring(3);else if(p[i])o.push(p[i]);}\
+if(!(parseInt(cv,10)>=480&&parseInt(cv,10)<=2400))cv=null;\
+if(!(W>=480&&W<=2400))W=0;\
 window.__kvh=H;\
-if(cur!=''+H){o.push('vh='+H);location.replace(location.pathname+'?'+o.join('&'));return}\
+var vw=cv||(W?''+W:null),vh=''+H;\
+if((vw&&vw!=cv)||ch!=vh){if(vw)o.push('vw='+vw);o.push('vh='+vh);\
+location.replace(location.pathname+'?'+o.join('&'));return}\
 function fix(){if(!document.links)return;try{\
 for(var j=0;j<document.links.length;j++){var a=document.links[j],h=a.getAttribute('href');\
-if(!h||h.charAt(0)=='#'||h.indexOf('javascript:')==0||h.indexOf('vh=')>-1)continue;\
-a.setAttribute('href',h+(h.indexOf('?')>-1?'&':'?')+'vh='+H)}}catch(e){}}\
+if(!h||h.charAt(0)=='#'||h.indexOf('javascript:')==0)continue;\
+var hw=h.indexOf('vw=')>-1,hv=h.indexOf('vh=')>-1;\
+if(hw&&hv)continue;\
+var add=[];if(vw&&!hw)add.push('vw='+vw);if(!hv)add.push('vh='+vh);\
+a.setAttribute('href',h+(h.indexOf('?')>-1?'&':'?')+add.join('&'))}}catch(e){}}\
 if(document.addEventListener){document.addEventListener('load',fix,false)}setTimeout(fix,0)\
 }catch(E){try{window.__kerr&&window.__kerr((E&&E.message)||E,0,'vp')}catch(x){}}})()";
 
