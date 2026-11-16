@@ -96,10 +96,11 @@
   }
 </script>
 
-<div class="row" style="margin-bottom:12px">
-  <h2 style="margin:0">阅读统计</h2>
-  <div class="spacer"></div>
-  <button class="ghost" on:click={load} disabled={loading}>{loading ? '读取中…' : '刷新'}</button>
+<div class="page-head">
+  <h2>阅读统计</h2>
+  <div class="page-actions">
+    <button class="ghost" on:click={load} disabled={loading}>{loading ? '读取中…' : '刷新'}</button>
+  </div>
 </div>
 
 <div class="row" style="margin-bottom:12px">
@@ -232,9 +233,9 @@
   }
   .bar-date { height: 18px; line-height: 18px; font-size: 10px; color: var(--muted); text-align: center; white-space: nowrap; }
   .book-list { display: grid; gap: 10px; }
-  .stat-book { display: grid; gap: 4px; }
-  .stat-book-main { display: flex; align-items: baseline; gap: 8px; }
-  .stat-book-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stat-book { display: grid; gap: 4px; min-width: 0; }
+  .stat-book-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .stat-book-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .meter { height: 6px; border: 1px solid var(--border); background: transparent; }
   .meter > div { height: 100%; background: #333; }
   .stats-empty { text-align: center; padding: 28px 18px; display: grid; gap: 8px; justify-items: center; }

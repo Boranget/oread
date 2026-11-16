@@ -37,13 +37,13 @@
   let lazyErrs = {};
 
   const TABS = [
-    { id: 'bookshelf', label: '书架' },
-    { id: 'discover', label: '发现' },
-    { id: 'stats', label: '统计' },
+    { id: 'bookshelf', label: '书架', short: '书架' },
+    { id: 'discover', label: '发现', short: '发现' },
+    { id: 'stats', label: '统计', short: '统计' },
     // 普通用户也可见，进入后是只读态，避免出现可点击但必然 403 的按钮
-    { id: 'sources', label: '书源管理' },
-    { id: 'replace', label: '替换规则' },
-    { id: 'settings', label: '设置' },
+    { id: 'sources', label: '书源管理', short: '书源' },
+    { id: 'replace', label: '替换规则', short: '替换' },
+    { id: 'settings', label: '设置', short: '设置' },
   ];
 
   // 其它页面（如 Discover 的空态引导）用事件请求切换 tab
@@ -262,7 +262,8 @@
     <div class="tabs">
       {#each TABS as t}
         <div class="tab" class:active={tab === t.id} on:click={() => selectTab(t.id)}>
-          {t.label}{#if t.id === 'discover' && $searchJobs.active > 0}<span
+          <span class="tab-full">{t.label}</span><span class="tab-short">{t.short}</span>{#if t.id ===
+          'discover' && $searchJobs.active > 0}<span
             class="tab-badge"
             aria-label={`${$searchJobs.active} 个搜索任务运行中`}
           >{$searchJobs.active}</span>{/if}

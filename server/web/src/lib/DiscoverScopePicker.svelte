@@ -55,7 +55,7 @@
   {#if sourceScope === 'custom' && scopeOpen}
     {#if groupOptions.length}
       <div class="row" style="margin-top:8px">
-        <select bind:value={groupFilter} style="width:100%;min-width:0" aria-label="按分类筛选书源">
+        <select bind:value={groupFilter} aria-label="按分类筛选书源">
           <option value="all">全部分类</option>
           {#each groupOptions as g}
             <option value={g}>{g}</option>

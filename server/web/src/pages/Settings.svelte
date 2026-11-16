@@ -371,10 +371,9 @@
   }
 </script>
 
-<div class="row" style="margin-bottom:12px">
-  <h2 style="margin:0">阅读设置</h2>
-  <div class="spacer"></div>
-  <span class="muted" style="font-size:12px">按账号保存</span>
+<div class="page-head">
+  <h2>阅读设置</h2>
+  <span class="page-count">按账号保存</span>
 </div>
 
 {#if error}<p class="err">{error}</p>{/if}
@@ -448,10 +447,10 @@
               <span class="user-name">
                 {u.username}{#if u.id === accountId}<span class="muted">（当前）</span>{/if}
               </span>
-              <span>{roleText(u.role)}</span>
-              <span class:user-off={u.disabled}>{u.disabled ? '已停用' : '启用中'}</span>
-              <span class="muted">{fmtServerTime(u.last_login_at)}</span>
-              <span>
+              <span class="user-meta user-role" data-label="角色">{roleText(u.role)}</span>
+              <span class="user-meta user-state" class:user-off={u.disabled} data-label="状态">{u.disabled ? '已停用' : '启用中'}</span>
+              <span class="user-meta user-login muted" data-label="最后登录">{fmtServerTime(u.last_login_at)}</span>
+              <span class="user-op">
                 <button
                   class="ghost"
                   on:click={() => toggleUser(u)}
@@ -692,24 +691,9 @@
 </div>
 
 <style>
-  .settings-wrap { max-width: none; display: grid; gap: 12px; }
   .settings-wrap h3 { margin-bottom: 12px; }
   .account-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .account-head b { font-size: 15px; }
-  .user-table { border: 1px solid var(--border, #d8d8d8); border-radius: 8px; overflow-x: auto; }
-  .user-row {
-    display: grid;
-    grid-template-columns: minmax(110px, 1.2fr) 70px 70px minmax(130px, 1fr) 96px;
-    gap: 8px;
-    align-items: center;
-    padding: 8px 10px;
-    border-top: 1px solid var(--border, #d8d8d8);
-    font-size: 13px;
-  }
-  .user-row:first-child { border-top: 0; }
-  .user-head { color: var(--muted); font-size: 12px; background: var(--soft-bg, #fafafa); }
-  .user-name { font-weight: 600; word-break: break-all; }
-  .user-off { color: var(--muted); }
   .field { margin-bottom: 16px; }
   .field:last-child { margin-bottom: 0; }
   .field-label { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
@@ -725,7 +709,6 @@
   .health-grid > div { display: flex; flex-direction: column; gap: 2px; }
   .health-grid span { font-size: 12px; }
   .health-grid b { font-size: 15px; font-variant-numeric: tabular-nums; }
-  .sticky-actions { position: sticky; bottom: 0; background: var(--bg); padding: 10px 0 calc(10px + env(safe-area-inset-bottom)); }
   .k-link {
     display: inline-block;
     padding: 8px 14px;

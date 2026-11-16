@@ -460,20 +460,20 @@
   });
 </script>
 
-<div class="row" style="margin-bottom:12px">
-  <h2 style="margin:0">我的书架</h2>
-  <div class="spacer"></div>
-  <span class="muted" style="font-size:12px">{books.length} 本</span>
-  <button class="ghost" on:click={toggleSelectMode}>{selectMode ? '退出多选' : '批量管理'}</button>
-  <button class="ghost" on:click={openGroups}>分组管理</button>
-  <button class="ghost" on:click={load} disabled={loading}>刷新</button>
+<div class="page-head">
+  <h2>我的书架</h2>
+  <span class="page-count">{books.length} 本</span>
+  <div class="page-actions">
+    <button class="ghost" on:click={toggleSelectMode}>{selectMode ? '退出多选' : '批量管理'}</button>
+    <button class="ghost" on:click={openGroups}>分组管理</button>
+    <button class="ghost" on:click={load} disabled={loading}>刷新</button>
+  </div>
 </div>
 
 <div class="row" style="margin-bottom:6px">
   <select
     bind:value={groupFilter}
     on:change={() => (page = 1)}
-    style="flex:1;min-width:0"
     aria-label="分组筛选"
   >
     <option value="all">全部书籍</option>
@@ -485,7 +485,6 @@
   <select
     bind:value={sortBy}
     on:change={() => (page = 1)}
-    style="flex:1;min-width:0"
     aria-label="排序方式"
   >
     <option value="default">默认（最近阅读）</option>

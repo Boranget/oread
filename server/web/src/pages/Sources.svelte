@@ -448,10 +448,9 @@
   }
 </script>
 
-<div class="row" style="margin-bottom:10px">
-  <h2 style="margin:0">书源管理</h2>
-  <div class="spacer"></div>
-  <span class="muted" style="font-size:12px">{sources.length} 个书源 · 可搜索 {searchableCount}</span>
+<div class="page-head">
+  <h2>书源管理</h2>
+  <span class="page-count">{sources.length} 个书源 · 可搜索 {searchableCount}</span>
 </div>
 
 {#if !isAdmin}
@@ -461,33 +460,28 @@
   </div>
 {/if}
 
-<div class="row" style="margin-bottom:10px">
-  {#if isAdmin}
+{#if isAdmin}
+  <div class="toolbar source-actions">
     <button class="ghost" on:click={() => fileInput.click()} disabled={!!busy}>导入 JSON</button>
-  {/if}
-  {#if isAdmin}
-    <select bind:value={exportTier} style="width:auto" aria-label="导出范围">
+    <button class="new-source" on:click={openNew}>新建</button>
+    <select bind:value={exportTier} class="wide" aria-label="导出范围">
       <option value="all">全部书源</option>
       <option value="preferred">只导优选</option>
     </select>
     <button class="ghost" on:click={exportAll} disabled={!!busy}>导出</button>
     <button class="ghost" on:click={openUpdateChecker} disabled={!!busy}>检查更新</button>
-  {/if}
-  <div class="spacer"></div>
-  {#if isAdmin}
-    <button on:click={openNew}>新建</button>
-  {/if}
-  <input class="file-input" type="file" accept=".json,application/json" bind:this={fileInput} on:change={importFromFile} />
-</div>
+    <input class="file-input" type="file" accept=".json,application/json" bind:this={fileInput} on:change={importFromFile} />
+  </div>
+{/if}
 
-<div class="row" style="margin-bottom:6px">
-  <input placeholder="搜索名称 / URL" bind:value={keyword} style="flex:1;min-width:140px" />
-  <select bind:value={filterStatus} style="width:auto" aria-label="启用状态筛选">
+<div class="toolbar">
+  <input class="grow wide" placeholder="搜索名称 / URL" bind:value={keyword} />
+  <select bind:value={filterStatus} aria-label="启用状态筛选">
     <option value="all">全部状态</option>
     <option value="enabled">已启用</option>
     <option value="disabled">已禁用</option>
   </select>
-  <select bind:value={filterGroup} style="width:auto" aria-label="分组筛选">
+  <select bind:value={filterGroup} aria-label="分组筛选">
     <option value="all">全部分组</option>
     {#each groupOptions as g}
       <option value={g}>{g}</option>
@@ -733,7 +727,7 @@
   .tier-observing { background: transparent; color: var(--fg); }
   .tier-quarantined { background: var(--border); color: var(--muted); border-color: var(--border); }
   .tier-summary { gap: 6px; flex-wrap: wrap; }
-  .tier-chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; cursor: pointer; }
+  .tier-chip { padding: 3px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; text-align: center; }
   .tier-chip.active { outline: 2px solid var(--fg); outline-offset: 1px; }
   .evidence-box {
     border: 1px solid var(--border);

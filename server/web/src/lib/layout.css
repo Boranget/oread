@@ -23,6 +23,52 @@ html[data-vp='sm'] .grid.cols2,
 html[data-vp='sm'] .grid.cols3 {
   grid-template-columns: 1fr;
 }
+
+/* ---------- 手机：页面骨架折行 ---------- */
+/* .page-head 保持 flex：.page-actions 作为一个整体换行，不会出现「刷新」单独
+   掉到第二行；标题行本身在 app.css 定义。 */
+/* .toolbar：两列等宽，.wide 占满整行（搜索框、导出范围） */
+html[data-vp='sm'] .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+html[data-vp='sm'] .toolbar > * { width: 100%; min-width: 0; }
+html[data-vp='sm'] .toolbar > .wide { grid-column: 1 / -1; }
+html[data-vp='sm'] .toolbar > .spacer { display: none; }
+/* 书源页：手机上「导入/新建」「导出范围」「导出/检查更新」各占一行，主次清楚 */
+html[data-vp='sm'] .source-actions .new-source { order: 0; margin-left: 0; }
+
+/* 设置页用户列表：手机上从 5 列表格改成卡片，列不再被压成一条缝 */
+html[data-vp='sm'] .user-table { border: 0; border-radius: 0; overflow: visible; }
+html[data-vp='sm'] .user-row.user-head { display: none; }
+html[data-vp='sm'] .user-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    'name op'
+    'role op'
+    'state op'
+    'login op';
+  gap: 2px 12px;
+  border: 1px solid var(--border, #d8d8d8);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+html[data-vp='sm'] .user-name { grid-area: name; font-size: 14px; }
+html[data-vp='sm'] .user-role { grid-area: role; }
+html[data-vp='sm'] .user-state { grid-area: state; }
+html[data-vp='sm'] .user-login { grid-area: login; }
+html[data-vp='sm'] .user-op { grid-area: op; align-self: center; }
+html[data-vp='sm'] .user-meta { display: flex; gap: 6px; font-size: 12px; }
+html[data-vp='sm'] .user-meta::before { content: attr(data-label) '：'; color: var(--muted); }
+
+/* 书源三档汇总：手机上三等分，不再各自缩成小圆球。
+   这里带上 .row 提高优先级，压过组件作用域样式里的 flex 声明。 */
+html[data-vp='sm'] .row.tier-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+html[data-vp='sm'] .row.tier-summary > button { width: 100%; }
+
+/* 统计页 KPI：两列卡片里「2 小时 34 分」会折行，收一档字号保持单行。
+   带上 .kpi 提高优先级，压过组件里的 .kpi-num 作用域样式。 */
+html[data-vp='sm'] .kpi .kpi-num { font-size: 22px; }
+
 html[data-vp='sm'] .nav .brand {
   display: none;
 }
@@ -40,11 +86,21 @@ html[data-vp='sm'] .nav .right button {
 html[data-vp='sm'] .nav .tabs::-webkit-scrollbar {
   display: none;
 }
-/* 5 个 tab + 退出，390px 下需要收窄导航项 */
+/* 6 个 tab + 退出：390px 下用短标签（书源/替换）与更窄的导航项，避免横向滚动 */
+html[data-vp='sm'] .nav .tabs {
+  gap: 2px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
 html[data-vp='sm'] .nav .tab {
   padding: 12px 7px;
   font-size: 13px;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
 }
+html[data-vp='sm'] .nav .tab .tab-full { display: none; }
+html[data-vp='sm'] .nav .tab .tab-short { display: inline; }
 html[data-vp='sm'] .modal {
   width: 94vw;
   max-width: 94vw;
@@ -52,7 +108,7 @@ html[data-vp='sm'] .modal {
   max-height: 84vh;
 }
 html[data-vp='sm'] .batch-bar {
-  top: 44px;
+  top: 45px; /* 导航 44px + 1px 下边框 */
 }
 html[data-vp='sm'] .rd-content:not(.paged) {
   padding-left: 16px;
@@ -86,11 +142,17 @@ html[data-vp='sm'] .rd-title {
 html[data-vp='sm'] button {
   min-height: 44px;
 }
-html[data-vp='sm'] .nav .tab {
-  min-height: 44px;
-  display: flex;
-  align-items: center;
-}
+/* 44px 只用于主操作与导航；胶囊、迷你按钮、任务操作保持紧凑，
+   否则 .chip / .tier-chip 会被撑成圆球，任务列表也会过高。 */
+html[data-vp='sm'] .chip,
+html[data-vp='sm'] .tier-chip,
+html[data-vp='sm'] .mini,
+html[data-vp='sm'] .acts button { min-height: 36px; }
+/* 正文里的内联文字按钮不参与触控高度 */
+html[data-vp='sm'] .empty-retry,
+html[data-vp='sm'] .link-btn { min-height: auto; }
+/* 三段式切换：三档等分，字号收一档，窄屏不溢出 */
+html[data-vp='sm'] .seg button { min-height: 40px; padding: 6px 8px; font-size: 13px; }
 html[data-vp='sm'] input,
 html[data-vp='sm'] select,
 html[data-vp='sm'] textarea {

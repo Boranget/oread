@@ -251,14 +251,15 @@
   }
 </script>
 
-<div class="row" style="margin-bottom:12px">
-  <h2 style="margin:0">替换规则</h2>
-  <div class="spacer"></div>
-  <button on:click={openNew}>新建规则</button>
-  <button class="ghost" on:click={openPreview}>预览</button>
-  <button class="ghost" disabled={exportBusy} on:click={exportRules}>
-    {exportBusy ? '导出中…' : '导出'}
-  </button>
+<div class="page-head">
+  <h2>替换规则</h2>
+  <div class="page-actions">
+    <button on:click={openNew}>新建规则</button>
+    <button class="ghost" on:click={openPreview}>预览</button>
+    <button class="ghost" disabled={exportBusy} on:click={exportRules}>
+      {exportBusy ? '导出中…' : '导出'}
+    </button>
+  </div>
 </div>
 
 {#if error}<p class="err">{error}</p>{/if}

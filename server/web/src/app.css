@@ -44,6 +44,18 @@ input, textarea, select {
 }
 input, select { min-height: var(--control-h, 36px); }
 textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+/* 文件选择：默认控件在窄屏下很突兀，统一成与其它输入一致的外观 */
+input[type='file'] { padding: 6px; font-size: 13px; cursor: pointer; }
+input[type='file']::file-selector-button {
+  margin-right: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--soft-bg, #eee);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
 .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
 
 /* 顶部导航 */
@@ -69,6 +81,8 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
   font-size: 14px;
 }
 .nav .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+/* 短标签只在手机断点显示（见 lib/layout.css），桌面保持完整名称 */
+.nav .tab .tab-short { display: none; }
 /* 发现 tab 上的运行中任务数：不依赖 JS 计算宽度，纯文本徽标 */
 .nav .tab-badge {
   display: inline-block;
@@ -103,12 +117,62 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, m
 .shelf-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; font-size: 12px; }
 .prog-line { color: var(--accent); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* 行内输入/下拉与按钮共享一行：输入按比例伸缩，按钮保持自然宽度。
+   否则 input 的 width:100% 会把同一行的按钮挤到下一行（发现页搜索框曾如此）。 */
+.row > input:not([type='checkbox']):not([type='radio']),
+.row > select { flex: 1 1 160px; width: auto; min-width: 0; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
 .err { color: var(--err, #b3392f); margin: 8px 0; }
 .empty { color: var(--muted); padding: 24px; text-align: center; }
 h2 { margin: 0 0 12px; font-size: 18px; }
 h3 { margin: 0 0 8px; font-size: 15px; }
+
+/* ---- 页面骨架 ----------------------------------------------------------
+   页面统一用这三类结构，不再各页手写 flex 与换行规则：
+   - .page-head  标题行：h2 + .page-count + .page-actions
+   - .page-actions 标题右侧的操作按钮（手机上折到第二行，见 layout.css）
+   - .toolbar    筛选/操作栏：输入、下拉、按钮混合排列，.wide 表示手机上整行
+   响应式规则集中在 lib/layout.css，组件只负责结构。 */
+.page-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.page-head h2 { margin: 0; }
+.page-count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.page-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar > input,
+.toolbar > select { flex: 1 1 160px; width: auto; min-width: 0; }
+.toolbar > input.grow { flex: 2 1 220px; }
+
+/* ---- 页面级布局（放全局，layout.css 的断点才能覆盖） ----
+   Svelte 的作用域选择器会重复 .svelte-xxx 提高优先级，若把布局写在组件
+   <style> 里，html[data-vp] 的断点规则会被压住。以下类只在单一页面使用，
+   统一在此定义结构与间距，组件 <style> 只留颜色/字重等外观。 */
+.settings-wrap { max-width: none; display: grid; gap: 12px; }
+.user-table { border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
+.user-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.2fr) 70px 70px minmax(130px, 1fr) 96px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.user-row:first-child { border-top: 0; }
+.user-head { color: var(--muted); font-size: 12px; background: var(--soft-bg, #fafafa); }
+.user-name { font-weight: 600; word-break: break-all; }
+.user-off { color: var(--muted); }
+.sticky-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  padding: 10px 0 calc(10px + env(safe-area-inset-bottom));
+}
+/* 书源页操作栏：桌面「新建」在最右；手机断点复位 order（见 layout.css） */
+.source-actions .new-source { order: 1; margin-left: auto; }
+.source-actions > select { flex: 0 0 auto; width: auto; }
 
 /* 书籍卡片 */
 .book {
