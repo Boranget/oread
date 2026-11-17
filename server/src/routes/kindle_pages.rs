@@ -126,7 +126,7 @@ table{{border-collapse:collapse}}\
         extra = extra_css,
         body = body,
         guard = K_GUARD_JS,
-        vpjs = K_VP_JS,
+        vpjs = k_vp_js(),
         probe = K_PROBE_JS
     )
 }
@@ -181,9 +181,11 @@ pub(super) fn top_bar(title: &str, sub: Option<&str>, actions: &str, vp: Vp) -> 
 }
 
 /// 顶栏动作链接：20px，间距 32px（用内边距，不依赖 flex/grid）
-pub(super) fn nav_link(href: &str, label: &str) -> String {
+pub(super) fn nav_link(href: &str, label: &str, vp: Vp) -> String {
+    // 窄屏压缩动作区间距与字号，保证三个动作 + 标题在 360–430 宽内不折行
+    let (pad, size) = if vp.narrow() { (16, 18) } else { (32, 20) };
     format!(
-        "<a href=\"{href}\" style=\"padding-left:32px;font-size:20px\">{label}</a>",
+        "<a href=\"{href}\" style=\"padding-left:{pad}px;font-size:{size}px\">{label}</a>",
         href = href,
         label = esc(label)
     )
@@ -312,10 +314,13 @@ pub(super) fn fit_px(s: &str, max_px: usize, size: usize, half: usize) -> String
 /// 高于翻页热区（5）与底栏（10）；三格全部 `display:block` 整格可点，
 /// 书架/目录链接都带当前 `fs/vw/vh`，点一次就能带着同一档字号与视口回去。
 pub(super) fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp) -> String {
-    let title_px = vp
-        .page_w()
-        .saturating_sub(READ_NAV_BACK_W + READ_NAV_TOC_W)
-        .saturating_sub(24);
+    // 窄屏把左右两格压到 110/80，标题仍居中；宽屏沿用 160/120
+    let (bw, tw) = if vp.narrow() {
+        (110, 80)
+    } else {
+        (READ_NAV_BACK_W, READ_NAV_TOC_W)
+    };
+    let title_px = vp.content_w().saturating_sub(bw + tw).saturating_sub(24);
     let title = fit_px(title, title_px, 20, 10);
     format!(
         "<div id=\"k-read-nav\"><table cellpadding=\"0\" cellspacing=\"0\"><tr>\
@@ -323,8 +328,6 @@ pub(super) fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp
 <td align=\"center\">{title}</td>\
 <td width=\"{tw}\" align=\"center\" style=\"border-left:1px solid #ccc\"><a href=\"{toc}\">目录</a></td>\
 </tr></table></div>",
-        bw = READ_NAV_BACK_W,
-        tw = READ_NAV_TOC_W,
         back = back_href,
         toc = toc_href,
         title = esc(&title)
@@ -446,10 +449,12 @@ pub(super) fn outline_button(href: &str, label: &str) -> String {
 /// 空书架：2px 描边块，整块在可用区内垂直居中（`table` 100% + `valign="middle"`），
 /// 含标题 26 加粗 + 说明 20 `#555` + 240×72 描边按钮。
 pub(super) fn empty_shelf(fs: usize, vp: Vp) -> String {
+    // 卡片最宽 600，窄屏收进版心（390 → 318），不横向溢出
+    let card_w = vp.page_w().min(600);
     format!(
         "<table width=\"{pw}\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
          <td align=\"center\" valign=\"middle\">\
-         <table width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #000\"><tr>\
+         <table width=\"{card_w}\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #000\"><tr>\
          <td align=\"left\" style=\"padding:32px\">\
          <div style=\"font-size:26px;line-height:40px;font-weight:700\">书架还是空的</div>\
          <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\

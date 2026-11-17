@@ -13,10 +13,18 @@ pub(super) struct Vp {
     pub(super) fixed: bool,
 }
 
+/// 视口合法范围（CSS px）。下限 240 覆盖手机（常见 360–430），上限 2400 防异常值撑爆版面；
+/// 服务端校验与 `K_VP_JS` 共用这两个值（脚本用 `$MIN`/`$MAX` 占位注入），不两处手写。
+pub(super) const VP_MIN: i64 = 240;
+pub(super) const VP_MAX: i64 = 2400;
+
 impl Vp {
     /// 缺参/越界时回落到默认视口，保证任何尺寸都不会算出负高度。
     pub(super) fn resolve(vw: Option<i64>, vh: Option<i64>, d: (usize, usize)) -> Self {
-        let ok = |v: Option<i64>| v.filter(|n| (480..=2400).contains(n)).map(|n| n as usize);
+        let ok = |v: Option<i64>| {
+            v.filter(|n| (VP_MIN..=VP_MAX).contains(n))
+                .map(|n| n as usize)
+        };
         Self {
             w: ok(vw).unwrap_or(d.0),
             h: ok(vh).unwrap_or(d.1),
@@ -62,6 +70,19 @@ impl Vp {
     pub(super) fn content_h(self) -> usize {
         self.layout_h().saturating_sub(self.bar_h() + 8)
     }
+    /// 窄屏（内容宽 < 600，约视口 < 744）：目录单列、表单堆叠、顶栏动作压缩。
+    /// 只按宽度判定，与设备类型无关：手机、窄窗口、平板分屏走同一套。
+    pub(super) fn narrow(self) -> bool {
+        self.content_w() < 600
+    }
+    /// 目录列数：窄屏单列，宽屏两列（每列最多 `K_TOC_PAGE / K_TOC_COLS` 行）。
+    pub(super) fn toc_cols(self) -> usize {
+        if self.narrow() {
+            1
+        } else {
+            K_TOC_COLS
+        }
+    }
     /// 左右翻页热区宽 = 视口宽 / 3（1072 → 357，CSS 用 33% 自适应）
     #[allow(dead_code)] // 仅单测引用：渲染改用 CSS 百分比，不再需要服务端算像素
     pub(super) fn hot_w(self) -> usize {
@@ -104,9 +125,10 @@ pub(super) const PARA_GAP_LINES: f64 = 0.6;
 pub(super) const fn para_gap_px(line: usize) -> usize {
     (line * 6) / 10
 }
-/// 目录每页章节数 = 每列行数 × 2；每列行数按可用高实算（72px/行，上限 15 行/列）。
+/// 目录每页章节数 = 每列行数 × 列数（窄屏单列）；每列行数按可用高实算（72px/行，上限 15 行/列）。
 pub(super) fn toc_page_size(vp: Vp) -> usize {
-    ((vp.nav_h().saturating_sub(BAR_H)) / 72).clamp(1, K_TOC_PAGE / K_TOC_COLS) * K_TOC_COLS
+    let rows = ((vp.nav_h().saturating_sub(BAR_H)) / 72).clamp(1, K_TOC_PAGE / K_TOC_COLS);
+    rows * vp.toc_cols()
 }
 /// 搜索结果每页条数 = （正文区 − 表单 88 − 翻页条 64）/ 112；
 /// `extra_rows` 是状态提示/回退说明/升级按钮额外占用的行数。
@@ -139,10 +161,16 @@ pub(super) const K_FS_COOKIE: &str = "k_fs";
 ///   宽：缺 `vw` 时取 `documentElement.clientWidth`（首屏 meta 是 `width=device-width`，
 ///       即设备真实 CSS 宽），取不到再退 `innerWidth`；KPW3 量出 1072，与旧行为一致。
 ///
-/// `vw` 已带合法值（480–2400）时原样保留，否则用实测宽度补齐；`vh` 永远以本次实测为准
+/// `vw` 已带合法值（`VP_MIN`–`VP_MAX`）时原样保留，否则用实测宽度补齐；`vh` 永远以本次实测为准
 /// （只作链接传输，不当用户偏好）。`load` 后把同一组参数补到页内所有链接，翻页不再二次重载。
-/// 同机型反复进入结果一致。
-pub(super) const K_VP_JS: &str = "(function(){try{\
+/// 同机型反复进入结果一致。返回注入边界值后的脚本。
+pub(super) fn k_vp_js() -> String {
+    K_VP_JS
+        .replace("$MIN", &VP_MIN.to_string())
+        .replace("$MAX", &VP_MAX.to_string())
+}
+
+const K_VP_JS: &str = "(function(){try{\
 var d=document.documentElement,ih=window.innerHeight||0,iw=window.innerWidth||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
 var H=(window.outerHeight||0)-1,AH=(sh.availHeight||0);\
@@ -154,8 +182,8 @@ var W=(d&&d.clientWidth>0)?d.clientWidth:iw;\
 var s=location.search.replace(/^\\?/,''),p=s?s.split('&'):[],o=[],cv=null,ch=null;\
 for(var i=0;i<p.length;i++){var k=p[i].split('=')[0];\
 if(k=='vw')cv=p[i].substring(3);else if(k=='vh')ch=p[i].substring(3);else if(p[i])o.push(p[i]);}\
-if(!(parseInt(cv,10)>=480&&parseInt(cv,10)<=2400))cv=null;\
-if(!(W>=480&&W<=2400))W=0;\
+if(!(parseInt(cv,10)>=$MIN&&parseInt(cv,10)<=$MAX))cv=null;\
+if(!(W>=$MIN&&W<=$MAX))W=0;\
 window.__kvh=H;\
 var vw=cv||(W?''+W:null),vh=''+H;\
 if((vw&&vw!=cv)||ch!=vh){if(vw)o.push('vw='+vw);o.push('vh='+vh);\

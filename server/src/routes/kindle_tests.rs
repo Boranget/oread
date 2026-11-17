@@ -523,7 +523,8 @@ fn viewport_is_fixed_and_page_is_self_contained() {
 /// 一次 replace 同时补齐 `vw`/`vh`；越界值不采用，已有合法参数原样保留。
 #[test]
 fn vp_js_measures_width_once_with_range_guard() {
-    let js = K_VP_JS;
+    let js = k_vp_js();
+    let (min, max) = (VP_MIN, VP_MAX);
     assert!(js.contains("clientWidth"), "宽度必须实测：{js}");
     assert!(
         js.contains("innerWidth"),
@@ -534,13 +535,14 @@ fn vp_js_measures_width_once_with_range_guard() {
         "实测宽度要写回 URL 与站内链接：{js}"
     );
     assert!(
-        js.contains("parseInt(cv,10)>=480&&parseInt(cv,10)<=2400"),
-        "已有 vw 越界（480–2400 之外）不得采用：{js}"
+        js.contains(&format!("parseInt(cv,10)>={min}&&parseInt(cv,10)<={max}")),
+        "已有 vw 越界（{min}–{max} 之外）不得采用：{js}"
     );
     assert!(
-        js.contains("W>=480&&W<=2400"),
+        js.contains(&format!("W>={min}&&W<={max}")),
         "实测宽度越界时不下发（服务端也会回落默认）：{js}"
     );
+    assert!(!js.contains('$'), "边界占位符必须全部注入：{js}");
     // 参数只保留一份：解析时把 vw/vh 摘出来，replace 时按 vw→vh 重新拼
     assert!(
         js.contains("k=='vw'") && js.contains("k=='vh'"),
@@ -681,7 +683,7 @@ fn list_pages_fit_inside_stage_at_reference_viewports() {
             "书架应贴近填满，别多留一整行"
         );
         let t = toc_page_size(vp);
-        assert!(t / K_TOC_COLS * 72 + BAR_H <= vp.nav_h(), "目录溢出");
+        assert!(t / vp.toc_cols() * 72 + BAR_H <= vp.nav_h(), "目录溢出");
         let q = search_page_size_extra(vp, 0);
         assert!(q * 112 + BAR_H + 88 <= vp.nav_h(), "搜索结果溢出");
     }
@@ -736,7 +738,7 @@ fn read_page_locks_one_screen_without_scrollbar_hacks() {
     );
     // 运行时视口脚本：outerHeight 为主、availHeight 上限保护、innerHeight 兜底；
     // 宽度缺参时取 clientWidth；不写 Cookie / sessionStorage；把 vw/vh 写回 URL 并补到页内链接。
-    let vpjs = K_VP_JS;
+    let vpjs = k_vp_js();
     assert!(vpjs.contains("(window.outerHeight||0)-1"), "{vpjs}");
     assert!(vpjs.contains("screen||{}"), "{vpjs}");
     assert!(vpjs.contains("availHeight"), "{vpjs}");
@@ -859,7 +861,7 @@ fn line_budget_tracks_runtime_height() {
 /// 顶栏只有一条、白底 + 1px #ccc，不再有整条灰底；书架/目录/搜索页不再渲染阅读页底栏。
 #[test]
 fn top_nav_is_single_and_has_no_gray_fill() {
-    let nav = top_bar("书架", None, &nav_link("/k/search", "搜索"), vp());
+    let nav = top_bar("书架", None, &nav_link("/k/search", "搜索", vp()), vp());
     assert!(nav.contains("height:73px;border-bottom:1px solid #ccc;background:#fff"));
     assert!(nav.contains("font-size:28px;line-height:72px;font-weight:700"));
     assert!(nav.contains("font-size:20px"), "动作链接 20px");
@@ -972,6 +974,55 @@ fn viewport_params_override_defaults_and_clamp() {
             "正文可用高必须扣掉 56px 顶栏与页码行"
         );
     }
+}
+
+/// 手机宽度（360–430 CSS px）必须被接受：否则 /k 仍按 1072 排版、右侧被裁掉。
+#[test]
+fn viewport_accepts_phone_widths() {
+    for w in [320i64, 360, 390, 412, 430] {
+        let v = Vp::resolve(Some(w), Some(800), (K_W, K_H));
+        assert_eq!(v.w, w as usize, "手机宽 {w} 必须原样采用");
+        assert!(v.fixed, "显式 vw 时锁宽");
+        assert!(v.page_w() >= 176, "版心宽不能算成 0：{w}");
+    }
+    // 低于下限仍回落默认（防 0 / 异常值）
+    assert_eq!(Vp::resolve(Some(239), None, (K_W, K_H)).w, K_W);
+    assert_eq!(Vp::resolve(Some(240), None, (K_W, K_H)).w, 240);
+}
+
+/// 手机视口（390×844）：目录单列、表单/空书架/顶栏都不横向溢出。
+#[test]
+fn narrow_viewport_switches_to_single_column_and_fits() {
+    let phone = vps(390, 844);
+    assert!(phone.narrow(), "390 宽必须判为窄屏");
+    assert_eq!(phone.toc_cols(), 1);
+    assert_eq!(phone.page_w(), 318);
+    assert_eq!(phone.content_w(), 246);
+    // 目录每页 = 单列行数（按高实算），且不溢出正文区
+    let rows = (phone.nav_h().saturating_sub(BAR_H)) / 72;
+    assert_eq!(toc_page_size(phone), rows);
+    assert!(toc_page_size(phone) * 72 + BAR_H <= phone.nav_h());
+    // 顶栏三个动作压缩后仍放得下（360 宽同样成立）
+    let nav = format!(
+        "{}{}{}",
+        nav_link("/k", "书架", phone),
+        nav_link("/k", "标准", phone),
+        nav_link("/k", "退出", phone)
+    );
+    assert!(nav.contains("padding-left:16px") && nav.contains("font-size:18px"));
+    assert!(!nav.contains("padding-left:32px"));
+    // 空书架卡片收进版心
+    let empty = empty_shelf(2, phone);
+    assert!(empty.contains("width=\"318\""), "{empty}");
+    assert!(!empty.contains("width=\"600\""), "{empty}");
+    // 阅读页顶栏左右格压缩，标题区不为负
+    let read_nav = read_nav_html("很长的书名", "/k", "/k/toc", phone);
+    assert!(read_nav.contains("width=\"110\"") && read_nav.contains("width=\"80\""));
+    assert!(!read_nav.contains("width=\"160\""), "{read_nav}");
+    // 宽屏（Kindle）行为不变
+    assert!(!vp().narrow());
+    assert_eq!(vp().toc_cols(), 2);
+    assert!(nav_link("/k", "书架", vp()).contains("padding-left:32px"));
 }
 
 /// 翻页/换章链接必须把 vw/vh 原样带下去（客户端零测量）。

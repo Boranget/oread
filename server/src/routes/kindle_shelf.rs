@@ -34,12 +34,42 @@ pub(super) async fn ensure_chapters(
 // ---------------- 登录 / 注销 ----------------
 
 pub(super) async fn login_form(
+    State(s): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let vp = vp_of(&s, &headers, num("vw"), num("vh"));
     let err = if q.get("err").map(|v| v == "1").unwrap_or(false) {
         "<p style=\"font-size:24px;line-height:36px;color:#333;margin-top:16px\">账号或密码错误，请重试</p>"
     } else {
         ""
+    };
+    // 窄屏（手机）：标签在上、输入框占满整行；宽屏（Kindle）：标签左置、输入框占满剩余宽度。
+    // 表格宽度取版心内容宽，任何视口都不会横向溢出。
+    let cw = vp.content_w();
+    let field = "font-size:24px;height:56px;border:1px solid #000;padding:0 12px;font-family:serif";
+    let form = if vp.narrow() {
+        format!(
+            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
+             <tr><td height=\"40\" style=\"font-size:24px\">账号</td></tr>\
+             <tr><td><input type=\"text\" name=\"username\" style=\"{field};width:100%\"></td></tr>\
+             <tr><td height=\"40\" style=\"font-size:24px\">密码</td></tr>\
+             <tr><td><input type=\"password\" name=\"password\" style=\"{field};width:100%\"></td></tr>\
+             <tr><td height=\"88\"><input type=\"submit\" value=\"登录\" style=\"{field};width:100%;background:#fff;color:#000\"></td></tr>\
+             </table>"
+        )
+    } else {
+        format!(
+            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
+             <tr><td width=\"120\" height=\"76\" style=\"font-size:24px\">账号</td>\
+             <td><input type=\"text\" name=\"username\" style=\"{field};width:100%\"></td></tr>\
+             <tr><td height=\"76\" style=\"font-size:24px\">密码</td>\
+             <td><input type=\"password\" name=\"password\" style=\"{field};width:100%\"></td></tr>\
+             <tr><td height=\"88\"></td>\
+             <td><input type=\"submit\" value=\"登录\" style=\"{field};width:240px;background:#fff;color:#000\"></td></tr>\
+             </table>"
+        )
     };
     page(
         "登录",
@@ -49,19 +79,11 @@ pub(super) async fn login_form(
              <div style=\"padding:36px\">\
              <p style=\"font-size:20px;line-height:32px;color:#555\">Kindle 极简阅读 · 请用网页端账号登录</p>\
              <p style=\"font-size:20px;line-height:32px;color:#555\">没有账号请先在电脑浏览器打开主站注册。</p>{err}\
-             <form method=\"post\" action=\"/k/login\">\
-             <table width=\"928\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
-             <tr><td width=\"120\" height=\"76\" style=\"font-size:24px\">账号</td>\
-             <td><input type=\"text\" name=\"username\" style=\"font-size:24px;height:56px;width:640px;border:1px solid #000;padding:0 12px;font-family:serif\"></td></tr>\
-             <tr><td height=\"76\" style=\"font-size:24px\">密码</td>\
-             <td><input type=\"password\" name=\"password\" style=\"font-size:24px;height:56px;width:640px;border:1px solid #000;padding:0 12px;font-family:serif\"></td></tr>\
-             <tr><td height=\"88\"></td>\
-             <td><input type=\"submit\" value=\"登录\" style=\"font-size:24px;height:56px;width:240px;border:1px solid #000;background:#fff;color:#000;font-family:serif\"></td></tr>\
-             </table></form></div>",
+             <form method=\"post\" action=\"/k/login\">{form}</form></div>",
             head = page_head("登录"),
             err = err
         ),
-        Vp::default(),
+        vp,
     )
 }
 
@@ -156,9 +178,9 @@ pub(super) async fn shelf(
     // 导航只出现一次：书架/搜索/目录用顶部导航，底栏只留给阅读页
     let nav = format!(
         "{}{}{}",
-        nav_link(&qlink("/k/search", fs, vp), "搜索"),
-        nav_link(&with_vp(&fs_url, vp), FS_SPECS[next_fs - 1].label),
-        nav_link("/k/logout", "退出"),
+        nav_link(&qlink("/k/search", fs, vp), "搜索", vp),
+        nav_link(&with_vp(&fs_url, vp), FS_SPECS[next_fs - 1].label, vp),
+        nav_link("/k/logout", "退出", vp),
     );
     let top = top_bar("书架", None, &nav, vp);
 
@@ -191,7 +213,7 @@ pub(super) async fn shelf(
                  <table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
                  <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
                  <td style=\"padding-left:24px\" valign=\"middle\">\
-                 <div style=\"font-size:32px;line-height:48px;font-weight:700\">{title}</div>\
+                 <div style=\"font-size:32px;line-height:48px;font-weight:700;white-space:nowrap;overflow:hidden\">{title}</div>\
                  <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:8px\"><tr>\
                  <td align=\"left\" style=\"font-size:20px;line-height:32px;color:#555\">{author}</td>\
                  <td align=\"right\" style=\"font-size:20px;line-height:32px;color:#555\">{pct:.0}%</td>\
@@ -265,7 +287,8 @@ pub(super) async fn toc(
     let total = visible.len() as i64;
     // 每列行数按「页面高 − 顶栏 − 底部分页条 − 安全余量」实算，30 只是上限
     let toc_page = toc_page_size(vp);
-    let rows_per_col = toc_page / K_TOC_COLS;
+    let cols_n = vp.toc_cols();
+    let rows_per_col = toc_page / cols_n;
     let t_pages = ((total + toc_page as i64 - 1) / toc_page as i64).max(1);
     let tp = q.tp.unwrap_or(1).clamp(1, t_pages);
     let start = ((tp - 1) * toc_page as i64) as usize;
@@ -311,17 +334,17 @@ pub(super) async fn toc(
     );
     let nav = format!(
         "{}{}{}",
-        nav_link(&qlink("/k", fs, vp), "书架"),
-        nav_link(&fs_href, FS_SPECS[next_fs - 1].label),
+        nav_link(&qlink("/k", fs, vp), "书架", vp),
+        nav_link(&fs_href, FS_SPECS[next_fs - 1].label, vp),
         back
     );
     let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
-    // 两列各 rows_per_col 行（1268 → 15 行/列）；列宽随版心自适应（1072 → 452，1024 → 428）
-    let col_w = vp.content_w().saturating_sub(24) / K_TOC_COLS;
-    let mut cols = [String::new(), String::new()];
+    // 每列 rows_per_col 行（1268 → 15 行/列）；列宽随版心自适应，窄屏单列（1072 → 452，390 → 246）
+    let col_w = vp.content_w().saturating_sub(24 * (cols_n - 1)) / cols_n;
+    let mut cols: Vec<String> = (0..cols_n).map(|_| String::new()).collect();
     for (i, c) in visible[start..end].iter().enumerate() {
-        let col = (i / rows_per_col).min(K_TOC_COLS - 1);
+        let col = (i / rows_per_col).min(cols_n - 1);
         let href = qlink(
             &format!(
                 "/k/read?book={}&source={}&ch={}&p=1",
@@ -359,15 +382,15 @@ pub(super) async fn toc(
             c
         );
     }
+    let cells = cols
+        .iter()
+        .map(|c| format!("<td width=\"{col_w}\" valign=\"top\">{c}</td>"))
+        .collect::<Vec<_>>()
+        .join("<td width=\"24\"></td>");
     let list = format!(
-        "<table width=\"{tw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}\"><tr>\
-         <td width=\"{col_w}\" valign=\"top\">{left}</td><td width=\"24\"></td><td width=\"{col_w}\" valign=\"top\">{right}</td>\
-         </tr></table>",
+        "<table width=\"{tw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}\"><tr>{cells}</tr></table>",
         tw = vp.content_w(),
         pad = SIDE_PAD,
-        col_w = col_w,
-        left = cols[0],
-        right = cols[1]
     );
 
     let prev = if tp > 1 {

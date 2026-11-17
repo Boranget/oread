@@ -393,7 +393,7 @@ impl Config {
             comic_slice_sd: env_u64("COMIC_SLICE_SD", 30).clamp(0, 255) as u8,
             comic_slice_r: env_u64("COMIC_SLICE_R", 96).clamp(8, 480) as u32,
             // `/k` 视口兜底：请求带 `vw`/`vh` 时以请求为准，缺参才用这两个环境默认值。
-            kindle_vw: env_u64("KINDLE_VW", 1072).clamp(480, 2400) as u32,
+            kindle_vw: env_u64("KINDLE_VW", 1072).clamp(240, 2400) as u32,
             kindle_vh: env_u64("KINDLE_VH", 1268).clamp(480, 2400) as u32,
             js_enabled: env_bool("JS_ENABLED", true),
             js_timeout_ms: resolve_js_timeout_ms(env_u64_opt("JS_TIMEOUT_MS")),

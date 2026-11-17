@@ -46,19 +46,31 @@ fn search_nav(key: &str, job: Option<&str>, include_cooled: bool, fs: usize, vp:
     url.push_str(cooled_suffix(include_cooled));
     format!(
         "{}{}",
-        nav_link(&qlink("/k", fs, vp), "书架"),
-        nav_link(&with_vp(&url, vp), FS_SPECS[next_fs - 1].label),
+        nav_link(&qlink("/k", fs, vp), "书架", vp),
+        nav_link(&with_vp(&url, vp), FS_SPECS[next_fs - 1].label, vp),
     )
 }
 
-fn search_form(key: &str, fs: usize) -> String {
+fn search_form(key: &str, fs: usize, vp: Vp) -> String {
+    let field = "font-size:24px;height:56px;border:1px solid #000;padding:0 12px;font-family:serif";
+    let btn = "font-size:24px;height:56px;border:1px solid #000;background:#fff;color:#000;font-family:serif";
+    // 窄屏：输入框与按钮各占一行、都吃满宽度；宽屏：一行排开（600 + 160）
+    let controls = if vp.narrow() {
+        format!(
+            "<input type=\"text\" name=\"key\" value=\"{key}\" style=\"{field};width:100%\">\
+             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:100%;margin-top:12px\">",
+            key = esc(key)
+        )
+    } else {
+        format!(
+            "<input type=\"text\" name=\"key\" value=\"{key}\" style=\"{field};width:600px\">\
+             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:160px;margin-left:12px\">",
+            key = esc(key)
+        )
+    };
     format!(
-        "<div style=\"padding:20px 36px 12px\"><form method=\"get\" action=\"/k/search\">\
-         <input type=\"text\" name=\"key\" value=\"{key}\" style=\"font-size:24px;height:56px;width:600px;border:1px solid #000;padding:0 12px;font-family:serif\">\
-         <input type=\"submit\" value=\"搜索\" style=\"font-size:24px;height:56px;width:160px;border:1px solid #000;background:#fff;color:#000;font-family:serif;margin-left:12px\">\
-         <input type=\"hidden\" name=\"fs\" value=\"{fs}\"></form></div>",
-        key = esc(key),
-        fs = fs
+        "<div style=\"padding:20px 36px 12px\"><form method=\"get\" action=\"/k/search\">{controls}\
+         <input type=\"hidden\" name=\"fs\" value=\"{fs}\"></form></div>"
     )
 }
 
@@ -137,7 +149,7 @@ pub(super) async fn search(
 
 fn search_home(fs: usize, explicit: bool, vp: Vp) -> Response {
     let top = top_bar("搜索", None, &search_nav("", None, false, fs, vp), vp);
-    let body = search_form("", fs);
+    let body = search_form("", fs, vp);
     let mut res = page("搜索", fs, &stage(&top, &body), vp);
     if explicit {
         remember_fs(&mut res, fs);
@@ -414,8 +426,8 @@ async fn result_page(
                  <table width=\"{rw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
                  <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
                  <td style=\"padding-left:24px\" valign=\"middle\">\
-                 <div style=\"font-size:32px;line-height:48px\">{name}</div>\
-                 <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:8px\">{sub}</div></td>\
+                 <div style=\"font-size:32px;line-height:48px;white-space:nowrap;overflow:hidden\">{name}</div>\
+                 <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:8px;white-space:nowrap;overflow:hidden\">{sub}</div></td>\
                  </tr></table></a></td></tr>",
                 href = href,
                 rw = vp.page_w(),
@@ -477,7 +489,7 @@ async fn result_page(
             href = esc(&with_vp(&href, vp))
         ));
     }
-    let body = format!("{}{}{}", search_form(key, fs), list, pager);
+    let body = format!("{}{}{}", search_form(key, fs, vp), list, pager);
     let mut res = page("搜索", fs, &stage(&top, &body), vp);
     if explicit {
         remember_fs(&mut res, fs);

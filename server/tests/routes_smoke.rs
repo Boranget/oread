@@ -579,6 +579,7 @@ async fn kindle_redirects_to_login_without_session() {
     );
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/k/login")
@@ -593,6 +594,29 @@ async fn kindle_redirects_to_login_without_session() {
         .unwrap();
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("<form"), "登录页应包含表单: {html}");
+
+    // 手机视口：登录页必须跟着 vw/vh 走（旧实现固定 1072 宽，右侧被裁）
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/k/login?vw=390&vh=844")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("content=\"width=390,"), "{html}");
+    assert!(html.contains("height:844px"), "文档高跟随 vh：{html}");
+    assert!(html.contains("width=\"246\""), "表单宽度取内容宽：{html}");
+    assert!(
+        !html.contains("width=\"928\""),
+        "手机不得渲染 928 宽表单：{html}"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
