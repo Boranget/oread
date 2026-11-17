@@ -151,7 +151,7 @@
 - 实现位置：[kindle.rs](../server/src/routes/kindle.rs)，路由 `/k`、`/k/toc`、`/k/read`、`/k/search`、`/k/login`、`/k/logout`、`/k/_selftest` 已在 [mod.rs](../server/src/routes/mod.rs) 合并。
 - 形态：**无业务 JS、纯 SSR、`table` 布局**；仅注入三类诊断脚本（错误兜底 `K_GUARD_JS`、视口标定 `K_VP_JS`、自报探针 `K_PROBE_JS`，见 [kindle.rs](../server/src/routes/kindle.rs) 顶部说明），不改变阅读行为；Cookie 登录（不依赖 Bearer JWT）；打开阅读页即自动写阅读进度（服务端 upsert，幂等）。
 - 字号分档：四档 `?fs=1/2/3/4`（小 28/46、标准 32/52、大 38/62、超小 20/36），也可写 `k_fs` Cookie。
-- 真机约束来源（Kindle Paperwhite 3）：屏幕 1072×1268、DPR 1.7964 但**浏览器不做缩放**；不支持 `flex` / `grid` / `vw` / `vh` 单位 / `calc`；`border-radius` 未用；**阅读页贴底元素用 `position:absolute;bottom:0`（相对 body），不用 `fixed`**——老 Silk 把 `fixed` 锚在布局视口（1268），比真实可见高（约 1180）大，底栏会掉出可见区；触摸事件**未证实**，故只用 `click`。视口可用 `?vw=&vh=` 参数化（缺参回落环境默认 `KINDLE_VW=1072` / `KINDLE_VH=1268`）；`<head>` 内联 ES5 每次进页面实测：高取 `outerHeight−1`（`screen.availHeight` 上限保护，`innerHeight` 兜底），宽取 `clientWidth`（首屏 meta 为 `width=device-width`，即设备真实 CSS 宽），一次 `location.replace` 把 `vw`/`vh` 带回 URL 并补到站内链接，**不落 Cookie / sessionStorage**。
+- 真机约束来源（Kindle Paperwhite 3）：屏幕 1072×1268、DPR 1.7964 但**浏览器不做缩放**；不支持 `flex` / `grid` / `vw` / `vh` 单位 / `calc`；`border-radius` 未用；**阅读页贴底元素用 `position:absolute;bottom:0`（相对 body），不用 `fixed`**——老 Silk 把 `fixed` 锚在布局视口（1268），比真实可见高（约 1180）大，底栏会掉出可见区；触摸事件**未证实**，故只用 `click`。视口可用 `?vw=&vh=` 参数化（缺参回落环境默认 `KINDLE_VW=1072` / `KINDLE_VH=1268`）；`<head>` 内联 ES5 每次进页面实测：高取 `min(outerHeight−1, innerHeight)`（`screen.availHeight` 上限保护），宽取 `clientWidth`（首屏 meta 为 `width=device-width`，即设备真实 CSS 宽），一次 `location.replace` 把 `vw`/`vh` 带回 URL 并补到站内链接，**不落 Cookie / sessionStorage**。
 - 定位：`/k` 是 EPUB 导出（见 2.6）的低成本替代路径，先保证“能读”，再考虑推送格式。
 
 #### 3.2.2 已修复缺陷（`已修复`，2026-11-03）

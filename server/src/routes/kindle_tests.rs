@@ -543,6 +543,12 @@ fn vp_js_measures_width_once_with_range_guard() {
         "实测宽度越界时不下发（服务端也会回落默认）：{js}"
     );
     assert!(!js.contains('$'), "边界占位符必须全部注入：{js}");
+    // 高取 outerHeight−1 与 innerHeight 的较小者：手机可视区以 inner 为准，
+    // Kindle 上 inner=1268 更大不会生效，真机仍是 1231。
+    assert!(
+        js.contains("if(H>200&&ih>200)H=mn(H,ih)"),
+        "高必须与 innerHeight 取较小者：{js}"
+    );
     // 参数只保留一份：解析时把 vw/vh 摘出来，replace 时按 vw→vh 重新拼
     assert!(
         js.contains("k=='vw'") && js.contains("k=='vh'"),

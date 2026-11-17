@@ -155,9 +155,10 @@ pub(super) const K_FS_COOKIE: &str = "k_fs";
 ///
 /// 每次进页面现算视口，再把 `vw=<宽>&vh=<高>` 带回 URL（缺哪个补哪个，最多 replace 一次）：
 ///
-///   高：1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）；
+///   高：1. `outerHeight − 1`（真机 1232 → 1231，最接近真实可用高）与 `innerHeight`
+///       取较小者（手机 innerHeight 才是可视区，Kindle 上 innerHeight=1268 更大、不生效）；
 ///       2. `screen.availHeight` 做上限保护；
-///       3. 两者都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
+///       3. 都取不到才退 `innerHeight`（1268 只作机型识别与兜底）。
 ///   宽：缺 `vw` 时取 `documentElement.clientWidth`（首屏 meta 是 `width=device-width`，
 ///       即设备真实 CSS 宽），取不到再退 `innerWidth`；KPW3 量出 1072，与旧行为一致。
 ///
@@ -174,6 +175,7 @@ const K_VP_JS: &str = "(function(){try{\
 var d=document.documentElement,ih=window.innerHeight||0,iw=window.innerWidth||0,sh=window.screen||{};\
 function mn(a,b){if(!(b>0))return a;if(!(a>0))return b;return a<b?a:b}\
 var H=(window.outerHeight||0)-1,AH=(sh.availHeight||0);\
+if(H>200&&ih>200)H=mn(H,ih);\
 if(!(H>200))H=AH;\
 if(AH>200)H=mn(H,AH);\
 if(!(H>200))H=ih;\

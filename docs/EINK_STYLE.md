@@ -60,7 +60,7 @@
 
 | 项 | 公式 | 参考值（KPW3 `vw=1072` / `vh=1268`） |
 |---|---|---|
-| 视口 | 每次进页面由 `<head>` 内联 ES5 实测：高 `outerHeight−1`（`availHeight` 上限、`innerHeight` 兜底），宽 `clientWidth`（缺参首屏 meta 为 `width=device-width`）；越界 240–2400 不采用 | `1072 × 1268` |
+| 视口 | 每次进页面由 `<head>` 内联 ES5 实测：高 `min(outerHeight−1, innerHeight)`（`availHeight` 上限），宽 `clientWidth`（缺参首屏 meta 为 `width=device-width`）；越界 240–2400 不采用 | `1072 × 1268` |
 | 版心宽 / 内容宽 | `vw − 72` / `vw − 144`（左右各 `36`） | `1000` / `928` |
 | 文档高 | `vh`（`html`/`body` 同高，`overflow:hidden`） | `1268` |
 | 阅读页底栏 | `vh × 13/250`，下限 `48`（内容高 = 底栏 − `12` 安全区） | `65` |
