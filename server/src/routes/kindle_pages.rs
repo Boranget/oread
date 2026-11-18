@@ -95,7 +95,8 @@ pub(super) fn page_html(title: &str, fs: usize, body: &str, vp: Vp) -> String {
 /// 且方向已定为「不靠骗浏览器」）。可用高由 `K_VP_JS` 现算并以 `vh` 参数传回；
 /// `html/body` 高度统一锁成运行时 `H`，任何页的贴底元素都落在真实可见区内。
 pub(super) fn page_html_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: Vp) -> String {
-    let spec = &FS_SPECS[fs - 1];
+    // 字号/行高按统一比例缩放（1072 → 原值，390 → 50%），见 `Vp::px`
+    let spec = vp.fs(fs);
     // 显式 vw → 锁死版心宽（1:1 不缩放）；缺参 → device-width
     let width = if vp.fixed {
         format!("width={}", vp.w)
@@ -122,7 +123,7 @@ table{{border-collapse:collapse}}\
         size = spec.size,
         line = spec.line,
         pw = vp.page_w(),
-        pad = SIDE_PAD,
+        pad = vp.pad(),
         extra = extra_css,
         body = body,
         guard = K_GUARD_JS,
@@ -159,34 +160,43 @@ pub(super) fn page_css(title: &str, fs: usize, body: &str, extra_css: &str, vp: 
 
 /// 顶栏（73px = 72 内容 + 1px 下边线，白底，只有一条）：
 /// 左：标题 28px 加粗（可带一段 20px 弱灰副标题）；右：动作链接 20px，间距 32px。
+/// 全部尺寸按 `Vp` 统一比例缩放：390 宽 → 44px 高、14px 标题、13px 动作。
 pub(super) fn top_bar(title: &str, sub: Option<&str>, actions: &str, vp: Vp) -> String {
     let sub = match sub {
         Some(s) => format!(
-            " <span style=\"font-size:20px;color:#555;font-weight:400\">{}</span>",
-            esc(s)
+            " <span style=\"font-size:{f20}px;color:#555;font-weight:400\">{}</span>",
+            esc(s),
+            f20 = vp.px(20)
         ),
         None => String::new(),
     };
+    let bar_h = vp.nav_bar_h();
+    let cell_h = bar_h.saturating_sub(1);
     format!(
-        "<div id=\"k-nav\" style=\"height:73px;border-bottom:1px solid #ccc;background:#fff;white-space:nowrap;overflow:hidden\">\
+        "<div id=\"k-nav\" style=\"height:{bar_h}px;border-bottom:1px solid #ccc;background:#fff;white-space:nowrap;overflow:hidden\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-         <td height=\"72\" align=\"left\" style=\"font-size:28px;line-height:72px;font-weight:700;padding-left:36px;overflow:hidden\">{title}{sub}</td>\
-         <td height=\"72\" align=\"right\" style=\"font-size:20px;line-height:72px;padding-right:36px\">{actions}</td>\
+         <td height=\"{cell_h}\" align=\"left\" style=\"font-size:{f28}px;line-height:{cell_h}px;font-weight:700;padding-left:{pad}px;overflow:hidden\">{title}{sub}</td>\
+         <td height=\"{cell_h}\" align=\"right\" style=\"font-size:{f20}px;line-height:{cell_h}px;padding-right:{pad}px\">{actions}</td>\
          </tr></table></div>",
+        bar_h = bar_h,
+        cell_h = cell_h,
         pw = vp.page_w(),
+        pad = vp.pad(),
+        f28 = vp.px(28),
+        f20 = vp.px(20),
         title = esc(title),
         sub = sub,
         actions = actions
     )
 }
 
-/// 顶栏动作链接：20px，间距 32px（用内边距，不依赖 flex/grid）
+/// 顶栏动作链接：参考 20px 字号、32px 间距，按统一比例缩放（390 → 13px / 16px）。
 pub(super) fn nav_link(href: &str, label: &str, vp: Vp) -> String {
-    // 窄屏压缩动作区间距与字号，保证三个动作 + 标题在 360–430 宽内不折行
-    let (pad, size) = if vp.narrow() { (16, 18) } else { (32, 20) };
     format!(
         "<a href=\"{href}\" style=\"padding-left:{pad}px;font-size:{size}px\">{label}</a>",
         href = href,
+        pad = vp.px(32),
+        size = vp.px(20),
         label = esc(label)
     )
 }
@@ -201,9 +211,9 @@ pub(super) fn fixed_bar(row: &str, vp: Vp) -> String {
         "<div id=\"k-bar\" style=\"position:absolute;left:0;right:0;bottom:0;height:{h}px;padding-bottom:{safe}px;background:#fff;z-index:10\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}px;table-layout:fixed\"><tr>{row}</tr></table></div>",
         h = vp.bar_h(),
-        safe = SAFE_BOTTOM,
+        safe = vp.len(SAFE_BOTTOM),
         pw = vp.page_w(),
-        pad = SIDE_PAD,
+        pad = vp.pad(),
         row = row
     )
 }
@@ -213,9 +223,10 @@ pub(super) fn bar_cell(href: &str, label: &str, vp: Vp) -> String {
     let ch = vp.bar_content_h().saturating_sub(1);
     format!(
         "<td width=\"33.33%\" height=\"{ch}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc\">\
-         <a href=\"{href}\" style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:34px;font-weight:700\">{label}</a></td>",
+         <a href=\"{href}\" style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:{fs}px;font-weight:700\">{label}</a></td>",
         href = href,
         ch = ch,
+        fs = vp.px(34),
         label = esc(label)
     )
 }
@@ -225,8 +236,9 @@ pub(super) fn bar_cell_off(label: &str, vp: Vp) -> String {
     let ch = vp.bar_content_h().saturating_sub(1);
     format!(
         "<td width=\"33.33%\" height=\"{ch}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc\">\
-         <span style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:34px;font-weight:700;color:#555\">{label}</span></td>",
+         <span style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:{fs}px;font-weight:700;color:#555\">{label}</span></td>",
         ch = ch,
+        fs = vp.px(34),
         label = esc(label)
     )
 }
@@ -238,17 +250,25 @@ pub(super) fn pager_bar(
     next: Option<(String, &'static str)>,
     vp: Vp,
 ) -> String {
+    let h = vp.pager_h();
+    let ch = h.saturating_sub(1);
     let cell = |item: &Option<(String, &'static str)>, fallback: &str| {
         match item {
         Some((href, label)) => format!(
-            "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
-             <a href=\"{href}\" style=\"display:block;height:63px;line-height:63px;font-size:24px\">{label}</a></td>",
+            "<td width=\"50%\" height=\"{h}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+             <a href=\"{href}\" style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:{fs}px\">{label}</a></td>",
+            h = h,
+            ch = ch,
+            fs = vp.px(24),
             href = href,
             label = esc(label)
         ),
         None => format!(
-            "<td width=\"50%\" height=\"64\" align=\"center\" valign=\"middle\" style=\"height:63px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
-             <span style=\"display:block;height:63px;line-height:63px;font-size:24px;color:#555\">{label}</span></td>",
+            "<td width=\"50%\" height=\"{h}\" align=\"center\" valign=\"middle\" style=\"height:{ch}px;border-top:1px solid #ccc;font-size:0;line-height:0\">\
+             <span style=\"display:block;height:{ch}px;line-height:{ch}px;font-size:{fs}px;color:#555\">{label}</span></td>",
+            h = h,
+            ch = ch,
+            fs = vp.px(24),
             label = fallback
         ),
     }
@@ -257,7 +277,7 @@ pub(super) fn pager_bar(
         "<div id=\"k-pager\" style=\"position:absolute;left:0;right:0;bottom:0;height:{h}px;background:#fff;z-index:8\">\
          <table width=\"{pw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"table-layout:fixed\"><tr>{p}{n}</tr></table></div>",
         pw = vp.page_w(),
-        h = BAR_H,
+        h = h,
         p = cell(&prev, "上一页"),
         n = cell(&next, "下一页")
     )
@@ -268,10 +288,10 @@ pub(super) fn pager_bar(
 /// `z-index:5` 高于正文（0）低于底栏（10）与顶栏（12）；顶栏整格可点，
 /// 热区又整整让开 56px，所以点书名/「书架」不会误翻页。不再写死 `height:vh−24`，
 /// 否则视口比参数矮时热区自己会顶出第二屏。
-pub(super) fn hot_zones(prev: Option<&str>, next: Option<&str>) -> String {
+pub(super) fn hot_zones(prev: Option<&str>, next: Option<&str>, vp: Vp) -> String {
     let css = format!(
         "position:absolute;top:{nav}px;bottom:0;width:33%;z-index:5;display:block",
-        nav = READ_NAV_H
+        nav = vp.read_nav_h()
     );
     let mut out = String::new();
     if let Some(pv) = prev {
@@ -314,14 +334,13 @@ pub(super) fn fit_px(s: &str, max_px: usize, size: usize, half: usize) -> String
 /// 高于翻页热区（5）与底栏（10）；三格全部 `display:block` 整格可点，
 /// 书架/目录链接都带当前 `fs/vw/vh`，点一次就能带着同一档字号与视口回去。
 pub(super) fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp) -> String {
-    // 窄屏把左右两格压到 110/80，标题仍居中；宽屏沿用 160/120
-    let (bw, tw) = if vp.narrow() {
-        (110, 80)
-    } else {
-        (READ_NAV_BACK_W, READ_NAV_TOC_W)
-    };
-    let title_px = vp.content_w().saturating_sub(bw + tw).saturating_sub(24);
-    let title = fit_px(title, title_px, 20, 10);
+    // 左右两格按统一比例缩放（1072 → 160/120，390 → 80/60），标题仍居中
+    let (bw, tw) = (vp.len(READ_NAV_BACK_W), vp.len(READ_NAV_TOC_W));
+    let title_px = vp
+        .content_w()
+        .saturating_sub(bw + tw)
+        .saturating_sub(vp.len(24));
+    let title = fit_px(title, title_px, vp.px(20), vp.len(10));
     format!(
         "<div id=\"k-read-nav\"><table cellpadding=\"0\" cellspacing=\"0\"><tr>\
 <td width=\"{bw}\" align=\"center\" style=\"border-right:1px solid #ccc\"><a href=\"{back}\">&larr; 书架</a></td>\
@@ -335,6 +354,7 @@ pub(super) fn read_nav_html(title: &str, back_href: &str, toc_href: &str, vp: Vp
 }
 
 pub(super) fn read_only_css(vp: Vp) -> String {
+    let nav_h = vp.read_nav_h();
     format!(
         // 整屏分页（v0.3.22）：文档高 = 运行时实测可用高（`layout_h()`，来自 `vh` 参数），
         // 顶栏/正文/底栏全部从它派生；正文区写死高度（= 文档高 − 顶栏 − 底栏）且
@@ -344,17 +364,20 @@ pub(super) fn read_only_css(vp: Vp) -> String {
         "html,body{{position:relative;top:0;left:0;width:100%;height:{doc}px;overflow:hidden}}\
          #k-read-nav{{position:absolute;top:0;left:0;right:0;height:{nav}px;padding:0 {pad}px;background:#fff;border-bottom:1px solid #000;z-index:12}}\
          #k-read-nav table{{width:100%;table-layout:fixed;border-collapse:collapse}}\
-         #k-read-nav td{{height:{tdh}px;padding:0;font-size:20px;line-height:28px;vertical-align:middle;overflow:hidden;white-space:nowrap;color:#000}}\
+         #k-read-nav td{{height:{tdh}px;padding:0;font-size:{f20}px;line-height:{l28}px;vertical-align:middle;overflow:hidden;white-space:nowrap;color:#000}}\
          #k-read-nav td a{{display:block;height:{tdh}px;line-height:{tdh}px;color:#000;text-decoration:none}}\
          #k-stage{{position:absolute;top:{nav}px;left:{pad}px;width:{sw}px;height:{sh}px;padding:{pt}px {pad}px 0;overflow:hidden}}\
-         #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:200px;font-size:20px;line-height:28px;color:#555;text-align:right}}",
+         #k-page-no{{position:absolute;right:{pad}px;bottom:8px;width:{pnw}px;font-size:{f20}px;line-height:{l28}px;color:#555;text-align:right}}",
         doc = vp.layout_h(),
-        pad = SIDE_PAD,
-        nav = READ_NAV_H,
-        tdh = READ_NAV_H - 1,
+        pad = vp.pad(),
+        nav = nav_h,
+        tdh = nav_h.saturating_sub(1),
         sw = vp.page_w(),
-        sh = vp.layout_h().saturating_sub(READ_NAV_H + vp.bar_h()),
-        pt = READ_PAD_TOP
+        sh = vp.layout_h().saturating_sub(nav_h + vp.bar_h()),
+        pt = vp.read_pad_top(),
+        pnw = vp.len(200),
+        f20 = vp.px(20),
+        l28 = vp.px(28)
     )
 }
 
@@ -373,14 +396,15 @@ pub(super) fn read_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String
     )
 }
 
-/// 目录链接（按 30 章/页定位到当前章所在目录页，并带上当前章用于高亮）
+/// 目录链接（按当前视口的每页章节数定位到当前章所在目录页，并带上当前章用于高亮）
 pub(super) fn toc_link(q: &ReadQ, fs: usize, ch: i64, p: i64, vp: Vp) -> String {
+    let per = toc_page_size(vp).max(1) as i64;
     qlink(
         &format!(
             "/k/toc?book={}&source={}&tp={}&ch={}&p={}",
             qenc(&q.book),
             qenc(&q.source),
-            (ch / K_TOC_PAGE as i64) + 1,
+            (ch / per) + 1,
             ch,
             p
         ),
@@ -437,11 +461,16 @@ pub(super) fn bar_cell_next(next: Option<&(String, &'static str)>, vp: Vp) -> St
     }
 }
 
-/// 描边按钮（只描边不填充、圆角 0、无阴影/渐变/过渡），240×72
-pub(super) fn outline_button(href: &str, label: &str) -> String {
+/// 描边按钮（只描边不填充、圆角 0、无阴影/渐变/过渡）：参考 240×72，按统一比例缩放
+pub(super) fn outline_button(href: &str, label: &str, vp: Vp) -> String {
+    let h = vp.tap(72);
     format!(
-        "<a href=\"{href}\" style=\"display:block;width:240px;height:72px;line-height:70px;border:1px solid #000;text-align:center;font-size:24px\">{label}</a>",
+        "<a href=\"{href}\" style=\"display:block;width:{w}px;height:{h}px;line-height:{lh}px;border:1px solid #000;text-align:center;font-size:{fs}px\">{label}</a>",
         href = href,
+        w = vp.len(240),
+        h = h,
+        lh = h.saturating_sub(2),
+        fs = vp.px(24),
         label = esc(label)
     )
 }
@@ -449,52 +478,69 @@ pub(super) fn outline_button(href: &str, label: &str) -> String {
 /// 空书架：2px 描边块，整块在可用区内垂直居中（`table` 100% + `valign="middle"`），
 /// 含标题 26 加粗 + 说明 20 `#555` + 240×72 描边按钮。
 pub(super) fn empty_shelf(fs: usize, vp: Vp) -> String {
-    // 卡片最宽 600，窄屏收进版心（390 → 318），不横向溢出
-    let card_w = vp.page_w().min(600);
+    // 卡片最宽 600（参考视口），窄屏收进版心，不横向溢出
+    let card_w = vp.len(600).min(vp.page_w());
     format!(
         "<table width=\"{pw}\" height=\"{h}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
          <td align=\"center\" valign=\"middle\">\
          <table width=\"{card_w}\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #000\"><tr>\
-         <td align=\"left\" style=\"padding:32px\">\
-         <div style=\"font-size:26px;line-height:40px;font-weight:700\">书架还是空的</div>\
-         <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\
-         <div style=\"margin-top:24px\">{btn}</div></td></tr></table></td></tr></table>",
+         <td align=\"left\" style=\"padding:{pad}px\">\
+         <div style=\"font-size:{f26}px;line-height:{l40}px;font-weight:700\">书架还是空的</div>\
+         <div style=\"font-size:{f20}px;line-height:{l32}px;color:#555;margin-top:{mt}px\">在电脑浏览器打开主站，把想看的书加进书架。</div>\
+         <div style=\"margin-top:{mt2}px\">{btn}</div></td></tr></table></td></tr></table>",
         pw = vp.page_w(),
         h = vp.nav_h(),
-        btn = outline_button(&qlink("/k/search", fs, vp), "去搜索一本书")
+        card_w = card_w,
+        pad = vp.px(32),
+        f26 = vp.px(26),
+        l40 = vp.px(40),
+        f20 = vp.px(20),
+        l32 = vp.px(32),
+        mt = vp.len(12),
+        mt2 = vp.len(24),
+        btn = outline_button(&qlink("/k/search", fs, vp), "去搜索一本书", vp)
     )
 }
 
 /// 带顶栏页面的标题行（页内标题，用于错误/分卷等没有顶栏动作的页面）
-pub(super) fn page_head(title: &str) -> String {
+pub(super) fn page_head(title: &str, vp: Vp) -> String {
+    let h = vp.nav_bar_h();
     format!(
-        "<div style=\"height:73px;border-bottom:1px solid #ccc;padding:0 36px;font-size:28px;line-height:72px;font-weight:700\">{title}</div>",
+        "<div style=\"height:{h}px;border-bottom:1px solid #ccc;padding:0 {pad}px;font-size:{f28}px;line-height:{cell}px;font-weight:700\">{title}</div>",
+        h = h,
+        pad = vp.pad(),
+        f28 = vp.px(28),
+        cell = h.saturating_sub(1),
         title = esc(title)
     )
 }
 
 /// 提示页（错误 / 分卷）：页内标题 + 说明 + 描边按钮，单屏内
-pub(super) fn notice_page(title: &str, msg: &str, href: &str, label: &str) -> String {
+pub(super) fn notice_page(title: &str, msg: &str, href: &str, label: &str, vp: Vp) -> String {
     format!(
-        "{head}<div style=\"padding:36px\"><p style=\"font-size:24px;line-height:36px;color:#333\">{msg}</p>\
-         <p style=\"margin-top:24px\">{btn}</p></div>",
-        head = page_head(title),
+        "{head}<div style=\"padding:{pad}px\"><p style=\"font-size:{f24}px;line-height:{l36}px;color:#333\">{msg}</p>\
+         <p style=\"margin-top:{mt}px\">{btn}</p></div>",
+        head = page_head(title, vp),
+        pad = vp.pad(),
+        f24 = vp.px(24),
+        l36 = vp.px(36),
+        mt = vp.len(24),
         msg = esc(msg),
-        btn = outline_button(href, label)
+        btn = outline_button(href, label, vp)
     )
 }
 
-pub(super) fn err_page(msg: &str) -> Response {
+pub(super) fn err_page(msg: &str, vp: Vp) -> Response {
     page(
         "错误",
         2,
-        &notice_page("出错了", msg, "/k", "返回书架"),
-        Vp::default(),
+        &notice_page("出错了", msg, "/k", "返回书架", vp),
+        vp,
     )
 }
 
-pub(super) fn err_to_page(e: AppError) -> Response {
-    err_page(&format!("{e}"))
+pub(super) fn err_to_page(e: AppError, vp: Vp) -> Response {
+    err_page(&format!("{e}"), vp)
 }
 
 /// 分卷行：`is_volume` 标记，或抓取层合成的 `volume:<book_url>#<index>` URL。
@@ -519,6 +565,7 @@ pub(super) fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp) -> Res
         "该条为分卷标题，请从目录选择章节",
         &back,
         "返回目录",
+        vp,
     );
     let mut res = page("分卷标题", fs, &body, vp);
     if explicit {
@@ -559,9 +606,9 @@ pub(super) fn char_em(c: char) -> f64 {
     }
 }
 
-/// 每行可用 em 数（版心宽度 ÷ 字号）；版心宽度随请求视口变化
-pub(super) fn line_em(spec: &FsSpec, page_w: usize) -> f64 {
-    (page_w - SIDE_PAD * 2) as f64 / spec.size as f64
+/// 每行可用 em 数（正文可用宽 ÷ 字号）；宽度取 `Vp::content_w()`，与 `#k-stage` 的实际文本宽一致
+pub(super) fn line_em(spec: &FsSpec, text_w: usize) -> f64 {
+    text_w as f64 / spec.size.max(1) as f64
 }
 
 /// 段落占用行数：首行缩进 2em，续行不缩进（与渲染的 text-indent:2em 一致）
@@ -607,12 +654,12 @@ pub(super) fn paginate_lines(
     text: &str,
     spec: &FsSpec,
     budget: usize,
-    page_w: usize,
+    text_w: usize,
 ) -> Vec<(usize, usize)> {
     if text.is_empty() {
         return vec![(0, 0)];
     }
-    let em = line_em(spec, page_w);
+    let em = line_em(spec, text_w);
     let budget = budget.max(1) as f64;
     let gap = para_gap_px(spec.line) as f64 / spec.line as f64;
     let mut pages: Vec<(usize, usize)> = Vec::new();
@@ -707,11 +754,11 @@ pub(super) struct PagePlan {
     pub(super) pages: Vec<(usize, usize, usize)>,
 }
 
-pub(super) fn plan_pages(text: &str, spec: &FsSpec, budget: usize, page_w: usize) -> PagePlan {
+pub(super) fn plan_pages(text: &str, spec: &FsSpec, budget: usize, text_w: usize) -> PagePlan {
     let chunks = chunk_ranges(text, K_CHUNK_CHARS);
     let mut pages = Vec::new();
     for (ci, &(cs, ce)) in chunks.iter().enumerate() {
-        for (s, e) in paginate_lines(&text[cs..ce], spec, budget, page_w) {
+        for (s, e) in paginate_lines(&text[cs..ce], spec, budget, text_w) {
             pages.push((ci, cs + s, cs + e));
         }
     }

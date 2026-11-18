@@ -15,10 +15,10 @@ pub(super) async fn read(
     let vp = vp_of(&s, &headers, q.vw, q.vh);
     let (source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
-        Err(e) => return err_to_page(e),
+        Err(e) => return err_to_page(e, vp),
     };
     if chapters.is_empty() {
-        return err_page("目录为空");
+        return err_page("目录为空", vp);
     }
     let ch = q.ch.unwrap_or(0).clamp(0, chapters.len() as i64 - 1);
     let chapter: &BookChapter = &chapters[ch as usize];
@@ -43,7 +43,7 @@ pub(super) async fn read(
         _ => {
             let mut fetched = match web_book::chapter_content(&source, chapter).await {
                 Ok(c) => c,
-                Err(e) => return err_page(&format!("正文抓取失败: {e}")),
+                Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
             };
             fetched.origin = source.book_source_url.clone();
             let limit = match replace::user_cache_limit_mb(&db.0).await {
@@ -77,10 +77,10 @@ pub(super) async fn read(
     .await;
     let mut text = html_to_text(body_html.as_deref().unwrap_or(""));
     let truncated = truncate_to_chars(&mut text, K_MAX_TEXT_CHARS);
-    let spec = &FS_SPECS[fs - 1];
-    // 每页行数由「正文可用高 ÷ 行高」动态算出（字号四档不再有 24/21/17/25 硬编码）
+    let spec = vp.fs(fs);
+    // 每页行数由「正文可用高 ÷ 行高」动态算出；字号/行高已按视口比例缩放
     let budget = line_budget(vp, spec.line);
-    let plan = plan_pages(&text, spec, budget, vp.page_w());
+    let plan = plan_pages(&text, &spec, budget, vp.content_w());
     let n = plan.pages.len() as i64;
     let p = q.p.unwrap_or(1).clamp(1, n);
     let (block_idx, cur_start, cur_end) = plan.pages[(p - 1) as usize];
@@ -166,6 +166,7 @@ pub(super) async fn read(
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
             next.as_ref().map(|x| x.0.as_str()),
+            vp,
         ),
         bottom = bottom
     );

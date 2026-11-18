@@ -18,6 +18,18 @@ pub(super) struct Vp {
 pub(super) const VP_MIN: i64 = 240;
 pub(super) const VP_MAX: i64 = 2400;
 
+/// 统一缩放下限（百分比）：390 宽手机 → 50%（正文 32 → 16px）。低于此值不再缩小，
+/// 否则次要文字会掉到不可读；屏幕更窄时靠单列布局容纳，而不是继续缩字。
+pub(super) const SCALE_MIN_PCT: usize = 50;
+/// 文本最小字号（px）
+pub(super) const TEXT_MIN: usize = 13;
+/// 可点区域最小高度（px）：触控热区不随缩放变小
+pub(super) const TAP_MIN: usize = 44;
+/// 左右留白下限（px）
+pub(super) const PAD_MIN: usize = 12;
+/// 窄屏阈值（视口宽 CSS px）：只按宽度判定，手机、窄窗口、平板分屏走同一套
+pub(super) const NARROW_W: usize = 744;
+
 impl Vp {
     /// 缺参/越界时回落到默认视口，保证任何尺寸都不会算出负高度。
     pub(super) fn resolve(vw: Option<i64>, vh: Option<i64>, d: (usize, usize)) -> Self {
@@ -31,13 +43,34 @@ impl Vp {
             fixed: ok(vw).is_some(),
         }
     }
-    /// 版心宽 = 视口宽 − 左右留白 ×2（1072 → 1000）
+    /// 统一缩放百分比：以参考视口 1072 为 100%，下限 50%（390 宽手机 → 50%）。
+    /// 所有字号、行高、留白都从它派生，**不再有第二处比例**。
+    pub(super) fn pct(self) -> usize {
+        (self.w * 100 / K_W).clamp(SCALE_MIN_PCT, 100)
+    }
+    /// 按比例换算长度（不设下限）：宽度、缩略图尺寸这类纯几何值用它。
+    pub(super) fn len(self, base: usize) -> usize {
+        base * self.pct() / 100
+    }
+    /// 文本尺寸：按比例缩放，下限 `TEXT_MIN`（13px），次要信息在手机上仍可读。
+    pub(super) fn px(self, base: usize) -> usize {
+        self.len(base).max(TEXT_MIN)
+    }
+    /// 可点区域 / 成块高度：按比例缩放，下限 `TAP_MIN`（44px），触控热区不随缩放变小。
+    pub(super) fn tap(self, base: usize) -> usize {
+        self.len(base).max(TAP_MIN)
+    }
+    /// 左右留白：按比例缩放，下限 `PAD_MIN`（12px）。手机上 36px 会吃掉 18% 屏宽。
+    pub(super) fn pad(self) -> usize {
+        self.len(SIDE_PAD).max(PAD_MIN)
+    }
+    /// 版心宽 = 视口宽 − 左右留白 ×2（1072 → 1000，390 → 354）
     pub(super) fn page_w(self) -> usize {
-        self.w.saturating_sub(SIDE_PAD * 2)
+        self.w.saturating_sub(self.pad() * 2)
     }
     /// 漫画图宽 = 版心宽 − 左右留白 ×2（1072 → 928，即切片版心宽 dw）
     pub(super) fn content_w(self) -> usize {
-        self.w.saturating_sub(SIDE_PAD * 4)
+        self.w.saturating_sub(self.pad() * 4)
     }
     /// 文档高 = 请求带回来的运行时实测可见高（`K_VP_JS` 现算，见 `layout_h` 上方说明）。
     /// 不再做任何固定 px 收缩/夹取：顶栏、底栏、正文切片都从这一个值派生。
@@ -49,31 +82,64 @@ impl Vp {
     pub(super) fn bar_h(self) -> usize {
         (self.layout_h() * 13 / 250).max(48)
     }
-    /// 底栏内容高（去掉 `SAFE_BOTTOM` 安全区）
+    /// 底栏内容高（去掉按比例缩放后的安全区），保证格高 + 安全区不超过底栏总高
     pub(super) fn bar_content_h(self) -> usize {
-        self.bar_h().saturating_sub(SAFE_BOTTOM).max(40)
+        self.bar_h().saturating_sub(self.len(SAFE_BOTTOM))
     }
     /// 阅读页正文容器高 = 文档高 − 底栏
     pub(super) fn body_h(self) -> usize {
         self.layout_h().saturating_sub(self.bar_h())
     }
-    /// 带顶栏页面的正文区高 = 文档高 − 顶栏 − 1（1268 → 1107）
-    pub(super) fn nav_h(self) -> usize {
-        self.layout_h().saturating_sub(NAV_H + 1)
+    /// 列表页顶栏总高（73 = 72 内容 + 1px 下边线；窄屏压到 44 触控下限）
+    pub(super) fn nav_bar_h(self) -> usize {
+        self.tap(NAV_H + 1)
     }
-    /// 小说正文可用高 = 正文容器 − 顶栏 − 顶部留白 − 页码行（1268 → 968）
+    /// 带顶栏页面的正文区高 = 文档高 − 顶栏（1268 → 1195，844 → 800）
+    pub(super) fn nav_h(self) -> usize {
+        self.layout_h().saturating_sub(self.nav_bar_h())
+    }
+    /// 列表页翻页条高（64 → 44 触控下限）
+    pub(super) fn pager_h(self) -> usize {
+        self.tap(BAR_H)
+    }
+    /// 目录行高（72 → 44 触控下限）
+    pub(super) fn toc_row_h(self) -> usize {
+        self.tap(TOC_ROW_H)
+    }
+    /// 阅读页顶栏高（56 → 44 触控下限）
+    pub(super) fn read_nav_h(self) -> usize {
+        self.tap(READ_NAV_H)
+    }
+    /// 阅读页正文顶部留白（36 → 18）
+    pub(super) fn read_pad_top(self) -> usize {
+        self.px(READ_PAD_TOP)
+    }
+    /// 正文底部页码行高（56 → 28）
+    pub(super) fn read_pageno_h(self) -> usize {
+        self.px(READ_PAGENO_H)
+    }
+    /// 小说正文可用高 = 正文容器 − 顶栏 − 顶部留白 − 页码行（1268 → 1055）
     pub(super) fn text_h(self) -> usize {
         self.body_h()
-            .saturating_sub(READ_NAV_H + READ_PAD_TOP + READ_PAGENO_H)
+            .saturating_sub(self.read_nav_h() + self.read_pad_top() + self.read_pageno_h())
+    }
+    /// 指定档位的实际字号/行高（参考表 × 统一比例）：分页与渲染必须用同一份。
+    pub(super) fn fs(self, fs: usize) -> FsSpec {
+        let spec = &FS_SPECS[fs - 1];
+        FsSpec {
+            size: self.px(spec.size),
+            line: self.px(spec.line),
+            label: spec.label,
+        }
     }
     /// 漫画整图/单片可用高 = 文档高 − 底栏 − 8（同一运行时高派生）
     pub(super) fn content_h(self) -> usize {
         self.layout_h().saturating_sub(self.bar_h() + 8)
     }
-    /// 窄屏（内容宽 < 600，约视口 < 744）：目录单列、表单堆叠、顶栏动作压缩。
+    /// 窄屏（视口宽 < 744）：目录单列、表单堆叠、顶栏动作压缩。
     /// 只按宽度判定，与设备类型无关：手机、窄窗口、平板分屏走同一套。
     pub(super) fn narrow(self) -> bool {
-        self.content_w() < 600
+        self.w < NARROW_W
     }
     /// 目录列数：窄屏单列，宽屏两列（每列最多 `K_TOC_PAGE / K_TOC_COLS` 行）。
     pub(super) fn toc_cols(self) -> usize {
@@ -88,17 +154,18 @@ impl Vp {
     pub(super) fn hot_w(self) -> usize {
         self.w / 3
     }
-    /// 书架每页本数与行高：优先保持 10 本/页，把可用高（`nav_h − 底栏`）等分给 10 行，
-    /// 行高上限 112；视口极矮（行高不足 56）才减少每页本数，保证列表永不超过 stage。
+    /// 书架每页本数与行高：行高按统一比例缩放（112 → 56），把可用高（`nav_h − 翻页条`）
+    /// 均分给整行；参考视口仍是 10 本/页，窄屏行变矮后多排几本（上限 `rows_cap`），
+    /// 视口极矮时减少本数，列表永不超过 stage。
     pub(super) fn shelf_layout(self) -> (usize, usize) {
-        let avail = self.nav_h().saturating_sub(BAR_H);
-        let row_h = (avail / K_SHELF_PAGE).clamp(56, 112);
-        let per_page = if avail / K_SHELF_PAGE >= 56 {
-            K_SHELF_PAGE
-        } else {
-            (avail / 56).clamp(1, K_SHELF_PAGE)
-        };
+        let avail = self.nav_h().saturating_sub(self.pager_h());
+        let row_h = (avail / K_SHELF_PAGE).clamp(self.tap(56), self.tap(K_SHELF_ROW_H));
+        let per_page = (avail / row_h).clamp(1, self.rows_cap(K_SHELF_PAGE));
         (per_page, row_h)
+    }
+    /// 行数上限：参考上限 × (100 / pct)。窄屏行变矮后仍能填满屏幕（1072 → 原值）。
+    pub(super) fn rows_cap(self, base: usize) -> usize {
+        (base * 100 / self.pct()).max(base)
     }
 }
 
@@ -125,15 +192,23 @@ pub(super) const PARA_GAP_LINES: f64 = 0.6;
 pub(super) const fn para_gap_px(line: usize) -> usize {
     (line * 6) / 10
 }
-/// 目录每页章节数 = 每列行数 × 列数（窄屏单列）；每列行数按可用高实算（72px/行，上限 15 行/列）。
+/// 目录每页章节数 = 每列行数 × 列数（窄屏单列）；每列行数按可用高实算（行高随缩放）。
 pub(super) fn toc_page_size(vp: Vp) -> usize {
-    let rows = ((vp.nav_h().saturating_sub(BAR_H)) / 72).clamp(1, K_TOC_PAGE / K_TOC_COLS);
+    let rows = (vp.nav_h().saturating_sub(vp.pager_h()) / vp.toc_row_h())
+        .clamp(1, vp.rows_cap(K_TOC_PAGE / K_TOC_COLS));
     rows * vp.toc_cols()
 }
-/// 搜索结果每页条数 = （正文区 − 表单 88 − 翻页条 64）/ 112；
+/// 搜索结果每页条数 = （正文区 − 表单 − 翻页条）/ 行高；表单高度窄屏是两行输入。
 /// `extra_rows` 是状态提示/回退说明/升级按钮额外占用的行数。
 pub(super) fn search_page_size_extra(vp: Vp, extra_rows: usize) -> usize {
-    let base = ((vp.nav_h().saturating_sub(BAR_H + 88)) / 112).clamp(1, K_SEARCH_PAGE);
+    let form_h = if vp.narrow() {
+        vp.tap(56) * 2 + vp.len(12) + vp.len(32)
+    } else {
+        vp.tap(88)
+    };
+    let row_h = vp.tap(112);
+    let base = ((vp.nav_h().saturating_sub(vp.pager_h() + form_h)) / row_h)
+        .clamp(1, vp.rows_cap(K_SEARCH_PAGE));
     base.saturating_sub(extra_rows).max(1)
 }
 /// 目录每页章节数上限：两列各 15 行 × 72px = 1080（实际行数按可用高实算）

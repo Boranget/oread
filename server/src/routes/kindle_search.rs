@@ -52,32 +52,52 @@ fn search_nav(key: &str, job: Option<&str>, include_cooled: bool, fs: usize, vp:
 }
 
 fn search_form(key: &str, fs: usize, vp: Vp) -> String {
-    let field = "font-size:24px;height:56px;border:1px solid #000;padding:0 12px;font-family:serif";
-    let btn = "font-size:24px;height:56px;border:1px solid #000;background:#fff;color:#000;font-family:serif";
+    let field = format!(
+        "font-size:{f}px;height:{h}px;border:1px solid #000;padding:0 {pad}px;font-family:serif",
+        f = vp.px(24),
+        h = vp.tap(56),
+        pad = vp.px(12)
+    );
+    let btn = format!(
+        "font-size:{f}px;height:{h}px;border:1px solid #000;background:#fff;color:#000;font-family:serif",
+        f = vp.px(24),
+        h = vp.tap(56)
+    );
     // 窄屏：输入框与按钮各占一行、都吃满宽度；宽屏：一行排开（600 + 160）
     let controls = if vp.narrow() {
         format!(
             "<input type=\"text\" name=\"key\" value=\"{key}\" style=\"{field};width:100%\">\
-             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:100%;margin-top:12px\">",
-            key = esc(key)
+             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:100%;margin-top:{mt}px\">",
+            key = esc(key),
+            mt = vp.len(12)
         )
     } else {
         format!(
-            "<input type=\"text\" name=\"key\" value=\"{key}\" style=\"{field};width:600px\">\
-             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:160px;margin-left:12px\">",
-            key = esc(key)
+            "<input type=\"text\" name=\"key\" value=\"{key}\" style=\"{field};width:{fw}px\">\
+             <input type=\"submit\" value=\"搜索\" style=\"{btn};width:{bw}px;margin-left:{ml}px\">",
+            key = esc(key),
+            fw = vp.len(600),
+            bw = vp.len(160),
+            ml = vp.len(12)
         )
     };
     format!(
-        "<div style=\"padding:20px 36px 12px\"><form method=\"get\" action=\"/k/search\">{controls}\
-         <input type=\"hidden\" name=\"fs\" value=\"{fs}\"></form></div>"
+        "<div style=\"padding:{pt}px {px}px {pb}px\"><form method=\"get\" action=\"/k/search\">{controls}\
+         <input type=\"hidden\" name=\"fs\" value=\"{fs}\"></form></div>",
+        pt = vp.len(20),
+        px = vp.pad(),
+        pb = vp.len(12)
     )
 }
 
-fn note_line(text: &str) -> String {
+fn note_line(text: &str, vp: Vp) -> String {
     format!(
-        "<p style=\"font-size:20px;line-height:32px;color:#555;padding:8px 36px 0\">{}</p>",
-        esc(text)
+        "<p style=\"font-size:{f}px;line-height:{l}px;color:#555;padding:{pt}px {px}px 0\">{}</p>",
+        esc(text),
+        f = vp.px(20),
+        l = vp.px(32),
+        pt = vp.len(8),
+        px = vp.pad()
     )
 }
 
@@ -93,12 +113,12 @@ fn see_other(location: &str, fs: usize, explicit: bool) -> Response {
     res
 }
 
-fn stage(top: &str, inner: &str) -> String {
+fn stage(top: &str, inner: &str, vp: Vp) -> String {
     format!(
         "{top}<div id=\"k-stage\" style=\"position:absolute;top:{nav}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{inner}</div>",
-        nav = NAV_H + 1,
-        pad = SIDE_PAD,
-        safe = SAFE_BOTTOM,
+        nav = vp.nav_bar_h(),
+        pad = vp.pad(),
+        safe = vp.len(SAFE_BOTTOM),
         top = top,
         inner = inner
     )
@@ -143,14 +163,14 @@ pub(super) async fn search(
             );
             see_other(&with_vp(&location, vp), fs, explicit)
         }
-        Err(e) => err_to_page(e),
+        Err(e) => err_to_page(e, vp),
     }
 }
 
 fn search_home(fs: usize, explicit: bool, vp: Vp) -> Response {
     let top = top_bar("搜索", None, &search_nav("", None, false, fs, vp), vp);
     let body = search_form("", fs, vp);
-    let mut res = page("搜索", fs, &stage(&top, &body), vp);
+    let mut res = page("搜索", fs, &stage(&top, &body, vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -179,7 +199,7 @@ async fn job_page(
             }
         }
         Ok(None) => expired_page(fs, explicit, vp),
-        Err(e) => err_to_page(e),
+        Err(e) => err_to_page(e, vp),
     }
 }
 
@@ -189,12 +209,37 @@ fn expired_page(fs: usize, explicit: bool, vp: Vp) -> Response {
         "搜索任务不存在或已过期，请重新搜索。",
         &qlink("/k/search", fs, vp),
         "重新搜索",
+        vp,
     );
     let mut res = page("搜索", fs, &body, vp);
     if explicit {
         remember_fs(&mut res, fs);
     }
     res
+}
+
+/// 页内块：上下/左右留白按统一比例缩放（参考 20/36/12）
+fn block(vp: Vp, inner: &str) -> String {
+    format!(
+        "<div style=\"padding:{pt}px {pad}px {pb}px\">{inner}</div>",
+        pt = vp.len(20),
+        pad = vp.pad(),
+        pb = vp.len(12)
+    )
+}
+
+/// 行内描边按钮（「显示更多结果」「用全部源搜索」）：高度按触控下限缩放
+fn inline_button(href: &str, label: &str, vp: Vp) -> String {
+    let h = vp.tap(56);
+    format!(
+        "<a href=\"{href}\" style=\"display:inline-block;height:{h}px;line-height:{h}px;\
+         padding:0 {pad}px;border:1px solid #000;font-size:{fs}px;color:#000\">{label}</a>",
+        href = esc(href),
+        h = h,
+        pad = vp.len(24),
+        fs = vp.px(24),
+        label = esc(label)
+    )
 }
 
 pub(super) fn progress_page(
@@ -214,13 +259,21 @@ pub(super) fn progress_page(
         vp,
     );
     let body = if meta.source_total == 0 {
-        format!(
-            "<div style=\"padding:20px 36px 12px\">\
-             <p style=\"font-size:28px;line-height:44px\">正在搜索「{key}」…</p>\
-             <p style=\"font-size:24px;line-height:36px;color:#555;margin-top:12px\">当前没有可搜索的源，请先在书源设置中导入并启用。</p>\
-             <p style=\"margin-top:24px\">{back}</p></div>",
-            key = esc(&meta.key),
-            back = outline_button(&qlink("/k/search", fs, vp), "重新搜索")
+        block(
+            vp,
+            &format!(
+                "<p style=\"font-size:{f28}px;line-height:{l44}px\">正在搜索「{key}」…</p>\
+                 <p style=\"font-size:{f24}px;line-height:{l36}px;color:#555;margin-top:{mt}px\">当前没有可搜索的源，请先在书源设置中导入并启用。</p>\
+                 <p style=\"margin-top:{mt2}px\">{back}</p>",
+                key = esc(&meta.key),
+                back = outline_button(&qlink("/k/search", fs, vp), "重新搜索", vp),
+                f28 = vp.px(28),
+                l44 = vp.px(44),
+                f24 = vp.px(24),
+                l36 = vp.px(36),
+                mt = vp.len(12),
+                mt2 = vp.len(24)
+            ),
         )
     } else {
         let done = c.finished.min(meta.source_total);
@@ -237,19 +290,27 @@ pub(super) fn progress_page(
         if c.cancelled > 0 {
             detail.push_str(&format!("，已取消 {} 个", c.cancelled));
         }
-        format!(
-            "<div style=\"padding:20px 36px 12px\">\
-             <p style=\"font-size:28px;line-height:44px\">正在搜索「{key}」…</p>\
-             <p style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">{detail}</p>\
-             <p style=\"font-size:20px;line-height:32px;color:#555;margin-top:12px\">页面每 {secs} 秒自动刷新，有结果后立即显示。</p>\
-             <p style=\"margin-top:24px\">{back}</p></div>",
-            key = esc(&meta.key),
-            detail = esc(&detail),
-            secs = SEARCH_REFRESH_SECS,
-            back = outline_button(&qlink("/k/search", fs, vp), "重新搜索")
+        block(
+            vp,
+            &format!(
+                "<p style=\"font-size:{f28}px;line-height:{l44}px\">正在搜索「{key}」…</p>\
+                 <p style=\"font-size:{f20}px;line-height:{l32}px;color:#555;margin-top:{mt}px\">{detail}</p>\
+                 <p style=\"font-size:{f20}px;line-height:{l32}px;color:#555;margin-top:{mt}px\">页面每 {secs} 秒自动刷新，有结果后立即显示。</p>\
+                 <p style=\"margin-top:{mt2}px\">{back}</p>",
+                key = esc(&meta.key),
+                detail = esc(&detail),
+                secs = SEARCH_REFRESH_SECS,
+                back = outline_button(&qlink("/k/search", fs, vp), "重新搜索", vp),
+                f28 = vp.px(28),
+                l44 = vp.px(44),
+                f20 = vp.px(20),
+                l32 = vp.px(32),
+                mt = vp.len(12),
+                mt2 = vp.len(24)
+            ),
         )
     };
-    let mut res = page_refresh("搜索", fs, &stage(&top, &body), vp, SEARCH_REFRESH_SECS);
+    let mut res = page_refresh("搜索", fs, &stage(&top, &body, vp), vp, SEARCH_REFRESH_SECS);
     if explicit {
         remember_fs(&mut res, fs);
     }
@@ -320,7 +381,7 @@ async fn result_page(
         };
         match r {
             Ok(v) => Some(v),
-            Err(e) => return err_to_page(e.into()),
+            Err(e) => return err_to_page(e.into(), vp),
         }
     } else {
         None
@@ -335,7 +396,7 @@ async fn result_page(
         Some(books) => books.len(),
         None => match count(shared, job_id, frozen).await {
             Ok(n) => n.max(0) as usize,
-            Err(e) => return err_to_page(e.into()),
+            Err(e) => return err_to_page(e.into(), vp),
         },
     };
 
@@ -375,18 +436,21 @@ async fn result_page(
 
     let mut list = String::new();
     for note in &notes {
-        list.push_str(&note_line(note));
+        list.push_str(&note_line(note, vp));
     }
     let mut pager = String::new();
+    let empty_style = format!(
+        "font-size:{}px;line-height:{}px;padding:0 {}px;color:#555",
+        vp.px(24),
+        vp.px(36),
+        vp.pad()
+    );
     if meta.source_total == 0 {
-        list.push_str(
-            "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">\
-             当前没有可搜索的源，请先在书源设置中导入并启用。</p>",
-        );
+        list.push_str(&format!(
+            "<p style=\"{empty_style}\">当前没有可搜索的源，请先在书源设置中导入并启用。</p>"
+        ));
     } else if total == 0 {
-        list.push_str(
-            "<p style=\"font-size:24px;line-height:36px;padding:0 36px;color:#555\">没有找到结果</p>",
-        );
+        list.push_str(&format!("<p style=\"{empty_style}\">没有找到结果</p>"));
     } else {
         let t_pages = total.div_ceil(per_page).max(1);
         let sp = q.sp.unwrap_or(1).clamp(1, t_pages as i64) as usize;
@@ -395,7 +459,7 @@ async fn result_page(
             Some(books) => books.iter().skip(start).take(per_page).cloned().collect(),
             None => match load_page_at(shared, job_id, frozen, start, per_page).await {
                 Ok(v) => v,
-                Err(e) => return err_to_page(e.into()),
+                Err(e) => return err_to_page(e.into(), vp),
             },
         };
         list.push_str(&format!(
@@ -420,17 +484,30 @@ async fn result_page(
             if b.origins.len() > 1 {
                 sub.push_str(&format!(" · {} 个源", b.origins.len()));
             }
+            let cover_w = vp.len(56);
+            let cover_h = vp.len(80);
             list.push_str(&format!(
                 "<tr><td style=\"padding:0\">\
-                 <a href=\"{href}\" style=\"display:block;height:112px;border-bottom:1px solid #ccc\">\
+                 <a href=\"{href}\" style=\"display:block;height:{rh}px;border-bottom:1px solid #ccc\">\
                  <table width=\"{rw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-                 <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
-                 <td style=\"padding-left:24px\" valign=\"middle\">\
-                 <div style=\"font-size:32px;line-height:48px;white-space:nowrap;overflow:hidden\">{name}</div>\
-                 <div style=\"font-size:20px;line-height:32px;color:#555;margin-top:8px;white-space:nowrap;overflow:hidden\">{sub}</div></td>\
+                 <td width=\"{cw}\" valign=\"middle\"><div style=\"width:{cw}px;height:{ch}px;border:1px solid #000;font-size:{f24}px;line-height:{clh}px;text-align:center\">{first}</div></td>\
+                 <td style=\"padding-left:{pl}px\" valign=\"middle\">\
+                 <div style=\"font-size:{f32}px;line-height:{l48}px;white-space:nowrap;overflow:hidden\">{name}</div>\
+                 <div style=\"font-size:{f20}px;line-height:{l32}px;color:#555;margin-top:{mt}px;white-space:nowrap;overflow:hidden\">{sub}</div></td>\
                  </tr></table></a></td></tr>",
                 href = href,
+                rh = vp.tap(112),
                 rw = vp.page_w(),
+                cw = cover_w,
+                ch = cover_h,
+                clh = cover_h.saturating_sub(2),
+                f24 = vp.px(24),
+                pl = vp.len(24),
+                f32 = vp.px(32),
+                l48 = vp.px(48),
+                f20 = vp.px(20),
+                l32 = vp.px(32),
+                mt = vp.len(8),
                 first = esc(&first.to_string()),
                 name = esc(name),
                 sub = esc(&sub)
@@ -462,10 +539,10 @@ async fn result_page(
         if lookup.running {
             let href = with_vp(&format!("{base}&sp={sp}&more=1"), vp);
             list.push_str(&format!(
-                "<div style=\"padding:12px 36px;text-align:center\">\
-                 <a href=\"{href}\" style=\"display:inline-block;height:56px;line-height:56px;\
-                 padding:0 24px;border:1px solid #000;font-size:24px;color:#000\">显示更多结果</a></div>",
-                href = esc(&href)
+                "<div style=\"padding:{pt}px {pad}px;text-align:center\">{btn}</div>",
+                pt = vp.len(12),
+                pad = vp.pad(),
+                btn = inline_button(&href, "显示更多结果", vp)
             ));
         }
     }
@@ -483,14 +560,14 @@ async fn result_page(
             fs,
         );
         list.push_str(&format!(
-            "<div style=\"padding:12px 36px\">\
-             <a href=\"{href}\" style=\"display:inline-block;height:56px;line-height:56px;\
-             padding:0 24px;border:1px solid #000;font-size:24px;color:#000\">用全部源搜索</a></div>",
-            href = esc(&with_vp(&href, vp))
+            "<div style=\"padding:{pt}px {pad}px\">{btn}</div>",
+            pt = vp.len(12),
+            pad = vp.pad(),
+            btn = inline_button(&with_vp(&href, vp), "用全部源搜索", vp)
         ));
     }
     let body = format!("{}{}{}", search_form(key, fs, vp), list, pager);
-    let mut res = page("搜索", fs, &stage(&top, &body), vp);
+    let mut res = page("搜索", fs, &stage(&top, &body, vp), vp);
     if explicit {
         remember_fs(&mut res, fs);
     }

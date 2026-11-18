@@ -636,17 +636,17 @@ fn read_line_budget_matches_reference() {
     }
     // 换尺寸：行预算随可用高变化，不会沿用 1072×1268 的常量
     let small = vps(1024, 1200);
-    let small_lines: Vec<usize> = FS_SPECS
-        .iter()
-        .map(|s| line_budget(small, s.line))
+    let small_lines: Vec<usize> = (1..=FS_SPECS.len())
+        .map(|i| line_budget(small, small.fs(i).line))
         .collect();
     assert_eq!(
         small_lines,
-        vec![21, 19, 15, 27],
+        vec![23, 20, 17, 29],
         "1024×1200 行预算应按可用高重算"
     );
-    for s in FS_SPECS.iter() {
-        assert!(line_budget(small, s.line) * s.line <= small.text_h());
+    for i in 1..=FS_SPECS.len() {
+        let spec = small.fs(i);
+        assert!(line_budget(small, spec.line) * spec.line <= small.text_h());
     }
     // 运行时低高（vh=1224）：底栏派生 63 → 正文可用 1013 → 22/19/16/28
     let fb = vps(1072, 1224);
@@ -657,7 +657,7 @@ fn read_line_budget_matches_reference() {
         "1224 行预算应按运行时可用来重算"
     );
     for s in FS_SPECS.iter() {
-        let last_bottom = 56 + 36 + line_budget(fb, s.line) * s.line;
+        let last_bottom = fb.read_nav_h() + fb.read_pad_top() + line_budget(fb, s.line) * s.line;
         assert!(
             last_bottom <= fb.layout_h() - fb.bar_h(),
             "{}px 末行越界：{last_bottom} > {}",
@@ -678,25 +678,31 @@ fn list_pages_fit_inside_stage_at_reference_viewports() {
     assert_eq!(toc_page_size(v), 30);
     assert_eq!(search_page_size_extra(v, 0), 9);
     let s = vps(1024, 1200);
-    assert_eq!((s.nav_h(), s.shelf_layout()), (1127, (10, 106)));
-    assert_eq!(toc_page_size(s), 28);
-    assert_eq!(search_page_size_extra(s, 0), 8);
+    assert_eq!((s.nav_h(), s.shelf_layout()), (1131, (10, 106)));
+    assert_eq!(toc_page_size(s), 30);
+    assert_eq!(search_page_size_extra(s, 0), 9);
     for vp in [v, s] {
         let (pp, rh) = vp.shelf_layout();
-        assert!(pp * rh + BAR_H <= vp.nav_h(), "书架列表溢出正文区");
+        assert!(pp * rh + vp.pager_h() <= vp.nav_h(), "书架列表溢出正文区");
         assert!(
-            (pp + 1) * rh + BAR_H > vp.nav_h(),
+            (pp + 1) * rh + vp.pager_h() > vp.nav_h(),
             "书架应贴近填满，别多留一整行"
         );
         let t = toc_page_size(vp);
-        assert!(t / vp.toc_cols() * 72 + BAR_H <= vp.nav_h(), "目录溢出");
+        assert!(
+            t / vp.toc_cols() * vp.toc_row_h() + vp.pager_h() <= vp.nav_h(),
+            "目录溢出"
+        );
         let q = search_page_size_extra(vp, 0);
-        assert!(q * 112 + BAR_H + 88 <= vp.nav_h(), "搜索结果溢出");
+        assert!(
+            q * vp.tap(112) + vp.pager_h() + vp.tap(88) <= vp.nav_h(),
+            "搜索结果溢出"
+        );
     }
     // 极矮视口：行高触底后减少每页本数，绝不溢出
     let tiny = vps(1072, 600);
     let (pp, rh) = tiny.shelf_layout();
-    assert!(pp * rh + BAR_H <= tiny.nav_h(), "极矮视口书架溢出");
+    assert!(pp * rh + tiny.pager_h() <= tiny.nav_h(), "极矮视口书架溢出");
 }
 
 /// 搜索页状态提示/回退说明/升级按钮各占一行：每多一行就少放一条结果，且至少保留 1 条。
@@ -937,7 +943,7 @@ fn hot_zones_are_one_third_screen_and_clickable() {
     assert_eq!(vp().w - vp().hot_w(), 1072 - vp().hot_w());
     assert!(vp().hot_w() >= 200, "热区宽必须 ≥ 200px");
     assert!(vp().h >= 200, "热区高必须 ≥ 200px");
-    let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"));
+    let z = hot_zones(Some("/k/read?p=1"), Some("/k/read?p=2"), vp());
     assert_eq!(z.matches("<a ").count(), 2);
     assert!(z.contains("left:0"), "{z}");
     assert!(z.contains("right:0"), "{z}");
@@ -948,10 +954,12 @@ fn hot_zones_are_one_third_screen_and_clickable() {
     // 顶栏整格可点，热区 z-index 5 < 顶栏 12：点书名/「书架」不会落到翻页区
     assert!(z.contains("z-index:5"), "{z}");
     assert_eq!(
-        hot_zones(Some("/k/read?p=1"), None).matches("<a ").count(),
+        hot_zones(Some("/k/read?p=1"), None, vp())
+            .matches("<a ")
+            .count(),
         1
     );
-    assert_eq!(hot_zones(None, None).matches("<a ").count(), 0);
+    assert_eq!(hot_zones(None, None, vp()).matches("<a ").count(), 0);
 }
 
 /// `vw`/`vh` 参数优先，缺参回落默认 1072×1268，越界值直接忽略。
@@ -972,12 +980,12 @@ fn viewport_params_override_defaults_and_clamp() {
         let v = vps(w, h);
         assert!(v.content_w() >= 320, "版心宽不能小于 320");
         assert!(v.content_h() >= 320, "可用高不能小于 320");
-        assert_eq!(v.content_w(), w - 144);
+        assert_eq!(v.content_w(), w - v.pad() * 4);
         assert_eq!(v.content_h(), h - v.bar_h() - 8);
         assert_eq!(
             v.text_h(),
-            h - v.bar_h() - READ_NAV_H - READ_PAD_TOP - READ_PAGENO_H,
-            "正文可用高必须扣掉 56px 顶栏与页码行"
+            h - v.bar_h() - v.read_nav_h() - v.read_pad_top() - v.read_pageno_h(),
+            "正文可用高必须扣掉顶栏、顶部留白与页码行"
         );
     }
 }
@@ -1002,12 +1010,20 @@ fn narrow_viewport_switches_to_single_column_and_fits() {
     let phone = vps(390, 844);
     assert!(phone.narrow(), "390 宽必须判为窄屏");
     assert_eq!(phone.toc_cols(), 1);
-    assert_eq!(phone.page_w(), 318);
-    assert_eq!(phone.content_w(), 246);
+    assert_eq!(phone.page_w(), 354);
+    assert_eq!(phone.content_w(), 318);
     // 目录每页 = 单列行数（按高实算），且不溢出正文区
-    let rows = (phone.nav_h().saturating_sub(BAR_H)) / 72;
+    let rows = (phone.nav_h().saturating_sub(phone.pager_h())) / phone.toc_row_h();
     assert_eq!(toc_page_size(phone), rows);
-    assert!(toc_page_size(phone) * 72 + BAR_H <= phone.nav_h());
+    assert!(toc_page_size(phone) * phone.toc_row_h() + phone.pager_h() <= phone.nav_h());
+    // 书架：行高触底 44/56，行数按可用高填满且不溢出
+    let (pp, rh) = phone.shelf_layout();
+    assert_eq!((pp, rh), (13, 56));
+    assert!(pp * rh + phone.pager_h() <= phone.nav_h());
+    // 搜索：表单两行 + 结果行 + 翻页条都装得下
+    let q = search_page_size_extra(phone, 0);
+    let form_h = phone.tap(56) * 2 + phone.len(12) + phone.len(32);
+    assert!(q * phone.tap(112) + phone.pager_h() + form_h <= phone.nav_h());
     // 顶栏三个动作压缩后仍放得下（360 宽同样成立）
     let nav = format!(
         "{}{}{}",
@@ -1015,15 +1031,15 @@ fn narrow_viewport_switches_to_single_column_and_fits() {
         nav_link("/k", "标准", phone),
         nav_link("/k", "退出", phone)
     );
-    assert!(nav.contains("padding-left:16px") && nav.contains("font-size:18px"));
+    assert!(nav.contains("padding-left:16px") && nav.contains("font-size:13px"));
     assert!(!nav.contains("padding-left:32px"));
-    // 空书架卡片收进版心
+    // 空书架卡片收进版心（600 × 50% = 300）
     let empty = empty_shelf(2, phone);
-    assert!(empty.contains("width=\"318\""), "{empty}");
+    assert!(empty.contains("width=\"300\""), "{empty}");
     assert!(!empty.contains("width=\"600\""), "{empty}");
-    // 阅读页顶栏左右格压缩，标题区不为负
+    // 阅读页顶栏左右格按比例压缩（160/120 × 50%），标题区不为负
     let read_nav = read_nav_html("很长的书名", "/k", "/k/toc", phone);
-    assert!(read_nav.contains("width=\"110\"") && read_nav.contains("width=\"80\""));
+    assert!(read_nav.contains("width=\"80\"") && read_nav.contains("width=\"60\""));
     assert!(!read_nav.contains("width=\"160\""), "{read_nav}");
     // 宽屏（Kindle）行为不变
     assert!(!vp().narrow());

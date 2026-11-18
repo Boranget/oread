@@ -65,6 +65,10 @@ const K_H: usize = 1268;
 const NAV_H: usize = 72;
 /// 底部固定栏高度（触控目标 64px，保守高于 44px 下限）
 const BAR_H: usize = 64;
+/// 目录每行高度（参考视口 72px；窄屏按统一比例缩放，见 `Vp::toc_row_h`）
+const TOC_ROW_H: usize = 72;
+/// 书架每行最高高度（参考视口 112px；窄屏按统一比例缩放）
+const K_SHELF_ROW_H: usize = 112;
 /// 底栏内部的底部安全留白（12px）：底栏总高 = 64 内容 + 12 安全区，避免文字贴屏幕底。
 const SAFE_BOTTOM: usize = 12;
 /// **版面尺寸不写死**（v0.3.22）：每次进页面由 `K_VP_JS` 在浏览器里现算，写成

@@ -141,12 +141,13 @@ pub(super) fn comic_stage(
             src = src
         )
     };
+    let nav_h = vp.read_nav_h();
     format!(
         "<div id=\"k-stage\" style=\"position:relative;top:0;left:0;right:auto;bottom:auto;margin-top:{nav}px;height:{h}px;width:{w}px;padding:0 {pad}px {pb}px;overflow:hidden\">{img}<div id=\"k-page-no\">{meta}</div></div>",
-        nav = READ_NAV_H,
-        h = vp.layout_h().saturating_sub(READ_NAV_H),
+        nav = nav_h,
+        h = vp.layout_h().saturating_sub(nav_h),
         w = vp.page_w(),
-        pad = SIDE_PAD,
+        pad = vp.pad(),
         pb = vp.bar_h() + 8,
         img = img,
         meta = esc(meta)

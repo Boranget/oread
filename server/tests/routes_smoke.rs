@@ -612,7 +612,11 @@ async fn kindle_redirects_to_login_without_session() {
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("content=\"width=390,"), "{html}");
     assert!(html.contains("height:844px"), "文档高跟随 vh：{html}");
-    assert!(html.contains("width=\"246\""), "表单宽度取内容宽：{html}");
+    assert!(html.contains("width=\"318\""), "表单宽度取内容宽：{html}");
+    assert!(
+        html.contains("font-size:16px;line-height:26px"),
+        "正文字号按统一比例缩到 50%：{html}"
+    );
     assert!(
         !html.contains("width=\"928\""),
         "手机不得渲染 928 宽表单：{html}"

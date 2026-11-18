@@ -18,10 +18,10 @@ pub(super) async fn comic_read(
     let chapter = &chapters[ch as usize];
     let images = match load_comic_images(s, pool, source, chapter, &q.book).await {
         Ok(v) => v,
-        Err(e) => return err_page(&e),
+        Err(e) => return err_page(&e, vp),
     };
     if images.is_empty() {
-        return err_page("本章没有图片");
+        return err_page("本章没有图片", vp);
     }
     // 尺寸：源页面已带宽高的直接用，缺失的批量探测（进程内缓存，同章重复打开不再回源）
     let mut dims: Vec<Option<(u32, u32)>> = images
@@ -59,12 +59,12 @@ pub(super) async fn comic_read(
     let sp = image::SliceParams::from_config(
         &s.cfg,
         Some(vp.content_w() as u32),
-        Some(vp.content_h().saturating_sub(READ_NAV_H) as u32),
+        Some(vp.content_h().saturating_sub(vp.read_nav_h()) as u32),
         None,
     );
     let pages = comic_pages(&images, &dims, &s.cfg, &sp);
     if pages.is_empty() {
-        return err_page("本章没有图片");
+        return err_page("本章没有图片", vp);
     }
     let n = pages.len() as i64;
     let p = q.p.unwrap_or(1).clamp(1, n);
@@ -128,6 +128,7 @@ pub(super) async fn comic_read(
         hot = hot_zones(
             prev.as_ref().map(|x| x.0.as_str()),
             next.as_ref().map(|x| x.0.as_str()),
+            vp,
         ),
         bottom = bottom
     );

@@ -41,34 +41,53 @@ pub(super) async fn login_form(
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
     let vp = vp_of(&s, &headers, num("vw"), num("vh"));
     let err = if q.get("err").map(|v| v == "1").unwrap_or(false) {
-        "<p style=\"font-size:24px;line-height:36px;color:#333;margin-top:16px\">账号或密码错误，请重试</p>"
+        format!(
+            "<p style=\"font-size:{f24}px;line-height:{l36}px;color:#333;margin-top:{mt}px\">账号或密码错误，请重试</p>",
+            f24 = vp.px(24),
+            l36 = vp.px(36),
+            mt = vp.len(16)
+        )
     } else {
-        ""
+        String::new()
     };
     // 窄屏（手机）：标签在上、输入框占满整行；宽屏（Kindle）：标签左置、输入框占满剩余宽度。
     // 表格宽度取版心内容宽，任何视口都不会横向溢出。
     let cw = vp.content_w();
-    let field = "font-size:24px;height:56px;border:1px solid #000;padding:0 12px;font-family:serif";
+    let field = format!(
+        "font-size:{f24}px;height:{h}px;border:1px solid #000;padding:0 {pad}px;font-family:serif",
+        f24 = vp.px(24),
+        h = vp.tap(56),
+        pad = vp.px(12)
+    );
+    let label_h = vp.tap(40);
+    let row_h = vp.tap(76);
+    let btn_h = vp.tap(88);
     let form = if vp.narrow() {
         format!(
-            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
-             <tr><td height=\"40\" style=\"font-size:24px\">账号</td></tr>\
+            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:{mt}px\">\
+             <tr><td height=\"{label_h}\" style=\"font-size:{f24}px\">账号</td></tr>\
              <tr><td><input type=\"text\" name=\"username\" style=\"{field};width:100%\"></td></tr>\
-             <tr><td height=\"40\" style=\"font-size:24px\">密码</td></tr>\
+             <tr><td height=\"{label_h}\" style=\"font-size:{f24}px\">密码</td></tr>\
              <tr><td><input type=\"password\" name=\"password\" style=\"{field};width:100%\"></td></tr>\
-             <tr><td height=\"88\"><input type=\"submit\" value=\"登录\" style=\"{field};width:100%;background:#fff;color:#000\"></td></tr>\
-             </table>"
+             <tr><td height=\"{btn_h}\"><input type=\"submit\" value=\"登录\" style=\"{field};width:100%;background:#fff;color:#000\"></td></tr>\
+             </table>",
+            mt = vp.len(24),
+            f24 = vp.px(24)
         )
     } else {
         format!(
-            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:24px\">\
-             <tr><td width=\"120\" height=\"76\" style=\"font-size:24px\">账号</td>\
+            "<table width=\"{cw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:{mt}px\">\
+             <tr><td width=\"{label_w}\" height=\"{row_h}\" style=\"font-size:{f24}px\">账号</td>\
              <td><input type=\"text\" name=\"username\" style=\"{field};width:100%\"></td></tr>\
-             <tr><td height=\"76\" style=\"font-size:24px\">密码</td>\
+             <tr><td height=\"{row_h}\" style=\"font-size:{f24}px\">密码</td>\
              <td><input type=\"password\" name=\"password\" style=\"{field};width:100%\"></td></tr>\
-             <tr><td height=\"88\"></td>\
-             <td><input type=\"submit\" value=\"登录\" style=\"{field};width:240px;background:#fff;color:#000\"></td></tr>\
-             </table>"
+             <tr><td height=\"{btn_h}\"></td>\
+             <td><input type=\"submit\" value=\"登录\" style=\"{field};width:{btn_w}px;background:#fff;color:#000\"></td></tr>\
+             </table>",
+            mt = vp.len(24),
+            label_w = vp.len(120),
+            f24 = vp.px(24),
+            btn_w = vp.len(240)
         )
     };
     page(
@@ -76,18 +95,25 @@ pub(super) async fn login_form(
         2,
         &format!(
             "{head}\
-             <div style=\"padding:36px\">\
-             <p style=\"font-size:20px;line-height:32px;color:#555\">Kindle 极简阅读 · 请用网页端账号登录</p>\
-             <p style=\"font-size:20px;line-height:32px;color:#555\">没有账号请先在电脑浏览器打开主站注册。</p>{err}\
+             <div style=\"padding:{pad}px\">\
+             <p style=\"font-size:{f20}px;line-height:{l32}px;color:#555\">Kindle 极简阅读 · 请用网页端账号登录</p>\
+             <p style=\"font-size:{f20}px;line-height:{l32}px;color:#555\">没有账号请先在电脑浏览器打开主站注册。</p>{err}\
              <form method=\"post\" action=\"/k/login\">{form}</form></div>",
-            head = page_head("登录"),
+            head = page_head("登录", vp),
+            pad = vp.pad(),
+            f20 = vp.px(20),
+            l32 = vp.px(32),
             err = err
         ),
         vp,
     )
 }
 
-pub(super) async fn login_post(State(s): State<AppState>, Form(q): Form<LoginQ>) -> Response {
+pub(super) async fn login_post(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(q): Form<LoginQ>,
+) -> Response {
     let row: Option<(i64, String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, password_hash, role, disabled, token_version FROM users WHERE username = ?",
     )
@@ -114,7 +140,7 @@ pub(super) async fn login_post(State(s): State<AppState>, Form(q): Form<LoginQ>)
     let (id, _, role, _, ver) = row.expect("checked above");
     let token = match auth::create_token_days(id, &q.username, &role, ver, &s.cfg.jwt_secret, 30) {
         Ok(t) => t,
-        Err(e) => return err_to_page(e),
+        Err(e) => return err_to_page(e, vp_of(&s, &headers, None, None)),
     };
     let cookie = format!(
         "k_session={}; Path=/; HttpOnly; Max-Age={}; SameSite=Lax",
@@ -163,7 +189,7 @@ pub(super) async fn shelf(
         .await
     {
         Ok(r) => r,
-        Err(e) => return err_to_page(AppError::Sqlx(e)),
+        Err(e) => return err_to_page(AppError::Sqlx(e), vp),
     };
 
     let next_fs = cycle_fs(fs);
@@ -207,20 +233,32 @@ pub(super) async fn shelf(
                 vp,
             );
             let first = title.chars().next().unwrap_or('书');
+            let cover_w = vp.len(56);
+            let cover_h = vp.len(80);
             list.push_str(&format!(
                 "<tr><td style=\"padding:0\">\
                  <a href=\"{read}\" style=\"display:block;height:{rh}px;border-bottom:1px solid #ccc\">\
                  <table width=\"{iw}\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-                 <td width=\"56\" valign=\"middle\"><div style=\"width:56px;height:80px;border:1px solid #000;font-size:24px;line-height:78px;text-align:center\">{first}</div></td>\
-                 <td style=\"padding-left:24px\" valign=\"middle\">\
-                 <div style=\"font-size:32px;line-height:48px;font-weight:700;white-space:nowrap;overflow:hidden\">{title}</div>\
-                 <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:8px\"><tr>\
-                 <td align=\"left\" style=\"font-size:20px;line-height:32px;color:#555\">{author}</td>\
-                 <td align=\"right\" style=\"font-size:20px;line-height:32px;color:#555\">{pct:.0}%</td>\
+                 <td width=\"{cw}\" valign=\"middle\"><div style=\"width:{cw}px;height:{ch}px;border:1px solid #000;font-size:{f24}px;line-height:{clh}px;text-align:center\">{first}</div></td>\
+                 <td style=\"padding-left:{pl}px\" valign=\"middle\">\
+                 <div style=\"font-size:{f32}px;line-height:{l48}px;font-weight:700;white-space:nowrap;overflow:hidden\">{title}</div>\
+                 <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:{mt}px\"><tr>\
+                 <td align=\"left\" style=\"font-size:{f20}px;line-height:{l32}px;color:#555\">{author}</td>\
+                 <td align=\"right\" style=\"font-size:{f20}px;line-height:{l32}px;color:#555\">{pct:.0}%</td>\
                  </tr></table></td></tr></table></a></td></tr>",
                 read = read,
                 rh = row_h,
                 iw = vp.page_w(),
+                cw = cover_w,
+                ch = cover_h,
+                clh = cover_h.saturating_sub(2),
+                f24 = vp.px(24),
+                pl = vp.len(24),
+                f32 = vp.px(32),
+                l48 = vp.px(48),
+                f20 = vp.px(20),
+                l32 = vp.px(32),
+                mt = vp.len(8),
                 first = esc(&first.to_string()),
                 title = esc(&title),
                 author = esc(if author.is_empty() { "未知作者" } else { author.as_str() }),
@@ -253,9 +291,9 @@ pub(super) async fn shelf(
     };
     let stage = format!(
         "<div id=\"k-stage\" style=\"position:absolute;top:{top}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{list}{pager}</div>",
-        top = NAV_H + 1,
-        pad = SIDE_PAD,
-        safe = SAFE_BOTTOM,
+        top = vp.nav_bar_h(),
+        pad = vp.pad(),
+        safe = vp.len(SAFE_BOTTOM),
         list = list,
         pager = pager
     );
@@ -279,7 +317,7 @@ pub(super) async fn toc(
     let (fs, explicit) = resolve_fs(&headers, q.fs);
     let (_source, chapters) = match ensure_chapters(&s, &db.0, &q.source, &q.book).await {
         Ok(v) => v,
-        Err(e) => return err_to_page(e),
+        Err(e) => return err_to_page(e, vp),
     };
     // 分卷标题不是可读章节：目录不展示、不计入总数与分页。
     // 保留 `BookChapter.index`（原始下标），链接仍按原 index 生成，/k/read 才能对得上。
@@ -329,8 +367,11 @@ pub(super) async fn toc(
         vp,
     );
     let back = format!(
-        "<a href=\"{}\" style=\"display:inline-block;min-width:80px;text-align:center;font-size:34px;line-height:72px;font-weight:400\">&#10005;</a>",
-        read_back
+        "<a href=\"{}\" style=\"display:inline-block;min-width:{mw}px;text-align:center;font-size:{fs}px;line-height:{lh}px;font-weight:400\">&#10005;</a>",
+        read_back,
+        mw = vp.len(80),
+        fs = vp.px(34),
+        lh = vp.nav_bar_h().saturating_sub(1)
     );
     let nav = format!(
         "{}{}{}",
@@ -340,8 +381,10 @@ pub(super) async fn toc(
     );
     let top = top_bar(&name, Some(&format!("共 {total} 章")), &nav, vp);
 
-    // 每列 rows_per_col 行（1268 → 15 行/列）；列宽随版心自适应，窄屏单列（1072 → 452，390 → 246）
-    let col_w = vp.content_w().saturating_sub(24 * (cols_n - 1)) / cols_n;
+    // 每列 rows_per_col 行（参考视口 15 行/列）；列宽随版心自适应，窄屏单列
+    let col_gap = vp.len(24);
+    let col_w = vp.content_w().saturating_sub(col_gap * (cols_n - 1)) / cols_n;
+    let row_h = vp.toc_row_h();
     let mut cols: Vec<String> = (0..cols_n).map(|_| String::new()).collect();
     for (i, c) in visible[start..end].iter().enumerate() {
         let col = (i / rows_per_col).min(cols_n - 1);
@@ -363,11 +406,17 @@ pub(super) async fn toc(
             esc(title)
         };
         cols[col].push_str(&format!(
-            "<tr><td height=\"72\" style=\"border-bottom:1px solid #ccc\">\
+            "<tr><td height=\"{rh}\" style=\"border-bottom:1px solid #ccc\">\
              <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-             <td width=\"80\" align=\"right\" valign=\"middle\" style=\"font-size:24px;line-height:46px;color:#555\">{no}</td>\
-             <td valign=\"middle\" style=\"padding-left:16px;font-size:28px;line-height:46px\"><a href=\"{href}\" style=\"display:block\">{name}</a></td>\
+             <td width=\"{nw}\" align=\"right\" valign=\"middle\" style=\"font-size:{f24}px;line-height:{l46}px;color:#555\">{no}</td>\
+             <td valign=\"middle\" style=\"padding-left:{pl}px;font-size:{f28}px;line-height:{l46}px\"><a href=\"{href}\" style=\"display:block\">{name}</a></td>\
              </tr></table></td></tr>",
+            rh = row_h,
+            nw = vp.len(80),
+            f24 = vp.px(24),
+            f28 = vp.px(28),
+            l46 = vp.px(46),
+            pl = vp.len(16),
             no = start + i + 1,
             href = href,
             name = name
@@ -375,7 +424,7 @@ pub(super) async fn toc(
     }
     for c in cols.iter_mut() {
         if c.is_empty() {
-            c.push_str("<tr><td height=\"72\"></td></tr>");
+            c.push_str(&format!("<tr><td height=\"{}\"></td></tr>", row_h));
         }
         *c = format!(
             "<table width=\"{col_w}\" cellpadding=\"0\" cellspacing=\"0\">{}</table>",
@@ -386,11 +435,11 @@ pub(super) async fn toc(
         .iter()
         .map(|c| format!("<td width=\"{col_w}\" valign=\"top\">{c}</td>"))
         .collect::<Vec<_>>()
-        .join("<td width=\"24\"></td>");
+        .join(&format!("<td width=\"{col_gap}\"></td>"));
     let list = format!(
         "<table width=\"{tw}\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-left:{pad}\"><tr>{cells}</tr></table>",
         tw = vp.content_w(),
-        pad = SIDE_PAD,
+        pad = vp.pad(),
     );
 
     let prev = if tp > 1 {
@@ -433,9 +482,9 @@ pub(super) async fn toc(
     };
     let stage = format!(
         "<div id=\"k-stage\" style=\"position:absolute;top:{top}px;left:{pad}px;right:{pad}px;bottom:{safe}px;overflow:hidden\">{list}{pager}</div>",
-        top = NAV_H + 1,
-        pad = SIDE_PAD,
-        safe = SAFE_BOTTOM,
+        top = vp.nav_bar_h(),
+        pad = vp.pad(),
+        safe = vp.len(SAFE_BOTTOM),
         list = list,
         pager = pager_bar(prev, next, vp)
     );
