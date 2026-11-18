@@ -96,10 +96,7 @@ pub(super) async fn content(
                     persist_book_changes(&db.0, st.take_changes()).await;
                 }
                 // 用户设置的缓存上限优先（且不超过全局上限），未设置时用全局配置
-                let limit = match replace::user_cache_limit_mb(&db.0).await {
-                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                    None => s.cfg.cache_limit_bytes(),
-                };
+                let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
                 save_content_cached(&db.0, &c, limit).await?;
                 c
             }
@@ -481,10 +478,7 @@ pub(super) async fn cache_all(
     let limited = pending.len() > max_chapters;
     pending.truncate(max_chapters);
 
-    let limit_bytes = match replace::user_cache_limit_mb(&db.0).await {
-        Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-        None => s.cfg.cache_limit_bytes(),
-    };
+    let limit_bytes = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
     let used_before: i64 =
         sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
             .fetch_one(&db.0)
@@ -662,6 +656,41 @@ pub(super) async fn cache_clear(
         "book_id": scope,
         "deleted": deleted,
         "bytes_freed": freed,
+    })))
+}
+
+/// 清理到上限：按 LRU 删除最久未读章节，直到总量不超过当前账号生效上限。
+///
+/// 与写入路径共用 `evict_content_to_limit`：调小 `cache_limit_mb` 后可用它立即生效，
+/// 不必等下一次落库。只动 `book_content`，不影响书架、目录与阅读进度。
+pub(super) async fn cache_trim(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    db: UserDb,
+) -> AppResult<Json<serde_json::Value>> {
+    let limit_bytes = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
+    let used_before: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+            .fetch_one(&db.0)
+            .await?;
+    let deleted = super::books_store::evict_content_to_limit(
+        &db.0,
+        limit_bytes,
+        super::books_store::EVICT_ROUNDS_TRIM,
+    )
+    .await?;
+    let used_after: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+            .fetch_one(&db.0)
+            .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "limit_bytes": limit_bytes,
+        "limit_mb": limit_bytes / (1024 * 1024),
+        "used_bytes_before": used_before,
+        "used_bytes_after": used_after,
+        "deleted": deleted,
+        "bytes_freed": (used_before - used_after).max(0),
     })))
 }
 

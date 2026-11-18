@@ -215,6 +215,7 @@
         Number(cacheRes.attempted) === 0
           ? '这本书的章节已全部缓存，无需再抓取'
           : `缓存完成：成功 ${cacheRes.cached} 章`;
+      await loadHealth();
     } catch (e) {
       cacheErr = /目录未缓存/.test(String(e && e.message))
         ? '缓存整本失败：这本书的目录还没缓存。请先在阅读器打开这本书，加载目录后再试。'
@@ -243,6 +244,7 @@
     try {
       clearRes = await api.cacheClear(cacheBook);
       cacheNotice = `已清理 ${clearRes.deleted} 章缓存`;
+      await loadHealth();
     } catch (e) {
       cacheErr = describeFailure(e, '清理缓存');
     } finally {
@@ -269,8 +271,26 @@
     try {
       clearAllRes = await api.cacheClear('');
       cacheNotice = `已清理全部缓存：${clearAllRes.deleted} 章`;
+      await loadHealth();
     } catch (e) {
       cacheErr = describeFailure(e, '清理全部缓存');
+    } finally {
+      cacheBusy = false;
+    }
+  }
+
+  async function trimCache() {
+    cacheBusy = true;
+    cacheErr = '';
+    cacheNotice = '';
+    try {
+      const res = await api.cacheTrim();
+      cacheNotice = res.deleted
+        ? `已按最久未读顺序清理 ${res.deleted} 章，释放 ${fmtBytes(res.bytes_freed)}`
+        : '当前占用未超过上限，无需清理';
+      await loadHealth();
+    } catch (e) {
+      cacheErr = describeFailure(e, '清理到上限');
     } finally {
       cacheBusy = false;
     }
@@ -353,6 +373,8 @@
         builtin_clean: !!settings.builtin_clean,
       });
       notice = '已保存';
+      // 上限可能刚被调小：刷新一次占用比例，便于决定是否「清理到上限」
+      loadHealth();
       setTimeout(() => (notice = ''), 1800);
     } catch (e) {
       // 400 时 api.js 会把后端 {"error":"..."} 原样透出，按提示修改即可
@@ -587,6 +609,43 @@
       <div class="spacer"></div>
       <button class="ghost" on:click={loadShelfBooks} disabled={shelfLoading}>{shelfLoading ? '读取中…' : '刷新书目'}</button>
     </div>
+    {#if health && health.cache}
+      <div class="cache-usage">
+        <div class="cache-usage-head">
+          <b>{fmtBytes(health.cache.bytes)}</b>
+          <span class="muted">
+            / {health.cache.limit_mb ?? health.cache_limit_mb ?? '?'} MB · {health.cache.rows} 章 · 已用 {health.cache.percent ?? 0}%
+          </span>
+        </div>
+        <div class="cache-meter">
+          <span style={`width:${Math.min(100, Math.max(0, Number(health.cache.percent) || 0))}%`}></span>
+        </div>
+        {#if Number(health.cache.percent) >= 100}
+          <p class="cache-warn">占用已超过上限，新章节落库时会自动淘汰最久未读的缓存；也可点「清理到上限」立即处理。</p>
+        {/if}
+        {#if Number(health.cache.image_cache_bytes) > 0}
+          <p class="muted field-hint">另有图片缓存 {fmtBytes(health.cache.image_cache_bytes)}（进程级、所有账号共享，不占正文上限）。</p>
+        {/if}
+        {#if (health.cache.books || []).length}
+          <ol class="cache-books">
+            {#each health.cache.books as b}
+              <li>
+                <div class="cache-book-row">
+                  <span class="cache-book-name">{b.name || b.book_url}</span>
+                  <b>{fmtBytes(b.bytes)}</b>
+                </div>
+              </li>
+            {/each}
+          </ol>
+        {/if}
+        <div class="cache-actions">
+          <button class="ghost" on:click={trimCache} disabled={cacheBusy}>
+            {cacheBusy ? '处理中…' : '清理到上限'}
+          </button>
+          <span class="muted field-hint" style="margin:0">按最久未读顺序删除超额部分，不影响书架与阅读进度。</span>
+        </div>
+      </div>
+    {/if}
     {#if shelfBooks.length}
       <div class="field">
         <div class="field-label">选择书籍</div>
@@ -722,6 +781,15 @@
 
   .cache-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
   .cache-global { align-items: center; border-top: 1px solid var(--border, #d8d8d8); padding-top: 10px; }
+  .cache-usage { border: 1px solid var(--border, #d8d8d8); padding: 10px 12px; margin-bottom: 14px; }
+  .cache-usage-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+  .cache-usage-head b { font-size: 18px; }
+  .cache-meter { height: 8px; border: 1px solid var(--border, #d8d8d8); margin: 8px 0 4px; }
+  .cache-meter span { display: block; height: 100%; background: var(--accent); }
+  .cache-books { margin: 8px 0 0; padding-left: 20px; font-size: 12px; line-height: 1.7; }
+  .cache-book-row { display: flex; justify-content: space-between; gap: 10px; }
+  .cache-book-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cache-books b { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .cache-result {
     border: 1px solid var(--border, #d8d8d8);
     padding: 10px 12px;

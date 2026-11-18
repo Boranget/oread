@@ -2025,6 +2025,33 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 删除不存在的书返回 `deleted=0`，仍 `ok:true`。
   - 清理后服务端会尝试回收 SQLite 空闲页，文件大小不保证立即下降。
 
+### 6.9.1 `POST /api/book/cache/trim`
+
+- 鉴权：登录
+- 验证状态：**已验证**（单测 `evict_to_limit_drops_oldest_rows`、冒烟 `cache_usage_and_trim_are_exposed`）
+- 用途：把正文缓存**立即压到当前账号生效上限以内**。写入路径（6.4 / 6.8）只在落库时淘汰；调小 `cache_limit_mb` 后可用本接口让上限立刻生效，不必等下一次阅读。
+- 请求体：无（`{}` 即可）。
+- 成功 `200`（示例为伪造值）：
+
+```json
+{ "ok": true, "limit_bytes": 52428800, "limit_mb": 50, "used_bytes_before": 62914560, "used_bytes_after": 52420000, "deleted": 37, "bytes_freed": 10494560 }
+```
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `ok` | boolean | 否 | 恒 true |
+| `limit_bytes` | integer | 否 | 生效上限 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)` |
+| `limit_mb` | integer | 否 | 同上，向下取整到 MB |
+| `used_bytes_before` / `used_bytes_after` | integer | 否 | 执行前后 `book_content` 占用 |
+| `deleted` | integer | 否 | 删除的章节行数（每批 16 行，最多 1024 批） |
+| `bytes_freed` | integer | 否 | 前后占用差（≥0） |
+
+- 错误：`401`；`500`（SQLite 查询失败）。
+- 行为：
+  - 按 `accessed_at` 升序（同秒内按 `rowid`）**成批淘汰**；未超上限时 `deleted=0`。
+  - 只删 `book_content`，不动 `book_chapters` / `book_meta` / 书架 / 进度；同样尝试回收 SQLite 空闲页。
+  - 与写入路径共用同一个淘汰函数，避免出现两套阈值。
+
 ### 6.10 `GET /api/book/export/info`
 
 - 鉴权：登录
@@ -3047,7 +3074,17 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "cache_limit_mb": 50,
   "js": { "enabled": true, "last_ms": 12, "max_ms": 48, "budget_ms": 200 },
   "http": { "concurrency": 3, "timeout_secs": 15, "max_body_mb": 5 },
-  "cache": { "bytes": 10485760, "mb": 10.0, "rows": 42 }
+  "cache": {
+    "bytes": 10485760,
+    "mb": 10.0,
+    "rows": 42,
+    "limit_bytes": 52428800,
+    "limit_mb": 50,
+    "percent": 20.0,
+    "image_cache_bytes": 2097152,
+    "total_bytes": 12582912,
+    "books": [{ "book_url": "https://example.com/book/123", "name": "示例书名", "bytes": 8388608 }]
+  }
 }
 ```
 
@@ -3056,9 +3093,15 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `cache.bytes` | integer | 否 | 当前用户正文缓存总字节 |
 | `cache.mb` | number | 否 | 保留 2 位小数 |
 | `cache.rows` | integer | 否 | `book_content` 行数 |
+| `cache.limit_bytes` | integer | 否 | 生效上限 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)` |
+| `cache.limit_mb` | integer | 否 | 同上，向下取整到 MB |
+| `cache.percent` | number | 否 | `bytes / limit_bytes`，保留 1 位小数（可 >100，表示调小上限后尚未清理） |
+| `cache.image_cache_bytes` | integer | 否 | 进程级图片 LRU 占用（所有账号共享，不占正文上限） |
+| `cache.total_bytes` | integer | 否 | `bytes + image_cache_bytes` |
+| `cache.books[]` | object[] | 否 | 占用最高的 5 本书：`book_url`、`name`（可能为空串）、`bytes` |
 
 - 错误：`401`；`500`（缓存查询失败被 `unwrap_or(0)` 吞掉，实际不会 500）。
-- 行为：与 `/healthz` 共用 `base_metrics`，追加当前用户库缓存统计（[health.rs](../server/src/routes/health.rs#L119-L148)）。
+- 行为：与 `/healthz` 共用 `base_metrics`，追加当前用户库缓存统计：占用、生效上限、占用比例、按书 Top5（[health.rs](../server/src/routes/health.rs#L184-L229)）。
 
 ### 11.4 其他
 
@@ -3404,11 +3447,13 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 
 ### 13.10 缓存管理
 
-- 状态：**部分已实现（2026-11-03）**：
-  - 已落地 `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空当前用户全部正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed}`；只删正文，不动目录。
-  - 已落地 `POST /api/book/cache-all`（6.8）：整本补缓存，带预算与并发。
-  - 仍未实现：`GET /api/cache/stats`（独立统计）、删目录缓存（强制重抓，解决 6.2 换源串目录）、二次确认参数。
-- 现状（已更新）：缓存用量可从 `/api/healthz` 或 6.8 返回的 `budget_bytes/used_bytes_*` 查看；清理走 6.9，不需要 `confirm`。
+- 状态：**已实现（2026-11-18 补齐清理到上限与管理页展示）**：
+  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空当前用户全部正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed}`；只删正文，不动目录。
+  - `POST /api/book/cache/trim`（6.9.1）：按 LRU 立即清理到生效上限（`min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)`），与写入路径共用同一淘汰函数。
+  - `POST /api/book/cache-all`（6.8）：整本补缓存，带预算与并发。
+  - 设置页「书籍缓存」卡片：展示占用/上限/比例、按书 Top5（名称+字节），提供「清理到上限」「清理本书」「清理全部」。
+  - 仍未实现：独立 `GET /api/cache/stats`（现由 `/api/healthz` 承担）、删目录缓存（强制重抓，解决 6.2 换源串目录）、二次确认参数（前端两步点击代替）。
+- 现状（已更新）：缓存用量从 `/api/healthz` 的 `cache.{bytes,rows,limit_bytes,percent,books}` 查看；清理走 6.9 / 6.9.1。
 - 后端改动点：仍是 `routes/books.rs`；只操作当前用户库。
 
 ### 13.11 账号与用户管理

@@ -457,6 +457,8 @@ export const api = {
   // 传空表示清理该用户全部正文缓存
   cacheClear: (bookId = '') =>
     request('POST', '/book/cache/clear', bookId ? { book_id: bookId } : {}),
+  // 清理到当前账号生效上限（LRU 淘汰最久未读章节），不影响书架与进度
+  cacheTrim: () => request('POST', '/book/cache/trim', {}),
 
   // ---- 导出 TXT（只读缓存，不发起抓取）----
   // 导出前计划：total/cached/missing/cached_bytes/complete/export_url

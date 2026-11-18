@@ -867,6 +867,63 @@ async fn clear_cache_by_book_and_by_user() {
     assert_eq!(left2, 0);
 }
 
+// 清理到上限：按最久未读（同秒内按 rowid）成批淘汰，直到总量不超上限
+#[tokio::test]
+async fn evict_to_limit_drops_oldest_rows() {
+    let pool = mem_pool().await;
+    for i in 0..20 {
+        let c = mk_content(&format!("https://x/c{i}"), "https://x/a", i, "aaaa");
+        upsert_content(&pool, &c).await.unwrap();
+    }
+    // 20 行 × 4 字节 = 80；上限 72 时删一轮（16 行）即回落到 16 字节
+    let deleted = evict_content_to_limit(&pool, 72, EVICT_ROUNDS_WRITE)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 16);
+    let left: Vec<String> = sqlx::query_scalar("SELECT url FROM book_content ORDER BY rowid")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 4, "只保留最新的 4 行");
+    assert_eq!(left.first().map(String::as_str), Some("https://x/c16"));
+
+    // 已在上限内：不再删除
+    assert_eq!(
+        evict_content_to_limit(&pool, 72, EVICT_ROUNDS_WRITE)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+// 生效上限：用户设置与部署上限取较小值；未设置时用部署上限。
+#[tokio::test]
+async fn effective_limit_takes_min_of_user_and_global() {
+    let pool = mem_pool().await;
+    sqlx::query("CREATE TABLE user_settings (key TEXT PRIMARY KEY, value TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let global = 50 << 20;
+    assert_eq!(content_cache_limit_bytes(&pool, global).await, global);
+
+    sqlx::query("INSERT INTO user_settings (key, value) VALUES ('cache_limit_mb','10')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(content_cache_limit_bytes(&pool, global).await, 10 << 20);
+
+    sqlx::query("UPDATE user_settings SET value='100' WHERE key='cache_limit_mb'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        content_cache_limit_bytes(&pool, global).await,
+        global,
+        "用户值更大时仍以部署上限为准"
+    );
+}
+
 // 行表去重：同书多源只合并来源，分数与序号保持首次入库时的值。
 #[tokio::test]
 async fn result_rows_dedupe_by_book_and_keep_first_score() {

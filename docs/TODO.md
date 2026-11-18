@@ -271,7 +271,7 @@
 | `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/pages/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
 | 构建脚本硬编码旧路径 | `已完成待验证` | 两个脚本都以 `$PSScriptRoot` 推导仓库根，并通过 `CARGO_TARGET_DIR` 输出（[build-dev.ps1](../scripts/build-dev.ps1#L28-L45)、[build-release.ps1](../scripts/build-release.ps1#L33-L45)） | 在仓库根与任意工作目录调用都应成功；当前脚本变量为 `OREAD_TARGET_WIN`/`OREAD_TARGET_MUSL`，工程侧改名后为 `BORANLIB_TARGET_*`（本文以现名为准） |
 
-缓存清理已落地（`POST /api/book/cache/clear`，支持单书/全库）；`cache_limit_mb` 仍只在写入新缓存时参与淘汰，没有“立即清理到上限”的入口，但不再缺“清空缓存”入口（[health.rs](../server/src/routes/health.rs)、[books.rs](../server/src/routes/books.rs)）。
+缓存管理已闭环：`POST /api/book/cache/clear` 支持单书/全库，`POST /api/book/cache/trim` 按 LRU 立即清理到生效上限（与写入路径共用同一淘汰函数）；设置页「书籍缓存」卡片展示占用/上限/比例、按书 Top5，并提供「清理到上限」（[health.rs](../server/src/routes/health.rs)、[books_content.rs](../server/src/routes/books_content.rs)、[Settings.svelte](../server/web/src/pages/Settings.svelte)）。
 
 ### 3.13 KPW3 真机约束：`/k` 与漫画阅读器必须遵守红线
 

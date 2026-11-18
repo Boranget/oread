@@ -166,6 +166,48 @@ async fn healthz_returns_ok_without_auth() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// 缓存管理：/api/healthz 暴露生效上限与占用比例；/api/book/cache/trim 空库也返回 200。
+#[tokio::test]
+async fn cache_usage_and_trim_are_exposed() {
+    let (app, _pool, dir) = test_app("cache-trim").await;
+    let token = register(&app, "trimmer").await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/healthz", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let limit = body["cache"]["limit_bytes"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("缺少 cache.limit_bytes: {body}"));
+    assert!(limit > 0, "生效上限应大于 0: {body}");
+    assert!(
+        body["cache"]["limit_mb"].as_i64().unwrap_or(0) * 1024 * 1024 <= limit,
+        "limit_mb 应由 limit_bytes 向下取整: {body}"
+    );
+    assert!(body["cache"]["percent"].is_number(), "缺少占用比例: {body}");
+    assert!(body["cache"]["books"].is_array(), "缺少按书占用: {body}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/book/cache/trim", "{}", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], true, "trim: {body}");
+    assert_eq!(body["deleted"], 0, "空缓存无需清理: {body}");
+    assert!(body["limit_mb"].as_i64().unwrap_or(0) > 0, "trim: {body}");
+    assert_eq!(
+        body["used_bytes_before"], body["used_bytes_after"],
+        "未删除时前后占用应一致: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // 响应编码层只挂在 `/k`：/k/login 的 HTML 走 gzip，API 热路径（/healthz）保持 identity。
 #[tokio::test]
 async fn kindle_pages_are_gzipped_but_api_stays_identity() {

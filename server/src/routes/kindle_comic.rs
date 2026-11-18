@@ -200,10 +200,7 @@ pub(super) async fn load_comic_images(
         images_json: Some(payload),
         ..Default::default()
     };
-    let limit = match replace::user_cache_limit_mb(pool).await {
-        Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-        None => s.cfg.cache_limit_bytes(),
-    };
+    let limit = content_cache_limit_bytes(pool, s.cfg.cache_limit_bytes()).await;
     if let Err(e) = save_content_cached(pool, &c, limit).await {
         tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
     }

@@ -450,6 +450,61 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     Ok(())
 }
 
+/// 当前账号生效的正文缓存上限（字节）：用户设置与部署上限取较小值。
+///
+/// 所有写入/清理路径都从这里取上限，避免 `min(user, cfg)` 在多处各写一遍后走样。
+pub(crate) async fn content_cache_limit_bytes(pool: &SqlitePool, cfg_limit: i64) -> i64 {
+    match crate::routes::replace::user_cache_limit_mb(pool).await {
+        Some(mb) => (mb * 1024 * 1024).min(cfg_limit),
+        None => cfg_limit,
+    }
+}
+
+/// 每批淘汰的行数：`DELETE ... LIMIT 16`。
+const EVICT_BATCH: usize = 16;
+/// 写入路径的淘汰轮数：新章节落库只需把总量压回上限附近。
+pub(crate) const EVICT_ROUNDS_WRITE: usize = 8;
+/// 手动「清理到上限」的轮数：足够一次清完历史积压，又不至于长时间占住连接。
+pub(crate) const EVICT_ROUNDS_TRIM: usize = 1024;
+
+/// 按 LRU 淘汰到 `limit_bytes` 以内：每轮删最久未读的 16 行，最多 `max_rounds` 轮。
+///
+/// 写入路径（新章节落库后）与「清理到上限」共用同一策略，返回删除行数。
+pub(crate) async fn evict_content_to_limit(
+    pool: &SqlitePool,
+    limit_bytes: i64,
+    max_rounds: usize,
+) -> anyhow::Result<u64> {
+    let mut deleted_total = 0u64;
+    for _ in 0..max_rounds {
+        let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+            .fetch_one(pool)
+            .await?;
+        if total <= limit_bytes {
+            break;
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM book_content WHERE rowid IN \
+             (SELECT rowid FROM book_content ORDER BY accessed_at ASC, rowid ASC LIMIT ?1)",
+        )
+        .bind(EVICT_BATCH as i64)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if deleted == 0 {
+            break;
+        }
+        deleted_total += deleted;
+        crate::cache_metrics::record_eviction(deleted);
+        tracing::info!(total, limit = limit_bytes, deleted, "content cache evicted");
+    }
+    if deleted_total > 0 {
+        // 增量归还有界空间（256 页 ≈ 1 MiB），避免文件只涨不落；非增量库为空操作。
+        let _ = crate::db::reclaim_pages(pool, 256).await;
+    }
+    Ok(deleted_total)
+}
+
 /// 正文落库 + 总量上限淘汰：超过 `limit_bytes` 时按 accessed_at 升序删除最久未读章节。
 pub(crate) async fn save_content_cached(
     pool: &SqlitePool,
@@ -464,30 +519,7 @@ pub(crate) async fn save_content_cached(
     }
     upsert_content(pool, c).await?;
     crate::cache_metrics::record_save();
-
-    // 淘汰：每轮删除最久未读的一批，最多 8 轮，避免极端情况下长时间占用连接
-    for _ in 0..8 {
-        let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(pool)
-            .await?;
-        if total <= limit_bytes {
-            break;
-        }
-        let deleted = sqlx::query(
-            "DELETE FROM book_content WHERE rowid IN \
-             (SELECT rowid FROM book_content ORDER BY accessed_at ASC LIMIT 16)",
-        )
-        .execute(pool)
-        .await?
-        .rows_affected();
-        if deleted == 0 {
-            break;
-        }
-        crate::cache_metrics::record_eviction(deleted as u64);
-        tracing::info!(total, limit = limit_bytes, deleted, "content cache evicted");
-        // 增量归还有界空间（256 页 ≈ 1 MiB），避免文件只涨不落；非增量库为空操作。
-        let _ = crate::db::reclaim_pages(pool, 256).await;
-    }
+    evict_content_to_limit(pool, limit_bytes, EVICT_ROUNDS_WRITE).await?;
     Ok(())
 }
 

@@ -94,10 +94,12 @@ async fn cache_usage(pool: &SqlitePool) -> (i64, i64) {
 }
 
 /// 按书占用（前 5 本），用于定位正文缓存空间被谁占住。
-async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, i64)> {
+/// `name` 取自 `book_meta`，缺失时前端回退显示 `book_url`。
+async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
     sqlx::query_as(
-        "SELECT book_url, COALESCE(SUM(size_bytes),0) AS total \
-         FROM book_content GROUP BY book_url ORDER BY total DESC LIMIT 5",
+        "SELECT c.book_url, COALESCE(m.name, '') AS name, COALESCE(SUM(c.size_bytes),0) AS total \
+         FROM book_content c LEFT JOIN book_meta m ON m.book_url = c.book_url \
+         GROUP BY c.book_url ORDER BY total DESC LIMIT 5",
     )
     .fetch_all(pool)
     .await
@@ -187,6 +189,14 @@ pub async fn healthz_user(
 ) -> AppResult<Json<serde_json::Value>> {
     let (bytes, rows) = cache_usage(&db.0).await;
     let books = cache_usage_by_book(&db.0).await;
+    // 与写入/清理路径同一口径：用户设置与部署上限取较小值
+    let limit_bytes =
+        crate::routes::books::content_cache_limit_bytes(&db.0, state.cfg.cache_limit_bytes()).await;
+    let percent = if limit_bytes > 0 {
+        ((bytes as f64) * 1000.0 / limit_bytes as f64).round() / 10.0
+    } else {
+        0.0
+    };
     let mut v = base_metrics(&state);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ok".into(), json!(true));
@@ -196,13 +206,21 @@ pub async fn healthz_user(
                 "bytes": bytes,
                 "mb": (bytes as f64 / MB as f64 * 100.0).round() / 100.0,
                 "rows": rows,
+                // 生效上限与占用比例：前端管理页直接渲染进度条，不用自己再算 min
+                "limit_bytes": limit_bytes,
+                "limit_mb": limit_bytes / (1024 * 1024),
+                "percent": percent,
                 // 图片缓存计入缓存预算统计（进程级，所有用户共享）
                 "image_cache_bytes": crate::image_cache::stats().0,
                 "total_bytes": bytes + crate::image_cache::stats().0 as i64,
                 // 前 5 本按占用降序，便于定位缓存被谁占住
                 "books": books
                     .iter()
-                    .map(|(url, bytes)| json!({ "book_url": url, "bytes": bytes }))
+                    .map(|(url, name, bytes)| json!({
+                        "book_url": url,
+                        "name": name,
+                        "bytes": bytes,
+                    }))
                     .collect::<Vec<_>>(),
             }),
         );

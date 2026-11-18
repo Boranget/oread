@@ -58,7 +58,7 @@ GET /api/book/content
 
 - **`shared.db`**：账户、书源、导入账本、体检语料。全局一份。
 - **`users/<uid>.db`**：书架、阅读进度、设置、书签、替换规则、`book_meta`/`book_chapters`、`book_content`。物理分桶，连接池有 LRU 上限。
-- **正文缓存**：存在用户库 `book_content`，键 `(url, origin)`，带 TTL 与管线指纹 `cache_version`；空正文不落库；超上限按 `accessed_at` 升序淘汰。
+- **正文缓存**：存在用户库 `book_content`，键 `(url, origin)`，带 TTL 与管线指纹 `cache_version`；空正文不落库；超上限按 `accessed_at` 升序淘汰。生效上限 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)`；写入路径与 `POST /api/book/cache/trim` 共用同一个淘汰函数，设置页可直接查看占用并清理到上限。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文缓存分开预算。
 - **规则缓存**：`<data_dir>/cache/rule/`，仅 `cache.getFile/putFile` 可写。
 - **搜索任务（`shared.db`.`search_jobs`）**：两段式搜索的元数据与最终快照。运行期进度以进程内注册表（`books_search_job`）为准；任务收尾时把 `books/errors` 写入 `snapshot_json`。内存只保留运行中 + 最近 20 个已完成任务（完成后再留 10 分钟），数据库保留每用户最近 50 个。`/api/search/result` 内存未命中时回退数据库快照，游标翻页继续复用 `rank_bucket/rank_seq`。进程启动时把上次遗留的 `running` 行标为 `interrupted`，避免前端永远轮询一个不会动的任务。

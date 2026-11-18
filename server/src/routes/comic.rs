@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use crate::auth::{AuthUser, UserDb};
 use crate::entities::{BookChapter, BookContent, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
-use crate::routes::books::{load_book_meta, save_content_cached};
+use crate::routes::books::{content_cache_limit_bytes, load_book_meta, save_content_cached};
 use crate::routes::image;
 use crate::routes::sources::load_source;
 use crate::routes::AppState;
@@ -271,10 +271,7 @@ async fn chapter_images(
                     ..Default::default()
                 };
                 // 缓存上限与小说正文同源（用户设置优先，否则全局配置）
-                let limit = match crate::routes::replace::user_cache_limit_mb(&db.0).await {
-                    Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                    None => s.cfg.cache_limit_bytes(),
-                };
+                let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
                 if let Err(e) = save_content_cached(&db.0, &c, limit).await {
                     tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
                 }

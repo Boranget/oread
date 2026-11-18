@@ -42,6 +42,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/book/search", get(book_search))
         .route("/api/book/cache-all", post(cache_all))
         .route("/api/book/cache/clear", post(cache_clear))
+        .route("/api/book/cache/trim", post(cache_trim))
         .route("/api/book/switch-source", post(switch_source))
 }
 
@@ -193,6 +194,8 @@ mod books_content;
 use books_content::*;
 #[path = "books_store.rs"]
 mod books_store;
+// 供 health / comic / kindle 等兄弟模块取“当前账号生效上限”，避免各自重算 min(user, cfg)
+pub(crate) use books_store::content_cache_limit_bytes;
 use books_store::*;
 
 pub(crate) use books_search_api::{

@@ -46,10 +46,7 @@ pub(super) async fn read(
                 Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
             };
             fetched.origin = source.book_source_url.clone();
-            let limit = match replace::user_cache_limit_mb(&db.0).await {
-                Some(mb) => (mb * 1024 * 1024).min(s.cfg.cache_limit_bytes()),
-                None => s.cfg.cache_limit_bytes(),
-            };
+            let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
             let _ = save_content_cached(&db.0, &fetched, limit).await;
             fetched
         }
