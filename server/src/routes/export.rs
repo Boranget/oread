@@ -25,7 +25,7 @@ use sqlx::SqlitePool;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::auth::{AuthUser, UserDb};
+use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
 
@@ -40,7 +40,7 @@ pub struct ExportQ {
     pub book_url: String,
 }
 
-/// 导出前的计划信息：章节总数、已缓存数、缺失数都基于当前用户库实时统计。
+/// 导出前的计划信息：章节总数、已缓存数、缺失数都基于馆藏库实时统计（全局共享）。
 #[derive(Debug, Clone, Default)]
 struct ExportPlan {
     name: String,
@@ -66,7 +66,7 @@ async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> 
     if book_url.is_empty() {
         return Err(AppError::BadRequest("book_url 不能为空".into()));
     }
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
         .bind(book_url)
         .fetch_one(pool)
         .await?;
@@ -83,7 +83,7 @@ async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> 
         Option<String>,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT name, author, origin_name, origin FROM book_meta WHERE book_url = ?1",
+        "SELECT name, author, origin_name, origin FROM library_books WHERE book_url = ?1",
     )
     .bind(book_url)
     .fetch_optional(pool)
@@ -103,7 +103,7 @@ async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> 
         "SELECT COUNT(*), \
          COALESCE(SUM(CASE WHEN ct.url IS NOT NULL THEN 1 ELSE 0 END), 0), \
          COALESCE(SUM(ct.size_bytes), 0) \
-         FROM book_chapters c LEFT JOIN book_content ct \
+         FROM library_chapters c LEFT JOIN library_content ct \
            ON ct.url = c.url AND ct.book_url = c.book_url \
               AND ct.content IS NOT NULL AND length(trim(ct.content)) > 0 \
          WHERE c.book_url = ?1 AND c.is_volume = 0 AND c.url NOT LIKE 'volume:%'",
@@ -225,7 +225,7 @@ async fn write_export(
     file.write_all(header.as_bytes()).await?;
 
     let chapters: Vec<(String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT url, title, is_volume FROM book_chapters \
+        "SELECT url, title, is_volume FROM library_chapters \
          WHERE book_url = ?1 ORDER BY \"index\"",
     )
     .bind(book_url.trim())
@@ -260,7 +260,7 @@ async fn write_export(
 
         // 一次只取一章正文；LIMIT 1 保证同 URL 同书的重复行不会读进内存。
         let body: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM book_content \
+            "SELECT content FROM library_content \
              WHERE url = ?1 AND book_url = ?2 AND content IS NOT NULL LIMIT 1",
         )
         .bind(&url)
@@ -305,11 +305,11 @@ async fn write_export(
 }
 
 async fn export_info(
+    State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let plan = build_plan(&db.0, &q.book_url).await?;
+    let plan = build_plan(&s.library, &q.book_url).await?;
     let export_url = format!(
         "/api/book/export/txt?book_url={}",
         url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()
@@ -331,10 +331,9 @@ async fn export_info(
 async fn export_txt(
     State(s): State<AppState>,
     u: AuthUser,
-    db: UserDb,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Response> {
-    let out = write_export(&db.0, &s.cfg.data_dir, u.id, &q.book_url).await?;
+    let out = write_export(&s.library, &s.cfg.data_dir, u.id, &q.book_url).await?;
 
     let filename = format!(
         "{}-{}.txt",
@@ -413,21 +412,22 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE book_meta (book_url TEXT PRIMARY KEY, name TEXT, author TEXT, \
+            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, name TEXT, author TEXT, \
              origin TEXT, origin_name TEXT)",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "CREATE TABLE book_chapters (url TEXT PRIMARY KEY, book_url TEXT NOT NULL, \
-             title TEXT, is_volume INTEGER NOT NULL DEFAULT 0, \"index\" INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE library_chapters (book_url TEXT NOT NULL, url TEXT NOT NULL, \
+             title TEXT, is_volume INTEGER NOT NULL DEFAULT 0, \"index\" INTEGER NOT NULL DEFAULT 0, \
+             PRIMARY KEY (book_url, url))",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "CREATE TABLE book_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
+            "CREATE TABLE library_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
              book_url TEXT NOT NULL, title TEXT, content TEXT, \
              size_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (url, origin))",
         )
@@ -439,7 +439,7 @@ mod tests {
 
     async fn insert_book(pool: &SqlitePool, book: &str) {
         sqlx::query(
-            "INSERT INTO book_meta (book_url, name, author, origin, origin_name) \
+            "INSERT INTO library_books (book_url, name, author, origin, origin_name) \
              VALUES (?1, '测试书', '测试作者', 'https://src', '测试源')",
         )
         .bind(book)
@@ -454,7 +454,7 @@ mod tests {
         ];
         for (url, title, is_volume, idx) in rows {
             sqlx::query(
-                "INSERT INTO book_chapters (url, book_url, title, is_volume, \"index\") \
+                "INSERT INTO library_chapters (url, book_url, title, is_volume, \"index\") \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .bind(url)
@@ -471,7 +471,7 @@ mod tests {
             ("https://x/c3", "第三章正文内容"),
         ] {
             sqlx::query(
-                "INSERT INTO book_content (url, book_url, content, size_bytes) \
+                "INSERT INTO library_content (url, book_url, content, size_bytes) \
                  VALUES (?1, ?2, ?3, ?4)",
             )
             .bind(url)
@@ -537,7 +537,7 @@ mod tests {
         let book = "https://x/book";
         insert_book(&pool, book).await;
         // 空串正文不应算“已缓存”
-        sqlx::query("UPDATE book_content SET content = '   ' WHERE url = 'https://x/c1'")
+        sqlx::query("UPDATE library_content SET content = '   ' WHERE url = 'https://x/c1'")
             .execute(&pool)
             .await
             .unwrap();
@@ -573,7 +573,7 @@ mod tests {
         let pool = export_pool().await;
         let book = "https://x/book";
         insert_book(&pool, book).await;
-        sqlx::query("UPDATE book_meta SET author = '作者：无语森' WHERE book_url = ?1")
+        sqlx::query("UPDATE library_books SET author = '作者：无语森' WHERE book_url = ?1")
             .bind(book)
             .execute(&pool)
             .await

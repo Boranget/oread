@@ -14,6 +14,10 @@ fn user_migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations/user")
 }
 
+fn library_migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations/library")
+}
+
 /// 内存优先的 SQLite 调优：WAL + NORMAL 同步 + 8MB 页缓存 + 禁用 mmap，
 /// 并设置 5s busy_timeout（多连接池并发下避免立即 SQLITE_BUSY）。
 /// 8MB 是每个「打开着的数据库文件」的上限，配合用户池 LRU（≤8 个）仍受控。
@@ -107,6 +111,33 @@ pub async fn init_shared(cfg: &Config) -> anyhow::Result<SqlitePool> {
         &pool,
         &shared_migrator(),
         crate::db_guard::Scope::Shared,
+    )
+    .await?;
+    if cfg.db_vacuum_convert {
+        ensure_incremental(&pool).await?;
+    }
+    Ok(pool)
+}
+
+/// 初始化馆藏库（全局一份）：建库 + 执行 library 迁移。
+///
+/// 与 `shared.db` / `users/*.db` 分开文件，避免正文写入与账号、搜索写入争同一写者。
+pub async fn init_library(cfg: &Config) -> anyhow::Result<SqlitePool> {
+    let data_dir = std::path::Path::new(&cfg.data_dir);
+    std::fs::create_dir_all(data_dir)?;
+    probe_writable_dir(data_dir)?;
+
+    let opts = SqliteConnectOptions::from_str(&cfg.library_db_url())?.create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(opts)
+        .await?;
+    apply_pragma(&pool).await?;
+    crate::db_guard::migrate_bucket(
+        cfg,
+        &pool,
+        &library_migrator(),
+        crate::db_guard::Scope::Library,
     )
     .await?;
     if cfg.db_vacuum_convert {

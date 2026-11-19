@@ -20,7 +20,6 @@
     theme: 'light',
     font_size: 18,
     line_height: 1.75,
-    cache_limit_mb: 50,
     auto_refresh: true,
     read_mode: 'scroll',
     page_width: PAGE_WIDTH_PX.normal,
@@ -270,10 +269,10 @@
     clearAllRes = null;
     try {
       clearAllRes = await api.cacheClear('');
-      cacheNotice = `已清理全部缓存：${clearAllRes.deleted} 章`;
+      cacheNotice = `已清理临时缓存：${clearAllRes.deleted} 章`;
       await loadHealth();
     } catch (e) {
-      cacheErr = describeFailure(e, '清理全部缓存');
+      cacheErr = describeFailure(e, '清理临时缓存');
     } finally {
       cacheBusy = false;
     }
@@ -286,11 +285,11 @@
     try {
       const res = await api.cacheTrim();
       cacheNotice = res.deleted
-        ? `已按最久未读顺序清理 ${res.deleted} 章，释放 ${fmtBytes(res.bytes_freed)}`
-        : '当前占用未超过上限，无需清理';
+        ? `已回收 ${res.books_deleted ?? 0} 本过期临时缓存（${res.deleted} 章），释放 ${fmtBytes(res.bytes_freed)}`
+        : '没有过期的临时缓存，无需回收';
       await loadHealth();
     } catch (e) {
-      cacheErr = describeFailure(e, '清理到上限');
+      cacheErr = describeFailure(e, '回收临时缓存');
     } finally {
       cacheBusy = false;
     }
@@ -365,7 +364,6 @@
         theme: settings.theme,
         font_size: Number(settings.font_size),
         line_height: Number(settings.line_height),
-        cache_limit_mb: Number(settings.cache_limit_mb),
         auto_refresh: !!settings.auto_refresh,
         read_mode: settings.read_mode,
         page_width: Number(settings.page_width) || DEFAULTS.page_width,
@@ -373,7 +371,6 @@
         builtin_clean: !!settings.builtin_clean,
       });
       notice = '已保存';
-      // 上限可能刚被调小：刷新一次占用比例，便于决定是否「清理到上限」
       loadHealth();
       setTimeout(() => (notice = ''), 1800);
     } catch (e) {
@@ -587,13 +584,7 @@
   </div>
 
   <div class="card">
-    <h3>缓存与刷新</h3>
-    <div class="field">
-      <div class="field-label">正文缓存上限（MB）</div>
-      <input type="number" min="10" max="1000" step="10" bind:value={settings.cache_limit_mb} />
-      <div class="muted field-hint">由服务端按账号执行 LRU 淘汰；实际上限取本值与服务端部署上限的较小值。</div>
-    </div>
-
+    <h3>刷新</h3>
     <label class="switch-row">
       <span>
         <b>自动刷新</b>
@@ -614,17 +605,28 @@
         <div class="cache-usage-head">
           <b>{fmtBytes(health.cache.bytes)}</b>
           <span class="muted">
-            / {health.cache.limit_mb ?? health.cache_limit_mb ?? '?'} MB · {health.cache.rows} 章 · 已用 {health.cache.percent ?? 0}%
+            {health.cache.rows} 章 · 馆藏 {health.cache.collection?.books ?? 0} 本 / 临时 {health.cache.temp?.books ?? 0} 本
           </span>
         </div>
-        <div class="cache-meter">
-          <span style={`width:${Math.min(100, Math.max(0, Number(health.cache.percent) || 0))}%`}></span>
+        <div class="health-grid" style="margin-top:8px">
+          <div>
+            <span class="muted">馆藏（永久）</span>
+            <b>{fmtBytes(health.cache.collection?.bytes ?? 0)} · {health.cache.collection?.chapters ?? 0} 章</b>
+          </div>
+          <div>
+            <span class="muted">临时缓存</span>
+            <b>{fmtBytes(health.cache.temp?.bytes ?? 0)} · {health.cache.temp?.chapters ?? 0} 章</b>
+          </div>
+          <div>
+            <span class="muted">临时 TTL</span>
+            <b>{health.cache.temp?.ttl_days ?? 30} 天未访问自动回收</b>
+          </div>
         </div>
-        {#if Number(health.cache.percent) >= 100}
-          <p class="cache-warn">占用已超过上限，新章节落库时会自动淘汰最久未读的缓存；也可点「清理到上限」立即处理。</p>
+        {#if Number(health.cache.temp?.expired_books) > 0}
+          <p class="cache-warn">有 {health.cache.temp.expired_books} 本临时缓存已过期，可立即回收。</p>
         {/if}
         {#if Number(health.cache.image_cache_bytes) > 0}
-          <p class="muted field-hint">另有图片缓存 {fmtBytes(health.cache.image_cache_bytes)}（进程级、所有账号共享，不占正文上限）。</p>
+          <p class="muted field-hint">另有图片缓存 {fmtBytes(health.cache.image_cache_bytes)}（进程级、所有账号共享）。</p>
         {/if}
         {#if (health.cache.books || []).length}
           <ol class="cache-books">
@@ -640,9 +642,9 @@
         {/if}
         <div class="cache-actions">
           <button class="ghost" on:click={trimCache} disabled={cacheBusy}>
-            {cacheBusy ? '处理中…' : '清理到上限'}
+            {cacheBusy ? '处理中…' : '回收过期临时缓存'}
           </button>
-          <span class="muted field-hint" style="margin:0">按最久未读顺序删除超额部分，不影响书架与阅读进度。</span>
+          <span class="muted field-hint" style="margin:0">只回收临时层；馆藏永久保存，不受影响。</span>
         </div>
       </div>
     {/if}
@@ -669,16 +671,16 @@
     {/if}
     <div class="cache-actions cache-global">
       <button class="ghost" on:click={clearAllCache} disabled={cacheBusy}>
-        {clearAllArmed ? '再次点击确认清理全部' : '清理全部缓存（当前账号）'}
+        {clearAllArmed ? '再次点击确认清理全部' : '清理全部临时缓存'}
       </button>
-      <span class="muted field-hint" style="margin:0">不影响书籍、书架和阅读进度，只删除已缓存的正文。</span>
+      <span class="muted field-hint" style="margin:0">只删除临时层的正文；已入馆的书不受影响，需要先移出馆藏。</span>
     </div>
     {#if cacheErr}<p class="err">{cacheErr}</p>{/if}
     {#if cacheNotice}<p class="ok-line">{cacheNotice}</p>{/if}
     {#if cacheRes}
       <div class="cache-result">
         <p>
-          <b>本次结果：</b>成功 {cacheRes.cached} 章 · 失败 {cacheRes.failed} 章 · 预算跳过 {cacheRes.skipped_budget} 章
+          <b>本次结果：</b>成功 {cacheRes.cached} 章 · 失败 {cacheRes.failed} 章
         </p>
         <p class="muted">
           已缓存 {cacheRes.already_cached + cacheRes.cached} / {cacheRes.total_chapters} 章 ·
@@ -688,9 +690,6 @@
           <p class="cache-warn">
             本次只缓存了前 {cacheRes.limit} 章，还有未缓存章节；可再次点击「缓存整本」继续。
           </p>
-        {/if}
-        {#if cacheRes.skipped_budget > 0}
-          <p class="cache-warn">缓存额度不足，跳过 {cacheRes.skipped_budget} 章；可调大正文缓存上限或先清理缓存后重试。</p>
         {/if}
         {#if cacheRes.failed > 0}
           <p class="muted">失败章节（最多列 5 条）：</p>
@@ -707,7 +706,7 @@
     {/if}
     {#if clearAllRes}
       <p class="muted">
-        全部清理完成（作用域 {clearAllRes.scope === 'user' ? '当前账号' : '单本'}）：删除 {clearAllRes.deleted} 章，释放 {fmtBytes(clearAllRes.bytes_freed)}。
+        临时缓存清理完成（{clearAllRes.scope === 'temp' ? '全部临时层' : '单本'}）：删除 {clearAllRes.deleted} 章，释放 {fmtBytes(clearAllRes.bytes_freed)}。
       </p>
     {/if}
   </div>
@@ -724,8 +723,8 @@
         <div><span class="muted">当前服务版本</span><b>{health.version ? `v${health.version}` : '未返回'}</b></div>
         <div><span class="muted">进程内存 RSS</span><b>{health.rss_mb == null ? '当前平台不可用' : health.rss_mb + ' MB'}</b></div>
         <div><span class="muted">打开的用户库</span><b>{health.open_user_dbs ?? 0}</b></div>
-        <div><span class="muted">正文缓存</span><b>{health.cache ? `${health.cache.mb} MB · ${health.cache.rows} 行` : '未返回'}</b></div>
-        <div><span class="muted">缓存上限</span><b>{health.cache_limit_mb ?? '?'} MB</b></div>
+        <div><span class="muted">馆藏正文（永久）</span><b>{health.cache ? `${fmtBytes(health.cache.collection?.bytes ?? 0)} · ${health.cache.collection?.books ?? 0} 本` : '未返回'}</b></div>
+        <div><span class="muted">临时缓存</span><b>{health.cache ? `${fmtBytes(health.cache.temp?.bytes ?? 0)} · ${health.cache.temp?.books ?? 0} 本` : '未返回'}</b></div>
         <div><span class="muted">HTTP 并发 / 超时</span><b>{health.http?.concurrency ?? '?'} / {health.http?.timeout_secs ?? '?'}s</b></div>
         <div><span class="muted">请求体上限</span><b>{health.http?.max_body_mb ?? '?'} MB</b></div>
         <div><span class="muted">JS 规则</span><b>{health.js?.enabled ? '开启' : '关闭'} · {health.js?.last_ms ?? 0} / {health.js?.max_ms ?? 0} ms</b></div>
@@ -784,8 +783,6 @@
   .cache-usage { border: 1px solid var(--border, #d8d8d8); padding: 10px 12px; margin-bottom: 14px; }
   .cache-usage-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
   .cache-usage-head b { font-size: 18px; }
-  .cache-meter { height: 8px; border: 1px solid var(--border, #d8d8d8); margin: 8px 0 4px; }
-  .cache-meter span { display: block; height: 100%; background: var(--accent); }
   .cache-books { margin: 8px 0 0; padding-left: 20px; font-size: 12px; line-height: 1.7; }
   .cache-book-row { display: flex; justify-content: space-between; gap: 10px; }
   .cache-book-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

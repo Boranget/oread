@@ -29,6 +29,7 @@
 
   const LAZY_TABS = {
     stats: () => import('./pages/Stats.svelte'),
+    library: () => import('./pages/Library.svelte'),
     sources: () => import('./pages/Sources.svelte'),
     replace: () => import('./pages/ReplaceRules.svelte'),
     settings: () => import('./pages/Settings.svelte'),
@@ -40,6 +41,8 @@
     { id: 'bookshelf', label: '书架', short: '书架' },
     { id: 'discover', label: '发现', short: '发现' },
     { id: 'stats', label: '统计', short: '统计' },
+    // 馆藏浏览所有登录账号可读；入馆/移出等写操作在页面内按管理员收口
+    { id: 'library', label: '馆藏', short: '馆藏' },
     // 普通用户也可见，进入后是只读态，避免出现可点击但必然 403 的按钮
     { id: 'sources', label: '书源管理', short: '书源' },
     { id: 'replace', label: '替换规则', short: '替换' },

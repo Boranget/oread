@@ -1,7 +1,7 @@
 //! 漫画阅读接口：`GET /api/comic/source` 与 `GET /api/comic/chapter`
 //!
-//! 章节图片列表复用 `book_chapters`（与小说目录同一张表、同一顺序），
-//! 图片缓存复用 `book_content`（`content_type=image`、`images` 列存 JSON），
+//! 章节图片列表复用 `library_chapters`（与小说目录同一张表、同一顺序），
+//! 图片缓存复用 `library_content`（`content_type=image`、`images` 列存 JSON），
 //! 单张图片继续走既有 `/api/book/image` 代理（内存 LRU + 5 MiB/15s HTTP 预算），
 //! 不另造一套缓存或抓取层。
 
@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use crate::auth::{AuthUser, UserDb};
 use crate::entities::{BookChapter, BookContent, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
-use crate::routes::books::{content_cache_limit_bytes, load_book_meta, save_content_cached};
+use crate::routes::books::{load_book_meta, save_content_cached};
 use crate::routes::image;
 use crate::routes::sources::load_source;
 use crate::routes::AppState;
@@ -42,7 +42,7 @@ pub struct ChapterQ {
     /// 书源 id（Legado `bookSourceUrl`）
     pub source: Option<String>,
     pub book_url: Option<String>,
-    /// 章节地址；缺省时按 `index` 从 `book_chapters` 取
+    /// 章节地址；缺省时按 `index` 从 `library_chapters` 取
     pub chapter_url: Option<String>,
     /// 1-based 目录序号（与 `/api/book/toc` 返回数组顺序一致）
     pub index: Option<i64>,
@@ -54,6 +54,7 @@ fn clean(v: Option<&str>) -> Option<&str> {
 
 /// 书源 id 解析：显式参数优先，其次书籍元数据里的 origin。
 async fn resolve_source_id(
+    lib: &SqlitePool,
     pool: &SqlitePool,
     source: Option<&str>,
     book_url: Option<&str>,
@@ -62,7 +63,7 @@ async fn resolve_source_id(
         return Ok(s.to_string());
     }
     if let Some(bu) = clean(book_url) {
-        if let Some(meta) = load_book_meta(pool, bu).await? {
+        if let Some(meta) = load_book_meta(lib, pool, bu).await? {
             if let Some(origin) = clean(meta.origin.as_deref()) {
                 return Ok(origin.to_string());
             }
@@ -75,11 +76,11 @@ async fn resolve_source_id(
 
 const CHAPTER_SQL: &str =
     "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
-     resource_url, tag, start, \"end\", update_time, word_count FROM book_chapters";
+     resource_url, tag, start, \"end\", update_time, word_count FROM library_chapters";
 
 /// 解析目标章节：优先 `chapter_url`；否则按 1-based `index` 取目录行。
 async fn resolve_chapter(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     book_url: &str,
     chapter_url: Option<&str>,
     index: Option<i64>,
@@ -93,7 +94,7 @@ async fn resolve_chapter(
         let found: Option<BookChapter> =
             sqlx::query_as::<_, BookChapter>(&format!("{CHAPTER_SQL} WHERE url = ?1 LIMIT 1"))
                 .bind(cu)
-                .fetch_optional(pool)
+                .fetch_optional(lib)
                 .await?;
         if let Some(c) = found {
             return Ok(c);
@@ -111,7 +112,7 @@ async fn resolve_chapter(
     ))
     .bind(book_url)
     .bind(idx)
-    .fetch_optional(pool)
+    .fetch_optional(lib)
     .await?;
     let c = row.ok_or_else(|| AppError::NotFound("目录尚未缓存或序号越界，请先打开目录".into()))?;
     if c.is_volume {
@@ -123,12 +124,13 @@ async fn resolve_chapter(
 }
 
 /// 章节目录序号（1-based）与总章节数；用于响应里的「第 n 章 / 共 m 章」。
-async fn chapter_position(pool: &SqlitePool, book_url: &str, chapter: &BookChapter) -> (i64, i64) {
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
-        .bind(book_url)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+async fn chapter_position(lib: &SqlitePool, book_url: &str, chapter: &BookChapter) -> (i64, i64) {
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(lib)
+            .await
+            .unwrap_or(0);
     let ordinal = if chapter.index >= 0 {
         chapter.index + 1
     } else {
@@ -143,7 +145,7 @@ async fn chapter_position(pool: &SqlitePool, book_url: &str, chapter: &BookChapt
 /// 而 `BookContent.images_json` 带 `#[sqlx(default)]`，列名对不上时会静默取 `None`，
 /// 导致图片章节缓存命中后拿到空列表。这里显式起别名 `images AS images_json`。
 pub(crate) async fn load_cached_images(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     url: &str,
     origin: &str,
     ttl_secs: i64,
@@ -151,21 +153,21 @@ pub(crate) async fn load_cached_images(
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images AS images_json \
-         FROM book_content WHERE url = ?1 AND origin = ?2 \
+         FROM library_content WHERE url = ?1 AND origin = ?2 \
            AND updated_at >= datetime('now', ?3)",
     )
     .bind(url)
     .bind(origin)
     .bind(format!("-{ttl_secs} seconds"))
-    .fetch_optional(pool)
+    .fetch_optional(lib)
     .await?;
     if row.is_some() {
         let _ = sqlx::query(
-            "UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
+            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
         )
         .bind(url)
         .bind(origin)
-        .execute(pool)
+        .execute(lib)
         .await;
     }
     Ok(row)
@@ -205,14 +207,20 @@ async fn source_type(
     db: UserDb,
     Query(q): Query<SourceQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let id = resolve_source_id(&db.0, q.source.as_deref(), q.book_url.as_deref()).await?;
+    let id = resolve_source_id(
+        &s.library,
+        &db.0,
+        q.source.as_deref(),
+        q.book_url.as_deref(),
+    )
+    .await?;
     let src = load_source(&s.shared, &id).await?;
     Ok(Json(source_json(&src)))
 }
 
 /// `GET /api/comic/chapter?source=&book_url=&chapter_url=&index=`
 ///
-/// 返回该章的有序图片 URL 列表；`cached=true` 表示命中 `book_content` 缓存（未回源）。
+/// 返回该章的有序图片 URL 列表；`cached=true` 表示命中 `library_content` 缓存（未回源）。
 async fn chapter_images(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -222,7 +230,13 @@ async fn chapter_images(
     let book_url = clean(q.book_url.as_deref())
         .ok_or_else(|| AppError::BadRequest("缺少 book_url".into()))?
         .to_string();
-    let source_id = resolve_source_id(&db.0, q.source.as_deref(), Some(book_url.as_str())).await?;
+    let source_id = resolve_source_id(
+        &s.library,
+        &db.0,
+        q.source.as_deref(),
+        Some(book_url.as_str()),
+    )
+    .await?;
     let source = load_source(&s.shared, &source_id).await?;
     if source.book_source_type != 2 {
         return Err(AppError::BadRequest(format!(
@@ -230,11 +244,11 @@ async fn chapter_images(
             source.book_source_type
         )));
     }
-    let chapter = resolve_chapter(&db.0, &book_url, q.chapter_url.as_deref(), q.index).await?;
+    let chapter = resolve_chapter(&s.library, &book_url, q.chapter_url.as_deref(), q.index).await?;
 
     // 1) 命中章节缓存：直接返回图片列表，不再回源
     let cached = load_cached_images(
-        &db.0,
+        &s.library,
         &chapter.url,
         &source.book_source_url,
         s.cfg.content_ttl_secs,
@@ -270,9 +284,8 @@ async fn chapter_images(
                     images_json: Some(payload),
                     ..Default::default()
                 };
-                // 缓存上限与小说正文同源（用户设置优先，否则全局配置）
-                let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
-                if let Err(e) = save_content_cached(&db.0, &c, limit).await {
+                // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
+                if let Err(e) = save_content_cached(&s.library, &c).await {
                     tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
                 }
             }
@@ -280,7 +293,7 @@ async fn chapter_images(
         }
     };
 
-    let (ordinal, total) = chapter_position(&db.0, &book_url, &chapter).await;
+    let (ordinal, total) = chapter_position(&s.library, &book_url, &chapter).await;
     let placeholder_suspected = !images.is_empty() && (chapter.is_pay || chapter.is_vip);
     // 每张图附 `slices`：>1 表示该图超长条页、需要按屏切片翻页；0 表示整图一屏。
     // 只按源页面给的 width/height 预判（未知尺寸按 1 屏处理，交给 `/k` 打开时再算）。

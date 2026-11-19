@@ -14,6 +14,8 @@ pub mod entities;
 pub mod error;
 pub mod image_cache;
 pub mod k_metrics;
+pub mod library;
+pub mod library_worker;
 pub mod models;
 pub mod query_class;
 pub mod req;

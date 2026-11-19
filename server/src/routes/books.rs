@@ -194,8 +194,6 @@ mod books_content;
 use books_content::*;
 #[path = "books_store.rs"]
 mod books_store;
-// 供 health / comic / kindle 等兄弟模块取“当前账号生效上限”，避免各自重算 min(user, cfg)
-pub(crate) use books_store::content_cache_limit_bytes;
 use books_store::*;
 
 pub(crate) use books_search_api::{
@@ -208,8 +206,9 @@ pub(crate) use books_search_source::{
     is_searchable_source, order_by_health, resolve_search_sources, CuratedMissingFallback,
 };
 pub(crate) use books_store::{
-    book_store_for, load_book_meta, load_cached_chapters, load_cached_content,
-    persist_book_changes, save_book_meta, save_chapters, save_content_cached,
+    book_name_of, book_store_for, content_cache_version, content_is_empty, load_book_meta,
+    load_cached_chapters, load_cached_content, persist_book_changes, save_book_meta, save_chapters,
+    save_content_cached, sync_total_chapter_num, upsert_content,
 };
 
 /// 启动时把上次进程遗留的 running 搜索任务标为 interrupted。

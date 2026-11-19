@@ -15,18 +15,6 @@ pub async fn replace_rule_enabled(db: &SqlitePool) -> bool {
     row.map(|(v,)| v != "0" && v != "false").unwrap_or(true)
 }
 
-/// 读取用户设置的正文缓存上限（MB）；未设置/非法值返回 None（表示沿用全局配置）。
-pub async fn user_cache_limit_mb(db: &SqlitePool) -> Option<i64> {
-    let v: Option<String> =
-        sqlx::query_scalar("SELECT value FROM user_settings WHERE key='cache_limit_mb'")
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
-    v.and_then(|x| x.trim().parse::<i64>().ok())
-        .filter(|m| *m > 0)
-}
-
 /// 读取用户图片样式：0 原始 / 1 宽度自适应 / 2 居中 / 3 隐藏。
 pub async fn user_image_style(db: &SqlitePool) -> i64 {
     let v: Option<String> =
@@ -245,7 +233,7 @@ pub async fn active_rules(db: &SqlitePool) -> Vec<ReplaceRule> {
 }
 
 /// 目录标题净化：规则只加载一次，按 `scope_title` 逐章应用。
-/// 只影响返回给用户的标题，`book_chapters` 缓存保持原文，开关可随时切换。
+/// 只影响返回给用户的标题，`library_chapters` 缓存保持原文，开关可随时切换。
 pub async fn purify_titles(db: &SqlitePool, book: &str, origin: &str, titles: &mut [String]) {
     let rules = active_rules(db).await;
     if rules.is_empty() {

@@ -36,7 +36,6 @@ pub struct SettingsQ {
     theme: Option<String>,
     font_size: Option<i64>,
     line_height: Option<f64>,
-    cache_limit_mb: Option<i64>,
     auto_refresh: Option<bool>,
     read_mode: Option<String>,
     /// 阅读页宽（CSS px）
@@ -54,7 +53,6 @@ const SETTINGS_DEFAULTS: &[(&str, &str)] = &[
     ("theme", "light"),
     ("font_size", "18"),
     ("line_height", "1.75"),
-    ("cache_limit_mb", "50"),
     ("auto_refresh", "1"),
     ("read_mode", "scroll"),
     ("page_width", "720"),

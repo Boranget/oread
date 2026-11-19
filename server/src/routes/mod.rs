@@ -8,6 +8,7 @@ pub mod image;
 pub mod import_url;
 mod inflight;
 pub mod kindle;
+pub mod library;
 pub mod replace;
 pub mod sources;
 pub mod stats;
@@ -45,6 +46,8 @@ impl UserPoolCache {
 #[derive(Clone)]
 pub struct AppState {
     pub shared: SqlitePool,
+    /// 馆藏库（全局一份）：书目 / 目录 / 正文 / 采购单。
+    pub library: SqlitePool,
     pub cfg: Config,
     /// 每用户独立 SQLite 连接池缓存（物理分桶 + LRU 上限）
     pub user_pools: Arc<Mutex<UserPoolCache>>,
@@ -52,21 +55,38 @@ pub struct AppState {
     pub fetcher: Arc<dyn crate::web_book::Fetcher>,
 }
 
-pub fn build_router(shared: SqlitePool, cfg: Config) -> Router {
-    build_router_with_fetcher(shared, cfg, Arc::new(crate::web_book::ReqFetcher))
+/// 构造进程级状态。后台任务（馆藏采购单）与 HTTP 路由必须共用同一份状态，
+/// 这样用户库连接池缓存只有一份。
+pub fn app_state(
+    shared: SqlitePool,
+    library: SqlitePool,
+    cfg: Config,
+    fetcher: Arc<dyn crate::web_book::Fetcher>,
+) -> AppState {
+    AppState {
+        shared,
+        library,
+        cfg,
+        user_pools: Arc::new(Mutex::new(UserPoolCache::default())),
+        fetcher,
+    }
+}
+
+pub fn build_router(shared: SqlitePool, library: SqlitePool, cfg: Config) -> Router {
+    let state = app_state(shared, library, cfg, Arc::new(crate::web_book::ReqFetcher));
+    build_router_with_state(state)
 }
 
 pub fn build_router_with_fetcher(
     shared: SqlitePool,
+    library: SqlitePool,
     cfg: Config,
     fetcher: Arc<dyn crate::web_book::Fetcher>,
 ) -> Router {
-    let state = AppState {
-        shared,
-        cfg: cfg.clone(),
-        user_pools: Arc::new(Mutex::new(UserPoolCache::default())),
-        fetcher,
-    };
+    build_router_with_state(app_state(shared, library, cfg, fetcher))
+}
+
+pub fn build_router_with_state(state: AppState) -> Router {
     // 所有路由统一携带 AppState；鉴权中间件内部放行公开路径
     let app = Router::new()
         .route("/api/health", get(health::simple))
@@ -89,6 +109,7 @@ pub fn build_router_with_fetcher(
         .merge(bookmarks::routes())
         .merge(replace::routes())
         .merge(stats::routes())
+        .merge(library::routes())
         // 响应编码层只挂在 `/k`：压缩 HTML 省 Kindle 流量，同时不碰 API 热路径
         //（全局挂载会让 /healthz、搜索结果等 JSON 都多一份 gzip CPU，实测 p95 +5ms）。
         // tower-http 默认谓词跳过图片与 <32B 响应，版面/分页内容不受影响。

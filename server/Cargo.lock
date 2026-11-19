@@ -398,6 +398,7 @@ dependencies = [
  "image",
  "jsonpath-rust",
  "jsonwebtoken",
+ "libc",
  "md-5",
  "once_cell",
  "regex",

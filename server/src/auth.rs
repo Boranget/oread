@@ -65,7 +65,7 @@ where
 
 /// 取得（缓存）某用户的独立连接池，并按 `db_max_open_users` 做 LRU 关闭。
 /// 内存预算：每个用户池 2 连接，同时最多 N 个池；淘汰时 `pool.close()` 释放文件句柄。
-async fn get_user_pool(state: &AppState, uid: i64) -> AppResult<SqlitePool> {
+pub(crate) async fn get_user_pool(state: &AppState, uid: i64) -> AppResult<SqlitePool> {
     {
         let mut cache = state.user_pools.lock().unwrap();
         cache.tick += 1;
@@ -307,6 +307,8 @@ pub async fn auth_middleware(
         };
         let pool = get_user_pool(&state, claims.sub).await?;
         req.extensions_mut().insert(UserDb(pool));
+        req.extensions_mut()
+            .insert(crate::library::LibraryDb(state.library.clone()));
         req.extensions_mut().insert(AuthUser {
             id: claims.sub,
             username: account.username,
@@ -337,6 +339,8 @@ pub async fn auth_middleware(
     };
     let pool = get_user_pool(&state, claims.sub).await?;
     req.extensions_mut().insert(UserDb(pool));
+    req.extensions_mut()
+        .insert(crate::library::LibraryDb(state.library.clone()));
     req.extensions_mut().insert(AuthUser {
         id: claims.sub,
         username: account.username,
@@ -551,7 +555,8 @@ mod tests {
         .await
         .unwrap();
         AppState {
-            shared: pool,
+            shared: pool.clone(),
+            library: pool,
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),

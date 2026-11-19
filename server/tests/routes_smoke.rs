@@ -44,7 +44,12 @@ async fn test_app(tag: &str) -> (axum::Router, SqlitePool, PathBuf) {
     let dir = temp_dir(tag);
     let cfg = test_config(&dir);
     let shared = db::init_shared(&cfg).await.expect("初始化共享库");
-    (routes::build_router(shared.clone(), cfg), shared, dir)
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    (
+        routes::build_router(shared.clone(), library, cfg),
+        shared,
+        dir,
+    )
 }
 
 async fn body_json(resp: Response) -> Value {
@@ -166,7 +171,7 @@ async fn healthz_returns_ok_without_auth() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-// 缓存管理：/api/healthz 暴露生效上限与占用比例；/api/book/cache/trim 空库也返回 200。
+// 馆藏监控：/api/healthz 暴露分层占用（不设上限）；/api/book/cache/trim 回收临时缓存。
 #[tokio::test]
 async fn cache_usage_and_trim_are_exposed() {
     let (app, _pool, dir) = test_app("cache-trim").await;
@@ -179,15 +184,8 @@ async fn cache_usage_and_trim_are_exposed() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    let limit = body["cache"]["limit_bytes"]
-        .as_i64()
-        .unwrap_or_else(|| panic!("缺少 cache.limit_bytes: {body}"));
-    assert!(limit > 0, "生效上限应大于 0: {body}");
-    assert!(
-        body["cache"]["limit_mb"].as_i64().unwrap_or(0) * 1024 * 1024 <= limit,
-        "limit_mb 应由 limit_bytes 向下取整: {body}"
-    );
-    assert!(body["cache"]["percent"].is_number(), "缺少占用比例: {body}");
+    assert_eq!(body["cache"]["collection"]["books"], 0, "{body}");
+    assert_eq!(body["cache"]["temp"]["books"], 0, "{body}");
     assert!(body["cache"]["books"].is_array(), "缺少按书占用: {body}");
 
     let resp = app
@@ -199,7 +197,6 @@ async fn cache_usage_and_trim_are_exposed() {
     let body = body_json(resp).await;
     assert_eq!(body["ok"], true, "trim: {body}");
     assert_eq!(body["deleted"], 0, "空缓存无需清理: {body}");
-    assert!(body["limit_mb"].as_i64().unwrap_or(0) > 0, "trim: {body}");
     assert_eq!(
         body["used_bytes_before"], body["used_bytes_after"],
         "未删除时前后占用应一致: {body}"
@@ -827,8 +824,10 @@ async fn toc_and_content_routes_with_injected_fetcher() {
     let dir = temp_dir("toc-content");
     let cfg = test_config(&dir);
     let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
     let app = routes::build_router_with_fetcher(
         shared.clone(),
+        library,
         cfg,
         std::sync::Arc::new(MockFetcher {
             content_calls: Default::default(),
@@ -894,8 +893,10 @@ async fn concurrent_content_requests_share_one_fetch() {
     let cfg = test_config(&dir);
     let shared = db::init_shared(&cfg).await.expect("初始化共享库");
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
     let app = routes::build_router_with_fetcher(
         shared.clone(),
+        library,
         cfg,
         std::sync::Arc::new(MockFetcher {
             content_calls: calls.clone(),
@@ -986,6 +987,169 @@ async fn admin_can_list_users() {
         users["users"].as_array().is_some_and(|a| !a.is_empty()),
         "管理员列表应至少包含自己: {users}"
     );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 馆藏浏览/管理：普通账号只读、管理员可入馆/移出/删除；`sort=collected` 的
+/// keyset 分页不能漏掉没有入馆时间的临时书。
+#[tokio::test]
+async fn library_browse_and_admin_actions() {
+    let dir = temp_dir("library");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let user = register(&app, "libuser").await;
+    let admin = register_admin(&app, &shared, "libadmin").await;
+
+    // 三本书：两本馆藏（入馆时间不同）+ 一本临时（没有入馆时间）。
+    for (url, tier, collected) in [
+        ("https://lib.test/a", "collection", Some(300i64)),
+        ("https://lib.test/b", "collection", Some(200)),
+        ("https://lib.test/c", "temp", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_books (book_url, name, tier, collected_at, last_accessed_at) \
+             VALUES (?1, ?1, ?2, ?3, 0)",
+        )
+        .bind(url)
+        .bind(tier)
+        .bind(collected)
+        .execute(&library)
+        .await
+        .unwrap();
+    }
+
+    // 普通账号可看占用，但不能管理。
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/library/stats", &user))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "普通账号读占用");
+    let stats = body_json(resp).await;
+    assert_eq!(stats["collection"]["books"], 2, "{stats}");
+    assert_eq!(stats["temp"]["books"], 1, "{stats}");
+    assert!(stats["disk"]["floor_bytes"].as_i64().unwrap_or(0) > 0);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/collect",
+            r#"{"book_url":"https://lib.test/a"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不能入馆");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/library/jobs", &user))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不能看采购单");
+
+    // sort=collected 分页：第一页取 2 本，第二页必须包含 collected_at 为 NULL 的临时书。
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/library/books?tier=all&sort=collected&limit=2",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page1 = body_json(resp).await;
+    let urls1: Vec<&str> = page1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["book_url"].as_str())
+        .collect();
+    assert_eq!(urls1, vec!["https://lib.test/a", "https://lib.test/b"]);
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("还有下一页")
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/library/books?tier=all&sort=collected&limit=2&cursor={cursor}"),
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page2 = body_json(resp).await;
+    let urls2: Vec<&str> = page2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["book_url"].as_str())
+        .collect();
+    assert_eq!(urls2, vec!["https://lib.test/c"], "NULL 入馆时间不能漏行");
+    assert!(page2["next_cursor"].is_null(), "{page2}");
+
+    // 管理员入馆：无书源时只标记馆藏，不排队下载。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/collect",
+            r#"{"book_url":"https://lib.test/new"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let collected = body_json(resp).await;
+    assert_eq!(collected["newly_collected"], true, "{collected}");
+    assert_eq!(collected["queued"], false, "没有书源不排队: {collected}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/release",
+            r#"{"book_url":"https://lib.test/new"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["released"], true);
+
+    // 仍在馆藏的书不能直接删除。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/delete",
+            r#"{"book_url":"https://lib.test/a"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "馆藏需先移出");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/delete",
+            r#"{"book_url":"https://lib.test/new"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["deleted_books"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get("/api/library/jobs", &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let _ = std::fs::remove_dir_all(dir);
 }

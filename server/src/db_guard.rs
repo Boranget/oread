@@ -35,10 +35,12 @@ const STARTUP_BACKOFF_SECS: u64 = 20;
 /// 迁移作用域：决定备份哪些文件、错误里显示哪个库。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
-    /// 共享库 `shared.db`：备份时连带 `users/*.db` 一起快照（用户库也可能随后迁移）。
+    /// 共享库 `shared.db`：备份时连带 `users/*.db` 与 `library.db` 一起快照。
     Shared,
     /// 单个用户库 `users/<uid>.db`：按需迁移时只备份该文件。
     User(i64),
+    /// 馆藏库 `library.db`：全局一份，内容是共享的。
+    Library,
 }
 
 impl Scope {
@@ -50,6 +52,7 @@ impl Scope {
         match self {
             Scope::Shared => "共享库".to_string(),
             Scope::User(uid) => format!("用户库 users/{uid}.db"),
+            Scope::Library => "馆藏库 library.db".to_string(),
         }
     }
 }

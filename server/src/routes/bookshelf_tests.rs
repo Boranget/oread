@@ -159,7 +159,8 @@ async fn shelf_badge_tracks_new_chapters_then_clears() {
         "CREATE TABLE bookshelf (book_id TEXT PRIMARY KEY, title TEXT, added_at TEXT, \
          enable_update INTEGER NOT NULL DEFAULT 1)",
         "CREATE TABLE book_meta (book_url TEXT PRIMARY KEY, total_chapter_num INTEGER)",
-        "CREATE TABLE book_chapters (url TEXT PRIMARY KEY, book_url TEXT)",
+        "CREATE TABLE library_chapters (book_url TEXT NOT NULL, url TEXT NOT NULL, \
+         PRIMARY KEY (book_url, url))",
         "CREATE TABLE book_updates (book_id TEXT PRIMARY KEY, total INTEGER NOT NULL DEFAULT 0, \
          seen_total INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
     ] {
@@ -196,11 +197,11 @@ async fn shelf_badge_tracks_new_chapters_then_clears() {
     assert_eq!(badge, 3);
 
     // 打开章节 → 清零
-    sqlx::query("INSERT INTO book_chapters (url, book_url) VALUES ('c1','b1')")
+    sqlx::query("INSERT INTO library_chapters (url, book_url) VALUES ('c1','b1')")
         .execute(&pool)
         .await
         .unwrap();
-    let seen = super::mark_shelf_seen(&pool, "b1").await.unwrap();
+    let seen = super::mark_shelf_seen(&pool, &pool, "b1").await.unwrap();
     assert_eq!(seen, 103);
     let badge: i64 = sqlx::query_scalar(
         "SELECT MAX(0, total - seen_total) FROM book_updates WHERE book_id='b1'",

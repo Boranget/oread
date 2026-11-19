@@ -28,17 +28,11 @@ async fn mem_pool() -> SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::query(
-        "CREATE TABLE book_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
-             book_url TEXT NOT NULL, title TEXT, content TEXT, \
-             chapter_index INTEGER NOT NULL DEFAULT 0, resource_url TEXT, \
-             is_local INTEGER NOT NULL DEFAULT 0, content_type TEXT NOT NULL DEFAULT 'text', \
-             images TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, cache_version TEXT, \
-             updated_at TEXT, accessed_at TEXT, PRIMARY KEY (url, origin))",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    // 馆藏库真实 schema：正文 / 书目 / 目录 / 采购单
+    sqlx::migrate!("./migrations/library")
+        .run(&pool)
+        .await
+        .expect("run library migrations");
     pool
 }
 
@@ -47,8 +41,8 @@ async fn mem_pool() -> SqlitePool {
 async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
     let pool = mem_pool().await;
     let empty = mk_content("u1", "b1", 1, "   ");
-    save_content_cached(&pool, &empty, 1 << 20).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u1'")
+    save_content_cached(&pool, &empty).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u1'")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -56,7 +50,7 @@ async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
 
     // 模拟修复前已经落库的空缓存：读取时应当作未命中并重新抓取。
     sqlx::query(
-            "INSERT INTO book_content (url, book_url, title, content, chapter_index, content_type, \
+            "INSERT INTO library_content (url, book_url, title, content, chapter_index, content_type, \
              updated_at, accessed_at) VALUES ('u1','b1','t','   ',1,'text',datetime('now'),datetime('now'))",
         )
         .execute(&pool)
@@ -76,10 +70,8 @@ async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
         images_json: Some("[]".into()),
         ..Default::default()
     };
-    save_content_cached(&pool, &img_empty, 1 << 20)
-        .await
-        .unwrap();
-    let n3: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u3'")
+    save_content_cached(&pool, &img_empty).await.unwrap();
+    let n3: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u3'")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -87,8 +79,8 @@ async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
 
     // 只有标签没有可见文字（@textNodes 空结果回退 @html 的产物）同样不落库。
     let markup = mk_content("u4", "b1", 4, "<div class=\"text\">   </div>");
-    save_content_cached(&pool, &markup, 1 << 20).await.unwrap();
-    let n4: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url='u4'")
+    save_content_cached(&pool, &markup).await.unwrap();
+    let n4: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u4'")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -96,7 +88,7 @@ async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
 
     // 带可见文字的 HTML 片段仍然落库并命中。
     let html = mk_content("u5", "b1", 5, "<p>有正文的段落</p>");
-    save_content_cached(&pool, &html, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &html).await.unwrap();
     assert!(load_cached_content(&pool, "u5", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -104,7 +96,7 @@ async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
 
     // 正常正文仍然命中。
     let ok = mk_content("u2", "b1", 2, "正文内容");
-    save_content_cached(&pool, &ok, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &ok).await.unwrap();
     assert!(load_cached_content(&pool, "u2", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -117,7 +109,7 @@ async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
     let pool = mem_pool().await;
     let body = "当前管线抓到的完整正文";
     let c = mk_content("u1", "b1", 1, body);
-    save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &c).await.unwrap();
     let hit = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -125,7 +117,7 @@ async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
     assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
 
     // 模拟旧解析管线写下的残缺正文（短但非空，之前只能等 TTL）。
-    sqlx::query("UPDATE book_content SET cache_version = 'p1-0000000000000000', content = '半截正文' WHERE url = 'u1'")
+    sqlx::query("UPDATE library_content SET cache_version = 'p1-0000000000000000', content = '半截正文' WHERE url = 'u1'")
             .execute(&pool)
             .await
             .unwrap();
@@ -138,7 +130,7 @@ async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
     );
 
     // 重建（重新抓取后写入）应回到命中，且指纹为当前版本。
-    save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &c).await.unwrap();
     let rebuilt = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -155,7 +147,7 @@ async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
 async fn legacy_content_without_version_is_miss_and_rewritten() {
     let pool = mem_pool().await;
     sqlx::query(
-        "INSERT INTO book_content (url, book_url, title, content, chapter_index, content_type, \
+        "INSERT INTO library_content (url, book_url, title, content, chapter_index, content_type, \
              updated_at, accessed_at) VALUES ('legacy','b1','t','迁移前的正文',1,'text',\
              datetime('now'),datetime('now'))",
     )
@@ -171,7 +163,7 @@ async fn legacy_content_without_version_is_miss_and_rewritten() {
     );
 
     let rebuilt = mk_content("legacy", "b1", 1, "迁移前的正文");
-    save_content_cached(&pool, &rebuilt, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &rebuilt).await.unwrap();
     let hit = load_cached_content(&pool, "legacy", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -187,7 +179,7 @@ async fn short_complete_content_is_cached_and_hit() {
     assert!(short.chars().count() < 100);
     assert!(short.chars().count() > 20);
     let c = mk_content("short", "b1", 1, short);
-    save_content_cached(&pool, &c, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &c).await.unwrap();
     let hit = load_cached_content(&pool, "short", "", 7 * 24 * 3600)
         .await
         .unwrap()
@@ -205,8 +197,8 @@ async fn content_cache_is_partitioned_by_origin() {
     a.origin = "https://source-a.example".into();
     let mut b = mk_content(url, "book-b", 1, "来源 B 的正文");
     b.origin = "https://source-b.example".into();
-    save_content_cached(&pool, &a, 1 << 20).await.unwrap();
-    save_content_cached(&pool, &b, 1 << 20).await.unwrap();
+    save_content_cached(&pool, &a).await.unwrap();
+    save_content_cached(&pool, &b).await.unwrap();
 
     let hit_a = load_cached_content(&pool, url, &a.origin, 7 * 24 * 3600)
         .await
@@ -219,7 +211,7 @@ async fn content_cache_is_partitioned_by_origin() {
         .expect("来源 B 应命中");
     assert_eq!(hit_b.content.as_deref(), Some("来源 B 的正文"));
 
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content WHERE url = ?1")
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url = ?1")
         .bind(url)
         .fetch_one(&pool)
         .await
@@ -540,21 +532,6 @@ fn disabled_and_quarantined_sources_never_enter_search_pool() {
     assert_eq!(names, vec!["enabled"], "停用/隔离源不得进入搜索池");
 }
 
-// 预算预占：并发下必须原子扣减，且耗尽后不再放行
-#[test]
-fn budget_reservation_is_atomic_and_bounded() {
-    let remaining = AtomicI64::new(100);
-    assert!(reserve_budget(&remaining, 0));
-    assert!(reserve_budget(&remaining, 40));
-    assert!(reserve_budget(&remaining, 60));
-    assert_eq!(remaining.load(Ordering::SeqCst), 0);
-    assert!(!reserve_budget(&remaining, 1));
-    // 单章超过总预算也直接拒绝，不出现负数
-    let small = AtomicI64::new(10);
-    assert!(!reserve_budget(&small, 11));
-    assert_eq!(small.load(Ordering::SeqCst), 10);
-}
-
 // LIKE 通配符必须按字面量匹配，避免用户输入 `%`/`_` 把全库搜出来
 #[test]
 fn like_wildcards_are_escaped() {
@@ -610,14 +587,14 @@ async fn upsert_content_keeps_single_row_and_updates_size() {
     let c2 = mk_content("https://x/1", "https://x/book", 1, "更长的正文内容");
     upsert_content(&pool, &c2).await.unwrap();
     let (rows, size): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM book_content")
+        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM library_content")
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(rows, 1);
     assert_eq!(size, "更长的正文内容".len() as i64);
     let title: String =
-        sqlx::query_scalar("SELECT title FROM book_content WHERE url = 'https://x/1'")
+        sqlx::query_scalar("SELECT title FROM library_content WHERE url = 'https://x/1'")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -647,14 +624,16 @@ async fn meta_pool() -> SqlitePool {
 async fn total_chapter_num_survives_detail_save_and_empty_refresh() {
     let pool = meta_pool().await;
     let url = "https://x/book";
-    sync_total_chapter_num(&pool, url, 500).await.unwrap();
+    sync_total_chapter_num(&pool, &pool, url, 500)
+        .await
+        .unwrap();
 
     let detail = Book {
         book_url: url.into(),
         name: Some("斗破苍穹".into()),
         ..Default::default()
     };
-    save_book_meta(&pool, &detail).await.unwrap();
+    save_book_meta(&pool, &pool, &detail).await.unwrap();
     let total: i64 =
         sqlx::query_scalar("SELECT total_chapter_num FROM book_meta WHERE book_url = ?1")
             .bind(url)
@@ -663,7 +642,7 @@ async fn total_chapter_num_survives_detail_save_and_empty_refresh() {
             .unwrap();
     assert_eq!(total, 500, "详情保存不应把总章节数写回 0");
 
-    sync_total_chapter_num(&pool, url, 0).await.unwrap();
+    sync_total_chapter_num(&pool, &pool, url, 0).await.unwrap();
     let total: i64 =
         sqlx::query_scalar("SELECT total_chapter_num FROM book_meta WHERE book_url = ?1")
             .bind(url)
@@ -672,7 +651,9 @@ async fn total_chapter_num_survives_detail_save_and_empty_refresh() {
             .unwrap();
     assert_eq!(total, 500, "空目录不应清掉已有总章节数");
 
-    sync_total_chapter_num(&pool, url, 520).await.unwrap();
+    sync_total_chapter_num(&pool, &pool, url, 520)
+        .await
+        .unwrap();
     let total: i64 =
         sqlx::query_scalar("SELECT total_chapter_num FROM book_meta WHERE book_url = ?1")
             .bind(url)
@@ -710,7 +691,7 @@ async fn detail_save_preserves_user_fields_and_null_fallbacks() {
         dur_chapter_time: 123,
         ..Default::default()
     };
-    save_book_meta(&pool, &initial).await.unwrap();
+    save_book_meta(&pool, &pool, &initial).await.unwrap();
 
     // 详情刷新：没有用户字段，名字/封面等也为空（规则缺字段）。
     let parsed = Book {
@@ -720,7 +701,7 @@ async fn detail_save_preserves_user_fields_and_null_fallbacks() {
         book_source_type: 2,
         ..Default::default()
     };
-    save_book_meta(&pool, &parsed).await.unwrap();
+    save_book_meta(&pool, &pool, &parsed).await.unwrap();
 
     let row: (
         Option<String>,
@@ -759,19 +740,7 @@ async fn detail_save_preserves_user_fields_and_null_fallbacks() {
 }
 
 async fn chapters_pool() -> SqlitePool {
-    let pool = mem_pool().await;
-    sqlx::query(
-        "CREATE TABLE book_chapters (url TEXT PRIMARY KEY, book_url TEXT NOT NULL, \
-             title TEXT, is_volume INTEGER NOT NULL DEFAULT 0, base_url TEXT, \
-             \"index\" INTEGER NOT NULL DEFAULT 0, is_vip INTEGER NOT NULL DEFAULT 0, \
-             is_pay INTEGER NOT NULL DEFAULT 0, resource_url TEXT, tag TEXT, \
-             start INTEGER NOT NULL DEFAULT 0, \"end\" INTEGER NOT NULL DEFAULT 0, \
-             update_time TEXT, word_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool
+    mem_pool().await
 }
 
 // 目录元信息往返：is_volume / is_vip / update_time / word_count 落库并读回；分卷分组正确
@@ -851,7 +820,7 @@ async fn clear_cache_by_book_and_by_user() {
         .unwrap();
     assert_eq!(deleted, 2);
     assert_eq!(freed, 7);
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content")
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -860,68 +829,11 @@ async fn clear_cache_by_book_and_by_user() {
     let (deleted_all, freed_all) = clear_content_cache(&pool, None).await.unwrap();
     assert_eq!(deleted_all, 1);
     assert_eq!(freed_all, 5);
-    let left2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content")
+    let left2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(left2, 0);
-}
-
-// 清理到上限：按最久未读（同秒内按 rowid）成批淘汰，直到总量不超上限
-#[tokio::test]
-async fn evict_to_limit_drops_oldest_rows() {
-    let pool = mem_pool().await;
-    for i in 0..20 {
-        let c = mk_content(&format!("https://x/c{i}"), "https://x/a", i, "aaaa");
-        upsert_content(&pool, &c).await.unwrap();
-    }
-    // 20 行 × 4 字节 = 80；上限 72 时删一轮（16 行）即回落到 16 字节
-    let deleted = evict_content_to_limit(&pool, 72, EVICT_ROUNDS_WRITE)
-        .await
-        .unwrap();
-    assert_eq!(deleted, 16);
-    let left: Vec<String> = sqlx::query_scalar("SELECT url FROM book_content ORDER BY rowid")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left.len(), 4, "只保留最新的 4 行");
-    assert_eq!(left.first().map(String::as_str), Some("https://x/c16"));
-
-    // 已在上限内：不再删除
-    assert_eq!(
-        evict_content_to_limit(&pool, 72, EVICT_ROUNDS_WRITE)
-            .await
-            .unwrap(),
-        0
-    );
-}
-
-// 生效上限：用户设置与部署上限取较小值；未设置时用部署上限。
-#[tokio::test]
-async fn effective_limit_takes_min_of_user_and_global() {
-    let pool = mem_pool().await;
-    sqlx::query("CREATE TABLE user_settings (key TEXT PRIMARY KEY, value TEXT)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let global = 50 << 20;
-    assert_eq!(content_cache_limit_bytes(&pool, global).await, global);
-
-    sqlx::query("INSERT INTO user_settings (key, value) VALUES ('cache_limit_mb','10')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(content_cache_limit_bytes(&pool, global).await, 10 << 20);
-
-    sqlx::query("UPDATE user_settings SET value='100' WHERE key='cache_limit_mb'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        content_cache_limit_bytes(&pool, global).await,
-        global,
-        "用户值更大时仍以部署上限为准"
-    );
 }
 
 // 行表去重：同书多源只合并来源，分数与序号保持首次入库时的值。
@@ -1676,6 +1588,7 @@ async fn search_result_filters_by_title_at_response_boundary() {
     let state = || {
         State(AppState {
             shared: pool.clone(),
+            library: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -1739,6 +1652,7 @@ async fn search_result_all_filtered_returns_empty_list() {
     let state = || {
         State(AppState {
             shared: pool.clone(),
+            library: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -1778,6 +1692,7 @@ async fn search_result_rejects_other_users_job() {
     let state = || {
         State(AppState {
             shared: pool.clone(),
+            library: pool.clone(),
             cfg: crate::config::Config::from_env(),
             user_pools: Default::default(),
             fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),

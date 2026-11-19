@@ -209,8 +209,6 @@ pub struct Config {
     pub cors_origins: Vec<String>,
 
     // ---- 低资源预算（474 MiB 可用内存的 OpenStick）----
-    /// 正文缓存落库总量上限（MiB）
-    pub cache_limit_mb: u64,
     /// 全局 HTTP 抓取并发上限（信号量）
     pub http_concurrency: usize,
     /// 单次抓取超时（秒）
@@ -330,6 +328,16 @@ pub struct Config {
     /// 前端静态资源目录。默认 `web/dist` 保持原有行为；
     /// 从其他 cwd 启动时用 `WEB_DIR` 指向绝对路径。
     pub web_dir: String,
+
+    // ---- 馆藏（library.db）----
+    /// 临时缓存 TTL（秒，默认 30 天）。只作用于 `tier=temp`，馆藏永不自动删除。
+    pub library_temp_ttl_secs: i64,
+    /// 磁盘安全阀（字节，默认 1 GiB）：剩余空间低于它时暂停后台整本下载。
+    /// 交互阅读不受影响。
+    pub library_disk_floor_bytes: u64,
+    /// 后台整本下载的并发任务数（默认 1）与单任务章节并发（默认 3）。
+    pub library_job_parallel: usize,
+    pub library_job_chapter_parallel: usize,
 }
 
 impl Config {
@@ -363,7 +371,6 @@ impl Config {
             production,
             cors_origins,
 
-            cache_limit_mb: env_u64("CACHE_LIMIT_MB", 50).clamp(4, 512),
             // 并发默认 16：扫参照显示同预算下 8→16 命中源 +3.3pt、首屏不变；上限 16。
             http_concurrency: clamp_http_concurrency(http_concurrency_raw.unwrap_or(16)),
             // all 范围：显式设置时尊重用户（min(配置,16)），未设置时用设备建议的 16。
@@ -432,6 +439,14 @@ impl Config {
             web_dir: env_prefixed("WEB_DIR")
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "web/dist".into()),
+            library_temp_ttl_secs: env_u64("LIBRARY_TEMP_TTL_DAYS", 30).clamp(1, 3650) as i64
+                * 86400,
+            library_disk_floor_bytes: env_u64("LIBRARY_DISK_FLOOR_MB", 1024).clamp(0, 1024 * 1024)
+                * 1024
+                * 1024,
+            library_job_parallel: env_u64("LIBRARY_JOB_PARALLEL", 1).clamp(1, 4) as usize,
+            library_job_chapter_parallel: env_u64("LIBRARY_JOB_CHAPTER_PARALLEL", 3).clamp(1, 8)
+                as usize,
         }
     }
 
@@ -441,10 +456,6 @@ impl Config {
         validate_cors_origins(&self.cors_origins)
     }
 
-    pub fn cache_limit_bytes(&self) -> i64 {
-        (self.cache_limit_mb * 1024 * 1024) as i64
-    }
-
     pub fn image_cache_limit_bytes(&self) -> usize {
         (self.image_cache_mb * 1024 * 1024) as usize
     }
@@ -452,6 +463,11 @@ impl Config {
     /// 共享桶连接串：sqlite://<data_dir>/shared.db
     pub fn shared_db_url(&self) -> String {
         format!("sqlite://{}/shared.db", self.data_dir)
+    }
+
+    /// 馆藏库连接串：sqlite://<data_dir>/library.db（全局一份，内容层）
+    pub fn library_db_url(&self) -> String {
+        format!("sqlite://{}/library.db", self.data_dir)
     }
 
     /// 用户独立桶连接串：sqlite://<data_dir>/users/<uid>.db（物理分桶）

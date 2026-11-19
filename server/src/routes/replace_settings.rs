@@ -53,7 +53,6 @@ pub async fn get_settings(
         "theme": get("theme"),
         "font_size": get("font_size").parse::<i64>().unwrap_or(18),
         "line_height": get("line_height").parse::<f64>().unwrap_or(1.75),
-        "cache_limit_mb": get("cache_limit_mb").parse::<i64>().unwrap_or(50),
         "auto_refresh": b("auto_refresh"),
         "read_mode": get("read_mode"),
         "page_width": get("page_width").parse::<i64>().unwrap_or(720),
@@ -93,13 +92,6 @@ pub(crate) fn validate_settings(q: &SettingsQ) -> AppResult<()> {
         if !v.is_finite() || !(1.2..=2.6).contains(&v) {
             return Err(AppError::BadRequest(
                 "line_height 必须在 1.2–2.6 之间".into(),
-            ));
-        }
-    }
-    if let Some(v) = q.cache_limit_mb {
-        if !(10..=1000).contains(&v) {
-            return Err(AppError::BadRequest(
-                "cache_limit_mb 必须在 10–1000 之间".into(),
             ));
         }
     }
@@ -166,9 +158,6 @@ pub async fn set_settings(
     }
     if let Some(v) = q.line_height {
         put_setting(&db.0, "line_height", &v.to_string()).await?;
-    }
-    if let Some(v) = q.cache_limit_mb {
-        put_setting(&db.0, "cache_limit_mb", &v.to_string()).await?;
     }
     if let Some(v) = q.auto_refresh {
         put_setting(&db.0, "auto_refresh", if v { "1" } else { "0" }).await?;

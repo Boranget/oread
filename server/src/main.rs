@@ -69,14 +69,30 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // 初始化共享桶（书源/账户），缺失则自动建库并执行迁移；
     // 迁移前会自动做一致性备份，失败时输出可读原因并保持非 0 退出码。
     let shared = db::init_shared(&cfg).await?;
+    // 馆藏库（全局内容层）：书目 / 目录 / 正文 / 采购单，单独文件避免与账号写入争锁。
+    let library = db::init_library(&cfg).await?;
     // 迁移已通过：清除失败标记，恢复正常启动速度。
     db_guard::clear_startup_failure(&cfg);
     // 上次进程遗留的搜索任务不会再有进度：标为 interrupted，重新登录后仍可查看/移除。
     routes::books::mark_interrupted_search_jobs(&shared).await;
+    // 上次进程遗留的馆藏采购单放回队列，由后台 worker 续跑（断点续跑）。
+    match boranlib::library::requeue_interrupted(&library).await {
+        Ok(n) if n > 0 => tracing::info!(count = n, "requeued interrupted library jobs"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "requeue library jobs failed"),
+    }
     // 首次启动自动创建管理员账号（凭据来自 ADMIN_USER/ADMIN_PASS）
     auth::bootstrap_admin(&shared, &cfg).await?;
 
-    let api = routes::build_router(shared, cfg.clone());
+    let state = routes::app_state(
+        shared,
+        library,
+        cfg.clone(),
+        std::sync::Arc::new(boranlib::web_book::ReqFetcher),
+    );
+    // 馆藏采购单执行器：低优先级后台整本下载 + 定期回收临时缓存。
+    boranlib::library_worker::spawn(state.clone());
+    let api = routes::build_router_with_state(state);
 
     // 前端静态资源（Svelte 构建产物 web/dist）；目录不存在时该路由返回 404，不影响 API。
     // 路径可被 WEB_DIR 覆盖（生产从 D:\tools\oread-target-win 启动，不能依赖 cwd 相对路径）。

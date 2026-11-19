@@ -46,6 +46,11 @@ pub(crate) async fn backup_now(cfg: &Config, scope: Scope) -> Result<PathBuf, St
             if shared.is_file() {
                 sources.push(shared);
             }
+            // 馆藏是全局内容，和 shared 同批备份，避免账号备份与内容备份错位。
+            let library = db_path_of(cfg, Scope::Library);
+            if library.is_file() {
+                sources.push(library);
+            }
             if let Ok(entries) = std::fs::read_dir(data_dir(cfg).join("users")) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -57,6 +62,12 @@ pub(crate) async fn backup_now(cfg: &Config, scope: Scope) -> Result<PathBuf, St
         }
         Scope::User(_) => {
             let path = db_path_of(cfg, scope);
+            if path.is_file() {
+                sources.push(path);
+            }
+        }
+        Scope::Library => {
+            let path = db_path_of(cfg, Scope::Library);
             if path.is_file() {
                 sources.push(path);
             }

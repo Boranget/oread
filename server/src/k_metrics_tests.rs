@@ -118,7 +118,8 @@ fn probe_summary_rejects_non_admin() {
         // 探针聚合只读文件系统，连接池仅用于构造 AppState
         let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let state = AppState {
-            shared: pool,
+            shared: pool.clone(),
+            library: pool,
             cfg: crate::config::Config::from_env(),
             user_pools: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::routes::UserPoolCache::default(),

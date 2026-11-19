@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::library;
+
 /// 正文：命中缓存（TTL 内）直接返回；否则抓取、落库、按总量上限淘汰最久未读的章节，
 /// 最后统一应用用户替换规则（标题/正文分别受 scope_title / scope_content 控制）。
 ///
@@ -22,7 +24,7 @@ pub(super) async fn content(
         ));
     }
     let mut c = match super::books_store::peek_cached_content(
-        &db.0,
+        &s.library,
         &q.chapter_url,
         &q.source,
         s.cfg.content_ttl_secs,
@@ -38,7 +40,7 @@ pub(super) async fn content(
             ))
             .await;
             if let Some(c) = super::books_store::peek_cached_content(
-                &db.0,
+                &s.library,
                 &q.chapter_url,
                 &q.source,
                 s.cfg.content_ttl_secs,
@@ -95,9 +97,8 @@ pub(super) async fn content(
                 if let Some(st) = &store {
                     persist_book_changes(&db.0, st.take_changes()).await;
                 }
-                // 用户设置的缓存上限优先（且不超过全局上限），未设置时用全局配置
-                let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
-                save_content_cached(&db.0, &c, limit).await?;
+                // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
+                save_content_cached(&s.library, &c).await?;
                 c
             }
         }
@@ -113,13 +114,13 @@ pub(super) async fn content(
             c.book_url = bu.to_string();
         }
     }
-    // 缓存书可能没存 book_url：用章节 URL 反查 book_chapters（其主键就是书籍 URL）。
+    // 缓存书可能没存 book_url：用章节 URL 反查 library_chapters（其主键就是书籍 URL）。
     if c.book_url.trim().is_empty() {
         let found: Option<String> = sqlx::query_scalar(
-            "SELECT book_url FROM book_chapters WHERE url = ?1 AND book_url <> '' LIMIT 1",
+            "SELECT book_url FROM library_chapters WHERE url = ?1 AND book_url <> '' LIMIT 1",
         )
         .bind(&q.chapter_url)
-        .fetch_optional(&db.0)
+        .fetch_optional(&s.library)
         .await
         .ok()
         .flatten();
@@ -131,9 +132,9 @@ pub(super) async fn content(
         c.title = q.title.clone().filter(|s| !s.trim().is_empty());
     }
     if c.title.is_none() {
-        c.title = sqlx::query_scalar("SELECT title FROM book_chapters WHERE url = ?1 LIMIT 1")
+        c.title = sqlx::query_scalar("SELECT title FROM library_chapters WHERE url = ?1 LIMIT 1")
             .bind(&q.chapter_url)
-            .fetch_optional(&db.0)
+            .fetch_optional(&s.library)
             .await
             .ok()
             .flatten()
@@ -149,9 +150,9 @@ pub(super) async fn content(
         // 图片章节不做正文净化/图片样式注入，避免把 <img> 列表当富文本改写
         let (images, truncated) = decode_cached_images(c.images_json.as_deref());
         let (is_pay, is_vip): (bool, bool) =
-            sqlx::query_as("SELECT is_pay, is_vip FROM book_chapters WHERE url = ?1 LIMIT 1")
+            sqlx::query_as("SELECT is_pay, is_vip FROM library_chapters WHERE url = ?1 LIMIT 1")
                 .bind(&q.chapter_url)
-                .fetch_optional(&db.0)
+                .fetch_optional(&s.library)
                 .await
                 .ok()
                 .flatten()
@@ -173,7 +174,9 @@ pub(super) async fn content(
             "prefetch_hint": {"count": prefetch, "priority": "high"},
         })));
     }
-    let book_name = book_name_of(&db.0, &c.book_url).await.unwrap_or_default();
+    let book_name = book_name_of(&s.library, &c.book_url)
+        .await
+        .unwrap_or_default();
     if use_replace {
         let (title, body) = replace::purify(
             &db.0,
@@ -279,9 +282,9 @@ pub(super) struct ContentSearchRow {
 }
 
 pub(super) async fn book_search(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
     Query(q): Query<BookSearchQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let book_id = q.book_id.trim();
@@ -301,7 +304,7 @@ pub(super) async fn book_search(
     let started = Instant::now();
     let pattern = escape_like(query);
     let rows_fut = sqlx::query_as::<_, ContentSearchRow>(
-        "SELECT url, title, chapter_index, content FROM book_content \
+        "SELECT url, title, chapter_index, content FROM library_content \
          WHERE book_url = ?1 AND content IS NOT NULL \
            AND content LIKE '%' || ?2 || '%' ESCAPE '\\' \
          ORDER BY chapter_index LIMIT ?3",
@@ -309,7 +312,7 @@ pub(super) async fn book_search(
     .bind(book_id)
     .bind(&pattern)
     .bind((limit + 1) as i64)
-    .fetch_all(&db.0);
+    .fetch_all(&s.library);
     let rows = tokio::time::timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS), rows_fut)
         .await
         .map_err(|_| {
@@ -338,11 +341,11 @@ pub(super) async fn book_search(
     // 明确告诉调用方“只搜了已缓存部分”，避免把部分结果当成全书结果。
     let (total, cached): (i64, i64) = sqlx::query_as(
         "SELECT \
-           (SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1), \
-           (SELECT COUNT(*) FROM book_content WHERE book_url = ?1 AND content IS NOT NULL)",
+           (SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1), \
+           (SELECT COUNT(*) FROM library_content WHERE book_url = ?1 AND content IS NOT NULL)",
     )
     .bind(book_id)
-    .fetch_one(&db.0)
+    .fetch_one(&s.library)
     .await?;
     let uncached = (total - cached).max(0);
     // 目录未缓存时无法判断“全书是否搜全”，此时不能报告 complete=true。
@@ -383,23 +386,9 @@ pub struct CacheAllQ {
 
 #[derive(Deserialize, Default)]
 pub struct CacheClearQ {
-    /// 缺省表示清空该用户的全部正文缓存
+    /// 缺省表示清空全部临时缓存
     #[serde(default, alias = "book_url", alias = "book_id")]
     pub book_id: Option<String>,
-}
-
-/// 原子预占预算：成功则扣减并返回 true；不足返回 false。
-pub(super) fn reserve_budget(remaining: &AtomicI64, size: i64) -> bool {
-    let mut cur = remaining.load(Ordering::SeqCst);
-    loop {
-        if size > cur {
-            return false;
-        }
-        match remaining.compare_exchange(cur, cur - size, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(v) => cur = v,
-        }
-    }
 }
 
 // `index`/`bytes` 供构造侧记录进度与诊断，部分分支只读取状态码而不读字段；保留完整载荷便于排查。
@@ -415,15 +404,12 @@ pub(super) enum CacheOutcome {
         title: Option<String>,
         error: String,
     },
-    Budget {
-        index: i64,
-    },
 }
 
 pub(super) async fn cache_all(
     State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
     Json(q): Json<CacheAllQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let started = Instant::now();
@@ -433,11 +419,11 @@ pub(super) async fn cache_all(
     }
     let chapters: Vec<BookChapter> = sqlx::query_as(
         "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
-         resource_url, tag, start, \"end\", update_time, word_count FROM book_chapters \
+         resource_url, tag, start, \"end\", update_time, word_count FROM library_chapters \
          WHERE book_url = ?1 ORDER BY \"index\"",
     )
     .bind(&book_url)
-    .fetch_all(&db.0)
+    .fetch_all(&s.library)
     .await?;
     if chapters.is_empty() {
         return Err(AppError::BadRequest(
@@ -448,24 +434,24 @@ pub(super) async fn cache_all(
         Some(s) => s.to_string(),
         None => {
             let origin: Option<String> =
-                sqlx::query_scalar("SELECT origin FROM book_meta WHERE book_url = ?1")
+                sqlx::query_scalar("SELECT origin FROM library_books WHERE book_url = ?1")
                     .bind(&book_url)
-                    .fetch_optional(&db.0)
+                    .fetch_optional(&s.library)
                     .await?;
-            origin.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-                AppError::BadRequest("缺少 source，且 book_meta 未记录书源".into())
-            })?
+            origin
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| AppError::BadRequest("缺少 source，且书目未记录书源".into()))?
         }
     };
     let source = load_source(&s.shared, &source_id).await?;
     // 只有当前解析管线指纹的记录才算已缓存；旧指纹/无指纹的行交给预取重建。
     let cached_urls: Vec<String> = sqlx::query_scalar(
-        "SELECT url FROM book_content WHERE book_url = ?1 AND content IS NOT NULL \
+        "SELECT url FROM library_content WHERE book_url = ?1 AND content IS NOT NULL \
          AND cache_version = ?2",
     )
     .bind(&book_url)
     .bind(content_cache_version())
-    .fetch_all(&db.0)
+    .fetch_all(&s.library)
     .await?;
     let cached_set: HashSet<String> = cached_urls.into_iter().collect();
     let total_chapters = chapters.len();
@@ -478,15 +464,12 @@ pub(super) async fn cache_all(
     let limited = pending.len() > max_chapters;
     pending.truncate(max_chapters);
 
-    let limit_bytes = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
     let used_before: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(&db.0)
+        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM library_content")
+            .fetch_one(&s.library)
             .await?;
     let attempted = pending.len();
-    let remaining = Arc::new(AtomicI64::new((limit_bytes - used_before).max(0)));
-    let exhausted = Arc::new(AtomicBool::new(false));
-    let pool = db.0.clone();
+    let pool = s.library.clone();
     let src = source.clone();
     let bu = book_url.clone();
 
@@ -494,12 +477,7 @@ pub(super) async fn cache_all(
         let pool = pool.clone();
         let src = src.clone();
         let bu = bu.clone();
-        let remaining = remaining.clone();
-        let exhausted = exhausted.clone();
         async move {
-            if exhausted.load(Ordering::SeqCst) {
-                return CacheOutcome::Budget { index: ch.index };
-            }
             let mut chapter = ch.clone();
             if chapter.book_url.as_deref().unwrap_or("").trim().is_empty() {
                 chapter.book_url = Some(bu.clone());
@@ -524,10 +502,6 @@ pub(super) async fn cache_all(
                             index: idx,
                             bytes: 0,
                         };
-                    }
-                    if !reserve_budget(&remaining, size) {
-                        exhausted.store(true, Ordering::SeqCst);
-                        return CacheOutcome::Budget { index: idx };
                     }
                     match upsert_content(&pool, &c).await {
                         Ok(()) => CacheOutcome::Cached {
@@ -556,7 +530,6 @@ pub(super) async fn cache_all(
     .await;
 
     let mut cached = 0usize;
-    let mut budget_skipped = 0usize;
     let mut cached_bytes = 0i64;
     let mut failures: Vec<serde_json::Value> = Vec::new();
     for o in outcomes {
@@ -565,7 +538,6 @@ pub(super) async fn cache_all(
                 cached += 1;
                 cached_bytes += bytes;
             }
-            CacheOutcome::Budget { .. } => budget_skipped += 1,
             CacheOutcome::Failed {
                 index,
                 url,
@@ -589,10 +561,8 @@ pub(super) async fn cache_all(
         "attempted": attempted,
         "cached": cached,
         "failed": failures.len(),
-        "skipped_budget": budget_skipped,
         "limited": limited,
         "limit": max_chapters,
-        "budget_bytes": limit_bytes,
         "used_bytes_before": used_before,
         "used_bytes_after": used_before + cached_bytes,
         "failures": failures,
@@ -600,48 +570,70 @@ pub(super) async fn cache_all(
     })))
 }
 
-/// 清空正文缓存：`book_id` 有值按书清，缺省清该用户全部。返回 (删除行数, 释放字节数)。
+/// 清空正文缓存：`book_id` 有值按书清，缺省清全部临时缓存。
+///
+/// 馆藏（`tier=collection`）不参与：那些正文只能由管理员「移出馆藏」后再清理，
+/// 避免任意账号把全局共享的馆藏内容删掉。返回 (删除行数, 释放字节数)。
 pub(crate) async fn clear_content_cache(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     book_id: Option<&str>,
 ) -> anyhow::Result<(u64, i64)> {
     let scope = book_id.map(str::trim).filter(|s| !s.is_empty());
     let (deleted, freed) = match scope {
         Some(id) => {
+            let tier: Option<String> =
+                sqlx::query_scalar("SELECT tier FROM library_books WHERE book_url = ?1")
+                    .bind(id)
+                    .fetch_optional(lib)
+                    .await?;
+            if tier.as_deref() == Some(library::TIER_COLLECTION) {
+                anyhow::bail!("该书已入馆，请先移出馆藏再清理正文");
+            }
             let freed: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(size_bytes),0) FROM book_content WHERE book_url = ?1",
+                "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
             )
             .bind(id)
-            .fetch_one(pool)
+            .fetch_one(lib)
             .await?;
-            let deleted = sqlx::query("DELETE FROM book_content WHERE book_url = ?1")
+            let deleted = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
                 .bind(id)
-                .execute(pool)
+                .execute(lib)
                 .await?
                 .rows_affected();
+            library::refresh_rollup(lib, id).await.ok();
             (deleted, freed)
         }
         None => {
-            let freed: i64 =
-                sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-                    .fetch_one(pool)
-                    .await?;
-            let deleted = sqlx::query("DELETE FROM book_content")
-                .execute(pool)
-                .await?
-                .rows_affected();
+            let freed: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url IN \
+                 (SELECT book_url FROM library_books WHERE tier = 'temp')",
+            )
+            .fetch_one(lib)
+            .await?;
+            let deleted = sqlx::query(
+                "DELETE FROM library_content WHERE book_url IN \
+                 (SELECT book_url FROM library_books WHERE tier = 'temp')",
+            )
+            .execute(lib)
+            .await?
+            .rows_affected();
+            let _ = sqlx::query(
+                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0 WHERE tier = 'temp'",
+            )
+            .execute(lib)
+            .await;
             (deleted, freed)
         }
     };
     // 有界归还空闲页，避免文件只涨不落。
-    let _ = crate::db::reclaim_pages(pool, 1024).await;
+    let _ = crate::db::reclaim_pages(lib, 1024).await;
     Ok((deleted, freed))
 }
 
 pub(super) async fn cache_clear(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
     Json(q): Json<CacheClearQ>,
 ) -> AppResult<Json<serde_json::Value>> {
     let scope = q
@@ -649,47 +641,39 @@ pub(super) async fn cache_clear(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let (deleted, freed) = clear_content_cache(&db.0, scope).await?;
+    let (deleted, freed) = clear_content_cache(&s.library, scope)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(json!({
         "ok": true,
-        "scope": if scope.is_some() { "book" } else { "user" },
+        "scope": if scope.is_some() { "book" } else { "temp" },
         "book_id": scope,
         "deleted": deleted,
         "bytes_freed": freed,
     })))
 }
 
-/// 清理到上限：按 LRU 删除最久未读章节，直到总量不超过当前账号生效上限。
+/// 回收过期临时缓存：`tier=temp` 且超过 TTL 未访问的书整本删除。
 ///
-/// 与写入路径共用 `evict_content_to_limit`：调小 `cache_limit_mb` 后可用它立即生效，
-/// 不必等下一次落库。只动 `book_content`，不影响书架、目录与阅读进度。
+/// 馆藏永不参与（不设容量上限，只做占用监控）。
 pub(super) async fn cache_trim(
     State(s): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
-    let limit_bytes = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
-    let used_before: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(&db.0)
-            .await?;
-    let deleted = super::books_store::evict_content_to_limit(
-        &db.0,
-        limit_bytes,
-        super::books_store::EVICT_ROUNDS_TRIM,
-    )
-    .await?;
-    let used_after: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(&db.0)
-            .await?;
+    let used_before = library::stats(&s.library, s.cfg.library_temp_ttl_secs)
+        .await
+        .content_bytes;
+    let report = library::cleanup_temp(&s.library, s.cfg.library_temp_ttl_secs).await?;
+    let used_after = library::stats(&s.library, s.cfg.library_temp_ttl_secs)
+        .await
+        .content_bytes;
     Ok(Json(json!({
         "ok": true,
-        "limit_bytes": limit_bytes,
-        "limit_mb": limit_bytes / (1024 * 1024),
         "used_bytes_before": used_before,
         "used_bytes_after": used_after,
-        "deleted": deleted,
+        "deleted": report.contents,
+        "books_deleted": report.books,
         "bytes_freed": (used_before - used_after).max(0),
     })))
 }

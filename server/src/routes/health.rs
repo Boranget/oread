@@ -80,25 +80,25 @@ pub fn rss_bytes() -> Option<u64> {
     None
 }
 
-/// 正文缓存占用（字节 + 行数）
+/// 馆藏正文占用（字节 + 行数）
 async fn cache_usage(pool: &SqlitePool) -> (i64, i64) {
-    let bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
+    let bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM library_content")
         .fetch_one(pool)
         .await
         .unwrap_or(0);
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_content")
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
         .fetch_one(pool)
         .await
         .unwrap_or(0);
     (bytes, rows)
 }
 
-/// 按书占用（前 5 本），用于定位正文缓存空间被谁占住。
-/// `name` 取自 `book_meta`，缺失时前端回退显示 `book_url`。
+/// 按书占用（前 5 本），用于定位馆藏空间被谁占住。
+/// `name` 取自 `library_books`，缺失时前端回退显示 `book_url`。
 async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
     sqlx::query_as(
-        "SELECT c.book_url, COALESCE(m.name, '') AS name, COALESCE(SUM(c.size_bytes),0) AS total \
-         FROM book_content c LEFT JOIN book_meta m ON m.book_url = c.book_url \
+        "SELECT c.book_url, COALESCE(b.name, '') AS name, COALESCE(SUM(c.size_bytes),0) AS total \
+         FROM library_content c LEFT JOIN library_books b ON b.book_url = c.book_url \
          GROUP BY c.book_url ORDER BY total DESC LIMIT 5",
     )
     .fetch_all(pool)
@@ -117,7 +117,7 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
         "rss_bytes": rss,
         "rss_mb": rss.map(|b| (b as f64 / MB as f64 * 100.0).round() / 100.0),
         "open_user_dbs": state.user_pools.lock().map(|c| c.len()).unwrap_or(0),
-        "cache_limit_mb": state.cfg.cache_limit_mb,
+        // 容量上限已废弃：馆藏永久保存，只报实际占用（见下方 cache.bytes）。
         "js": {
             "enabled": state.cfg.js_enabled,
             "last_ms": js_last,
@@ -181,22 +181,15 @@ pub async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(v)
 }
 
-/// 需要登录：在公开指标上追加当前用户的正文缓存占用。
+/// 需要登录：在公开指标上追加馆藏占用（全局共享，不设上限，只做监控）。
 pub async fn healthz_user(
     State(state): State<AppState>,
     _u: AuthUser,
-    db: UserDb,
+    _db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (bytes, rows) = cache_usage(&db.0).await;
-    let books = cache_usage_by_book(&db.0).await;
-    // 与写入/清理路径同一口径：用户设置与部署上限取较小值
-    let limit_bytes =
-        crate::routes::books::content_cache_limit_bytes(&db.0, state.cfg.cache_limit_bytes()).await;
-    let percent = if limit_bytes > 0 {
-        ((bytes as f64) * 1000.0 / limit_bytes as f64).round() / 10.0
-    } else {
-        0.0
-    };
+    let (bytes, rows) = cache_usage(&state.library).await;
+    let books = cache_usage_by_book(&state.library).await;
+    let stats = crate::library::stats(&state.library, state.cfg.library_temp_ttl_secs).await;
     let mut v = base_metrics(&state);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ok".into(), json!(true));
@@ -206,14 +199,26 @@ pub async fn healthz_user(
                 "bytes": bytes,
                 "mb": (bytes as f64 / MB as f64 * 100.0).round() / 100.0,
                 "rows": rows,
-                // 生效上限与占用比例：前端管理页直接渲染进度条，不用自己再算 min
-                "limit_bytes": limit_bytes,
-                "limit_mb": limit_bytes / (1024 * 1024),
-                "percent": percent,
-                // 图片缓存计入缓存预算统计（进程级，所有用户共享）
+                // 分层监控：馆藏永久保存，临时缓存按 TTL 回收
+                "collection": {
+                    "books": stats.collection_books,
+                    "chapters": stats.collection_chapters,
+                    "bytes": stats.collection_bytes,
+                    "mb": (stats.collection_bytes as f64 / MB as f64 * 100.0).round() / 100.0,
+                },
+                "temp": {
+                    "books": stats.temp_books,
+                    "chapters": stats.temp_chapters,
+                    "bytes": stats.temp_bytes,
+                    "mb": (stats.temp_bytes as f64 / MB as f64 * 100.0).round() / 100.0,
+                    "expired_books": stats.temp_expired_books,
+                    "ttl_days": state.cfg.library_temp_ttl_secs / 86_400,
+                },
+                "books_total": stats.collection_books + stats.temp_books,
+                // 图片缓存计入占用统计（进程级，所有用户共享）
                 "image_cache_bytes": crate::image_cache::stats().0,
                 "total_bytes": bytes + crate::image_cache::stats().0 as i64,
-                // 前 5 本按占用降序，便于定位缓存被谁占住
+                // 前 5 本按占用降序，便于定位空间被谁占住
                 "books": books
                     .iter()
                     .map(|(url, name, bytes)| json!({

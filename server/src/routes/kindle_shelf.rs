@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 目录（带缓存）：先读 book_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
+/// 目录（带缓存）：先读 library_chapters，miss 则 book_info 补 toc_url 后抓目录并落库
 pub(super) async fn ensure_chapters(
     s: &AppState,
     db: &SqlitePool,
@@ -10,7 +10,7 @@ pub(super) async fn ensure_chapters(
     book_url: &str,
 ) -> AppResult<(BookSource, Vec<BookChapter>)> {
     let source = load_source(&s.shared, source_url).await?;
-    if let Some(chaps) = load_cached_chapters(db, book_url, s.cfg.toc_ttl_secs).await? {
+    if let Some(chaps) = load_cached_chapters(&s.library, book_url, s.cfg.toc_ttl_secs).await? {
         return Ok((source, chaps));
     }
     let mut book = Book {
@@ -20,14 +20,14 @@ pub(super) async fn ensure_chapters(
         book_source_type: source.book_source_type,
         ..Default::default()
     };
-    if let Some(m) = load_book_meta(db, book_url).await? {
+    if let Some(m) = load_book_meta(&s.library, db, book_url).await? {
         book.toc_url = m.toc_url;
     }
     // 补详情拿 tocUrl（字面量 URL 的情况也要先走 book_info）
     web_book::book_info(&source, &mut book).await?;
-    save_book_meta(db, &book).await?;
+    save_book_meta(&s.library, db, &book).await?;
     let chapters = web_book::chapter_list(&source, &book).await?;
-    save_chapters(db, book_url, &chapters).await?;
+    save_chapters(&s.library, book_url, &chapters).await?;
     Ok((source, chapters))
 }
 
@@ -331,7 +331,7 @@ pub(super) async fn toc(
     let tp = q.tp.unwrap_or(1).clamp(1, t_pages);
     let start = ((tp - 1) * toc_page as i64) as usize;
     let end = (start + toc_page).min(visible.len());
-    let name = load_book_meta(&db.0, &q.book)
+    let name = load_book_meta(&s.library, &db.0, &q.book)
         .await
         .ok()
         .flatten()

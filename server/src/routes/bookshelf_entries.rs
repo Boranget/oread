@@ -121,16 +121,20 @@ pub(crate) async fn record_toc_delta(pool: &SqlitePool, book_id: &str, after_tot
 }
 
 /// 打开章节后清除角标：把已看总数对齐到当前目录总数，返回对齐后的总数。
-pub(crate) async fn mark_shelf_seen(pool: &SqlitePool, id: &str) -> AppResult<i64> {
+pub(crate) async fn mark_shelf_seen(
+    pool: &SqlitePool,
+    lib: &SqlitePool,
+    id: &str,
+) -> AppResult<i64> {
     let meta_total: Option<i64> =
         sqlx::query_scalar("SELECT total_chapter_num FROM book_meta WHERE book_url = ?1")
             .bind(id)
             .fetch_optional(pool)
             .await?;
     let chapter_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(lib)
             .await?
             .unwrap_or(0);
     let total = meta_total.unwrap_or(0).max(chapter_total).max(0);
@@ -150,7 +154,7 @@ pub(crate) async fn mark_shelf_seen(pool: &SqlitePool, id: &str) -> AppResult<i6
 }
 
 pub async fn mark_seen(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     _u: AuthUser,
     db: UserDb,
     Json(q): Json<BookIdQ>,
@@ -159,7 +163,7 @@ pub async fn mark_seen(
     if id.is_empty() {
         return Err(AppError::BadRequest("book_id 不能为空".into()));
     }
-    let total = mark_shelf_seen(&db.0, id).await?;
+    let total = mark_shelf_seen(&db.0, &s.library, id).await?;
     Ok(Json(
         json!({"ok": true, "seen_total": total, "new_chapters": 0}),
     ))

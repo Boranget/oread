@@ -1,16 +1,120 @@
 //! books 路由的 store 部分（move-only 从 books.rs 拆出）。
+//!
+//! 内容层（书目源字段 / 目录 / 正文）落在馆藏库 `library.db`，全局共享；
+//! 用户层（分组、自定义封面/简介/标签、排序、`dur_*`）仍在用户库 `book_meta`。
+//! 写书时两边各写自己那份，读书时以馆藏为准、用用户库覆盖个人字段。
 
 use super::*;
 
-// ---------------- 缓存落库辅助 ----------------
+use crate::library::{self, LibraryBook};
+
+// ---------------- 书目 ----------------
+
+/// 馆藏书目行 → `Book`（用户字段留默认值，由 `overlay_user_fields` 覆盖）。
+fn book_from_library(l: &LibraryBook) -> Book {
+    Book {
+        book_url: l.book_url.clone(),
+        toc_url: l.toc_url.clone(),
+        origin: l.origin.clone(),
+        origin_name: l.origin_name.clone(),
+        name: l.name.clone(),
+        author: l.author.clone(),
+        kind: l.kind.clone(),
+        cover_url: l.cover_url.clone(),
+        intro: l.intro.clone(),
+        charset: l.charset.clone(),
+        book_source_type: l.book_source_type,
+        latest_chapter_title: l.latest_chapter_title.clone(),
+        latest_chapter_time: l.latest_chapter_time,
+        total_chapter_num: l.total_chapter_num,
+        word_count: l.word_count.clone(),
+        ..Default::default()
+    }
+}
+
+/// 把用户库里的个人字段覆盖到馆藏基线上。
+///
+/// 只覆盖用户字段：分组、自定义封面/简介/标签、排序、`can_update`、`dur_*`、`variable`。
+/// 书源能重新提供的字段（书名/作者/封面/简介/章节数等）一律以馆藏为准。
+fn overlay_user_fields(base: &mut Book, user: Book) {
+    base.group = user.group;
+    base.custom_tag = user.custom_tag;
+    base.custom_cover_url = user.custom_cover_url;
+    base.custom_intro = user.custom_intro;
+    base.dur_chapter_title = user.dur_chapter_title;
+    base.dur_chapter_index = user.dur_chapter_index;
+    base.dur_chapter_pos = user.dur_chapter_pos;
+    base.dur_chapter_time = user.dur_chapter_time;
+    base.can_update = user.can_update;
+    base.order = user.order;
+    base.origin_order = user.origin_order;
+    base.variable = user.variable;
+    base.last_check_time = user.last_check_time;
+    base.last_check_count = user.last_check_count;
+}
 
 /// 写入解析/抓取得到的书籍元信息。
 ///
-/// 这是“解析路径”：只更新来源可重新提供的字段，`group` / `can_update` / `order` /
-/// `origin_order` / `variable` / `custom_tag` / `custom_cover_url` / `custom_intro` /
-/// `dur_chapter_*` 属于用户或本地阅读状态，冲突时一律保留旧值（首次插入仍按传入值落库）。
-/// 可空字段用 COALESCE 兜底，避免规则缺字段时把已有书名/作者等清空。
-pub(crate) async fn save_book_meta(pool: &SqlitePool, b: &Book) -> anyhow::Result<()> {
+/// 两处落库：
+/// 1. `library.db.library_books`：书源可重新提供的字段（全局共享，冲突时保留更完整的一份）；
+/// 2. 用户库 `book_meta`：整行照旧写入，作为书架/统计等本地查询的便捷副本，
+///    同时承载分组、自定义封面/简介/标签、排序、`dur_*` 等个人字段。
+///
+/// 馆藏层的 `tier` / `collected_at` 不在这里改：入馆/移出是独立的管理动作。
+pub(crate) async fn save_book_meta(
+    lib: &SqlitePool,
+    pool: &SqlitePool,
+    b: &Book,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO library_books \
+         (book_url, toc_url, origin, origin_name, name, author, kind, cover_url, intro, charset, \
+          book_source_type, latest_chapter_title, latest_chapter_time, total_chapter_num, \
+          word_count, last_accessed_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+         ON CONFLICT(book_url) DO UPDATE SET \
+          toc_url=COALESCE(excluded.toc_url, library_books.toc_url), \
+          origin=COALESCE(excluded.origin, library_books.origin), \
+          origin_name=COALESCE(excluded.origin_name, library_books.origin_name), \
+          name=COALESCE(NULLIF(excluded.name, ''), library_books.name), \
+          author=COALESCE(NULLIF(excluded.author, ''), library_books.author), \
+          kind=COALESCE(NULLIF(excluded.kind, ''), library_books.kind), \
+          cover_url=COALESCE(NULLIF(excluded.cover_url, ''), library_books.cover_url), \
+          intro=COALESCE(NULLIF(excluded.intro, ''), library_books.intro), \
+          charset=COALESCE(NULLIF(excluded.charset, ''), library_books.charset), \
+          book_source_type=CASE WHEN excluded.book_source_type > 0 \
+                                THEN excluded.book_source_type ELSE library_books.book_source_type END, \
+          latest_chapter_title=COALESCE(NULLIF(excluded.latest_chapter_title, ''), \
+                                        library_books.latest_chapter_title), \
+          latest_chapter_time=CASE WHEN excluded.latest_chapter_time > 0 \
+                                   THEN excluded.latest_chapter_time \
+                                   ELSE library_books.latest_chapter_time END, \
+          total_chapter_num=CASE WHEN excluded.total_chapter_num > 0 \
+                                 THEN excluded.total_chapter_num \
+                                 ELSE library_books.total_chapter_num END, \
+          word_count=COALESCE(NULLIF(excluded.word_count, ''), library_books.word_count), \
+          last_accessed_at=excluded.last_accessed_at",
+    )
+    .bind(&b.book_url)
+    .bind(&b.toc_url)
+    .bind(&b.origin)
+    .bind(&b.origin_name)
+    .bind(&b.name)
+    .bind(&b.author)
+    .bind(&b.kind)
+    .bind(&b.cover_url)
+    .bind(&b.intro)
+    .bind(&b.charset)
+    .bind(b.book_source_type)
+    .bind(&b.latest_chapter_title)
+    .bind(b.latest_chapter_time)
+    .bind(b.total_chapter_num)
+    .bind(&b.word_count)
+    .bind(library::now_ms())
+    .execute(lib)
+    .await?;
+
+    // 用户库：整行照旧写入。这是个人视图的便捷副本，不承担跨账号共享。
     sqlx::query(
         "INSERT INTO book_meta \
          (book_url, toc_url, origin, origin_name, name, author, kind, cover_url, intro, charset, \
@@ -71,15 +175,32 @@ pub(crate) async fn save_book_meta(pool: &SqlitePool, b: &Book) -> anyhow::Resul
     Ok(())
 }
 
+/// 读书目：馆藏提供源字段，用户库覆盖个人字段。
+///
+/// 只有用户库有行（历史数据）时直接返回该行；只有馆藏有行时（别的账号抓过这本书）
+/// 也能读到完整书目，第二个账号不必重新抓详情。
 pub(crate) async fn load_book_meta(
+    lib: &SqlitePool,
     pool: &SqlitePool,
     book_url: &str,
 ) -> anyhow::Result<Option<Book>> {
-    let b: Option<Book> = sqlx::query_as::<_, Book>("SELECT * FROM book_meta WHERE book_url = ?")
-        .bind(book_url)
-        .fetch_optional(pool)
-        .await?;
-    Ok(b)
+    let src = library::load_book(lib, book_url).await?;
+    let user: Option<Book> =
+        sqlx::query_as::<_, Book>("SELECT * FROM book_meta WHERE book_url = ?")
+            .bind(book_url)
+            .fetch_optional(pool)
+            .await?;
+    Ok(match (src, user) {
+        (None, None) => None,
+        (None, Some(user)) => Some(user),
+        (Some(src), user) => {
+            let mut book = book_from_library(&src);
+            if let Some(user) = user {
+                overlay_user_fields(&mut book, user);
+            }
+            Some(book)
+        }
+    })
 }
 
 // ---------------- 跨请求 book 层状态（变量 + cache） ----------------
@@ -190,6 +311,9 @@ pub(crate) async fn persist_book_changes(pool: &SqlitePool, changes: Vec<web_boo
 }
 
 /// 构造并预载一本书的作用域容器。
+///
+/// 注意：这里用的是**用户库**——`book_vars` / `book_cache` 是书源登录态，
+/// 共享会串账号，必须留在借书证里。
 pub(crate) async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::BookStore {
     let (vars, cache) = load_book_scope(pool, key).await;
     let store = web_book::BookStore::new();
@@ -197,57 +321,63 @@ pub(crate) async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::Bo
     store
 }
 
+// ---------------- 目录（馆藏） ----------------
+
 /// 目录缓存读取：TTL 内存在任意章节则整体命中（一次 SELECT 避免 N 次查询）。
 pub(crate) async fn load_cached_chapters(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     book_url: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<Vec<BookChapter>>> {
     let fresh: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM book_chapters \
+        "SELECT COUNT(*) FROM library_chapters \
          WHERE book_url = ?1 AND updated_at >= datetime('now', ?2)",
     )
     .bind(book_url)
     .bind(format!("-{ttl_secs} seconds"))
-    .fetch_one(pool)
+    .fetch_one(lib)
     .await?;
     if fresh == 0 {
         return Ok(None);
     }
     let rows: Vec<BookChapter> = sqlx::query_as(
         "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
-         resource_url, tag, start, \"end\", update_time, word_count FROM book_chapters \
+         resource_url, tag, start, \"end\", update_time, word_count FROM library_chapters \
          WHERE book_url = ?1 ORDER BY \"index\"",
     )
     .bind(book_url)
-    .fetch_all(pool)
+    .fetch_all(lib)
     .await?;
+    library::touch_book(lib, book_url).await;
     Ok(Some(rows))
 }
 
-/// 目录整本刷新：先清旧章节再写入，避免目录缩短后残留脏数据（写入放大优先让位于内存峰值）。
+/// 目录整本刷新：先清旧章节再写入，避免目录缩短后残留脏数据。
+///
+/// 同时回写馆藏书目的 `total_chapter_num` / `checked_at`，让列表页不必再聚合目录表。
 pub(crate) async fn save_chapters(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     book_url: &str,
     chapters: &[BookChapter],
 ) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM book_chapters WHERE book_url = ?")
+    sqlx::query("DELETE FROM library_chapters WHERE book_url = ?")
         .bind(book_url)
-        .execute(pool)
+        .execute(lib)
         .await?;
     for c in chapters {
         sqlx::query(
-            "INSERT INTO book_chapters \
-             (url, book_url, title, is_volume, base_url, \"index\", is_vip, is_pay, resource_url, tag, start, \"end\", update_time, word_count, updated_at) \
+            "INSERT INTO library_chapters \
+             (book_url, url, title, is_volume, base_url, \"index\", is_vip, is_pay, resource_url, tag, start, \"end\", update_time, word_count, updated_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14, datetime('now')) \
-             ON CONFLICT(url) DO UPDATE SET title=excluded.title, is_volume=excluded.is_volume, \
-              base_url=excluded.base_url, \"index\"=excluded.\"index\", is_vip=excluded.is_vip, \
-              is_pay=excluded.is_pay, resource_url=excluded.resource_url, tag=excluded.tag, \
-              start=excluded.start, \"end\"=excluded.\"end\", update_time=excluded.update_time, \
+             ON CONFLICT(book_url, url) DO UPDATE SET title=excluded.title, \
+              is_volume=excluded.is_volume, base_url=excluded.base_url, \
+              \"index\"=excluded.\"index\", is_vip=excluded.is_vip, is_pay=excluded.is_pay, \
+              resource_url=excluded.resource_url, tag=excluded.tag, start=excluded.start, \
+              \"end\"=excluded.\"end\", update_time=excluded.update_time, \
               word_count=excluded.word_count, updated_at=datetime('now')",
         )
+        .bind(book_url)
         .bind(&c.url)
-        .bind(&c.book_url)
         .bind(&c.title)
         .bind(c.is_volume)
         .bind(&c.base_url)
@@ -260,11 +390,86 @@ pub(crate) async fn save_chapters(
         .bind(c.end)
         .bind(&c.update_time)
         .bind(c.word_count)
-        .execute(pool)
+        .execute(lib)
         .await?;
     }
+    let total = chapters.len() as i64;
+    sqlx::query(
+        "INSERT INTO library_books (book_url, total_chapter_num, checked_at, last_accessed_at) \
+         VALUES (?1, ?2, ?3, ?3) \
+         ON CONFLICT(book_url) DO UPDATE SET \
+          total_chapter_num = CASE WHEN excluded.total_chapter_num > 0 \
+                                   THEN excluded.total_chapter_num \
+                                   ELSE library_books.total_chapter_num END, \
+          checked_at = excluded.checked_at, last_accessed_at = excluded.last_accessed_at",
+    )
+    .bind(book_url)
+    .bind(total)
+    .bind(library::now_ms())
+    .execute(lib)
+    .await?;
     Ok(())
 }
+
+/// 回写总章节数（只增不减，避免空目录把已有值清零）。
+///
+/// 馆藏层是唯一权威，同时把副本写回用户库 `book_meta`，
+/// 让书架进度百分比等既有查询不必改口径。
+pub(crate) async fn sync_total_chapter_num(
+    lib: &SqlitePool,
+    pool: &SqlitePool,
+    book_url: &str,
+    total: i64,
+) -> anyhow::Result<()> {
+    if total <= 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO library_books (book_url, total_chapter_num) VALUES (?1, ?2) \
+         ON CONFLICT(book_url) DO UPDATE SET total_chapter_num = excluded.total_chapter_num",
+    )
+    .bind(book_url)
+    .bind(total)
+    .execute(lib)
+    .await?;
+    let _ = sqlx::query(
+        "INSERT INTO book_meta (book_url, total_chapter_num) VALUES (?1, ?2) \
+         ON CONFLICT(book_url) DO UPDATE SET total_chapter_num = excluded.total_chapter_num",
+    )
+    .bind(book_url)
+    .bind(total)
+    .execute(pool)
+    .await;
+    Ok(())
+}
+
+/// 目录写入后，用已缓存正文的长度回填章节字数（SQLite `length()` 对 TEXT 按字符计数）。
+pub(crate) async fn backfill_word_counts(lib: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE library_chapters SET word_count = COALESCE((\
+           SELECT length(trim(content)) FROM library_content \
+           WHERE library_content.url = library_chapters.url \
+             AND library_content.book_url = library_chapters.book_url \
+             AND content IS NOT NULL\
+         ), 0) WHERE book_url = ?1",
+    )
+    .bind(book_url)
+    .execute(lib)
+    .await?;
+    Ok(())
+}
+
+/// 取书籍名称（用于替换规则的 scope 匹配）。
+pub(crate) async fn book_name_of(lib: &SqlitePool, book_url: &str) -> anyhow::Result<String> {
+    let name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM library_books WHERE book_url = ?")
+            .bind(book_url)
+            .fetch_optional(lib)
+            .await?;
+    Ok(name.unwrap_or_default())
+}
+
+// ---------------- 正文（馆藏） ----------------
 
 /// 正文解析管线各步骤的版本号。抽取策略、清洗步骤、替换规则等任一变更时，
 /// 递增对应数字即可让全量旧缓存失效，无需人工清库，也不按时间粗暴失效。
@@ -274,7 +479,7 @@ pub(super) const CONTENT_PIPELINE_STEPS: &[(&str, u32)] = &[
     ("replace", 1), // 书源替换规则
 ];
 
-/// 当前解析管线指纹（`p1-<fnv64>`）。存进 `book_content.cache_version`；
+/// 当前解析管线指纹（`p1-<fnv64>`）。存进 `library_content.cache_version`；
 /// 读取时指纹不符或缺失（旧记录）都按未命中处理并重建。
 pub(crate) fn content_cache_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
@@ -293,30 +498,30 @@ pub(crate) fn content_cache_version() -> &'static str {
     })
 }
 
-/// 正文缓存读取：TTL 内命中原管线指纹则更新 accessed_at（LRU 依据）。
+/// 正文缓存读取：TTL 内命中原管线指纹则更新 accessed_at。
 /// `origin` 是书源 URL，与章节 `url` 共同构成缓存键，避免镜像源同 URL 串正文。
 pub(crate) async fn load_cached_content(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     url: &str,
     origin: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<BookContent>> {
-    load_cached_content_inner(pool, url, origin, ttl_secs, true).await
+    load_cached_content_inner(lib, url, origin, ttl_secs, true).await
 }
 
 /// single-flight 闸门后的复查：命中照常计数，未命中不计数。
 /// 否则 N 个并发请求会各记一次 miss，把命中率算低。
 pub(crate) async fn peek_cached_content(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     url: &str,
     origin: &str,
     ttl_secs: i64,
 ) -> anyhow::Result<Option<BookContent>> {
-    load_cached_content_inner(pool, url, origin, ttl_secs, false).await
+    load_cached_content_inner(lib, url, origin, ttl_secs, false).await
 }
 
 async fn load_cached_content_inner(
-    pool: &SqlitePool,
+    lib: &SqlitePool,
     url: &str,
     origin: &str,
     ttl_secs: i64,
@@ -325,13 +530,13 @@ async fn load_cached_content_inner(
     let row: Option<BookContent> = sqlx::query_as(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images, cache_version \
-         FROM book_content WHERE url = ?1 AND origin = ?2 \
+         FROM library_content WHERE url = ?1 AND origin = ?2 \
            AND updated_at >= datetime('now', ?3)",
     )
     .bind(url)
     .bind(origin)
     .bind(format!("-{ttl_secs} seconds"))
-    .fetch_optional(pool)
+    .fetch_optional(lib)
     .await?;
     if let Some(row) = row {
         // 空正文（文本为空 / 图片章节零图）视为缓存未命中：旧版本的空白缓存不再命中，
@@ -356,12 +561,15 @@ async fn load_cached_content_inner(
             return Ok(None);
         }
         let _ = sqlx::query(
-            "UPDATE book_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
+            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
         )
         .bind(url)
         .bind(origin)
-        .execute(pool)
+        .execute(lib)
         .await;
+        if !row.book_url.trim().is_empty() {
+            library::touch_book(lib, &row.book_url).await;
+        }
         crate::cache_metrics::record_hit();
         return Ok(Some(row));
     }
@@ -373,7 +581,7 @@ async fn load_cached_content_inner(
 
 /// 判定缓存正文是否为空：文本章节按渲染结果判断（去掉标签/`&nbsp;` 后无可见字符）；
 /// 图片章节 images 列表为空。
-pub(super) fn content_is_empty(c: &BookContent) -> bool {
+pub(crate) fn content_is_empty(c: &BookContent) -> bool {
     if c.content_type.trim() == "image" {
         decode_cached_images(c.images_json.as_deref()).0.is_empty()
     } else {
@@ -399,7 +607,7 @@ pub(super) fn text_is_blank(s: &str) -> bool {
 
 /// 单条正文 upsert（不做淘汰），供 `/api/book/content` 与整本缓存共用。
 /// 缓存键为 `(url, origin)`；调用方必须先把 `c.origin` 填成书源 URL。
-pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
+pub(crate) async fn upsert_content(lib: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
     let content_type = if c.content_type.trim().is_empty() {
         "text"
     } else {
@@ -408,13 +616,13 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     let size = (c.content.as_deref().map(|s| s.len()).unwrap_or(0)
         + c.images_json.as_deref().map(|s| s.len()).unwrap_or(0)) as i64;
     sqlx::query(
-        "INSERT INTO book_content \
+        "INSERT INTO library_content \
          (url, origin, book_url, title, content, chapter_index, resource_url, is_local, \
           content_type, images, size_bytes, cache_version, updated_at, accessed_at) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now')) \
          ON CONFLICT(url, origin) DO UPDATE SET \
           book_url=CASE WHEN excluded.book_url <> '' THEN excluded.book_url \
-                        ELSE book_content.book_url END, \
+                        ELSE library_content.book_url END, \
           title=excluded.title, content=excluded.content, \
           chapter_index=excluded.chapter_index, resource_url=excluded.resource_url, \
           is_local=excluded.is_local, content_type=excluded.content_type, \
@@ -434,100 +642,35 @@ pub(crate) async fn upsert_content(pool: &SqlitePool, c: &BookContent) -> anyhow
     .bind(&c.images_json)
     .bind(size)
     .bind(content_cache_version())
-    .execute(pool)
+    .execute(lib)
     .await?;
     // 正文字数回填到目录行（未知时保持 0）；SQLite TEXT 的 length() 按字符计数。
     let chars = c.content.as_deref().unwrap_or("").trim().chars().count() as i64;
     let _ = sqlx::query(
-        "UPDATE book_chapters SET word_count = ?2 \
+        "UPDATE library_chapters SET word_count = ?2 \
          WHERE url = ?1 AND (?3 = '' OR book_url = ?3)",
     )
     .bind(&c.url)
     .bind(chars)
     .bind(&c.book_url)
-    .execute(pool)
+    .execute(lib)
     .await;
+    if !c.book_url.trim().is_empty() {
+        library::ensure_book(lib, &c.book_url).await.ok();
+        library::refresh_rollup(lib, &c.book_url).await.ok();
+    }
     Ok(())
 }
 
-/// 当前账号生效的正文缓存上限（字节）：用户设置与部署上限取较小值。
-///
-/// 所有写入/清理路径都从这里取上限，避免 `min(user, cfg)` 在多处各写一遍后走样。
-pub(crate) async fn content_cache_limit_bytes(pool: &SqlitePool, cfg_limit: i64) -> i64 {
-    match crate::routes::replace::user_cache_limit_mb(pool).await {
-        Some(mb) => (mb * 1024 * 1024).min(cfg_limit),
-        None => cfg_limit,
-    }
-}
-
-/// 每批淘汰的行数：`DELETE ... LIMIT 16`。
-const EVICT_BATCH: usize = 16;
-/// 写入路径的淘汰轮数：新章节落库只需把总量压回上限附近。
-pub(crate) const EVICT_ROUNDS_WRITE: usize = 8;
-/// 手动「清理到上限」的轮数：足够一次清完历史积压，又不至于长时间占住连接。
-pub(crate) const EVICT_ROUNDS_TRIM: usize = 1024;
-
-/// 按 LRU 淘汰到 `limit_bytes` 以内：每轮删最久未读的 16 行，最多 `max_rounds` 轮。
-///
-/// 写入路径（新章节落库后）与「清理到上限」共用同一策略，返回删除行数。
-pub(crate) async fn evict_content_to_limit(
-    pool: &SqlitePool,
-    limit_bytes: i64,
-    max_rounds: usize,
-) -> anyhow::Result<u64> {
-    let mut deleted_total = 0u64;
-    for _ in 0..max_rounds {
-        let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM book_content")
-            .fetch_one(pool)
-            .await?;
-        if total <= limit_bytes {
-            break;
-        }
-        let deleted = sqlx::query(
-            "DELETE FROM book_content WHERE rowid IN \
-             (SELECT rowid FROM book_content ORDER BY accessed_at ASC, rowid ASC LIMIT ?1)",
-        )
-        .bind(EVICT_BATCH as i64)
-        .execute(pool)
-        .await?
-        .rows_affected();
-        if deleted == 0 {
-            break;
-        }
-        deleted_total += deleted;
-        crate::cache_metrics::record_eviction(deleted);
-        tracing::info!(total, limit = limit_bytes, deleted, "content cache evicted");
-    }
-    if deleted_total > 0 {
-        // 增量归还有界空间（256 页 ≈ 1 MiB），避免文件只涨不落；非增量库为空操作。
-        let _ = crate::db::reclaim_pages(pool, 256).await;
-    }
-    Ok(deleted_total)
-}
-
-/// 正文落库 + 总量上限淘汰：超过 `limit_bytes` 时按 accessed_at 升序删除最久未读章节。
-pub(crate) async fn save_content_cached(
-    pool: &SqlitePool,
-    c: &BookContent,
-    limit_bytes: i64,
-) -> anyhow::Result<()> {
+/// 正文落库（馆藏不设容量上限，只做 TTL 回收，所以这里不做淘汰）。
+pub(crate) async fn save_content_cached(lib: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
     // 空正文不落库：源站临时占位/规则失效时抓到的空结果只影响本次请求，
     // 后续重试与换源不会被这份空缓存挡住。
     if content_is_empty(c) {
         tracing::debug!(url = c.url.as_str(), "skip caching empty chapter content");
         return Ok(());
     }
-    upsert_content(pool, c).await?;
+    upsert_content(lib, c).await?;
     crate::cache_metrics::record_save();
-    evict_content_to_limit(pool, limit_bytes, EVICT_ROUNDS_WRITE).await?;
     Ok(())
-}
-
-/// 取书籍名称（用于替换规则的 scope 匹配）
-pub(super) async fn book_name_of(pool: &SqlitePool, book_url: &str) -> anyhow::Result<String> {
-    let name: Option<String> = sqlx::query_scalar("SELECT name FROM book_meta WHERE book_url = ?")
-        .bind(book_url)
-        .fetch_optional(pool)
-        .await?;
-    Ok(name.unwrap_or_default())
 }

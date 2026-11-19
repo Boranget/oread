@@ -404,7 +404,7 @@ export const api = {
         use_replace: useReplace === null || useReplace === undefined ? undefined : useReplace ? '1' : '0',
       })}`
     ),
-  // 正文：正常总带 book_url（书名圈定的替换规则才生效）；后端按 缓存 → 参数 → book_chapters 三级回填，
+  // 正文：正常总带 book_url（书名圈定的替换规则才生效）；后端按 缓存 → 参数 → library_chapters 三级回填，
   // 拿不到才回 400 {"error":"missing_book_url"}
   // useReplace: true/false 显式覆盖账号的替换规则开关；null/undefined 沿用账号设置
   content: (source, chapterUrl, bookUrl = '', title = '', useReplace = null) =>
@@ -531,6 +531,33 @@ export const api = {
   // ---- stats ----
   recordReading: (p, keepalive = false) => request('POST', '/stats/reading', p, { keepalive }),
   statsOverview: (days = 7) => request('GET', `/stats/overview?${buildQuery({ days })}`),
-  // /api/healthz：进程指标 + 当前用户正文缓存用量（只读）
+  // /api/healthz：进程指标 + 馆藏/临时缓存占用（只读）
   healthz: () => request('GET', '/healthz'),
+
+  // ---- library（馆藏：全局共享内容层）----
+  libraryStats: () => request('GET', '/library/stats'),
+  // tier=collection|temp|all；cursor 为 keyset 游标（原样回传 next_cursor）
+  libraryBooks: (opts = {}) =>
+    request(
+      'GET',
+      `/library/books?${buildQuery({
+        tier: opts.tier,
+        sort: opts.sort,
+        q: opts.q,
+        cursor: opts.cursor,
+        limit: opts.limit,
+      })}`
+    ),
+  // 入馆（管理员）：置为永久保存并排队后台整本下载
+  libraryCollect: (bookUrl, source = '') =>
+    request('POST', '/library/collect', { book_url: bookUrl, ...(source ? { source } : {}) }),
+  // 移出馆藏（管理员）：降级为临时缓存
+  libraryRelease: (bookUrl) => request('POST', '/library/release', { book_url: bookUrl }),
+  // 整本删除（管理员）：馆藏需先移出
+  libraryDelete: (bookUrl) => request('POST', '/library/delete', { book_url: bookUrl }),
+  // 立即回收过期临时缓存（管理员）
+  libraryCleanTemp: () => request('POST', '/library/temp/clean'),
+  libraryJobs: (opts = {}) =>
+    request('GET', `/library/jobs?${buildQuery({ status: opts.status, limit: opts.limit })}`),
+  libraryJobCancel: (id) => request('POST', '/library/jobs/cancel', { id }),
 };

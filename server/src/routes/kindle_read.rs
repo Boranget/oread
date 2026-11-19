@@ -32,7 +32,7 @@ pub(super) async fn read(
     }
 
     let mut c: BookContent = match load_cached_content(
-        &db.0,
+        &s.library,
         &chapter.url,
         &source.book_source_url,
         s.cfg.content_ttl_secs,
@@ -46,8 +46,7 @@ pub(super) async fn read(
                 Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
             };
             fetched.origin = source.book_source_url.clone();
-            let limit = content_cache_limit_bytes(&db.0, s.cfg.cache_limit_bytes()).await;
-            let _ = save_content_cached(&db.0, &fetched, limit).await;
+            let _ = save_content_cached(&s.library, &fetched).await;
             fetched
         }
     };
@@ -58,7 +57,7 @@ pub(super) async fn read(
         c.title = chapter.title.clone();
     }
     // 与主站一致：正文输出前应用用户替换规则
-    let book_name = load_book_meta(&db.0, &q.book)
+    let book_name = load_book_meta(&s.library, &db.0, &q.book)
         .await
         .ok()
         .flatten()

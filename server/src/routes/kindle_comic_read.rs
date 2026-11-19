@@ -109,7 +109,7 @@ pub(super) async fn comic_read(
         .clone()
         .unwrap_or_else(|| format!("第 {} 章", ch + 1));
     // 与小说页同一套顶栏：书名优先，取不到回落章节名
-    let book_name = load_book_meta(pool, &q.book)
+    let book_name = load_book_meta(&s.library, pool, &q.book)
         .await
         .ok()
         .flatten()

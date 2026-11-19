@@ -451,7 +451,7 @@
     showToc = false;
     suppressScroll = true;
     restored = false;
-    // book_url 三级回填（缓存 → 请求参数 → book_chapters 反查）由后端负责，
+    // book_url 三级回填（缓存 → 请求参数 → library_chapters 反查）由后端负责，
     // 本地没地址也照发，不硬停；后端仍判 missing_book_url 时才用本地地址重试一次。
     const contentBookUrl = book.bookUrl || (info && info.book_url) || '';
     try {

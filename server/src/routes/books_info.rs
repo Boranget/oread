@@ -61,8 +61,8 @@ pub(super) async fn book_info(
         cover_url: q.cover_url.clone().filter(|s| !s.trim().is_empty()),
         ..Default::default()
     };
-    // 已有 book_meta（书架/上次详情）里的字段也作为兜底，规则为空时不丢
-    if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
+    // 已有书目（馆藏源字段 + 用户覆盖）里的字段也作为兜底，规则为空时不丢
+    if let Some(m) = load_book_meta(&s.library, &db.0, &q.book_url).await? {
         book.name = book.name.or(m.name);
         book.author = book.author.or(m.author);
         book.intro = book.intro.or(m.intro);
@@ -79,11 +79,11 @@ pub(super) async fn book_info(
     let store = book_store_for(&db.0, &key).await;
     web_book::book_info_book(s.fetcher.as_ref(), &source, &mut book, Some(&store)).await?;
     persist_book_changes(&db.0, store.take_changes()).await;
-    save_book_meta(&db.0, &book).await?;
+    save_book_meta(&s.library, &db.0, &book).await?;
     Ok(Json(book))
 }
 
-/// 目录：优先命中 `book_chapters` 的 TTL 缓存；过期或缺失时抓取并整本替换缓存。
+/// 目录：优先命中 `library_chapters` 的 TTL 缓存；过期或缺失时抓取并整本替换缓存。
 /// `use_replace` 与 `/api/book/content` 同名：显式开关覆盖账号设置，缺省沿用
 /// `use_replace_rule`；净化只作用于返回标题，缓存保留原文。
 pub(super) async fn toc(
@@ -94,11 +94,11 @@ pub(super) async fn toc(
 ) -> AppResult<Json<Vec<BookChapter>>> {
     let use_replace = resolve_use_replace(q.use_replace.as_deref(), &db.0).await;
     let mut chapters = if let Some(chaps) =
-        load_cached_chapters(&db.0, &q.book_url, s.cfg.toc_ttl_secs).await?
+        load_cached_chapters(&s.library, &q.book_url, s.cfg.toc_ttl_secs).await?
     {
         // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
         // 不必等缓存过期重抓。
-        let _ = sync_total_chapter_num(&db.0, &q.book_url, chaps.len() as i64).await;
+        let _ = sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64).await;
         chaps
     } else {
         let source = load_source(&s.shared, &q.source).await?;
@@ -106,7 +106,7 @@ pub(super) async fn toc(
             book_url: q.book_url.clone(),
             ..Default::default()
         };
-        if let Some(m) = load_book_meta(&db.0, &q.book_url).await? {
+        if let Some(m) = load_book_meta(&s.library, &db.0, &q.book_url).await? {
             book.toc_url = m.toc_url;
         }
         let key = web_book::book_key(&source, &book.book_url);
@@ -114,17 +114,19 @@ pub(super) async fn toc(
         let chapters =
             web_book::chapter_list_book(s.fetcher.as_ref(), &source, &book, Some(&store)).await?;
         persist_book_changes(&db.0, store.take_changes()).await;
-        save_chapters(&db.0, &q.book_url, &chapters).await?;
+        save_chapters(&s.library, &q.book_url, &chapters).await?;
         // 目录落库时同步总章节数，供进度百分比与书架完成度使用
-        sync_total_chapter_num(&db.0, &q.book_url, chapters.len() as i64).await?;
+        sync_total_chapter_num(&s.library, &db.0, &q.book_url, chapters.len() as i64).await?;
         // 记录目录总数变化（首次建基线不出角标）
         crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64).await;
         // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-        let _ = backfill_word_counts(&db.0, &q.book_url).await;
+        let _ = backfill_word_counts(&s.library, &q.book_url).await;
         chapters
     };
     if use_replace && !chapters.is_empty() {
-        let book_name = book_name_of(&db.0, &q.book_url).await.unwrap_or_default();
+        let book_name = book_name_of(&s.library, &q.book_url)
+            .await
+            .unwrap_or_default();
         let mut cleaned: Vec<String> = chapters
             .iter()
             .map(|c| c.title.clone().unwrap_or_default())
@@ -156,43 +158,6 @@ pub(crate) fn enrich_volumes(chapters: &mut [BookChapter]) {
             c.volume_title = current.clone();
         }
     }
-}
-
-/// 回写总章节数。只在 total > 0 时写，避免空目录把已有值清零；
-/// upsert 用 `book_meta` 自身值兜底，凡是详情/书架等路径都不可能再把它降成 0。
-pub(super) async fn sync_total_chapter_num(
-    pool: &SqlitePool,
-    book_url: &str,
-    total: i64,
-) -> anyhow::Result<()> {
-    if total <= 0 {
-        return Ok(());
-    }
-    sqlx::query(
-        "INSERT INTO book_meta (book_url, total_chapter_num) VALUES (?1, ?2) \
-         ON CONFLICT(book_url) DO UPDATE SET total_chapter_num = excluded.total_chapter_num",
-    )
-    .bind(book_url)
-    .bind(total)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 目录写入后，用已缓存正文的长度回填章节字数（SQLite `length()` 对 TEXT 按字符计数）。
-pub(super) async fn backfill_word_counts(pool: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE book_chapters SET word_count = COALESCE((\
-           SELECT length(trim(content)) FROM book_content \
-           WHERE book_content.url = book_chapters.url \
-             AND book_content.book_url = book_chapters.book_url \
-             AND content IS NOT NULL\
-         ), 0) WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 // ---------------- 批量刷新目录 ----------------
@@ -285,13 +250,15 @@ pub(super) async fn toc_batch(
     }
 
     let pool = db.0.clone();
+    let lib = s.library.clone();
     let shared = s.shared.clone();
     let done: Vec<TocBatchOutcome> = stream::iter(urls.into_iter().map(|book_url| {
         let pool = pool.clone();
+        let lib = lib.clone();
         let shared = shared.clone();
         let source_override = source_override.clone();
         async move {
-            let meta = match load_book_meta(&pool, &book_url).await {
+            let meta = match load_book_meta(&lib, &pool, &book_url).await {
                 Ok(m) => m,
                 Err(e) => {
                     return TocBatchOutcome {
@@ -377,21 +344,21 @@ pub(super) async fn toc_batch(
             }
             // 保存前记录旧目录，用于计算新增/删除章节（总数变化之外的可核对增量）
             let before_total: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url = ?1")
+                sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
                     .bind(&book_url)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&lib)
                     .await
                     .unwrap_or(None)
                     .unwrap_or(0);
             let old_urls: HashSet<String> =
-                sqlx::query_scalar("SELECT url FROM book_chapters WHERE book_url = ?1")
+                sqlx::query_scalar("SELECT url FROM library_chapters WHERE book_url = ?1")
                     .bind(&book_url)
-                    .fetch_all(&pool)
+                    .fetch_all(&lib)
                     .await
                     .unwrap_or_default()
                     .into_iter()
                     .collect();
-            if let Err(e) = save_chapters(&pool, &book_url, &chapters).await {
+            if let Err(e) = save_chapters(&lib, &book_url, &chapters).await {
                 return TocBatchOutcome {
                     book_url,
                     status: "failed",
@@ -401,8 +368,8 @@ pub(super) async fn toc_batch(
                     ..Default::default()
                 };
             }
-            let _ = sync_total_chapter_num(&pool, &book_url, chapters.len() as i64).await;
-            let _ = backfill_word_counts(&pool, &book_url).await;
+            let _ = sync_total_chapter_num(&lib, &pool, &book_url, chapters.len() as i64).await;
+            let _ = backfill_word_counts(&lib, &book_url).await;
             let after_total = chapters.len() as i64;
             let new_urls: HashSet<&str> = chapters.iter().map(|c| c.url.as_str()).collect();
             let added = new_urls.iter().filter(|u| !old_urls.contains(**u)).count() as i64;

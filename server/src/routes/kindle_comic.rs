@@ -154,16 +154,16 @@ pub(super) fn comic_stage(
     )
 }
 
-/// 取本章图片：先读 `book_content.images` 缓存，未命中回源并按 `/api/comic/chapter` 同规则回写。
+/// 取本章图片：先读 `library_content.images` 缓存，未命中回源并按 `/api/comic/chapter` 同规则回写。
 pub(super) async fn load_comic_images(
     s: &AppState,
-    pool: &SqlitePool,
+    _pool: &SqlitePool,
     source: &BookSource,
     chapter: &BookChapter,
     book_url: &str,
 ) -> Result<Vec<BookImage>, String> {
     if let Ok(Some(c)) = crate::routes::comic::load_cached_images(
-        pool,
+        &s.library,
         &chapter.url,
         &source.book_source_url,
         s.cfg.content_ttl_secs,
@@ -200,8 +200,7 @@ pub(super) async fn load_comic_images(
         images_json: Some(payload),
         ..Default::default()
     };
-    let limit = content_cache_limit_bytes(pool, s.cfg.cache_limit_bytes()).await;
-    if let Err(e) = save_content_cached(pool, &c, limit).await {
+    if let Err(e) = save_content_cached(&s.library, &c).await {
         tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
     }
     Ok(images)

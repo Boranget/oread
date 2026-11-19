@@ -160,9 +160,9 @@
 |---|---|---|
 | 1 | 书架列表 500：无进度记录时 `COALESCE(rp.position,0)` 返回 INTEGER，sqlx 按 f64 解码报 `mismatched types` | 列表 SQL 改为 `CAST(COALESCE(rp.position,0) AS REAL)`，并抽出 `progress_percent()` 统一口径（[bookshelf.rs](../server/src/routes/bookshelf.rs#L76-L95)、[bookshelf.rs](../server/src/routes/bookshelf.rs#L336-L349)） |
 | 2 | `nextTocUrl` 返回字面量 `"null"`，被当 URL 拼成 `/toc/null` 并反复追加目录 | 新增 `blank_value()` 拦截 `""` / `"null"` / `"None"` / `"undefined"`，命中即停止翻页（[web_book.rs](../server/src/web_book.rs#L38-L42)） |
-| 3 | 设置接口零校验：`/api/settings` 任意键任意值直接入库 | `validate_settings()`：`theme` ∈ light/dark/sepia、字号 12–30、行距 1.2–2.6、`image_style` 0–3、`cache_limit_mb` 4–512，越界 400（[replace.rs](../server/src/routes/replace.rs#L171-L215)） |
+| 3 | 设置接口零校验：`/api/settings` 任意键任意值直接入库 | `validate_settings()`：`theme` ∈ light/dark/sepia、字号 12–30、行距 1.2–2.6、`image_style` 0–3，越界 400（[replace.rs](../server/src/routes/replace.rs#L171-L215)） |
 | 4 | 进度读回丢 `total_chapters` / `percent`：GET 只回 `chapter_index` 与 `position` | 补 `total_chapters`（`book_meta` → `book_stats` 回退）与 `percent`（含章内比例）（[bookshelf.rs](../server/src/routes/bookshelf.rs#L362-L406)） |
-| 5 | 替换规则按书名失效 / `book_url` 为空：正文接口只带 `chapter_url` 时书名作用域匹配不到 | `book_url` 三级回填（缓存 → 请求参数 → `book_chapters` 反查），`title` 同链路；仍空则 400 `missing_book_url`（[books.rs](../server/src/routes/books.rs#L306-L342)） |
+| 5 | 替换规则按书名失效 / `book_url` 为空：正文接口只带 `chapter_url` 时书名作用域匹配不到 | `book_url` 三级回填（缓存 → 请求参数 → `library_chapters` 反查），`title` 同链路；仍空则 400 `missing_book_url`（[books.rs](../server/src/routes/books.rs#L306-L342)） |
 | 6 | `@js:` 规则递归爆栈：JS 段递归/死循环无上限，单条规则可打穿请求线程 | boa 运行时设 `recursion_limit=100`、`loop_iteration_limit=500_000`、`stack_size_limit=512`（KB）（[rule_engine.rs](../server/src/rule_engine.rs#L26-L53)） |
 | 7 | 初始选择器不支持 `tag.a`：`tag.` 前缀被当普通 CSS 标签，选不到元素 | 识别 `tag.` 前缀并按标签名选择（[rule_engine.rs](../server/src/rule_engine.rs#L345-L390)） |
 | 8 | B1：相对 `searchUrl` 未归并，`/search?q=` 这类地址直接请求失败 | 统一用 `resolve_url(base, maybe)` 归并为绝对 URL（[web_book.rs](../server/src/web_book.rs#L44-L52)） |
@@ -237,7 +237,7 @@
 - 状态：`待确认`
 - 现象：目录缓存按 `book_url`、正文缓存按 `chapter_url`，都不带 `source`（[books.rs](../server/src/routes/books.rs#L272-L339)）。
 - 影响：两个书源共用同一 URL（镜像站/同源转发）时会串目录/正文；换源后旧缓存也不会主动清理。
-- 建议：缓存键加 `origin`，或在换源成功时清理该书的 `book_chapters/book_content`。
+- 建议：缓存键加 `origin`，或在换源成功时清理该书的 `library_chapters/library_content`。
 - 为什么：影响面取决于书源生态，但一旦踩中就是“换源后内容还是旧的”，很难排查。
 
 ### 3.10 P3：`GET /api/bookshelf` 的 `book_id` 参数被忽略
@@ -266,12 +266,11 @@
 | 聚合搜索分页语义错误 | `已完成待验证` | `/api/search` 与 `/api/search/aggregate` 共用 `aggregated()`：各源只抓第 1 页、去重截断 400、60s 缓存、本地切片（[books.rs](../server/src/routes/books.rs#L103-L205)） | 同一 `key` 连续翻 1/2/3 页无重复、无缺书；`total` 与实际可翻条数一致 |
 | `bookshelf` 缺 `group` 字段与“移入分组”接口 | `已完成待验证` | 迁移已加 `"group"`；`POST /api/bookshelf/group` 支持 `book_id`/`book_ids`，空 group 移出（[bookshelf.rs](../server/src/routes/bookshelf.rs#L18-L24)、[bookshelf.rs](../server/src/routes/bookshelf.rs#L157-L186)） | 单本/批量移入、移出、书架列表分组筛选；`book_meta.group` 同步 |
 | 阅读统计表已建但无路由 | `已完成待验证` | `/api/stats/reading`、`/api/stats/overview` 已实现并注册（[stats.rs](../server/src/routes/stats.rs)、[mod.rs](../server/src/routes/mod.rs)） | 上报后 `reading_stats` 累加、`book_stats.read_chapters` 取最大值、streak 跨天逻辑；前端接入见 3.4 |
-| `cache_limit_mb` 未按用户生效 | `已完成待验证` | `GET /api/book/content` 保存新缓存时用 `user_cache_limit_mb` 与全局上限取 min（[books.rs](../server/src/routes/books.rs#L312-L317)、[replace.rs](../server/src/routes/replace.rs#L218-L228)） | 改小上限后新缓存是否按新值淘汰；已有缓存不会回溯淘汰（见下方“剩余缺口”） |
 | `image_style` 未处理图片 | `已完成待验证` | 后端 `apply_image_style` 已按 0/1/2/3 改写或删除 `<img>`（[replace.rs](../server/src/routes/replace.rs#L241-L274)） | 需前端实际渲染图片才能看到效果，见 3.8 |
 | `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/pages/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
 | 构建脚本硬编码旧路径 | `已完成待验证` | 两个脚本都以 `$PSScriptRoot` 推导仓库根，并通过 `CARGO_TARGET_DIR` 输出（[build-dev.ps1](../scripts/build-dev.ps1#L28-L45)、[build-release.ps1](../scripts/build-release.ps1#L33-L45)） | 在仓库根与任意工作目录调用都应成功；当前脚本变量为 `OREAD_TARGET_WIN`/`OREAD_TARGET_MUSL`，工程侧改名后为 `BORANLIB_TARGET_*`（本文以现名为准） |
 
-缓存管理已闭环：`POST /api/book/cache/clear` 支持单书/全库，`POST /api/book/cache/trim` 按 LRU 立即清理到生效上限（与写入路径共用同一淘汰函数）；设置页「书籍缓存」卡片展示占用/上限/比例、按书 Top5，并提供「清理到上限」（[health.rs](../server/src/routes/health.rs)、[books_content.rs](../server/src/routes/books_content.rs)、[Settings.svelte](../server/web/src/pages/Settings.svelte)）。
+缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。
 
 ### 3.13 KPW3 真机约束：`/k` 与漫画阅读器必须遵守红线
 
@@ -339,7 +338,7 @@
 | 5 | CI（`cargo check` / `cargo test`） | `已完成待验证` | 已有 `.github/workflows/ci.yml`，在 `server` 下跑 `cargo check --all-targets` 与 `cargo test`（[ci.yml](../.github/workflows/ci.yml)） | 防止跨 agent 改动把主干编译搞坏；当前缺少前端构建与接口冒烟测试，可后续追加 |
 | 6 | 资源监控（RSS / 写入量） | `待做` | `/api/healthz` 公开、`/healthz/user` 需登录且带缓存统计（[health.rs](../server/src/routes/health.rs)），但没有进程级 RSS、磁盘写入、请求耗时的持续采集 | 设备内存有限，SQLite WAL + 正文缓存会持续增长；有指标才能定位“越跑越卡” |
 | 7 | eMMC 写入量长期观察 | `待做` | 设备侧指标，仓库内无采集代码 | WAL + 频繁 progress upsert 会放大写入；长期观察可决定是否降低 checkpoint 频率或合并进度写入 |
-| 8 | 目录/正文缓存的可观测性 | `待做` | 仅有 `healthz_user` 的 `cache{bytes,mb,rows}`；缺少命中率、淘汰次数、按书占用 | 调 `CONTENT_TTL_SECS`/`cache_limit_mb` 时需要数据支撑，否则只能拍脑袋 |
+| 8 | 馆藏/临时缓存的可观测性 | `部分完成` | `/api/healthz` 已暴露 `cache{bytes,rows,collection,temp,books_total,books[]}`，`/api/library/stats` 暴露分层占用、过期本数与磁盘水位；命中率/淘汰次数仍只有进程内 `cache_metrics` | 调 `CONTENT_TTL_SECS`/`LIBRARY_TEMP_TTL_DAYS` 时需要数据支撑；下一步可把命中率与后台下载吞吐接入 `/api/library/stats` |
 
 ---
 

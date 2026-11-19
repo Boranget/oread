@@ -10,6 +10,7 @@ pub(crate) fn db_path_of(cfg: &Config, scope: Scope) -> PathBuf {
     match scope {
         Scope::Shared => data_dir(cfg).join("shared.db"),
         Scope::User(uid) => data_dir(cfg).join("users").join(format!("{uid}.db")),
+        Scope::Library => data_dir(cfg).join("library.db"),
     }
 }
 
@@ -17,6 +18,7 @@ pub(crate) fn db_file_name(scope: Scope) -> String {
     match scope {
         Scope::Shared => "shared.db".to_string(),
         Scope::User(uid) => format!("users/{uid}.db"),
+        Scope::Library => "library.db".to_string(),
     }
 }
 

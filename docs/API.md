@@ -73,7 +73,7 @@
 | 分卷行 URL `volume:<book_url>#<index>` 禁止抓正文 | 6.2、6.4 | 仅单测（URL 生成）；**无 HTTP 证据** |
 | 新增书签 `GET/POST /api/bookmarks`、`DELETE /api/bookmarks/delete` | 6.6 | **已验证**（回归 6/6：字段、`position` 0/1 放行与 1.5/-0.1 400、2001 字 400、按书 3 条、`deleted=1`、`id=0` 400） |
 | 新增 `GET /api/book/search` | 6.7 | **已验证**（回归 6/6：命中 2 章、`complete` 两种状态、参数校验、`limit` clamp）；**504 未触发** |
-| 新增 `POST /api/book/cache-all` | 6.8 | **已验证**（回归 4/4：逐章失败隔离、`limited` 截断、无目录/空 url 400）；`skipped_budget` 未单独验证 |
+| 新增 `POST /api/book/cache-all` | 6.8 | **已验证**（回归 4/4：逐章失败隔离、`limited` 截断、无目录/空 url 400） |
 | 新增 `POST /api/book/cache/clear` | 6.9 | **已验证**（回归 4/4：按书 `deleted>=3`、用户级 `scope=user` + `bytes_freed`） |
 | 新增 `POST /api/bookshelf/batch` | 7.11 | **已验证**（回归 4/4：`set_group updated=2 failed=1`、`remove_group`/`remove`、非法 action/空 ids 400） |
 | 设置新增 `page_width`/`font_family`，并改为全字段校验 | 9.1、9.2 | **已验证**（回归 4/4：默认值、`640/mono` 写入读回、300/2100/`comic` 400 不覆盖、320/2000 与枚举） |
@@ -84,7 +84,7 @@
 |---|---|---|
 | 书签 GET/POST/过滤/DELETE | 6/6：完整字段、`position=0/1` 放行、`1.5/-0.1` 400、2001 字/空 `book_id`/负章节 400、按书 3 条、`deleted=1`、`id=0` 400 | 同章多条（无唯一约束） |
 | `GET /api/book/search` | 6/6：4 章缓存 3 章、命中 2 章、`complete=false/true` 两态、空 `q`/201 字 400、`limit=999`→50 | **超时 504 未触发**（实测 200 / 1 ms） |
-| `POST /api/book/cache-all` | 4/4：`limited=true attempted=2 cached=2`、逐章失败隔离（`cached=3 failed=1`）、无目录/空 `book_url` 400 | `skipped_budget` 预算跳过未单独验证 |
+| `POST /api/book/cache-all` | 4/4：`limited=true attempted=2 cached=2`、逐章失败隔离（`cached=3 failed=1`）、无目录/空 `book_url` 400 | — |
 | `POST /api/book/cache/clear` | 4/4：按书 `deleted>=3`、用户级 `scope=user` + `bytes_freed` | — |
 | 规则包 export/import/preview | 8/8：非空导出（camelCase、无本地 id）、`?id` 单条/404、`inserted=1` 可回读、坏正则 200+`invalid_regex`、私网 400、非法结构 400 | 5 MiB / 15 s 预算分支 |
 | `POST /api/sources/check-updates` | 4/4：四类差异各 1（`updated=1 local_newer=1 same=1 new=1`）、只读、空数组 | — |
@@ -244,7 +244,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 目录落库写入 `"index"` 列（[books.rs](../server/src/routes/books.rs#L421-L455)）。
 - 进度默认值 0，`set_progress` 用 `chapter_index.max(0)`（[bookshelf.rs](../server/src/routes/bookshelf.rs#L371-L374)）。
 - 单本统计 `read_chapters = chapter_index + 1`，说明 `chapter_index` 是下标（[bookshelf.rs](../server/src/routes/bookshelf.rs#L412)，[stats.rs](../server/src/routes/stats.rs#L98)）。
-- 返回的 `BookChapter` 中唯一的 id 是 `url`（`book_chapters.url` 主键）；没有数值章节 id。
+- 返回的 `BookChapter` 中唯一的 id 是 `url`（`library_chapters` 联合主键的一部分）；没有数值章节 id。
 
 前端必须遵守：
 
@@ -288,7 +288,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 | 字段 | 存储/返回格式 | 时区 | 依据 |
 |---|---|---|---|
-| `bookshelf.added_at`、`reading_progress.updated_at`、`book_stats.last_read_at`、`book_content.updated_at/accessed_at` | `"YYYY-MM-DD HH:MM:SS"`（无时区后缀） | SQLite `datetime('now')` = **UTC** | 迁移默认值 + 各 SQL |
+| `bookshelf.added_at`、`reading_progress.updated_at`、`book_stats.last_read_at`、`library_content.updated_at/accessed_at` | `"YYYY-MM-DD HH:MM:SS"`（无时区后缀） | SQLite `datetime('now')` = **UTC** | 迁移默认值 + 各 SQL |
 | `reading_stats.day`、`reading_streak.last_day`、统计接口的 `day` | `"YYYY-MM-DD"` | **服务器本地日期**（`chrono::Local` / `date('now','localtime')`） | [stats.rs](../server/src/routes/stats.rs#L44-L50)，[bookshelf.rs](../server/src/routes/bookshelf.rs#L199-L210) |
 | `reading_streak` 对外字段 | 整数天数（`streak_days`/`longest_streak_days`） | — | 同上 |
 | JWT `exp` | Unix 秒 | UTC | [auth.rs](../server/src/auth.rs#L121-L134) |
@@ -1458,7 +1458,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ## 6. 书籍与正文
 
-> 6.1~6.9 依赖用户库（`users/{uid}.db`）：`book_meta`、`book_chapters`、`book_content`、`bookmarks`、`user_settings`。其中抓取类接口（详情/目录/目录批量/正文/整本缓存）的失败统一映射为 `400 {"error":"internal: ..."}`（`anyhow` → `AppError::BadRequest`，见 [error.rs](../server/src/error.rs#L61-L65)），不是 502/504；唯一例外是 6.7 书内搜索超过 5s 返回 `504`。
+> 6.1~6.9 的内容层在馆藏库（`library.db`）：`library_books`、`library_chapters`、`library_content`；个人状态（`bookmarks`、`user_settings`、书架、进度、书源登录态）仍在用户库（`users/{uid}.db`）。其中抓取类接口（详情/目录/目录批量/正文/整本缓存）的失败统一映射为 `400 {"error":"internal: ..."}`（`anyhow` → `AppError::BadRequest`，见 [error.rs](../server/src/error.rs#L61-L65)），不是 502/504；唯一例外是 6.7 书内搜索超过 5s 返回 `504`。
 
 ### 6.1 `GET /api/book/info`
 
@@ -1622,10 +1622,10 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：缺参 → 400 纯文本；`404 source not found`（仅缓存未命中时才会加载书源）；`400 internal: ...`（目录抓取/解析失败）；`401`。
 - 行为：
-  - **缓存优先**：只要该 `book_url` 在 `book_chapters` 中有任意一行 `updated_at >= now - TOC_TTL_SECS`，就直接返回全部缓存行，**不再访问网络，也忽略 `source` 参数**（[books.rs](../server/src/routes/books.rs#L238-L259)、[books.rs](../server/src/routes/books.rs#L393-L418)）。
+  - **缓存优先**：只要该 `book_url` 在 `library_chapters` 中有任意一行 `updated_at >= now - TOC_TTL_SECS`，就直接返回全部缓存行，**不再访问网络，也忽略 `source` 参数**（[books.rs](../server/src/routes/books.rs#L238-L259)、[books.rs](../server/src/routes/books.rs#L393-L418)）。
   - TTL 来自 `BORANLIB_TOC_TTL_SECS`（兼容旧前缀 `LEGADO_TOC_TTL_SECS`），默认 21600 秒（6 小时），启动时钳制到 60..604800（[config.rs](../server/src/config.rs#L40-L62)）。
-  - 未命中：读取 `book_meta.toc_url`（若有）作为目录页，解析 `ruleToc`；支持 `nextTocUrl`，最多 10 页。
-  - 落库策略：先 `DELETE FROM book_chapters WHERE book_url=?` 再逐条插入（整本替换）。若解析结果为 0 章，会保存 0 行，下次仍会重新抓取。
+  - 未命中：读取 `library_books.toc_url`（若有）作为目录页，解析 `ruleToc`；支持 `nextTocUrl`，最多 10 页。
+  - 落库策略：先 `DELETE FROM library_chapters WHERE book_url=?` 再逐条插入（整本替换）。若解析结果为 0 章，会保存 0 行，下次仍会重新抓取。
   - **缓存按 `book_url` 而非 `source` 或 `origin`**：换源后同一 `book_url` 会返回旧源目录；不同书源的同名 URL 也会串数据。见 TODO。
   - `chapter_index` 使用返回数组下标（`index`），见 2.2。
   - **新字段来源**：`is_volume` / `is_vip` / `update_time` 由 `ruleToc.isVolume` / `isVip` / `updateTime` 解析；`update_time` 原样保存，**不保证是标准时间格式**，前端不要直接当时间戳解析。
@@ -1643,7 +1643,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `book_urls` | string[] | 是 | 书籍 URL 列表；也接受 Legado 风格的别名 `book_ids` |
-| `source` | string | 否 | 统一书源 ID；缺省时逐本读 `book_meta.origin` |
+| `source` | string | 否 | 统一书源 ID；缺省时逐本读 `library_books.origin` |
 
 示例（伪造值）：
 
@@ -1688,9 +1688,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 行为：
   - **并发 3**（`TOC_BATCH_CONCURRENCY = 3`）、单次最多 **100** 本（`TOC_BATCH_MAX = 100`）。
   - 输入逐项 `trim`；空串**静默忽略**；重复项不重复抓取，第二个及以后记 `status="skipped"`、`error="重复的 book_url"`。
-  - 每本的源：请求 `source` 非空时统一用它；否则读 `book_meta.origin`。两者都没有 → `skipped`（`缺少书源，且 book_meta 未记录 origin`）；源不存在 → `skipped`（`书源不存在：...`）。
+  - 每本的源：请求 `source` 非空时统一用它；否则读 `library_books.origin`。两者都没有 → `skipped`（`缺少书源，且 library_books 未记录 origin`）；源不存在 → `skipped`（`书源不存在：...`）。
   - 抓取目录失败 → `failed`（`抓取目录失败：...`）；目录为空 → `failed`（`目录为空`）；写库失败 → `failed`（`写入目录失败：...`）。
-  - 成功 → **整本替换** `book_chapters`（先删后插）、更新 `book_meta.total_chapter_num`、回填 `word_count`，状态 `updated`。
+  - 成功 → **整本替换** `library_chapters`（先删后插）、更新 `library_books.total_chapter_num`、回填 `word_count`，状态 `updated`。
   - **`results` 顺序不保证与输入一致**：重复项的 `skipped` 先写入结果，其余由 `buffer_unordered` 并发完成顺序决定。前端应按 `book_url` 对齐，不要按数组下标。
   - 与 6.2 不同，本接口**不读 TOC TTL**，总是重新抓取并覆盖缓存。
 
@@ -1712,7 +1712,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 |---|---|---|---|
 | `book_url` | string | 否 | 所属书籍 URL；**必定非空**（回填失败时整个请求返回 400） |
 | `url` | string | 否 | 章节 URL |
-| `title` | string | 是 | 章节标题；优先缓存值，其次请求参数 `title`，再按 `chapter_url` 反查 `book_chapters.title`；都拿不到才为 `null` |
+| `title` | string | 是 | 章节标题；优先缓存值，其次请求参数 `title`，再按 `chapter_url` 反查 `library_chapters.title`；都拿不到才为 `null` |
 | `content` | string | 是 | 正文（经用户替换规则 + 图片样式处理） |
 | `chapter_index` | integer | 否 | 章节下标；新抓取时恒 0（前端用目录数据补全） |
 | `resource_url` | string | 是 | 当前 null |
@@ -1734,18 +1734,17 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：缺参 → 400 纯文本；`404 source not found`（仅缓存未命中）；`400 internal: ...`；`401`；**`400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`**（见下）。
 - 行为：
-  - 缓存命中（`book_content.updated_at >= now - CONTENT_TTL_SECS`）直接返回，并更新 `accessed_at`（LRU 依据）。TTL 来自 `CONTENT_TTL_SECS`，默认 `604800` 秒（7 天），钳制 60..2592000。
-  - 缓存未命中：加载书源（不在缓存中的源 → 404）→ 仅用 `url` 构造 `BookChapter`，再按下面的回填链补齐 `book_url` / `title` → 抓取（[books.rs](../server/src/routes/books.rs#L263-L305)、[web_book.rs](../server/src/web_book.rs#L284-L292)）。
-  - **`book_url` 回填链**（依次尝试，任一命中即用）：① 缓存/抓取结果自带；② 请求参数 `book_url`；③ `SELECT book_url FROM book_chapters WHERE url = chapter_url`（章节表的主键就是书籍 URL。`book_meta` 有 `book_url` 列，但只对有元数据的书；缓存书走这里）。三步都为空 → 返回 `400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`，不再返回空 `book_url`。
-  - **`title` 回填链**：① 缓存/抓取结果；② 请求参数 `title`；③ 按 `chapter_url` 反查 `book_chapters.title`；都无则为 `null`。前端无需自行补 `book_url`，`title` 仅用于展示，缺失不影响正文。
+  - 缓存命中（`library_content.updated_at >= now - CONTENT_TTL_SECS`）直接返回，并刷新书目 `last_accessed_at`（临时层 TTL 依据）。TTL 来自 `CONTENT_TTL_SECS`，默认 `604800` 秒（7 天），钳制 60..2592000。
+  - 缓存未命中：加载书源（不在缓存中的源 → 404）→ 仅用 `url` 构造 `BookChapter`，再按下面的回填链补齐 `book_url` / `title` → 抓取。
+  - **`book_url` 回填链**（依次尝试，任一命中即用）：① 缓存/抓取结果自带；② 请求参数 `book_url`；③ `SELECT book_url FROM library_chapters WHERE url = chapter_url`；④ 馆藏书目里按章节反查。都为空 → 返回 `400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`，不再返回空 `book_url`。
+  - **`title` 回填链**：① 缓存/抓取结果；② 请求参数 `title`；③ 按 `chapter_url` 反查 `library_chapters.title`；都无则为 `null`。前端无需自行补 `book_url`，`title` 仅用于展示，缺失不影响正文。
   - 正文抓取支持 `nextContentUrl` 拼接（最多 10 页）；`sourceRegex` → `replaceRegex` 先源清洗后可读性替换。
   - **每次都执行用户替换规则**（包括缓存命中）：若 `use_replace_rule` 未关闭，按 `replace_rules.order,id` 应用；标题受 `scope_title` 控制，正文受 `scope_content` 控制；`scope`/`exclude_scope` 每行一个书名或书源域名，命中任一即生效（[replace.rs](../server/src/routes/replace.rs#L335-L359)）。
-  - 书名取自 `book_meta.name`，按回填后的 `book_url` 查；回填成功（即响应 `book_url` 非空）时书名作用域规则可正常匹配，回填失败已直接 400，不会带着空书名执行规则。
+  - 书名取自馆藏书目（`library_books.name`），读时用当前账号的 `book_meta` 覆盖；回填成功（即响应 `book_url` 非空）时书名作用域规则可正常匹配，回填失败已直接 400，不会带着空书名执行规则。
   - 随后按用户 `image_style` 改写 `<img>`：`0` 原样、`1` 追加 `max-width:100%;height:auto;`、`2` 追加 `display:block;margin:0 auto;`、`3` 删除图片标签（[replace.rs](../server/src/routes/replace.rs#L229-L255)）。
-  - 缓存上限：用户 `cache_limit_mb` 若存在且 >0，则 `min(用户值, 全局 CACHE_LIMIT_MB)`；否则用全局值。全局默认 50 MiB，钳制 4..512。
-  - 淘汰：插入后若 `SUM(size_bytes) > limit`，循环最多 8 轮，每轮按 `accessed_at ASC` 删 16 行（[books.rs](../server/src/routes/books.rs#L481-L532)）。
+  - 正文写入 `library_content`（全局共享，**不设容量上限**，不做 LRU 淘汰）：`tier=collection` 永久保存，`tier=temp` 按书目 `last_accessed_at` 做 TTL 回收。
   - `size_bytes` 用 `content.len()`（UTF-8 字节数）近似。
-  - 缓存按 `chapter_url` 唯一；同一章节 URL 不会被不同书源区分。
+  - 缓存按 `(chapter_url, origin)` 唯一；同一章节 URL 在不同书源下互不影响。
   - 若书源 `ruleContent` 使用了 `@js:` 且调用了不支持的内置（`java.ajax`/`post`/`getCookie`/`webView*` 等），规则求值抛错，本章抓取失败，返回 `400 internal: ...`；不再像旧版那样返回空正文。
   - `java.getElements`/`getString`/`getStringList` 在正文规则中可用，但只支持**字面量选择器**，且只作用于当前页 HTML；上限与失败语义见 2.7。JS 超过 `JS_TIMEOUT_MS`（默认 3000ms）预算同样会导致本章抓取失败。
 
@@ -1889,8 +1888,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `hits[].match_count` | integer | 否 | 该章内命中次数（ASCII 大小写不敏感，按 LIKE 语义） |
 | `hits[].offset` | integer | 否 | **首个命中在正文中的字符偏移**（不是字节偏移） |
 | `hits[].snippet` | string | 否 | 上下文片段：命中前 40 字符 + 关键词 + 后 40 字符，两端截断处加 `…` |
-| `total_chapters` | integer | 否 | `book_chapters` 中该书的章节总数；目录未缓存为 0 |
-| `cached_chapters` | integer | 否 | `book_content` 中该书已缓存正文的章节数 |
+| `total_chapters` | integer | 否 | `library_chapters` 中该书的章节总数；目录未缓存为 0 |
+| `cached_chapters` | integer | 否 | `library_content` 中该书已缓存正文的章节数 |
 | `uncached_chapters` | integer | 否 | `max(0, total_chapters - cached_chapters)` |
 | `complete` | boolean | 否 | `uncached_chapters == 0 && total_chapters > 0` |
 | `note` | string | 否 | 覆盖度提示，三种固定文案见下 |
@@ -1905,7 +1904,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `504 {"error":"书内搜索超过 5s 预算，请缩短关键词"}`：查询超过 5 秒（`SEARCH_TIMEOUT_SECS = 5`）。
   - 缺参/JSON 非法 → 400/422 纯文本；`401`；`500`。
 - 行为：
-  - **只搜索 `book_content` 中已缓存且 `content` 非空的章节**，不触发任何网络抓取；未缓存章节不会出现在结果里。
+  - **只搜索 `library_content` 中已缓存且 `content` 非空的章节**，不触发任何网络抓取；未缓存章节不会出现在结果里。
   - 匹配使用 SQLite `LIKE`（ASCII 大小写不敏感），`%`/`_`/`\` 按字面量转义。
   - 同一章节只返回首个命中（`hits` 按章节去重）。
   - 先取 `limit + 1` 条判断 `truncated`，再截断到 `limit`。
@@ -1914,13 +1913,13 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ### 6.8 `POST /api/book/cache-all`
 
 - 鉴权：登录
-- 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B3，4/4）：`limit` 截断 `limited=true attempted=2 cached=2`；全量缓存单章失败 `cached=3 failed=1`，失败项定位到 `b1-c3`，整体 `ok=true`（**逐章失败隔离已验证**）；无目录/空 `book_url` 400。**`skipped_budget` 预算跳过未单独验证**（预算预留函数仅单测）。
+- 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B3，4/4）：`limit` 截断 `limited=true attempted=2 cached=2`；全量缓存单章失败 `cached=3 failed=1`，失败项定位到 `b1-c3`，整体 `ok=true`（**逐章失败隔离已验证**）；无目录/空 `book_url` 400。
 - 请求体：
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
 | `book_url` | string | 是 | — | 书籍 URL；也接受别名 `book_id` |
-| `source` | string | 否 | — | 书源 ID；缺省读 `book_meta.origin` |
+| `source` | string | 否 | — | 书源 ID；缺省读 `library_books.origin` |
 | `limit` | integer | 否 | 200 | 本次最多抓取章节数，clamp **1..500** |
 
 示例（伪造值）：
@@ -1941,10 +1940,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "attempted": 50,
   "cached": 48,
   "failed": 2,
-  "skipped_budget": 0,
   "limited": true,
   "limit": 50,
-  "budget_bytes": 52428800,
   "used_bytes_before": 10485760,
   "used_bytes_after": 20971520,
   "failures": [
@@ -1963,11 +1960,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `attempted` | integer | 否 | 本次实际尝试抓取的章节数（≤ `limit`） |
 | `cached` | integer | 否 | 本次成功写入的章节数 |
 | `failed` | integer | 否 | 本次失败数，= `failures.length` |
-| `skipped_budget` | integer | 否 | 因超出缓存预算被跳过的章节数 |
 | `limited` | boolean | 否 | 是否因 `limit` 截断（待抓数量 > `limit`） |
 | `limit` | integer | 否 | 生效的 `limit`（clamp 后） |
-| `budget_bytes` | integer | 否 | 本次可用缓存预算（字节） |
-| `used_bytes_before` / `used_bytes_after` | integer | 否 | 执行前后该用户正文缓存占用 |
+| `used_bytes_before` / `used_bytes_after` | integer | 否 | 执行前后**馆藏库**正文总占用（全局共享） |
 | `failures[]` | object[] | 否 | 失败明细，按 `chapter_index` 升序 |
 | `failures[].chapter_index` | integer | 否 | 章节下标 |
 | `failures[].chapter_url` | string | 否 | 章节 URL |
@@ -1977,27 +1972,27 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：
   - `400 {"error":"book_url 不能为空"}`。
-  - `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`：`book_chapters` 中该书无行。
-  - `400 {"error":"缺少 source，且 book_meta 未记录书源"}`：既没传 `source`，`book_meta.origin` 也为空。
+  - `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`：馆藏目录中该书无行。
+  - `400 {"error":"缺少 source，且书目未记录书源"}`：既没传 `source`，`library_books.origin` 也为空。
   - `404 source not found`：`source` 不存在；`401`；`500`。
 - 行为：
   - 需要目录已缓存；否则先调 6.2。
-  - 跳过 `is_volume = true` 的分卷行；跳过 `book_content` 中已有正文的章节。
+  - 跳过 `is_volume = true` 的分卷行；跳过馆藏正文中已有正文的章节。
   - **并发 3**；按 `index` 升序取前 `limit` 个待抓章节。
-  - 预算 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB) - 当前已用`（下限 0）；抓取正文后按字节**原子预留**，预留失败即置 `skipped_budget`，并停止后续抓取（后续都计为 `skipped_budget`）。
+  - 馆藏不设容量上限，不再按预算跳过；写入使用与 6.4 相同的 upsert，并回填 `book_url`/`chapter_index`。
   - **部分失败仍返回 `200`**，通过 `failed`/`failures` 表达；不会整批回滚已成功的章节。
-  - 写入使用与 6.4 相同的 upsert，并回填 `book_url`/`chapter_index`。
 
 ### 6.9 `POST /api/book/cache/clear`
 
 - 鉴权：登录
-- 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B3，4/4）：按书清理 `scope=book`、`deleted>=3`；用户级 `scope=user` 并返回 `bytes_freed`；不传 `book_id` 走用户级（不是 400）。
+- 验证状态：**已验证**（冒烟 `cache_usage_and_trim_are_exposed` 等；馆藏分层改造后复跑）
+- 用途：清理**临时缓存层**的正文；馆藏（`tier=collection`）不参与，需管理员先「移出馆藏」（见 6.12）。
 - 请求体：可为空对象 `{}`；字段全部可选：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `book_id` | string | 否 | 只清该书的正文缓存；也接受别名 `book_url` |
-| — | — | — | 不传/空串/全空白 → 清空**当前用户的全部**正文缓存 |
+| — | — | — | 不传/空串/全空白 → 清空**全部临时层**正文缓存 |
 
 示例（伪造值）：
 
@@ -2014,43 +2009,43 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `ok` | boolean | 否 | 恒 true |
-| `scope` | string | 否 | `"book"`（按书）或 `"user"`（全部） |
+| `scope` | string | 否 | `"book"`（按书）或 `"temp"`（全部临时层） |
 | `book_id` | string | 是 | 按书清理时回显；全部清理为 `null` |
-| `deleted` | integer | 否 | 删除的 `book_content` 行数 |
+| `deleted` | integer | 否 | 删除的 `library_content` 行数 |
 | `bytes_freed` | integer | 否 | 删除行的 `size_bytes` 合计（近似释放字节） |
 
-- 错误：JSON 非法 → 400/422 纯文本；`401`；`500`。
+- 错误：JSON 非法 → 400/422 纯文本；`400 {"error":"该书已入馆，请先移出馆藏再清理正文"}`；`401`；`500`。
 - 行为：
-  - **只删 `book_content`**，不动 `book_chapters`、`book_meta`、书架/进度/统计。
+  - **只删 `library_content`**，不动 `library_chapters`、`library_books`、书架/进度/统计。
+  - 按书清理时若该书仍在馆藏，直接 `400`，避免任意账号删除全局共享内容。
   - 删除不存在的书返回 `deleted=0`，仍 `ok:true`。
   - 清理后服务端会尝试回收 SQLite 空闲页，文件大小不保证立即下降。
 
 ### 6.9.1 `POST /api/book/cache/trim`
 
 - 鉴权：登录
-- 验证状态：**已验证**（单测 `evict_to_limit_drops_oldest_rows`、冒烟 `cache_usage_and_trim_are_exposed`）
-- 用途：把正文缓存**立即压到当前账号生效上限以内**。写入路径（6.4 / 6.8）只在落库时淘汰；调小 `cache_limit_mb` 后可用本接口让上限立刻生效，不必等下一次阅读。
+- 验证状态：**已验证**（单测 `cleanup_temp_*`、冒烟 `cache_usage_and_trim_are_exposed`）
+- 用途：立即回收**过期临时缓存**（`tier=temp` 且超过 TTL 未访问），不等每小时后台任务。馆藏永久保存，不参与回收。
 - 请求体：无（`{}` 即可）。
 - 成功 `200`（示例为伪造值）：
 
 ```json
-{ "ok": true, "limit_bytes": 52428800, "limit_mb": 50, "used_bytes_before": 62914560, "used_bytes_after": 52420000, "deleted": 37, "bytes_freed": 10494560 }
+{ "ok": true, "used_bytes_before": 62914560, "used_bytes_after": 52420000, "deleted": 37, "books_deleted": 2, "bytes_freed": 10494560 }
 ```
 
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `ok` | boolean | 否 | 恒 true |
-| `limit_bytes` | integer | 否 | 生效上限 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)` |
-| `limit_mb` | integer | 否 | 同上，向下取整到 MB |
-| `used_bytes_before` / `used_bytes_after` | integer | 否 | 执行前后 `book_content` 占用 |
-| `deleted` | integer | 否 | 删除的章节行数（每批 16 行，最多 1024 批） |
+| `used_bytes_before` / `used_bytes_after` | integer | 否 | 执行前后馆藏库正文总占用 |
+| `deleted` | integer | 否 | 删除的正文行数 |
+| `books_deleted` | integer | 否 | 被整本移除的过期临时书目数 |
 | `bytes_freed` | integer | 否 | 前后占用差（≥0） |
 
 - 错误：`401`；`500`（SQLite 查询失败）。
 - 行为：
-  - 按 `accessed_at` 升序（同秒内按 `rowid`）**成批淘汰**；未超上限时 `deleted=0`。
-  - 只删 `book_content`，不动 `book_chapters` / `book_meta` / 书架 / 进度；同样尝试回收 SQLite 空闲页。
-  - 与写入路径共用同一个淘汰函数，避免出现两套阈值。
+  - 以 `library_books.last_accessed_at < now - LIBRARY_TEMP_TTL_DAYS` 为过期口径（默认 30 天）。
+  - 只删 `tier=temp` 的书目/目录/正文；馆藏不受影响。
+  - 后台每小时自动执行同一函数（见 `library_worker::cleanup_loop`），本接口用于「立即回收」。
 
 ### 6.10 `GET /api/book/export/info`
 
@@ -2083,11 +2078,11 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `book_url` | string | 否 | 回显 `trim()` 后的值 |
-| `name` | string | 否 | `book_meta.name`；为空时回落为 `book_url` |
-| `author` | string | 否 | `book_meta.author`；为空时回落为 `"未知"` |
-| `source` | string | 否 | 优先 `book_meta.origin_name`，其次 `origin`；都为空时是空串 |
-| `total_chapters` | integer | 否 | **正文章节数**：`book_chapters` 中 `is_volume=0` 且 `url NOT LIKE 'volume:%'` 的行数；分卷行不计 |
-| `cached_chapters` | integer | 否 | `book_content` 中存在且 `trim(content)` 非空的章节数 |
+| `name` | string | 否 | `library_books.name`；为空时回落为 `book_url` |
+| `author` | string | 否 | `library_books.author`；为空时回落为 `"未知"` |
+| `source` | string | 否 | 优先 `library_books.origin_name`，其次 `origin`；都为空时是空串 |
+| `total_chapters` | integer | 否 | **正文章节数**：`library_chapters` 中 `is_volume=0` 且 `url NOT LIKE 'volume:%'` 的行数；分卷行不计 |
+| `cached_chapters` | integer | 否 | `library_content` 中存在且 `trim(content)` 非空的章节数 |
 | `missing_chapters` | integer | 否 | `max(total - cached, 0)` |
 | `cached_bytes` | integer | 否 | 已缓存章节的 `size_bytes` 合计（字节） |
 | `complete` | boolean | 否 | `cached_chapters >= total_chapters`；全书未缓存但 `total=0` 时也为 `true` |
@@ -2096,7 +2091,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：
   - 缺 `book_url` → `400` 纯文本：``Failed to deserialize query string: missing field `book_url` ``
   - `book_url=""` → `400 {"error":"book_url 不能为空"}`
-  - 目录未缓存（`book_chapters` 无行）→ `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
+  - 目录未缓存（`library_chapters` 无行）→ `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
   - `401`；`500`
 - 行为：
   - 每次实时统计，不使用导出缓存。
@@ -2157,7 +2152,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ```
 
 - 规则：
-  - 章节按 `book_chapters."index"` 排序；标题为空时回落为 `第 N 章`。
+  - 章节按 `library_chapters."index"` 排序；标题为空时回落为 `第 N 章`。
   - **分卷行**（`is_volume=1` 或 `url` 以 `volume:` 开头）只写 `【分卷】<title>` 分隔，**不计入** `total`，也不占章节序号。
   - 正文按 `trim()` 后写入；只有空白的内容按“未缓存”处理。
   - **多本导出不提供 zip**：由调用方对每本书各请求一次本接口，得到多个独立 TXT；服务端没有批量打包接口。
@@ -2174,6 +2169,180 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - **未验证**：
   - 超大书压力样本：本轮仅 72 章，未做 10k+ 章 / GB 级文件。
   - `is_pay=true` 章节：导出不做付费过滤（只要已缓存就导出），真实付费样本链路仅单测。
+
+---
+
+## 6.12 馆藏（`/api/library/*`）
+
+> 内容层全局共享：书目 / 目录 / 正文只存一份（`library.db`），所有登录账号读同一份。
+> **浏览与占用**所有登录账号可读；**入馆 / 移出 / 删除 / 回收临时缓存**仅管理员。
+> 账号私有状态（书架、进度、设置、书源登录态）仍在 `users/<uid>.db`。
+
+### 6.12.1 `GET /api/library/stats`
+
+- 鉴权：登录（不要求 admin）
+- 参数：无
+- 成功 `200`（示例为伪造值）：
+
+```json
+{
+  "ok": true,
+  "collection": { "books": 12, "chapters": 3600, "bytes": 734003200, "mb": 700.0 },
+  "temp": { "books": 3, "chapters": 240, "bytes": 20971520, "mb": 20.0, "expired_books": 1, "ttl_days": 30 },
+  "total": { "books": 15, "chapters": 3840, "content_rows": 3840, "bytes": 754974720, "mb": 720.0 },
+  "disk": { "free_bytes": 10737418240, "free_mb": 10240, "floor_bytes": 1073741824, "floor_mb": 1024, "download_paused": false }
+}
+```
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `collection` | object | 否 | 馆藏层（永久）书目数 / 已缓存章节 / 正文字节 |
+| `temp` | object | 否 | 临时层书目数 / 章节 / 字节；`expired_books` 为超过 TTL 未访问的本数；`ttl_days` 为配置的 TTL |
+| `total` | object | 否 | 两层合计；`content_rows` 为 `library_content` 行数 |
+| `disk.free_bytes` / `free_mb` | integer/null | 是 | 数据目录所在卷剩余空间；平台取不到时为 `null` |
+| `disk.floor_bytes` / `floor_mb` | integer | 否 | 磁盘安全阀（`LIBRARY_DISK_FLOOR_MB`，默认 1024 MB） |
+| `disk.download_paused` | boolean | 否 | 剩余空间低于安全阀时为 `true`，后台整本下载暂停（交互阅读不受影响） |
+
+### 6.12.2 `GET /api/library/books`
+
+- 鉴权：登录（不要求 admin）
+- 查询参数：
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `tier` | string | `collection` | `collection` / `temp` / `all` |
+| `sort` | string | `accessed` | `accessed`（最近访问） / `collected`（入馆时间） |
+| `q` | string | — | 书名或作者模糊匹配（`%`/`_` 已转义为字面量） |
+| `cursor` | string | — | keyset 游标，原样回传上一页的 `next_cursor`；首页不传 |
+| `limit` | integer | 50 | clamp 1..200 |
+
+- 成功 `200`：
+
+```json
+{
+  "ok": true,
+  "tier": "collection",
+  "sort": "accessed",
+  "limit": 50,
+  "items": [
+    {
+      "book_url": "https://example.com/book/123",
+      "name": "示例书名",
+      "author": "示例作者",
+      "origin": "https://example.com",
+      "origin_name": "示例源",
+      "cover_url": "https://example.com/cover.jpg",
+      "tier": "collection",
+      "collected_at": 1763000000000,
+      "last_accessed_at": 1763500000000,
+      "checked_at": 1763400000000,
+      "total_chapter_num": 300,
+      "cached_chapters": 300,
+      "content_bytes": 8388608,
+      "content_mb": 8.0,
+      "download_percent": 100
+    }
+  ],
+  "next_cursor": "1763500000000:https://example.com/book/123"
+}
+```
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `items[].tier` | string | 否 | `collection` / `temp` |
+| `items[].collected_at` | integer | 是 | 入馆时间（epoch ms），临时层为 `null` |
+| `items[].last_accessed_at` / `checked_at` | integer | 否 | 最近访问 / 最近检查时间（epoch ms） |
+| `items[].cached_chapters` | integer | 否 | 馆藏正文中已缓存章节数 |
+| `items[].download_percent` | integer/null | 是 | `cached_chapters / total_chapter_num`；目录未知时为 `null` |
+| `next_cursor` | string/null | 是 | keyset 游标 `<sort_ts>:<book_url>`；没有下一页为 `null` |
+
+- 错误：`400`（`tier`/`sort` 非法）；`401`；`500`。
+- 行为：`ORDER BY <sort_expr> DESC, book_url ASC`，用游标续页，**不使用 OFFSET**；不返回总数。
+  - `sort=accessed` 用 `last_accessed_at`；`sort=collected` 用 `COALESCE(collected_at, 0)`（临时层没有入馆时间，按 0 排序，分页不会漏行）。
+
+### 6.12.3 `POST /api/library/collect`（管理员）
+
+- 鉴权：登录 + **admin**
+- 用途：把书置为馆藏（永久保存），并排一张后台整本下载任务。
+- 请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `book_url` | string | 是 | 书籍 URL；也接受别名 `book_id` |
+| `source` | string | 否 | 书源 ID；缺省用 `library_books.origin` |
+
+- 成功 `200`：
+
+```json
+{ "ok": true, "book_url": "https://example.com/book/123", "newly_collected": true, "job_id": "lj1234-7", "queued": true }
+```
+
+- 行为：
+  - 已有 `queued`/`running` 采购单时**不重复创建**，直接返回已有 `job_id`（幂等）。
+  - 没记录书源且未传 `source` 时仍会入馆，但 `queued=false`、`job_id=null`。
+  - 后台下载由 `library_worker` 执行，不依赖前端保持页面打开。
+
+### 6.12.4 `POST /api/library/release`（管理员）
+
+- 鉴权：登录 + **admin**
+- 用途：移出馆藏，降级为临时缓存（内容先保留，交给 TTL 或手动删除）。
+- 请求体：`{ "book_url": "..." }`（别名 `book_id`）。
+- 成功 `200`：`{ "ok": true, "book_url": "...", "released": true, "tier": "temp" }`；书不在馆藏时 `released=false`，仍 `200`。
+
+### 6.12.5 `POST /api/library/delete`（管理员）
+
+- 鉴权：登录 + **admin**
+- 用途：整本删除书目 + 目录 + 正文。
+- 请求体：`{ "book_url": "..." }`。
+- 成功 `200`：
+
+```json
+{ "ok": true, "book_url": "...", "deleted_books": 1, "deleted_chapters": 300, "deleted_contents": 300, "bytes_freed": 8388608 }
+```
+
+- 错误：`404 {"error":"馆藏里没有这本书"}`；`400 {"error":"该书仍在馆藏中，请先移出馆藏再删除"}`。
+
+### 6.12.6 `POST /api/library/temp/clean`（管理员）
+
+- 鉴权：登录 + **admin**
+- 用途：立即回收过期临时缓存（与 `POST /api/book/cache/trim` 同一实现，见 6.9.1）。
+- 请求体：无。
+- 成功 `200`：`{ "ok": true, "books": 2, "chapters": 120, "contents": 120, "bytes_freed": 10485760, "ttl_days": 30 }`。
+
+### 6.12.7 `GET /api/library/jobs`（管理员）
+
+- 鉴权：登录 + **admin**
+- 查询参数：`status`（逗号分隔，如 `queued,running`；缺省全部）、`limit`（默认 100，clamp 1..500）。
+- 成功 `200`：
+
+```json
+{
+  "ok": true,
+  "items": [
+    { "id": "lj1234-7", "book_url": "https://example.com/book/123", "source": "https://example.com",
+      "status": "running", "total": 300, "done": 120, "failed": 1, "skipped": 0,
+      "error": null, "created_at": 1763500000000, "updated_at": 1763500600000, "finished_at": null }
+  ]
+}
+```
+
+- `status` 取值：`queued` / `running` / `done` / `partial` / `failed` / `cancelled`。
+- 进度口径：`done` 只计本次新下载的章节；`skipped` 是开工前已缓存、无需再下的章节；`failed` 为本次失败数。前端进度按 `(done + skipped) / total` 计算，三者不重叠。
+- 排序：`created_at DESC`。
+
+### 6.12.8 `POST /api/library/jobs/cancel`（管理员）
+
+- 鉴权：登录 + **admin**
+- 请求体：`{ "id": "lj1234-7" }`。
+- 成功 `200`：`{ "ok": true, "id": "lj1234-7", "cancelled": true }`；任务已结束时 `cancelled=false`。
+- 行为：worker 在每章开始前检查状态，取消后尽快停止；已下载章节保留在馆藏。
+
+### 6.12.9 后台执行器与安全阀
+
+- 独立低优先级通道：默认 1 个任务并发（`LIBRARY_JOB_PARALLEL`），每任务 3 章并发（`LIBRARY_JOB_CHAPTER_PARALLEL`）。
+- 进程重启后把残留 `running` 任务放回队列，按 `library_job_items` 断点续跑。
+- 磁盘安全阀：数据目录剩余空间低于 `LIBRARY_DISK_FLOOR_MB`（默认 1024 MB）时暂停下载，每 60 秒重试；交互阅读与临时缓存不受影响。
+- 临时缓存 TTL：默认 30 天（`LIBRARY_TEMP_TTL_DAYS`），每小时后台回收一次；馆藏永久保存，不自动淘汰。
 
 ---
 
@@ -2831,7 +3000,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `theme` | string | `"light"` | 阅读器主题；设置页与阅读器共用 |
 | `font_size` | integer | `18` | 阅读器字号，写回 `user_settings` |
 | `line_height` | number | `1.8` | 阅读器行距，写回 `user_settings` |
-| `cache_limit_mb` | integer | `50` | 正文缓存上限（MB），实际使用时与全局上限取 min |
 | `auto_refresh` | boolean | `true` | 打开书架时自动检查更新（前端 `Bookshelf.svelte` 消费；24h 本机节流，只刷新 `enable_update` 未关闭的书） |
 | `read_mode` | string | `"scroll"` | `scroll` / `paged` / `fade`（POST 白名单）；`paged` 无分页数据支撑 |
 | `page_width` | integer | `800` | 阅读页宽（CSS px），POST 范围 **320–2000** |
@@ -2847,7 +3015,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "theme": "light",
   "font_size": 18,
   "line_height": 1.8,
-  "cache_limit_mb": 50,
   "auto_refresh": true,
   "read_mode": "scroll",
   "page_width": 800,
@@ -2860,7 +3027,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 读取 `user_settings` 全部行，缺省键补 `SETTINGS_DEFAULTS`（[replace.rs](../server/src/routes/replace.rs#L40-L50)）。
   - 布尔解析：值为 `"1"` 或 `"true"` 才是 true，其余 false；因此库里存 `"True"` 会被当 false。
   - 数字解析失败回退默认值。
-  - `cache_limit_mb` 不在此处钳制；非法/<=0 时在正文缓存逻辑里回退全局值。
   - 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B9，4/4）：缺省返回默认值（`page_width=800`、`font_family=serif`）；写入后读回一致。`builtin_clean` 键为 2026-11-03 新增（设置页开关已接，默认 `false`），未纳入该回归用例。
 
 ### 9.2 `POST /api/settings`
@@ -2881,7 +3047,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
     - `theme`：`light` / `dark` / `sepia`。
     - `font_size`：12–30。
     - `line_height`：有限数且 1.2–2.6。
-    - `cache_limit_mb`：10–1000。
     - `image_style`：0–3。
     - `read_mode`：`scroll` / `paged` / `fade`。
     - `page_width`：320–2000。
@@ -3019,7 +3184,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "rss_bytes": 52428800,
   "rss_mb": 50.0,
   "open_user_dbs": 2,
-  "cache_limit_mb": 50,
   "js": { "enabled": true, "last_ms": 12, "max_ms": 48, "budget_ms": 200 },
   "http": { "concurrency": 3, "timeout_secs": 15, "max_body_mb": 5 }
 }
@@ -3031,7 +3195,6 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `rss_bytes` | integer | 是 | Linux `/proc/self/statm`、Windows `GetProcessMemoryInfo`；其他平台 null |
 | `rss_mb` | number | 是 | 保留 2 位小数；`rss_bytes` 为 null 时 null |
 | `open_user_dbs` | integer | 否 | 当前缓存中的用户连接池数 |
-| `cache_limit_mb` | integer | 否 | 全局正文缓存上限（MiB） |
 | `js.enabled` | boolean | 否 | `JS_ENABLED` |
 | `js.last_ms` | integer | 否 | 最近一次 JS 规则耗时；未执行过 0 |
 | `js.max_ms` | integer | 否 | 历史最大耗时 |
@@ -3071,16 +3234,15 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "rss_bytes": 52428800,
   "rss_mb": 50.0,
   "open_user_dbs": 2,
-  "cache_limit_mb": 50,
   "js": { "enabled": true, "last_ms": 12, "max_ms": 48, "budget_ms": 200 },
   "http": { "concurrency": 3, "timeout_secs": 15, "max_body_mb": 5 },
   "cache": {
     "bytes": 10485760,
     "mb": 10.0,
     "rows": 42,
-    "limit_bytes": 52428800,
-    "limit_mb": 50,
-    "percent": 20.0,
+    "collection": { "books": 2, "chapters": 40, "bytes": 8388608, "mb": 8.0 },
+    "temp": { "books": 1, "chapters": 2, "bytes": 2097152, "mb": 2.0, "expired_books": 0, "ttl_days": 30 },
+    "books_total": 3,
     "image_cache_bytes": 2097152,
     "total_bytes": 12582912,
     "books": [{ "book_url": "https://example.com/book/123", "name": "示例书名", "bytes": 8388608 }]
@@ -3090,18 +3252,18 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
-| `cache.bytes` | integer | 否 | 当前用户正文缓存总字节 |
+| `cache.bytes` | integer | 否 | 馆藏库正文总字节（全局共享） |
 | `cache.mb` | number | 否 | 保留 2 位小数 |
-| `cache.rows` | integer | 否 | `book_content` 行数 |
-| `cache.limit_bytes` | integer | 否 | 生效上限 = `min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)` |
-| `cache.limit_mb` | integer | 否 | 同上，向下取整到 MB |
-| `cache.percent` | number | 否 | `bytes / limit_bytes`，保留 1 位小数（可 >100，表示调小上限后尚未清理） |
-| `cache.image_cache_bytes` | integer | 否 | 进程级图片 LRU 占用（所有账号共享，不占正文上限） |
+| `cache.rows` | integer | 否 | `library_content` 行数 |
+| `cache.collection` | object | 否 | 馆藏层：书目数 / 章节 / 字节 / MB |
+| `cache.temp` | object | 否 | 临时层：书目数 / 章节 / 字节 / MB、`expired_books`、`ttl_days` |
+| `cache.books_total` | integer | 否 | 两层书目合计 |
+| `cache.image_cache_bytes` | integer | 否 | 进程级图片 LRU 占用（所有账号共享） |
 | `cache.total_bytes` | integer | 否 | `bytes + image_cache_bytes` |
 | `cache.books[]` | object[] | 否 | 占用最高的 5 本书：`book_url`、`name`（可能为空串）、`bytes` |
 
 - 错误：`401`；`500`（缓存查询失败被 `unwrap_or(0)` 吞掉，实际不会 500）。
-- 行为：与 `/healthz` 共用 `base_metrics`，追加当前用户库缓存统计：占用、生效上限、占用比例、按书 Top5（[health.rs](../server/src/routes/health.rs#L184-L229)）。
+- 行为：与 `/healthz` 共用 `base_metrics`，追加馆藏分层统计：占用、馆藏/临时拆分、按书 Top5（[health.rs](../server/src/routes/health.rs)）。
 
 ### 11.4 其他
 
@@ -3169,7 +3331,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 当前 `:3000` 实例运行的是工程侧旧构建名的 `legado-server.exe`（对外发布名 `boranlib.exe`）：**9,315,840 B / mtime 2026-11-03 14:46:58 / sha256 `B498BB42…`**（99 项单测通过）；#55~#56 的复测与 #57~#58 的实测均基于该实例。
   - #40~#43（export/import/preview/check-updates）与 #44~#54 的主要成功/错误路径均已验证；#55~#56（两段式搜索）已于 2026-11-03 14:0x / 15:0x 在 `:3000` 上 HTTP 实测（字段、中间态、分页 clamp、404、`source_ids`、淘汰顺序）；#57~#58（导出）已实测 `info` 与 `txt`（含文件头/占位/x-* 头）。覆盖明细见开头复核表。
   - **#59~#63（健康巡检 / 汇总 / 重置 / prune / quarantine）已在 2026-11-04 于隔离端口 `:3061` 完成 HTTP 实测**（隔离数据目录复制自 `server/data`，未触碰 `:3000/:3500`）；覆盖连续 3 次失败进入冷却、默认搜索跳过与 `include_cooled=1` 放行、`FAIL_ENGINE` 不冷却、导入体检三态、`prune` 预览/确认、`quarantine` 与复用复活、导出排除隔离区。`cargo test` 默认线程 **186 passed / 0 failed**。
-  - 仍无 HTTP 证据的关键项：`book/search` 超时 504（实测 200 / 1 ms 未触发）、`toc` 分卷行真实数据渲染、用 `volume:` URL 请求正文、`cache-all` 的 `skipped_budget`、`toc/batch` 并发 3、`admin/status` 最后管理员保护、`preview` 5 MiB / 15 s 预算、`@js` 200ms 超预算、DOM 桥上限、`search` 单源 200 / 总 400 截断、`export` 的 `is_pay=true` 真实样本与 10k+ 章压力。
+  - 仍无 HTTP 证据的关键项：`book/search` 超时 504（实测 200 / 1 ms 未触发）、`toc` 分卷行真实数据渲染、用 `volume:` URL 请求正文、`toc/batch` 并发 3、`admin/status` 最后管理员保护、`preview` 5 MiB / 15 s 预算、`@js` 200ms 超预算、DOM 桥上限、`search` 单源 200 / 总 400 截断、`export` 的 `is_pay=true` 真实样本与 10k+ 章压力。
 - **待确认**：`latest_chapter_time`/`start`/`end` 的数值语义、部署时区对 `day` 的影响、SQLite `disk I/O error` 根因、`Book.can_update` 默认 false 是否预期（见 14 节）。
 
 ### 12.2 全量清单
@@ -3178,7 +3340,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 |---|---|---|---|---|---|---|
 | 1 | GET | `/api/health` | 公开 | 否 | — | `text/plain: ok` |
 | 2 | GET | `/healthz` | 公开 | 否 | — | 进程指标 JSON |
-| 3 | GET | `/api/healthz` | JWT | 否 | — | 进程指标 + 用户缓存 |
+| 3 | GET | `/api/healthz` | JWT | 否 | — | 进程指标 + 馆藏/临时缓存占用 |
 | 4 | POST | `/api/auth/register` | 公开 | 否 | `username,password` | `{token}` |
 | 5 | POST | `/api/auth/login` | 公开 | 否 | `username,password` | `{token}` |
 | 6 | GET | `/api/sources` | JWT | 否 | — | `BookSourceListItem[]` |
@@ -3224,8 +3386,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 46 | POST | `/api/admin/users/status` | JWT | **是** | `user_id,disabled` | `{ok,user_id,disabled}` |
 | 47 | POST | `/api/book/toc/batch` | JWT | 否 | `book_urls`（别名 `book_ids`）`,source?` | `{ok,total,updated,failed,skipped,results[],elapsed_ms}` |
 | 48 | GET | `/api/book/search` | JWT | 否 | `book_id,q,limit?` | `{ok,book_id,query,limit,truncated,hits[],total_chapters,cached_chapters,uncached_chapters,complete,note,elapsed_ms}` |
-| 49 | POST | `/api/book/cache-all` | JWT | 否 | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/skipped_budget/...`） |
-| 50 | POST | `/api/book/cache/clear` | JWT | 否 | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed}` |
+| 49 | POST | `/api/book/cache-all` | JWT | 否 | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/limited/...`） |
+| 50 | POST | `/api/book/cache/clear` | JWT | 否 | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed}`（只清临时层） |
 | 51 | GET | `/api/bookmarks` | JWT | 否 | `book_id?` | `Bookmark[]`（裸数组） |
 | 52 | POST | `/api/bookmarks` | JWT | 否 | `book_id,chapter_index?,position?,chapter_title?,note?` | `Bookmark` |
 | 53 | DELETE | `/api/bookmarks/delete` | JWT | 否 | `id` | `{ok,deleted}` |
@@ -3241,6 +3403,15 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 63 | POST | `/api/sources/quarantine` | JWT | **是** | `{source_ids,reason?}` | `{ok,affected,missing[],reason}` |
 | 64 | GET | `/api/k/metrics` | JWT | **是** | `date?` | 按路径聚合的埋点统计 |
 | 65 | GET | `/api/k/metrics/export` | JWT | **是** | `date?` | 该日 JSONL 原文 |
+| 66 | POST | `/api/book/cache/trim` | JWT | 否 | — | `{ok,used_bytes_before,used_bytes_after,deleted,books_deleted,bytes_freed}`（回收过期临时缓存） |
+| 67 | GET | `/api/library/stats` | JWT | 否 | — | `{ok,collection,temp,total,disk}` |
+| 68 | GET | `/api/library/books` | JWT | 否 | `tier?,sort?,q?,cursor?,limit?` | `{ok,tier,sort,limit,items[],next_cursor}` |
+| 69 | POST | `/api/library/collect` | JWT | **是** | `book_url`（别名 `book_id`）`,source?` | `{ok,book_url,newly_collected,job_id,queued}` |
+| 70 | POST | `/api/library/release` | JWT | **是** | `book_url`（别名 `book_id`） | `{ok,book_url,released,tier}` |
+| 71 | POST | `/api/library/delete` | JWT | **是** | `book_url`（别名 `book_id`） | `{ok,book_url,deleted_books,deleted_chapters,deleted_contents,bytes_freed}` |
+| 72 | POST | `/api/library/temp/clean` | JWT | **是** | — | `{ok,books,chapters,contents,bytes_freed,ttl_days}` |
+| 73 | GET | `/api/library/jobs` | JWT | **是** | `status?,limit?` | `{ok,items[]}` |
+| 74 | POST | `/api/library/jobs/cancel` | JWT | **是** | `id` | `{ok,id,cancelled}` |
 
 ---
 
@@ -3400,7 +3571,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ```
 
 - 行为：
-  - `cached`：只扫 `book_content` 中该书已缓存章节，零网络请求，快。
+  - `cached`：只扫 `library_content` 中该书已缓存章节，零网络请求，快。
   - `all`：按目录逐章抓取（受 `HTTP_CONCURRENCY` 与超时约束），建议服务端限流并设置总预算。
   - 大小写不敏感；`snippet` 由服务端截取（如前后 30 字符）。
 - 风险：`all` 在几百章书上可能超过请求超时，建议改为“创建任务 + 轮询”，但当前项目没有任务表，**待产品决策**。
@@ -3447,14 +3618,17 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 
 ### 13.10 缓存管理
 
-- 状态：**已实现（2026-11-18 补齐清理到上限与管理页展示）**：
-  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空当前用户全部正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed}`；只删正文，不动目录。
-  - `POST /api/book/cache/trim`（6.9.1）：按 LRU 立即清理到生效上限（`min(用户 cache_limit_mb, 全局 CACHE_LIMIT_MB)`），与写入路径共用同一淘汰函数。
-  - `POST /api/book/cache-all`（6.8）：整本补缓存，带预算与并发。
-  - 设置页「书籍缓存」卡片：展示占用/上限/比例、按书 Top5（名称+字节），提供「清理到上限」「清理本书」「清理全部」。
+- 状态：**已实现（2026-11-19 切换为馆藏分层模型）**：
+  - 内容层全局共享：书目 / 目录 / 正文存 `library.db`；账号只保留书架、进度、设置等私有状态。
+  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空**全部临时层**正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed}`；馆藏需先移出。
+  - `POST /api/book/cache/trim`（6.9.1）：立即回收过期临时缓存。
+  - `POST /api/book/cache-all`（6.8）：整本补缓存，不再有预算上限。
+  - `GET /api/library/stats`、`GET /api/library/books`、`POST /api/library/{collect,release,delete,temp/clean}`、`GET /api/library/jobs`、`POST /api/library/jobs/cancel`（6.12）：馆藏浏览、入馆、移出、删除、后台整本下载与取消。
+  - 设置页「缓存与刷新」卡片：展示馆藏/临时分层占用、TTL 与过期提示，提供「回收过期临时缓存」「清理本书」「清理全部临时缓存」。
+  - 新增「馆藏」页：统计卡片、keyset 分页列表、入馆/移出/删除、采购单进度与取消。
   - 仍未实现：独立 `GET /api/cache/stats`（现由 `/api/healthz` 承担）、删目录缓存（强制重抓，解决 6.2 换源串目录）、二次确认参数（前端两步点击代替）。
-- 现状（已更新）：缓存用量从 `/api/healthz` 的 `cache.{bytes,rows,limit_bytes,percent,books}` 查看；清理走 6.9 / 6.9.1。
-- 后端改动点：仍是 `routes/books.rs`；只操作当前用户库。
+- 现状（已更新）：缓存用量从 `/api/healthz` 的 `cache.{bytes,rows,collection,temp,books}` 查看；清理走 6.9 / 6.9.1，馆藏写操作走 6.12。
+- 后端改动点：`routes/books_store.rs`（馆藏读写）、`library.rs`（分层与采购单）、`library_worker.rs`（后台执行器）、`routes/library.rs`（管理接口）。
 
 ### 13.11 账号与用户管理
 
@@ -3532,7 +3706,6 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 | `BORANLIB_ENV` | `LEGADO_ENV` | 未设置时：debug=开发、release=生产 | `production`/`prod`/`release` 视为生产；生产环境会校验 JWT secret 与首次管理员口令 |
 | `BORANLIB_JWT_SECRET` | `LEGADO_JWT_SECRET` | `<寮€鍙戝崰浣嶅瘑閽?` | token 签名；**生产环境必须设置且至少 32 字节**，否则拒绝启动 |
 | `BORANLIB_CORS_ORIGINS` | `LEGADO_CORS_ORIGINS` | 空（不添加 CORS 层） | 逗号分隔的精确来源白名单，如 `https://reader.example,http://127.0.0.1:5173`；拒绝 `*` |
-| `BORANLIB_CACHE_LIMIT_MB` | `LEGADO_CACHE_LIMIT_MB` | `50`（4..512） | 全局正文缓存上限 |
 | `BORANLIB_HTTP_CONCURRENCY` | `LEGADO_HTTP_CONCURRENCY` | `16`（1..16） | **出站 HTTP 请求并发**（进程级全局信号量），与「每源在飞上限」叠加：单源先受 `concurrentRate`（默认 8）约束，再参与全局 16 槽竞争。默认 16：2026-11-04 扫参照（同预算 10s、单源 8s）下 8→16 命中源 12.5%→15.8%（+3.3pt），首屏不变；显式设置时 `scope=all` 也取该值（上限 16） |
 | `BORANLIB_SOURCE_CONCURRENCY_DEFAULT` | `LEGADO_SOURCE_CONCURRENCY_DEFAULT` | `8`（1..8） | **每源在飞请求上限的默认值**，仅在书源未声明 `concurrentRate` 时使用；`0`/非法回退 8，超过 8 夹回。默认 8 与旧行为等价；收紧到 2/4 只在同源图片突发时增加排队、RSS 无显著收益（2026-11-05 对照），按设备需要自行下调。运行中改它需重启；单源覆盖见书源字段 `concurrentRate` |
 | `BORANLIB_SEARCH_TIMEOUT_SECS` | `LEGADO_SEARCH_TIMEOUT_SECS` | `8`（5..30） | **curated 单源**搜索预算；影响 `/api/search`、`/api/search/aggregate`、`/api/search/start`、`/api/search/result` 的 `deadline_ms`。只设它、不设任何整批变量时整批预算与它同值（兼容旧部署） |

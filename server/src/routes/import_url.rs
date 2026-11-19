@@ -406,8 +406,15 @@ async fn import_url(
 
     let key = web_book::book_key(&source, &book_url);
     let store = crate::routes::books::book_store_for(&db.0, &key).await;
-    let (book, created) =
-        import_book_from_html(&db.0, &source, &book_url, &page.body, Some(&store)).await?;
+    let (book, created) = import_book_from_html(
+        &s.library,
+        &db.0,
+        &source,
+        &book_url,
+        &page.body,
+        Some(&store),
+    )
+    .await?;
     Ok(Json(ImportUrlResp {
         book_url: book.book_url,
         source_id: source.book_source_url.clone(),
@@ -423,6 +430,7 @@ async fn import_url(
 
 /// 解析 + 兜底 + 落库。抽成独立函数便于单测（不发起网络请求）。
 async fn import_book_from_html(
+    lib: &SqlitePool,
     pool: &SqlitePool,
     source: &BookSource,
     book_url: &str,
@@ -490,7 +498,7 @@ async fn import_book_from_html(
     .bind(&source.book_source_url)
     .execute(pool)
     .await?;
-    crate::routes::books::save_book_meta(pool, &book).await?;
+    crate::routes::books::save_book_meta(lib, pool, &book).await?;
     if let Some(st) = store {
         crate::routes::books::persist_book_changes(pool, st.take_changes()).await;
     }
@@ -512,7 +520,7 @@ mod tests {
         }
     }
 
-    async fn memory_pool() -> SqlitePool {
+    async fn memory_pool() -> (SqlitePool, SqlitePool) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -522,7 +530,16 @@ mod tests {
             .run(&pool)
             .await
             .expect("run user migrations");
-        pool
+        let lib = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open memory library db");
+        sqlx::migrate!("./migrations/library")
+            .run(&lib)
+            .await
+            .expect("run library migrations");
+        (lib, pool)
     }
 
     const DETAIL_HTML: &str = r#"
@@ -603,15 +620,15 @@ mod tests {
 
     #[tokio::test]
     async fn import_is_idempotent() {
-        let pool = memory_pool().await;
+        let (lib, pool) = memory_pool().await;
         let source = detail_source();
         let url = "https://x.example/book/1";
-        let (b1, created1) = import_book_from_html(&pool, &source, url, DETAIL_HTML, None)
+        let (b1, created1) = import_book_from_html(&lib, &pool, &source, url, DETAIL_HTML, None)
             .await
             .expect("first import");
         assert!(created1);
         assert_eq!(b1.name.as_deref(), Some("正式书名"));
-        let (b2, created2) = import_book_from_html(&pool, &source, url, DETAIL_HTML, None)
+        let (b2, created2) = import_book_from_html(&lib, &pool, &source, url, DETAIL_HTML, None)
             .await
             .expect("second import");
         assert!(!created2, "重复导入不得重复建书");

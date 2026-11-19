@@ -265,7 +265,8 @@ async fn import_test_state() -> AppState {
         .await
         .unwrap();
     AppState {
-        shared: pool,
+        shared: pool.clone(),
+        library: pool,
         cfg: crate::config::Config::from_env(),
         user_pools: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
@@ -332,7 +333,8 @@ async fn shared_state() -> AppState {
     .await
     .unwrap();
     AppState {
-        shared: pool,
+        shared: pool.clone(),
+        library: pool,
         cfg: crate::config::Config::from_env(),
         user_pools: Default::default(),
         fetcher: std::sync::Arc::new(crate::web_book::ReqFetcher),
