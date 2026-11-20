@@ -127,6 +127,13 @@
   - 漫画导出/下载（TXT 导出只覆盖文字）。
 - 依据：[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
 
+### 2.8 书模型与可交换元数据（`进行中`）
+
+- 状态：`进行中`。Phase 0 已完成：迁移 `0003_metadata.sql` + `GET/POST /api/library/book/meta`。
+- 已完成：`language` / `publisher` / `pubdate` / `series_name` / `series_index` 入库；`library_identifiers`（ISBN 等 `scheme/value`）与 `library_tags` 独立成表；全局（内容层）与个人（用户库）边界见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 4 节。
+- 还差：EPUB/OPDS 消费这些字段（Phase 1–3）、从书源详情页自动映射系列/标签、前端编辑入口。
+- 参考：calibre 的 `Metadata` / OPF 字段体系（只学语义与规范，不复制 GPL 代码）。
+
 ---
 
 ## 三、已知缺陷与缺口

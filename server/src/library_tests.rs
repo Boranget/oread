@@ -318,6 +318,83 @@ async fn delete_book_removes_rows_and_cancels_active_jobs() {
 }
 
 #[tokio::test]
+async fn metadata_patch_writes_clears_and_replaces() {
+    let p = pool().await;
+    insert_book(&p, "b1", TIER_COLLECTION, Some(now_ms()), now_ms()).await;
+
+    let patch = MetadataPatch {
+        language: Some("zh".into()),
+        // 纯空白等于清空：管理员用它纠错
+        publisher: Some("   ".into()),
+        pubdate: Some("2020-01-01".into()),
+        series_name: Some("银河系漫游指南".into()),
+        series_index: Some(1.5),
+        identifiers: Some(vec![
+            ("isbn".into(), "9787532754687".into()),
+            ("isbn".into(), " 9787532754687 ".into()), // 去重
+            ("".into(), "x".into()),                   // 非法项跳过
+        ]),
+        tags: Some(vec![
+            "科幻".into(),
+            " 科幻 ".into(), // 去重
+            "".into(),       // 跳过
+            "经典".into(),
+        ]),
+    };
+    assert!(!patch.is_empty());
+    update_metadata(&p, "b1", &patch).await.unwrap();
+
+    let b = load_book(&p, "b1").await.unwrap().unwrap();
+    assert_eq!(b.language.as_deref(), Some("zh"));
+    assert_eq!(b.publisher, None, "空白文本应落成 NULL");
+    assert_eq!(b.pubdate.as_deref(), Some("2020-01-01"));
+    assert_eq!(b.series_name.as_deref(), Some("银河系漫游指南"));
+    assert_eq!(b.series_index, Some(1.5));
+
+    let extras = load_metadata_extras(&p, "b1").await.unwrap();
+    assert_eq!(
+        extras.identifiers,
+        vec![("isbn".to_string(), "9787532754687".to_string())]
+    );
+    assert_eq!(extras.tags, vec!["科幻".to_string(), "经典".to_string()]);
+
+    // 缺省字段保持不变；显式空数组表示清空
+    let patch2 = MetadataPatch {
+        tags: Some(vec![]),
+        ..Default::default()
+    };
+    update_metadata(&p, "b1", &patch2).await.unwrap();
+    let b2 = load_book(&p, "b1").await.unwrap().unwrap();
+    assert_eq!(b2.language.as_deref(), Some("zh"), "缺省字段应保持不变");
+    let extras2 = load_metadata_extras(&p, "b1").await.unwrap();
+    assert!(extras2.tags.is_empty());
+    assert_eq!(extras2.identifiers.len(), 1, "只清标签，不动标识");
+
+    // 整本删除要清掉扩展表，避免孤儿行
+    delete_book(&p, "b1").await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_tags")
+        .fetch_one(&p)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_identifiers")
+        .fetch_one(&p)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn empty_metadata_patch_is_detected() {
+    assert!(MetadataPatch::default().is_empty());
+    assert!(!MetadataPatch {
+        tags: Some(vec![]),
+        ..Default::default()
+    }
+    .is_empty());
+}
+
+#[tokio::test]
 async fn upsert_rollup_creates_book_and_refreshes_stats() {
     let p = pool().await;
     insert_content(&p, "b1", "c1", 100).await;

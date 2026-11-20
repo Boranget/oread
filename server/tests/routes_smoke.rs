@@ -1153,3 +1153,96 @@ async fn library_browse_and_admin_actions() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// 元数据读写：普通账号可读、只有管理员能改；空补丁与非法值返回 400。
+#[tokio::test]
+async fn library_metadata_read_and_admin_write() {
+    let dir = temp_dir("library-meta");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let user = register(&app, "metauser").await;
+    let admin = register_admin(&app, &shared, "metaadmin").await;
+
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, tier, last_accessed_at) \
+         VALUES ('https://m.test/a', '银河系漫游指南', 'collection', 0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+
+    // 普通账号可读；未设置的可空字段返回 null、数组返回空。
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/library/book/meta?book_url=https%3A%2F%2Fm.test%2Fa",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(resp).await;
+    assert_eq!(meta["meta"]["name"], "银河系漫游指南");
+    assert!(meta["meta"]["language"].is_null());
+    assert!(meta["meta"]["tags"].as_array().unwrap().is_empty());
+
+    // 普通账号不能写馆藏元数据。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/meta",
+            r#"{"book_url":"https://m.test/a","language":"zh"}"#,
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 管理员写入：标识 scheme 归一为小写，标签去空白。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/meta",
+            r#"{"book_url":"https://m.test/a","language":"zh","series_name":"银河系漫游指南","series_index":1.0,"identifiers":[{"scheme":"ISBN","value":"9787532754687"}],"tags":[" 科幻 ","经典"]}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(resp).await;
+    assert_eq!(meta["meta"]["language"], "zh");
+    assert_eq!(meta["meta"]["series_index"], 1.0);
+    assert_eq!(meta["meta"]["identifiers"][0]["scheme"], "isbn");
+    assert_eq!(
+        meta["meta"]["tags"],
+        serde_json::json!(["科幻", "经典"]),
+        "{meta}"
+    );
+
+    // 空补丁：400，避免静默成功。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/meta",
+            r#"{"book_url":"https://m.test/a"}"#,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 不在馆藏里的书：404。
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/library/book/meta?book_url=https%3A%2F%2Fm.test%2Fnone",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

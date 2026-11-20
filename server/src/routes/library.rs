@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/library/stats", get(stats))
         .route("/api/library/books", get(books))
+        .route("/api/library/book/meta", get(book_meta).post(set_book_meta))
         .route("/api/library/comic/estimate", post(comic_estimate))
         .route("/api/library/collect", post(collect))
         .route("/api/library/release", post(release))
@@ -128,6 +129,11 @@ fn book_item(b: &LibraryBook) -> serde_json::Value {
         "origin": b.origin,
         "origin_name": b.origin_name,
         "cover_url": b.cover_url,
+        "language": b.language,
+        "publisher": b.publisher,
+        "pubdate": b.pubdate,
+        "series_name": b.series_name,
+        "series_index": b.series_index,
         "tier": b.tier,
         "collected_at": b.collected_at,
         "last_accessed_at": b.last_accessed_at,
@@ -145,6 +151,197 @@ fn book_item(b: &LibraryBook) -> serde_json::Value {
             None
         },
     })
+}
+
+// ---------------------------------------------------------------------------
+// 单书元数据（OPF 语义字段）
+// ---------------------------------------------------------------------------
+
+/// 元数据的长度上限：只防滥用，不追求完整校验（语言/日期允许书写源原样值）。
+const META_MAX_TEXT: usize = 200;
+const META_MAX_LANGUAGE: usize = 35; // BCP 47 上限
+const META_MAX_TAGS: usize = 64;
+const META_MAX_TAG_LEN: usize = 64;
+const META_MAX_IDS: usize = 32;
+const META_MAX_SCHEME_LEN: usize = 32;
+const META_MAX_ID_VALUE_LEN: usize = 128;
+
+#[derive(Deserialize)]
+pub struct MetaQ {
+    #[serde(alias = "book_id")]
+    pub book_url: String,
+}
+
+#[derive(Deserialize)]
+pub struct IdentifierReq {
+    pub scheme: String,
+    pub value: String,
+}
+
+/// 写入请求：缺省字段 = 保持不变；文本传空串 = 清空；数组传 `[]` = 清空该项。
+#[derive(Deserialize, Default)]
+pub struct MetaPatchReq {
+    #[serde(alias = "book_id")]
+    pub book_url: String,
+    pub language: Option<String>,
+    pub publisher: Option<String>,
+    pub pubdate: Option<String>,
+    pub series_name: Option<String>,
+    pub series_index: Option<f64>,
+    pub identifiers: Option<Vec<IdentifierReq>>,
+    pub tags: Option<Vec<String>>,
+}
+
+fn check_meta_len(label: &str, value: &str, max: usize) -> AppResult<()> {
+    if value.chars().count() > max {
+        return Err(AppError::BadRequest(format!(
+            "{label} 过长（最多 {max} 个字符）"
+        )));
+    }
+    Ok(())
+}
+
+/// 把请求体校验后转成领域补丁；非法值直接 400，不落库。
+fn to_metadata_patch(req: MetaPatchReq) -> AppResult<library::MetadataPatch> {
+    for (label, value, max) in [
+        ("language", req.language.as_deref(), META_MAX_LANGUAGE),
+        ("publisher", req.publisher.as_deref(), META_MAX_TEXT),
+        ("pubdate", req.pubdate.as_deref(), META_MAX_TEXT),
+        ("series_name", req.series_name.as_deref(), META_MAX_TEXT),
+    ] {
+        if let Some(v) = value {
+            check_meta_len(label, v, max)?;
+        }
+    }
+    if let Some(idx) = req.series_index {
+        if !idx.is_finite() || idx < 0.0 {
+            return Err(AppError::BadRequest(
+                "series_index 必须是 >= 0 的有限数".into(),
+            ));
+        }
+    }
+
+    let identifiers = match req.identifiers {
+        Some(list) => {
+            if list.len() > META_MAX_IDS {
+                return Err(AppError::BadRequest(format!(
+                    "identifiers 最多 {META_MAX_IDS} 条"
+                )));
+            }
+            let mut out = Vec::with_capacity(list.len());
+            for id in list {
+                let scheme = id.scheme.trim();
+                let value = id.value.trim();
+                if scheme.is_empty() || value.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "identifier 的 scheme/value 不能为空".into(),
+                    ));
+                }
+                check_meta_len("identifier.scheme", scheme, META_MAX_SCHEME_LEN)?;
+                check_meta_len("identifier.value", value, META_MAX_ID_VALUE_LEN)?;
+                out.push((scheme.to_lowercase(), value.to_string()));
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
+    let tags = match req.tags {
+        Some(list) => {
+            if list.len() > META_MAX_TAGS {
+                return Err(AppError::BadRequest(format!(
+                    "tags 最多 {META_MAX_TAGS} 个"
+                )));
+            }
+            let mut out = Vec::with_capacity(list.len());
+            for tag in list {
+                let tag = tag.trim();
+                if tag.is_empty() {
+                    continue;
+                }
+                check_meta_len("tag", tag, META_MAX_TAG_LEN)?;
+                out.push(tag.to_string());
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
+    Ok(library::MetadataPatch {
+        language: req.language,
+        publisher: req.publisher,
+        pubdate: req.pubdate,
+        series_name: req.series_name,
+        series_index: req.series_index,
+        identifiers,
+        tags,
+    })
+}
+
+fn metadata_json(b: &LibraryBook, extras: &library::MetadataExtras) -> serde_json::Value {
+    json!({
+        "book_url": b.book_url,
+        "name": b.name,
+        "author": b.author,
+        "tier": b.tier,
+        "language": b.language,
+        "publisher": b.publisher,
+        "pubdate": b.pubdate,
+        "series_name": b.series_name,
+        "series_index": b.series_index,
+        "identifiers": extras
+            .identifiers
+            .iter()
+            .map(|(scheme, value)| json!({ "scheme": scheme, "value": value }))
+            .collect::<Vec<_>>(),
+        "tags": extras.tags,
+    })
+}
+
+/// 读一本书的元数据。登录即可读（馆藏全局共享）。
+async fn book_meta(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    Query(q): Query<MetaQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let book_url = q.book_url.trim();
+    if book_url.is_empty() {
+        return Err(AppError::BadRequest("book_url 不能为空".into()));
+    }
+    let book = library::load_book(&s.library, book_url)
+        .await?
+        .ok_or_else(|| AppError::NotFound("馆藏里没有这本书".into()))?;
+    let extras = library::load_metadata_extras(&s.library, book_url).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "meta": metadata_json(&book, &extras),
+    })))
+}
+
+/// 写一本书的元数据。仅管理员：馆藏是全局共享内容，普通账号只能改自己的书架字段。
+async fn set_book_meta(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Json(req): Json<MetaPatchReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_admin(&u)?;
+    let book_url = req.book_url.trim().to_string();
+    if book_url.is_empty() {
+        return Err(AppError::BadRequest("book_url 不能为空".into()));
+    }
+    let patch = to_metadata_patch(req)?;
+    if patch.is_empty() {
+        return Err(AppError::BadRequest("没有可更新的字段".into()));
+    }
+    library::update_metadata(&s.library, &book_url, &patch).await?;
+    let book = library::load_book(&s.library, &book_url)
+        .await?
+        .ok_or_else(|| AppError::NotFound("馆藏里没有这本书".into()))?;
+    let extras = library::load_metadata_extras(&s.library, &book_url).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "meta": metadata_json(&book, &extras),
+    })))
 }
 
 /// 馆藏浏览：keyset 分页（`sort_ts DESC, book_url ASC`），不返回总数、不做 OFFSET。
@@ -726,5 +923,71 @@ mod tests {
         assert!(sample_indices(0, 3).is_empty());
         assert_eq!(sample_indices(2, 3), vec![0, 1]);
         assert_eq!(sample_indices(10, 3), vec![0, 4, 9]);
+    }
+
+    fn meta_req(idx: Option<f64>, tags: Option<Vec<&str>>) -> MetaPatchReq {
+        MetaPatchReq {
+            book_url: "b".into(),
+            language: Some(" zh ".into()),
+            series_index: idx,
+            tags: tags.map(|v| v.into_iter().map(str::to_string).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn metadata_patch_normalizes_identifiers_and_tags() {
+        let req = MetaPatchReq {
+            identifiers: Some(vec![
+                IdentifierReq {
+                    scheme: " ISBN ".into(),
+                    value: " 9787532754687 ".into(),
+                },
+                IdentifierReq {
+                    scheme: "SOURCE".into(),
+                    value: "abc".into(),
+                },
+            ]),
+            ..meta_req(Some(1.0), Some(vec![" 科幻 ", "", "经典"]))
+        };
+        let p = to_metadata_patch(req).unwrap();
+        assert_eq!(
+            p.language.as_deref(),
+            Some(" zh "),
+            "文本原样保留，落库时再 trim"
+        );
+        assert_eq!(
+            p.identifiers.unwrap(),
+            vec![
+                ("isbn".to_string(), "9787532754687".to_string()),
+                ("source".to_string(), "abc".to_string()),
+            ]
+        );
+        assert_eq!(
+            p.tags.unwrap(),
+            vec!["科幻".to_string(), "经典".to_string()]
+        );
+    }
+
+    #[test]
+    fn metadata_patch_rejects_bad_values() {
+        // 负数 / NaN 的系列序号
+        assert!(to_metadata_patch(meta_req(Some(-1.0), None)).is_err());
+        assert!(to_metadata_patch(meta_req(Some(f64::NAN), None)).is_err());
+        // 语言超过 BCP 47 上限
+        let long = MetaPatchReq {
+            language: Some("x".repeat(META_MAX_LANGUAGE + 1)),
+            ..Default::default()
+        };
+        assert!(to_metadata_patch(long).is_err());
+        // 空 scheme
+        let bad_id = MetaPatchReq {
+            identifiers: Some(vec![IdentifierReq {
+                scheme: "  ".into(),
+                value: "x".into(),
+            }]),
+            ..Default::default()
+        };
+        assert!(to_metadata_patch(bad_id).is_err());
     }
 }

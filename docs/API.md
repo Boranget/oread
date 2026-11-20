@@ -2237,6 +2237,11 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
       "cover_url": "https://example.com/cover.jpg",
       "kind": null,
       "book_source_type": 0,
+      "language": null,
+      "publisher": null,
+      "pubdate": null,
+      "series_name": null,
+      "series_index": null,
       "tier": "collection",
       "collected_at": 1763000000000,
       "last_accessed_at": 1763500000000,
@@ -2260,6 +2265,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `items[].collected_at` | integer | 是 | 入馆时间（epoch ms），临时层为 `null` |
 | `items[].last_accessed_at` / `checked_at` | integer | 否 | 最近访问 / 最近检查时间（epoch ms） |
 | `items[].cached_chapters` | integer | 否 | 馆藏正文中已缓存章节数；漫画还要求图片全部落盘才算已缓存 |
+| `items[].series_name` / `series_index` | string/number | 是 | 系列名与卷序号（OPF `belongs-to-collection` 口径），未填写为 `null` |
+| `items[].language` / `publisher` / `pubdate` | string | 是 | 语言 / 出版社 / 出版日期；未填写为 `null`；标签与标识用 6.12.3 单独读取 |
 | `items[].content_bytes` / `image_bytes` | integer | 否 | 正文（含图片清单 JSON）/ 漫画图片原始字节占用 |
 | `items[].book_source_type` | integer | 否 | `2` 为漫画；前端据此在入馆前做体积预估 |
 | `items[].download_percent` | integer/null | 是 | `cached_chapters / total_chapter_num`；目录未知时为 `null` |
@@ -2269,7 +2276,55 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 行为：`ORDER BY <sort_expr> DESC, book_url ASC`，用游标续页，**不使用 OFFSET**；不返回总数。
   - `sort=accessed` 用 `last_accessed_at`；`sort=collected` 用 `COALESCE(collected_at, 0)`（临时层没有入馆时间，按 0 排序，分页不会漏行）。
 
-### 6.12.3 `POST /api/library/comic/estimate`（管理员）
+### 6.12.3 单书元数据：`GET` / `POST /api/library/book/meta`
+
+长期图书馆需要的 OPF 语义字段：系列、语言、出版信息、标识（ISBN 等）与标签。
+这些属于**全局内容层**（`library.db`）：一个账号改，所有账号看到；写入仅管理员。
+个人字段（星级、分组、私人标签）不在这里，仍留在 `users/<uid>.db`。
+
+- 鉴权：`GET` 登录即可；`POST` 需要 **admin**
+- `GET` 查询参数：`book_url`（必填，也接受 `book_id`）
+- 成功 `200`：
+
+```json
+{
+  "ok": true,
+  "meta": {
+    "book_url": "https://example.com/book/123",
+    "name": "示例书名",
+    "author": "示例作者",
+    "tier": "collection",
+    "language": "zh",
+    "publisher": "示例出版社",
+    "pubdate": "2020-01-01",
+    "series_name": "银河系漫游指南",
+    "series_index": 1.0,
+    "identifiers": [
+      { "scheme": "isbn", "value": "9787532754687" }
+    ],
+    "tags": ["科幻", "经典"]
+  }
+}
+```
+
+- `POST` 请求体（除 `book_url` 外全部可选）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `book_url` | string | 馆藏书目主键；不存在时自动建一行临时书目 |
+| `language` | string | BCP 47，最长 35 |
+| `publisher` / `pubdate` / `series_name` | string | 最长 200；`pubdate` 原样保存（如 `2020-01-01`） |
+| `series_index` | number | `>= 0` 的有限数 |
+| `identifiers` | array | `[{ "scheme": "isbn", "value": "..." }]`；`scheme` 归一为小写 |
+| `tags` | string[] | 去首尾空白、去重；最多 64 个、每个 64 字符 |
+
+- 语义：**缺省字段 = 保持不变**；文本传空串 = 清空；`identifiers`/`tags` 传 `[]` = 清空该项。
+- 限制：`identifiers` 最多 32 条，`scheme` ≤ 32 字符、`value` ≤ 128 字符。
+- 成功 `200`：返回写入后的 `meta`（结构同 `GET`）。
+- 错误：`400`（空补丁 / 数值非法 / 超长）；`403`（非管理员写入）；`404`（`GET` 时书不在馆藏）；`401`。
+- 行为：`GET` 只读书目与扩展表，不触发抓取；`POST` 不改变 `tier` / 入馆状态。
+
+### 6.12.4 `POST /api/library/comic/estimate`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：漫画入馆前的体积预估。抽样 3 章 × 2 张图，只探测响应头（优先 `Range: bytes=0-0` 读 `Content-Range`，不支持时用 `Content-Length`），不下载整图。
@@ -2315,7 +2370,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 误差来源：每章图片数只能抽样、单图大小波动、加密图解密后大小变化；前端必须展示「抽样估算，以实际下载为准」。
 - 错误：`400`（目录为空 / 书源不可用）；`401`。
 
-### 6.12.4 `POST /api/library/collect`（管理员）
+### 6.12.5 `POST /api/library/collect`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：把书置为馆藏（永久保存），并排一张后台整本下载任务。
@@ -2337,7 +2392,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 没记录书源且未传 `source` 时仍会入馆，但 `queued=false`、`job_id=null`。
   - 后台下载由 `library_worker` 执行，不依赖前端保持页面打开。
 
-### 6.12.5 `POST /api/library/release`（管理员）
+### 6.12.6 `POST /api/library/release`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：移出馆藏，降级为临时缓存（内容先保留，交给 TTL 或手动删除）。
@@ -2345,7 +2400,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 成功 `200`：`{ "ok": true, "book_url": "...", "released": true, "tier": "temp" }`；书不在馆藏时 `released=false`，仍 `200`。
 - 行为：移出时**取消该书未完成的后台下载任务**（已下载章节保留）；已结束的采购单不受影响。
 
-### 6.12.6 `POST /api/library/delete`（管理员）
+### 6.12.7 `POST /api/library/delete`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：整本删除书目 + 目录 + 正文 + 已落盘的漫画图片。
@@ -2359,14 +2414,14 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：`404 {"error":"馆藏里没有这本书"}`；`400 {"error":"该书仍在馆藏中，请先移出馆藏再删除"}`。
 - 行为：删除与「取消该书未完成任务」在同一事务内完成，避免后台 worker 删除后继续写入。
 
-### 6.12.7 `POST /api/library/temp/clean`（管理员）
+### 6.12.8 `POST /api/library/temp/clean`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：立即回收过期临时缓存（与 `POST /api/book/cache/trim` 同一实现，见 6.9.1）。
 - 请求体：无。
 - 成功 `200`：`{ "ok": true, "books": 2, "chapters": 120, "contents": 120, "images": 340, "bytes_freed": 12582912, "ttl_days": 30 }`。
 
-### 6.12.8 `GET /api/library/jobs`（管理员）
+### 6.12.9 `GET /api/library/jobs`（管理员）
 
 - 鉴权：登录 + **admin**
 - 查询参数：`status`（逗号分隔，如 `queued,running`；缺省全部；未知状态返回 400）、`limit`（默认 100，clamp 1..500）。
@@ -2387,14 +2442,14 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 进度口径：`done` 只计本次新下载的章节；`skipped` 是开工前已缓存、无需再下的章节；`failed` 为本次失败数。前端进度按 `(done + skipped) / total` 计算，三者不重叠。
 - 排序：`created_at DESC`。
 
-### 6.12.9 `POST /api/library/jobs/cancel`（管理员）
+### 6.12.10 `POST /api/library/jobs/cancel`（管理员）
 
 - 鉴权：登录 + **admin**
 - 请求体：`{ "id": "lj1234-7" }`。
 - 成功 `200`：`{ "ok": true, "id": "lj1234-7", "cancelled": true }`；任务已结束时 `cancelled=false`。
 - 行为：worker 在每章开始前检查状态，取消后尽快停止；已下载章节保留在馆藏。
 
-### 6.12.10 后台执行器与安全阀
+### 6.12.11 后台执行器与安全阀
 
 - 独立低优先级通道：默认 1 个任务并发（`LIBRARY_JOB_PARALLEL`），每任务 3 章并发（`LIBRARY_JOB_CHAPTER_PARALLEL`）。
 - 进程重启后把残留 `running` 任务放回队列，按 `library_job_items` 断点续跑。

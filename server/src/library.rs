@@ -121,6 +121,13 @@ pub struct LibraryBook {
     pub latest_chapter_time: i64,
     pub total_chapter_num: i64,
     pub word_count: Option<String>,
+    /// OPF 语义字段（全局内容层，管理员可编辑；标签/标识在同库的扩展表里）
+    pub language: Option<String>,
+    pub publisher: Option<String>,
+    /// 出版日期原样保存（`YYYY-MM-DD` 或书写源给的字符串）
+    pub pubdate: Option<String>,
+    pub series_name: Option<String>,
+    pub series_index: Option<f64>,
     pub tier: String,
     pub collected_at: Option<i64>,
     pub last_accessed_at: i64,
@@ -236,6 +243,169 @@ pub async fn adopt_source(
 }
 
 // ---------------------------------------------------------------------------
+// 元数据（OPF 语义字段）
+// ---------------------------------------------------------------------------
+
+/// 全局内容层的元数据补丁。
+///
+/// 每个字段都是 `None = 保持不变`；文本字段传空串表示清空（落库为 NULL）。
+/// `identifiers` / `tags` 传 `Some(vec![])` 表示清空，`Some(非空)` 表示整体替换。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MetadataPatch {
+    pub language: Option<String>,
+    pub publisher: Option<String>,
+    pub pubdate: Option<String>,
+    pub series_name: Option<String>,
+    pub series_index: Option<f64>,
+    pub identifiers: Option<Vec<(String, String)>>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl MetadataPatch {
+    /// 一个字段都没带：路由层据此返回 400，避免空补丁静默成功。
+    pub fn is_empty(&self) -> bool {
+        self.language.is_none()
+            && self.publisher.is_none()
+            && self.pubdate.is_none()
+            && self.series_name.is_none()
+            && self.series_index.is_none()
+            && self.identifiers.is_none()
+            && self.tags.is_none()
+    }
+}
+
+/// 一本书的扩展元数据：标签与标识单独成表，按需读取。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MetadataExtras {
+    pub identifiers: Vec<(String, String)>,
+    pub tags: Vec<String>,
+}
+
+fn non_empty(v: &str) -> Option<&str> {
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// 写入元数据补丁：先确保书目存在，再按需更新列、整体替换标识与标签。
+///
+/// 只动全局内容层；个人字段（星级、分组、私人标签）留在用户库。
+pub async fn update_metadata(
+    pool: &SqlitePool,
+    book_url: &str,
+    patch: &MetadataPatch,
+) -> anyhow::Result<()> {
+    let book_url = book_url.trim();
+    ensure_book(pool, book_url).await?;
+    let mut tx = pool.begin().await?;
+
+    let mut sets: Vec<&str> = Vec::new();
+    if patch.language.is_some() {
+        sets.push("language = ?");
+    }
+    if patch.publisher.is_some() {
+        sets.push("publisher = ?");
+    }
+    if patch.pubdate.is_some() {
+        sets.push("pubdate = ?");
+    }
+    if patch.series_name.is_some() {
+        sets.push("series_name = ?");
+    }
+    if patch.series_index.is_some() {
+        sets.push("series_index = ?");
+    }
+    if !sets.is_empty() {
+        let sql = format!(
+            "UPDATE library_books SET {} WHERE book_url = ?",
+            sets.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = &patch.language {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = &patch.publisher {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = &patch.pubdate {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = &patch.series_name {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = patch.series_index {
+            q = q.bind(v);
+        }
+        q.bind(book_url).execute(&mut *tx).await?;
+    }
+
+    if let Some(list) = &patch.identifiers {
+        sqlx::query("DELETE FROM library_identifiers WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        for (scheme, value) in list {
+            let (Some(scheme), Some(value)) = (non_empty(scheme), non_empty(value)) else {
+                continue;
+            };
+            sqlx::query(
+                "INSERT OR IGNORE INTO library_identifiers (book_url, scheme, value) \
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(book_url)
+            .bind(scheme)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    if let Some(tags) = &patch.tags {
+        sqlx::query("DELETE FROM library_tags WHERE book_url = ?1")
+            .bind(book_url)
+            .execute(&mut *tx)
+            .await?;
+        for tag in tags {
+            let Some(tag) = non_empty(tag) else {
+                continue;
+            };
+            sqlx::query("INSERT OR IGNORE INTO library_tags (book_url, tag) VALUES (?1, ?2)")
+                .bind(book_url)
+                .bind(tag)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 读取标签与标识（按 scheme/tag 排序，保证输出稳定）。
+pub async fn load_metadata_extras(
+    pool: &SqlitePool,
+    book_url: &str,
+) -> anyhow::Result<MetadataExtras> {
+    let identifiers = sqlx::query_as::<_, (String, String)>(
+        "SELECT scheme, value FROM library_identifiers \
+         WHERE book_url = ?1 ORDER BY scheme, value",
+    )
+    .bind(book_url)
+    .fetch_all(pool)
+    .await?;
+    let tags = sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM library_tags WHERE book_url = ?1 ORDER BY tag",
+    )
+    .bind(book_url)
+    .fetch_all(pool)
+    .await?;
+    Ok(MetadataExtras { identifiers, tags })
+}
+
+// ---------------------------------------------------------------------------
 // 清理 / 删除
 // ---------------------------------------------------------------------------
 
@@ -336,6 +506,15 @@ pub async fn delete_book(pool: &SqlitePool, book_url: &str) -> anyhow::Result<De
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    // 元数据扩展表没有外键，整本删除时显式清理，避免孤儿行长期堆积。
+    sqlx::query("DELETE FROM library_identifiers WHERE book_url = ?1")
+        .bind(book_url)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM library_tags WHERE book_url = ?1")
+        .bind(book_url)
+        .execute(&mut *tx)
+        .await?;
     let books = sqlx::query("DELETE FROM library_books WHERE book_url = ?1")
         .bind(book_url)
         .execute(&mut *tx)

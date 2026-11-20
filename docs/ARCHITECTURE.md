@@ -64,11 +64,12 @@ GET /api/book/content
 ## 4. 数据与缓存
 
 - **`shared.db`**：账户、书源、导入账本、体检语料。全局一份。
-- **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总，含 `image_bytes`）、`library_chapters`（目录）、`library_content`（正文/图片清单，键 `(url, origin)`，图片章节带 `images_ready`）、`library_images`（漫画图片原始字节 BLOB，键 `(url, origin)`）、`library_jobs`/`library_job_items`（采购单）。
+- **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总，含 `image_bytes`）、`library_chapters`（目录）、`library_content`（正文/图片清单，键 `(url, origin)`，图片章节带 `images_ready`）、`library_images`（漫画图片原始字节 BLOB，键 `(url, origin)`）、`library_identifiers` / `library_tags`（OPF 语义扩展，键 `book_url`）、`library_jobs`/`library_job_items`（采购单）。
   - `tier=collection`：馆藏，永久保存，不自动淘汰；只有管理员能移出或删除。
   - `tier=temp`：临时缓存，按 `last_accessed_at` 做 TTL 回收（默认 30 天），每小时后台清理。
   - **不设容量上限**，只做占用监控；`/api/healthz` 与 `/api/library/stats` 暴露分层占用。
   - 登录态书源抓到的内容同样共享（方案 A）：`library_content.scope_uid` 预留，当前恒为 0。
+  - **元数据分层**：系列、语言、出版社、出版日期、标识（ISBN 等）、标签属于「谁抓到都一样」的全局字段，写在 `library_books` / `library_identifiers` / `library_tags`；星级、分组、私人标签留在用户库。读写接口见 [API.md](API.md) 6.12.3。
 - **`users/<uid>.db`**：书架、阅读进度、设置、书签、替换规则、书源登录态（`book_vars`/`book_cache`）、个人覆盖字段。物理分桶，连接池有 LRU 上限。`book_meta.total_chapter_num` 保留为馆藏权威值的副本，书架进度口径不变。
 - **正文读取**：先查 `library_content`（TTL + 管线指纹 `cache_version`），命中刷新访问时间；未命中抓取后写馆藏。空正文不落库。
   - `tier=collection` 的书**不按 TTL 过期**：正文、目录、漫画图片列表都直接读馆藏，书源失效后已入馆的书仍可打开。

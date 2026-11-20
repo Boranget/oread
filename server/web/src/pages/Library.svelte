@@ -385,7 +385,7 @@
             {#if b.origin_name}<span class="muted tiny-note">{b.origin_name}</span>{/if}
           </div>
           <div class="muted tiny-note">
-            {b.author || '佚名'} · 已缓存 {b.cached_chapters} / {b.total_chapter_num || '?'} 章 · 正文 {fmtBytes(b.content_bytes)}{#if b.image_bytes} · 图片 {fmtBytes(b.image_bytes)}{/if}
+            {b.author || '佚名'}{#if b.series_name} · {b.series_name}{#if b.series_index != null} #{b.series_index}{/if}{/if} · 已缓存 {b.cached_chapters} / {b.total_chapter_num || '?'} 章 · 正文 {fmtBytes(b.content_bytes)}{#if b.image_bytes} · 图片 {fmtBytes(b.image_bytes)}{/if}
             · 最近访问 {fmtDate(b.last_accessed_at)}
             {#if b.tier === 'collection' && b.collected_at} · 入馆 {fmtDate(b.collected_at)}{/if}
           </div>
