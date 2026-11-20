@@ -112,7 +112,7 @@
 - 状态：`延后`
 - 为什么：Kindle 的替代路径之一是生成 EPUB 推送到设备，绕开浏览器能力限制（KPW3 上无 JS / 无 WebView 富文本）；PDF 的字体嵌入与版面成本更高，先不做。
 - 排期：优先级**低于** `/k` 极简页（见 3.2.1）；前置依赖是正文分段（HTML → 段落）与图片处理（下载、内联、尺寸约束），这两项在正文管线里尚未定型。
-- **TXT 导出已完成**（`/api/book/export/info` + `/api/book/export/txt`，见 [API.md](../docs/API.md) 6.10/6.11）；EPUB/PDF 仍延后，前置依赖是正文分段与图片处理。
+- **TXT 导出已完成**（`/api/book/export/info` + `/api/book/export/txt`，见 [API.md](../docs/API.md) 6.10/6.11），写入逻辑已迁入 `server/src/ebook/`（见 2.9）；EPUB/PDF 仍延后，前置依赖是正文分段与图片处理。
 - 依据：`/api/book/content` 返回文本/HTML 混合正文（见 [API.md](../docs/API.md) 6.3），当前没有 EPUB/PDF 打包依赖。
 
 ### 2.7 漫画链路（`处理中`）
@@ -133,6 +133,21 @@
 - 已完成：`language` / `publisher` / `pubdate` / `series_name` / `series_index` 入库；`library_identifiers`（ISBN 等 `scheme/value`）与 `library_tags` 独立成表；全局（内容层）与个人（用户库）边界见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 4 节。
 - 还差：EPUB/OPDS 消费这些字段（Phase 1–3）、从书源详情页自动映射系列/标签、前端编辑入口。
 - 参考：calibre 的 `Metadata` / OPF 字段体系（只学语义与规范，不复制 GPL 代码）。
+
+### 2.9 电子书管线（`进行中`）
+
+- 状态：`进行中`。Phase 1 已完成：`server/src/ebook/` 领域层 + TXT 导出迁入。
+- 已完成：
+  - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；
+  - `source`：只读馆藏组装书视图（目录缺失 → 409），`LibraryReader` 按章读取、空白正文视为未缓存；
+  - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
+  - `format/txt`：与旧导出逐字一致（头部、分卷、`[n/N]` 标题、未缓存占位、结尾统计），逐章流式写盘。
+- 还差：
+  - `library_artifacts` 表与内容 hash 复用：TXT 含导出时间戳、且是临时文件，收益低；等 CBZ/EPUB（确定性产物）再做；
+  - CBZ（Phase 2）：消费 `library_images`，复用同一 `FormatWriter`；
+  - EPUB（Phase 3）：前置是正文 HTML → 语义分段与图片内联；
+  - OPDS（Phase 4）与可选 AZW3/推送（Phase 5）。
+- 纪律：`ebook` 层只读馆藏、不抓网络、不决定 `data_dir` 布局；GPL 代码不复制，只按公开规范独立实现。
 
 ---
 

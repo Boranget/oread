@@ -1,7 +1,10 @@
 //! 已缓存正文导出为 TXT。
 //!
+//! HTTP 层只负责三件事：算文件名、流式回传、清理临时文件。真正的写入逻辑在
+//! [`crate::ebook::format::txt`]；增删格式只需换 writer，这里不再关心正文字段。
+//!
 //! 约束（低内存机型）：
-//! - **逐章流式写盘**：一次只在内存里持有一章的正文，绝不整本 join 后落盘；
+//! - **逐章流式写盘**：一次只在内存里持有一章正文，绝不整本 join 后落盘；
 //! - 未缓存章节必须显式占位，不能静默丢章；
 //! - 导出接口本身只读缓存、不发起任何网络抓取。
 //!
@@ -23,10 +26,14 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::auth::AuthUser;
-use crate::error::{AppError, AppResult};
+use crate::ebook::format::txt::{normalize_author, TxtWriter};
+use crate::ebook::pipeline::FormatWriter;
+use crate::ebook::source::{load_book_input, LibraryReader};
+use crate::ebook::BookInput;
+use crate::error::AppResult;
 use crate::routes::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -40,106 +47,17 @@ pub struct ExportQ {
     pub book_url: String,
 }
 
-/// 导出前的计划信息：章节总数、已缓存数、缺失数都基于馆藏库实时统计（全局共享）。
-#[derive(Debug, Clone, Default)]
-struct ExportPlan {
-    name: String,
-    author: String,
-    source: String,
-    total_chapters: i64,
-    cached_chapters: i64,
-    cached_bytes: i64,
-}
-
 struct ExportFile {
     path: PathBuf,
-    plan: ExportPlan,
+    input: BookInput,
     /// 实际写入的已缓存章节数（导出过程中缓存被并发清理时可能略小于计划值）
     written_cached: i64,
     size_bytes: u64,
 }
 
-const PLACEHOLDER_TITLE: &str = "【未缓存】";
-
-async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<ExportPlan> {
-    let book_url = book_url.trim();
-    if book_url.is_empty() {
-        return Err(AppError::BadRequest("book_url 不能为空".into()));
-    }
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
-        .bind(book_url)
-        .fetch_one(pool)
-        .await?;
-    if rows == 0 {
-        // 前置条件不满足（目录还没缓存），用 409 而不是 400
-        return Err(AppError::Conflict(
-            "目录未缓存，请先调用 GET /api/book/toc".into(),
-        ));
-    }
-    #[allow(clippy::type_complexity)] // 元数据行与 SQL 列一一对应，保持就地元组便于核对。
-    let meta: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
-        "SELECT name, author, origin_name, origin FROM library_books WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .fetch_optional(pool)
-    .await?;
-    let (name, author, origin_name, origin) = meta.unwrap_or_default();
-    let name = name
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| book_url.to_string());
-    let author = normalize_author(author.as_deref().unwrap_or(""));
-    let source = origin_name
-        .filter(|s| !s.trim().is_empty())
-        .or(origin)
-        .unwrap_or_default();
-
-    // 分卷行不是正文章节，不计入总数；空正文（只有空白）等同未缓存。
-    let (total, cached, cached_bytes): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), \
-         COALESCE(SUM(CASE WHEN ct.url IS NOT NULL THEN 1 ELSE 0 END), 0), \
-         COALESCE(SUM(ct.size_bytes), 0) \
-         FROM library_chapters c LEFT JOIN library_content ct \
-           ON ct.url = c.url AND ct.book_url = c.book_url \
-              AND ct.content IS NOT NULL AND length(trim(ct.content)) > 0 \
-         WHERE c.book_url = ?1 AND c.is_volume = 0 AND c.url NOT LIKE 'volume:%'",
-    )
-    .bind(book_url)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(ExportPlan {
-        name,
-        author,
-        source,
-        total_chapters: total,
-        cached_chapters: cached,
-        cached_bytes,
-    })
-}
-
-/// 规范化书源里的作者字段：书源常自带 `作者：` / `作 者：` / `Authors:` 等标签，
-/// 导出时统一剥掉标签与首尾空白，空值回落为“未知”。
-fn normalize_author(raw: &str) -> String {
-    let mut s = raw.trim();
-    for label in ["作者", "作 者", "Authors", "authors", "AUTHOR", "AUTHORS"] {
-        if let Some(rest) = s.strip_prefix(label) {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('：')) {
-                s = rest.trim();
-                break;
-            }
-        }
-    }
-    if s.is_empty() {
-        "未知".into()
-    } else {
-        s.to_string()
-    }
+/// 导出前的计划 = 只读的书视图（元数据 + 目录 + 缓存统计）。
+async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<BookInput> {
+    load_book_input(pool, book_url).await
 }
 
 /// 去掉路径分隔符与控制字符，避免书名被当成目录/文件名注入；过长时截断。
@@ -182,14 +100,14 @@ async fn cleanup_stale(dir: &Path) {
     }
 }
 
-/// 逐章查询正文并流式写入磁盘。内存峰值 ≈ 单章正文 + 16 KiB 缓冲。
+/// 逐章读取并流式写入磁盘：内存峰值 ≈ 单章正文 + 16 KiB 回传缓冲。
 async fn write_export(
     pool: &SqlitePool,
     data_dir: &str,
     uid: i64,
     book_url: &str,
 ) -> AppResult<ExportFile> {
-    let plan = build_plan(pool, book_url).await?;
+    let input = build_plan(pool, book_url).await?;
     let dir = Path::new(data_dir).join("exports").join(uid.to_string());
     fs::create_dir_all(&dir).await?;
     cleanup_stale(&dir).await;
@@ -198,109 +116,20 @@ async fn write_export(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = dir.join(format!("{}-{}.txt", sanitize_filename(&plan.name), seq));
+    let path = dir.join(format!(
+        "{}-{}.txt",
+        sanitize_filename(&input.meta.name),
+        seq
+    ));
 
-    let missing = (plan.total_chapters - plan.cached_chapters).max(0);
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let mut header = format!(
-        "书名：{}\n作者：{}\n书源：{}\n书籍地址：{}\n导出时间：{}\n\
-         章节：已缓存 {}/{} 章，缺 {} 章\n",
-        plan.name,
-        plan.author,
-        plan.source,
-        book_url.trim(),
-        now,
-        plan.cached_chapters,
-        plan.total_chapters,
-        missing
-    );
-    if missing > 0 {
-        header.push_str("提示：缺失章节已用占位说明标出，不会静默丢章。\n");
-    }
-    header.push('\n');
-    header.push_str(&"=".repeat(60));
-    header.push('\n');
+    let reader = LibraryReader::new(pool, book_url);
+    let report = TxtWriter.write(&input, &reader, &path).await?;
 
-    let mut file = File::create(&path).await?;
-    file.write_all(header.as_bytes()).await?;
-
-    let chapters: Vec<(String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT url, title, is_volume FROM library_chapters \
-         WHERE book_url = ?1 ORDER BY \"index\"",
-    )
-    .bind(book_url.trim())
-    .fetch_all(pool)
-    .await?;
-
-    let mut written_cached = 0i64;
-    let mut seq_no = 0i64;
-    for (url, title, is_volume) in chapters {
-        if is_volume || url.starts_with("volume:") {
-            if let Some(t) = title.filter(|s| !s.trim().is_empty()) {
-                file.write_all(format!("\n\n【分卷】{}\n", t.trim()).as_bytes())
-                    .await?;
-            }
-            continue;
-        }
-        seq_no += 1;
-        let title = title
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("第 {seq_no} 章"));
-        let heading = if plan.total_chapters > 0 {
-            format!(
-                "\n\n===== [{}/{}] {} =====\n\n",
-                seq_no,
-                plan.total_chapters,
-                title.trim()
-            )
-        } else {
-            format!("\n\n===== {} =====\n\n", title.trim())
-        };
-        file.write_all(heading.as_bytes()).await?;
-
-        // 一次只取一章正文；LIMIT 1 保证同 URL 同书的重复行不会读进内存。
-        let body: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM library_content \
-             WHERE url = ?1 AND book_url = ?2 AND content IS NOT NULL LIMIT 1",
-        )
-        .bind(&url)
-        .bind(book_url.trim())
-        .fetch_optional(pool)
-        .await?;
-        match body.filter(|c| !c.trim().is_empty()) {
-            Some(body) => {
-                file.write_all(body.trim().as_bytes()).await?;
-                file.write_all(b"\n").await?;
-                written_cached += 1;
-            }
-            None => {
-                file.write_all(
-                    format!(
-                        "{}本章正文尚未缓存。章节地址：{}\n\
-                         请先在阅读端打开本章，或执行“缓存全部”后重新导出。\n",
-                        PLACEHOLDER_TITLE, url
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            }
-        }
-    }
-
-    let footer = format!(
-        "\n\n===== 导出结束：实际写入 {}/{} 章 =====\n",
-        written_cached, plan.total_chapters
-    );
-    file.write_all(footer.as_bytes()).await?;
-    file.flush().await?;
-    drop(file);
-
-    let size_bytes = fs::metadata(&path).await?.len();
     Ok(ExportFile {
         path,
-        plan,
-        written_cached,
-        size_bytes,
+        input,
+        written_cached: report.written_chapters,
+        size_bytes: report.size_bytes,
     })
 }
 
@@ -316,14 +145,15 @@ async fn export_info(
     );
     Ok(Json(json!({
         "book_url": q.book_url.trim(),
-        "name": plan.name,
-        "author": plan.author,
-        "source": plan.source,
+        "name": plan.meta.name,
+        // 与 TXT 头部同一口径：剥掉“作者：”标签
+        "author": normalize_author(&plan.meta.author),
+        "source": plan.meta.source.clone().unwrap_or_default(),
         "total_chapters": plan.total_chapters,
         "cached_chapters": plan.cached_chapters,
-        "missing_chapters": (plan.total_chapters - plan.cached_chapters).max(0),
+        "missing_chapters": plan.missing_chapters,
         "cached_bytes": plan.cached_bytes,
-        "complete": plan.cached_chapters >= plan.total_chapters,
+        "complete": plan.complete(),
         "export_url": export_url,
     })))
 }
@@ -337,7 +167,7 @@ async fn export_txt(
 
     let filename = format!(
         "{}-{}.txt",
-        sanitize_filename(&out.plan.name),
+        sanitize_filename(&out.input.meta.name),
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let file = File::open(&out.path).await?;
@@ -374,20 +204,15 @@ async fn export_txt(
     );
     h.insert(
         "x-total-chapters",
-        HeaderValue::from_str(&out.plan.total_chapters.to_string()).expect("数字 header"),
+        HeaderValue::from_str(&out.input.total_chapters.to_string()).expect("数字 header"),
     );
     h.insert(
         "x-cached-chapters",
-        HeaderValue::from_str(&out.plan.cached_chapters.to_string()).expect("数字 header"),
+        HeaderValue::from_str(&out.input.cached_chapters.to_string()).expect("数字 header"),
     );
     h.insert(
         "x-missing-chapters",
-        HeaderValue::from_str(
-            &(out.plan.total_chapters - out.plan.cached_chapters)
-                .max(0)
-                .to_string(),
-        )
-        .expect("数字 header"),
+        HeaderValue::from_str(&out.input.missing_chapters.to_string()).expect("数字 header"),
     );
     h.insert(
         "x-written-chapters",
@@ -403,6 +228,7 @@ async fn export_txt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn export_pool() -> SqlitePool {
@@ -413,7 +239,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, name TEXT, author TEXT, \
-             origin TEXT, origin_name TEXT)",
+             origin TEXT, origin_name TEXT, intro TEXT, language TEXT, publisher TEXT, \
+             pubdate TEXT, series_name TEXT, series_index REAL)",
         )
         .execute(&pool)
         .await
@@ -518,11 +345,11 @@ mod tests {
         assert!(text.contains("第一章正文\n第二段"), "命中的正文应原样保留");
         assert!(text.contains("第三章正文内容"));
         // 未缓存章节只有一个占位块，且没有被跳过
-        assert_eq!(text.matches(PLACEHOLDER_TITLE).count(), 1);
+        assert_eq!(text.matches("【未缓存】").count(), 1);
         assert!(text.contains("章节地址：https://x/c2"));
 
-        assert_eq!(out.plan.total_chapters, 3, "分卷行不计入章节总数");
-        assert_eq!(out.plan.cached_chapters, 2);
+        assert_eq!(out.input.total_chapters, 3, "分卷行不计入章节总数");
+        assert_eq!(out.input.cached_chapters, 2);
         assert_eq!(out.written_cached, 2);
         assert!(out.size_bytes > 0);
         // UTF-8 往返：中文内容读回后完全一致
@@ -619,9 +446,9 @@ mod tests {
             .await
             .unwrap();
         let plan = build_plan(&pool, book).await.unwrap();
-        assert_eq!(plan.total_chapters, out.plan.total_chapters);
-        assert_eq!(plan.cached_chapters, out.plan.cached_chapters);
-        assert_eq!(plan.cached_bytes, out.plan.cached_bytes);
+        assert_eq!(plan.total_chapters, out.input.total_chapters);
+        assert_eq!(plan.cached_chapters, out.input.cached_chapters);
+        assert_eq!(plan.cached_bytes, out.input.cached_bytes);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

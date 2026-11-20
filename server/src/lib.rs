@@ -10,6 +10,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod db_guard;
+pub mod ebook;
 pub mod entities;
 pub mod error;
 pub mod image_cache;
