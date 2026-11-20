@@ -69,6 +69,8 @@ GET /api/book/content
   - 登录态书源抓到的内容同样共享（方案 A）：`library_content.scope_uid` 预留，当前恒为 0。
 - **`users/<uid>.db`**：书架、阅读进度、设置、书签、替换规则、书源登录态（`book_vars`/`book_cache`）、个人覆盖字段。物理分桶，连接池有 LRU 上限。`book_meta.total_chapter_num` 保留为馆藏权威值的副本，书架进度口径不变。
 - **正文读取**：先查 `library_content`（TTL + 管线指纹 `cache_version`），命中刷新访问时间；未命中抓取后写馆藏。空正文不落库。
+  - `tier=collection` 的书**不按 TTL 过期**：正文、目录、漫画图片列表都直接读馆藏，书源失效后已入馆的书仍可打开。
+  - 回源失败时（正文/目录）回退到库中旧缓存，正文响应带 `stale=true`；完全无缓存才返回错误。
 - **采购单**：入馆时排队，`library_worker` 在服务端整本下载（默认 1 任务 × 3 章并发），进程重启后把 `running` 放回队列断点续跑；剩余磁盘低于 `LIBRARY_DISK_FLOOR_MB`（默认 1 GiB）时暂停，交互阅读不受影响。
 - **冷却与来源回填**：任务开始前查 `source_health.cooldown_until`，冷却中的书源把任务推迟到冷却结束（`library_jobs.updated_at` 即「下次可执行时间」），先跑别的书；worker 加载到真实书源后回填馆藏书目缺失的 `origin` / `origin_name` / `book_source_type`。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文分开预算。

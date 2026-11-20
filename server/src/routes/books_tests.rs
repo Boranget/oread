@@ -1949,3 +1949,110 @@ fn result_response_exposes_status_and_cancel_counts() {
     assert_eq!(v["total"], 1);
     assert_eq!(v["finished_at"], 42);
 }
+
+// 馆藏层不按 TTL 过期：已入馆的书，源失效后仍能读旧正文/旧目录。
+#[tokio::test]
+async fn collection_content_and_toc_ignore_ttl() {
+    let pool = mem_pool().await;
+    let book = "https://x/collected";
+    upsert_content(&pool, &mk_content("https://x/c1", book, 1, "正文"))
+        .await
+        .unwrap();
+    save_chapters(
+        &pool,
+        book,
+        &[BookChapter {
+            url: "https://x/c1".into(),
+            title: Some("第一章".into()),
+            book_url: Some(book.into()),
+            index: 1,
+            ..Default::default()
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(crate::library::collect(&pool, book).await.unwrap());
+
+    // 正文与目录都改成 30 天前，模拟「很久没读 + 书源已失效」。
+    sqlx::query("UPDATE library_content SET updated_at = datetime('now','-30 days')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE library_chapters SET updated_at = datetime('now','-30 days')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        load_cached_content(&pool, "https://x/c1", "", 60)
+            .await
+            .unwrap()
+            .is_some(),
+        "馆藏正文不应因 TTL 过期"
+    );
+    assert!(
+        load_cached_chapters(&pool, book, 60)
+            .await
+            .unwrap()
+            .is_some(),
+        "馆藏目录不应因 TTL 过期"
+    );
+}
+
+// 临时层仍按 TTL 过期；回源失败时可读旧缓存兜底。
+#[tokio::test]
+async fn temp_content_expires_but_stale_fallback_reads_it() {
+    let pool = mem_pool().await;
+    let book = "https://x/temp";
+    upsert_content(&pool, &mk_content("https://x/t1", book, 1, "旧正文"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE library_content SET updated_at = datetime('now','-30 days')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        load_cached_content(&pool, "https://x/t1", "", 60)
+            .await
+            .unwrap()
+            .is_none(),
+        "临时层过期后正常读取应未命中"
+    );
+    let stale = load_stale_content(&pool, "https://x/t1", "")
+        .await
+        .unwrap()
+        .expect("兜底应拿到旧正文");
+    assert_eq!(stale.content.as_deref(), Some("旧正文"));
+}
+
+// 目录兜底：过期后 load_any_chapters 仍能拿到。
+#[tokio::test]
+async fn any_chapters_returns_expired_toc() {
+    let pool = mem_pool().await;
+    let book = "https://x/toc";
+    save_chapters(
+        &pool,
+        book,
+        &[BookChapter {
+            url: "https://x/toc1".into(),
+            title: Some("第一章".into()),
+            book_url: Some(book.into()),
+            index: 1,
+            ..Default::default()
+        }],
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE library_chapters SET updated_at = datetime('now','-30 days')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(load_cached_chapters(&pool, book, 60)
+        .await
+        .unwrap()
+        .is_none());
+    let cached = load_any_chapters(&pool, book).await.unwrap().unwrap();
+    assert_eq!(cached.len(), 1);
+}

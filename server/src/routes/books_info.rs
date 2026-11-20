@@ -101,27 +101,36 @@ pub(super) async fn toc(
         let _ = sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64).await;
         chaps
     } else {
-        let source = load_source(&s.shared, &q.source).await?;
-        let mut book = Book {
-            book_url: q.book_url.clone(),
-            ..Default::default()
-        };
-        if let Some(m) = load_book_meta(&s.library, &db.0, &q.book_url).await? {
-            book.toc_url = m.toc_url;
+        match fetch_toc(&s, &db, &q).await {
+            Ok(chapters) => {
+                save_chapters(&s.library, &q.book_url, &chapters).await?;
+                // 目录落库时同步总章节数，供进度百分比与书架完成度使用
+                sync_total_chapter_num(&s.library, &db.0, &q.book_url, chapters.len() as i64)
+                    .await?;
+                // 记录目录总数变化（首次建基线不出角标）
+                crate::routes::bookshelf::record_toc_delta(
+                    &db.0,
+                    &q.book_url,
+                    chapters.len() as i64,
+                )
+                .await;
+                // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
+                let _ = backfill_word_counts(&s.library, &q.book_url).await;
+                chapters
+            }
+            // 回源失败：库里还有旧目录就先返回，避免书源失效后整本书打不开。
+            Err(e) => match super::books_store::load_any_chapters(&s.library, &q.book_url).await? {
+                Some(chaps) => {
+                    tracing::warn!(
+                        book = %q.book_url,
+                        error = %e,
+                        "toc fetch failed; serving cached toc"
+                    );
+                    chaps
+                }
+                None => return Err(e),
+            },
         }
-        let key = web_book::book_key(&source, &book.book_url);
-        let store = book_store_for(&db.0, &key).await;
-        let chapters =
-            web_book::chapter_list_book(s.fetcher.as_ref(), &source, &book, Some(&store)).await?;
-        persist_book_changes(&db.0, store.take_changes()).await;
-        save_chapters(&s.library, &q.book_url, &chapters).await?;
-        // 目录落库时同步总章节数，供进度百分比与书架完成度使用
-        sync_total_chapter_num(&s.library, &db.0, &q.book_url, chapters.len() as i64).await?;
-        // 记录目录总数变化（首次建基线不出角标）
-        crate::routes::bookshelf::record_toc_delta(&db.0, &q.book_url, chapters.len() as i64).await;
-        // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-        let _ = backfill_word_counts(&s.library, &q.book_url).await;
-        chapters
     };
     if use_replace && !chapters.is_empty() {
         let book_name = book_name_of(&s.library, &q.book_url)
@@ -145,6 +154,24 @@ pub(super) async fn toc(
     }
     enrich_volumes(&mut chapters);
     Ok(Json(chapters))
+}
+
+/// 回源抓取目录，不负责落库。
+async fn fetch_toc(s: &AppState, db: &UserDb, q: &BookQ) -> AppResult<Vec<BookChapter>> {
+    let source = load_source(&s.shared, &q.source).await?;
+    let mut book = Book {
+        book_url: q.book_url.clone(),
+        ..Default::default()
+    };
+    if let Some(m) = load_book_meta(&s.library, &db.0, &q.book_url).await? {
+        book.toc_url = m.toc_url;
+    }
+    let key = web_book::book_key(&source, &book.book_url);
+    let store = book_store_for(&db.0, &key).await;
+    let chapters =
+        web_book::chapter_list_book(s.fetcher.as_ref(), &source, &book, Some(&store)).await?;
+    persist_book_changes(&db.0, store.take_changes()).await;
+    Ok(chapters)
 }
 
 /// 分卷分组：分卷行用自己的标题，普通章节继承最近的前置分卷标题。

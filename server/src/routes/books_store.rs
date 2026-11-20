@@ -324,6 +324,8 @@ pub(crate) async fn book_store_for(pool: &SqlitePool, key: &str) -> web_book::Bo
 // ---------------- 目录（馆藏） ----------------
 
 /// 目录缓存读取：TTL 内存在任意章节则整体命中（一次 SELECT 避免 N 次查询）。
+///
+/// 馆藏层（`tier=collection`）不按 TTL 过期：书源失效后，已入馆的书仍要能打开目录。
 pub(crate) async fn load_cached_chapters(
     lib: &SqlitePool,
     book_url: &str,
@@ -331,7 +333,10 @@ pub(crate) async fn load_cached_chapters(
 ) -> anyhow::Result<Option<Vec<BookChapter>>> {
     let fresh: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM library_chapters \
-         WHERE book_url = ?1 AND updated_at >= datetime('now', ?2)",
+         WHERE book_url = ?1 \
+           AND (updated_at >= datetime('now', ?2) \
+                OR EXISTS (SELECT 1 FROM library_books b \
+                           WHERE b.book_url = ?1 AND b.tier = 'collection'))",
     )
     .bind(book_url)
     .bind(format!("-{ttl_secs} seconds"))
@@ -340,6 +345,29 @@ pub(crate) async fn load_cached_chapters(
     if fresh == 0 {
         return Ok(None);
     }
+    load_chapters(lib, book_url).await
+}
+
+/// 忽略 TTL 读取已缓存的目录：回源失败时作为兜底，避免书源失效就完全打不开。
+pub(crate) async fn load_any_chapters(
+    lib: &SqlitePool,
+    book_url: &str,
+) -> anyhow::Result<Option<Vec<BookChapter>>> {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM library_chapters WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(lib)
+            .await?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    load_chapters(lib, book_url).await
+}
+
+async fn load_chapters(
+    lib: &SqlitePool,
+    book_url: &str,
+) -> anyhow::Result<Option<Vec<BookChapter>>> {
     let rows: Vec<BookChapter> = sqlx::query_as(
         "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
          resource_url, tag, start, \"end\", update_time, word_count FROM library_chapters \
@@ -534,7 +562,8 @@ async fn load_cached_content_inner(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images, cache_version \
          FROM library_content WHERE url = ?1 AND origin = ?2 \
-           AND updated_at >= datetime('now', ?3)",
+           AND (updated_at >= datetime('now', ?3) \
+                OR book_url IN (SELECT book_url FROM library_books WHERE tier = 'collection'))",
     )
     .bind(url)
     .bind(origin)
@@ -578,6 +607,41 @@ async fn load_cached_content_inner(
     }
     if count_miss {
         crate::cache_metrics::record_miss();
+    }
+    Ok(None)
+}
+
+/// 回源失败时的兜底：忽略 TTL 读取最后一次成功缓存的正文。
+///
+/// 只用于「抓取失败」分支，不参与正常命中；调用方应在响应里标记 `stale`，
+/// 让前端提示「书源暂不可用，显示已缓存内容」。
+pub(crate) async fn load_stale_content(
+    lib: &SqlitePool,
+    url: &str,
+    origin: &str,
+) -> anyhow::Result<Option<BookContent>> {
+    let row: Option<BookContent> = sqlx::query_as(
+        "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
+         content_type, images, cache_version \
+         FROM library_content WHERE url = ?1 AND origin = ?2",
+    )
+    .bind(url)
+    .bind(origin)
+    .fetch_optional(lib)
+    .await?;
+    if let Some(row) = row.filter(|r| !content_is_empty(r)) {
+        // 这次读取是真实发生的：刷新访问时间，避免临时层把它当成「很久没读」清掉。
+        let _ = sqlx::query(
+            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
+        )
+        .bind(url)
+        .bind(origin)
+        .execute(lib)
+        .await;
+        if !row.book_url.trim().is_empty() {
+            library::touch_book(lib, &row.book_url).await;
+        }
+        return Ok(Some(row));
     }
     Ok(None)
 }

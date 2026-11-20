@@ -111,6 +111,10 @@
           {#if isPaged}<span class="dot">·</span><span>{pageIndex + 1} / {pageCount} 页</span>{/if}
         </div>
 
+        {#if current && current.stale}
+          <div class="stale-hint" role="note">书源暂不可用，显示已缓存内容</div>
+        {/if}
+
         {#if current && current.replace_applied}
           <div class="replace-hint" role="note">已应用替换规则 · 可在 Aa 设置中关闭</div>
         {/if}
@@ -269,7 +273,8 @@
     align-items: center;
   }
   .dot { opacity: 0.6; }
-  .replace-hint {
+  .replace-hint,
+  .stale-hint {
     font-size: 12px;
     color: var(--rd-muted);
     border: 1px solid var(--rd-border, #ccc);

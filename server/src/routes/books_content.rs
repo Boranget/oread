@@ -23,6 +23,7 @@ pub(super) async fn content(
             "该条为分卷标题，请从目录选择章节".into(),
         ));
     }
+    let mut stale = false;
     let mut c = match super::books_store::peek_cached_content(
         &s.library,
         &q.chapter_url,
@@ -51,55 +52,32 @@ pub(super) async fn content(
             } else {
                 // 真正触发抓取时才记一次 miss；并发等待者只记 hit，命中率不被稀释。
                 crate::cache_metrics::record_miss();
-                let source = load_source(&s.shared, &q.source).await?;
-                let chapter = BookChapter {
-                    url: q.chapter_url.clone(),
-                    // 书籍地址用于按 book_key 预载跨请求变量/cache（老客户端可能不传）
-                    book_url: q.book_url.clone().filter(|s| !s.trim().is_empty()),
-                    ..Default::default()
-                };
-                let store = match chapter.book_url.as_deref() {
-                    Some(bu) if !bu.trim().is_empty() => {
-                        let key = web_book::book_key(&source, bu);
-                        Some(book_store_for(&db.0, &key).await)
+                match fetch_content(&s, &db, &q).await {
+                    Ok(c) => {
+                        // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
+                        save_content_cached(&s.library, &c).await?;
+                        c
                     }
-                    _ => None,
-                };
-                let mut c = if source.book_source_type == 2 {
-                    // 漫画源：只抽图片列表，content 置空以保持字段类型不变
-                    let imgs = web_book::chapter_images_book(
-                        s.fetcher.as_ref(),
-                        &source,
-                        &chapter,
-                        store.as_ref(),
-                    )
-                    .await?;
-                    BookContent {
-                        book_url: chapter.book_url.clone().unwrap_or_default(),
-                        url: chapter.url.clone(),
-                        title: chapter.title.clone(),
-                        content: Some(String::new()),
-                        chapter_index: chapter.index,
-                        content_type: "image".into(),
-                        images_json: Some(serde_json::to_string(&imgs)?),
-                        ..Default::default()
-                    }
-                } else {
-                    web_book::chapter_content_book(
-                        s.fetcher.as_ref(),
-                        &source,
-                        &chapter,
-                        store.as_ref(),
+                    // 回源失败：库里还有旧正文就先用着，别让已下载的书因源失效而打不开。
+                    Err(e) => match super::books_store::load_stale_content(
+                        &s.library,
+                        &q.chapter_url,
+                        &q.source,
                     )
                     .await?
-                };
-                c.origin = source.book_source_url.clone();
-                if let Some(st) = &store {
-                    persist_book_changes(&db.0, st.take_changes()).await;
+                    {
+                        Some(c) => {
+                            stale = true;
+                            tracing::warn!(
+                                url = %q.chapter_url,
+                                error = %e,
+                                "content fetch failed; serving stale cache"
+                            );
+                            c
+                        }
+                        None => return Err(e),
+                    },
                 }
-                // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
-                save_content_cached(&s.library, &c).await?;
-                c
             }
         }
     };
@@ -170,6 +148,8 @@ pub(super) async fn content(
             "truncated": truncated,
             "placeholder_suspected": placeholder_suspected,
             "replace_applied": false,
+            // 回源失败、返回的是库里的旧缓存时为 true
+            "stale": stale,
             // 前端可按 priority 分批：前 3 张为 high，其余 normal
             "prefetch_hint": {"count": prefetch, "priority": "high"},
         })));
@@ -204,7 +184,51 @@ pub(super) async fn content(
         "truncated": false,
         "placeholder_suspected": false,
         "replace_applied": use_replace,
+        // 回源失败、返回的是库里的旧缓存时为 true
+        "stale": stale,
     })))
+}
+
+/// 回源抓取一章正文（文本或图片列表），不负责落库。
+async fn fetch_content(s: &AppState, db: &UserDb, q: &ContentQ) -> AppResult<BookContent> {
+    let source = load_source(&s.shared, &q.source).await?;
+    let chapter = BookChapter {
+        url: q.chapter_url.clone(),
+        // 书籍地址用于按 book_key 预载跨请求变量/cache（老客户端可能不传）
+        book_url: q.book_url.clone().filter(|s| !s.trim().is_empty()),
+        ..Default::default()
+    };
+    let store = match chapter.book_url.as_deref() {
+        Some(bu) if !bu.trim().is_empty() => {
+            let key = web_book::book_key(&source, bu);
+            Some(book_store_for(&db.0, &key).await)
+        }
+        _ => None,
+    };
+    let mut c = if source.book_source_type == 2 {
+        // 漫画源：只抽图片列表，content 置空以保持字段类型不变
+        let imgs =
+            web_book::chapter_images_book(s.fetcher.as_ref(), &source, &chapter, store.as_ref())
+                .await?;
+        BookContent {
+            book_url: chapter.book_url.clone().unwrap_or_default(),
+            url: chapter.url.clone(),
+            title: chapter.title.clone(),
+            content: Some(String::new()),
+            chapter_index: chapter.index,
+            content_type: "image".into(),
+            images_json: Some(serde_json::to_string(&imgs)?),
+            ..Default::default()
+        }
+    } else {
+        web_book::chapter_content_book(s.fetcher.as_ref(), &source, &chapter, store.as_ref())
+            .await?
+    };
+    c.origin = source.book_source_url.clone();
+    if let Some(st) = &store {
+        persist_book_changes(&db.0, st.take_changes()).await;
+    }
+    Ok(c)
 }
 
 /// 解析图片缓存 JSON；兼容旧的裸数组形态，缺失/损坏时返回空列表。

@@ -1622,10 +1622,11 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：缺参 → 400 纯文本；`404 source not found`（仅缓存未命中时才会加载书源）；`400 internal: ...`（目录抓取/解析失败）；`401`。
 - 行为：
-  - **缓存优先**：只要该 `book_url` 在 `library_chapters` 中有任意一行 `updated_at >= now - TOC_TTL_SECS`，就直接返回全部缓存行，**不再访问网络，也忽略 `source` 参数**（[books.rs](../server/src/routes/books.rs#L238-L259)、[books.rs](../server/src/routes/books.rs#L393-L418)）。
+  - **缓存优先**：只要该 `book_url` 在 `library_chapters` 中有任意一行 `updated_at >= now - TOC_TTL_SECS`，**或该书 `tier=collection`（馆藏目录不按 TTL 过期）**，就直接返回全部缓存行，**不再访问网络，也忽略 `source` 参数**（[books_info.rs](../server/src/routes/books_info.rs)）。
   - TTL 来自 `BORANLIB_TOC_TTL_SECS`（兼容旧前缀 `LEGADO_TOC_TTL_SECS`），默认 21600 秒（6 小时），启动时钳制到 60..604800（[config.rs](../server/src/config.rs#L40-L62)）。
   - 未命中：读取 `library_books.toc_url`（若有）作为目录页，解析 `ruleToc`；支持 `nextTocUrl`，最多 10 页。
-  - 落库策略：先 `DELETE FROM library_chapters WHERE book_url=?` 再逐条插入（整本替换）。若解析结果为 0 章，会保存 0 行，下次仍会重新抓取。
+  - **回源失败兜底**：抓取失败但库中仍有旧目录时，直接返回旧目录并记 warning；完全无缓存才把原错误返回前端。
+  - 落库策略：在单事务内先 `DELETE FROM library_chapters WHERE book_url=?` 再逐条插入（整本替换），失败不会留下半份目录。若解析结果为 0 章，会保存 0 行，下次仍会重新抓取。
   - **缓存按 `book_url` 而非 `source` 或 `origin`**：换源后同一 `book_url` 会返回旧源目录；不同书源的同名 URL 也会串数据。见 TODO。
   - `chapter_index` 使用返回数组下标（`index`），见 2.2。
   - **新字段来源**：`is_volume` / `is_vip` / `update_time` 由 `ruleToc.isVolume` / `isVip` / `updateTime` 解析；`update_time` 原样保存，**不保证是标准时间格式**，前端不要直接当时间戳解析。
@@ -1717,6 +1718,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `chapter_index` | integer | 否 | 章节下标；新抓取时恒 0（前端用目录数据补全） |
 | `resource_url` | string | 是 | 当前 null |
 | `is_local` | boolean | 否 | 当前 false |
+| `stale` | boolean | 否 | 回源失败、返回库中旧缓存时为 `true`；正常命中或新抓取为 `false` |
 
 示例（伪造值）：
 
@@ -1734,8 +1736,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：缺参 → 400 纯文本；`404 source not found`（仅缓存未命中）；`400 internal: ...`；`401`；**`400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`**（见下）。
 - 行为：
-  - 缓存命中（`library_content.updated_at >= now - CONTENT_TTL_SECS`）直接返回，并刷新书目 `last_accessed_at`（临时层 TTL 依据）。TTL 来自 `CONTENT_TTL_SECS`，默认 `604800` 秒（7 天），钳制 60..2592000。
+  - 缓存命中直接返回，并刷新书目 `last_accessed_at`（临时层 TTL 依据）。命中条件：`updated_at >= now - CONTENT_TTL_SECS`，**或该书 `tier=collection`（馆藏层不按 TTL 过期）**。TTL 来自 `CONTENT_TTL_SECS`，默认 `604800` 秒（7 天），钳制 60..2592000。
   - 缓存未命中：加载书源（不在缓存中的源 → 404）→ 仅用 `url` 构造 `BookChapter`，再按下面的回填链补齐 `book_url` / `title` → 抓取。
+  - **回源失败兜底**：若抓取失败但库中仍有该章节的非空旧缓存（忽略 TTL），直接返回旧内容并置 `stale=true`，同时记一条 warning；只有完全无缓存时才把原错误返回给前端。
   - **`book_url` 回填链**（依次尝试，任一命中即用）：① 缓存/抓取结果自带；② 请求参数 `book_url`；③ `SELECT book_url FROM library_chapters WHERE url = chapter_url`；④ 馆藏书目里按章节反查。都为空 → 返回 `400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`，不再返回空 `book_url`。
   - **`title` 回填链**：① 缓存/抓取结果；② 请求参数 `title`；③ 按 `chapter_url` 反查 `library_chapters.title`；都无则为 `null`。前端无需自行补 `book_url`，`title` 仅用于展示，缺失不影响正文。
   - 正文抓取支持 `nextContentUrl` 拼接（最多 10 页）；`sourceRegex` → `replaceRegex` 先源清洗后可读性替换。

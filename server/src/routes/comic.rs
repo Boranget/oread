@@ -154,7 +154,8 @@ pub(crate) async fn load_cached_images(
         "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
          content_type, images AS images_json \
          FROM library_content WHERE url = ?1 AND origin = ?2 \
-           AND updated_at >= datetime('now', ?3)",
+           AND (updated_at >= datetime('now', ?3) \
+                OR book_url IN (SELECT book_url FROM library_books WHERE tier = 'collection'))",
     )
     .bind(url)
     .bind(origin)
