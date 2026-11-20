@@ -2190,18 +2190,18 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ```json
 {
   "ok": true,
-  "collection": { "books": 12, "chapters": 3600, "bytes": 734003200, "mb": 700.0 },
-  "temp": { "books": 3, "chapters": 240, "bytes": 20971520, "mb": 20.0, "expired_books": 1, "ttl_days": 30 },
-  "total": { "books": 15, "chapters": 3840, "content_rows": 3840, "bytes": 754974720, "mb": 720.0 },
+  "collection": { "books": 12, "chapters": 3600, "bytes": 734003200, "mb": 700.0, "text_bytes": 134217728, "image_bytes": 599785472 },
+  "temp": { "books": 3, "chapters": 240, "bytes": 20971520, "mb": 20.0, "text_bytes": 18874368, "image_bytes": 2097152, "expired_books": 1, "ttl_days": 30 },
+  "total": { "books": 15, "chapters": 3840, "content_rows": 3840, "image_rows": 6200, "text_bytes": 153092096, "image_bytes": 601882624, "bytes": 754974720, "mb": 720.0 },
   "disk": { "free_bytes": 10737418240, "free_mb": 10240, "floor_bytes": 1073741824, "floor_mb": 1024, "download_paused": false }
 }
 ```
 
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
-| `collection` | object | 否 | 馆藏层（永久）书目数 / 已缓存章节 / 正文字节 |
-| `temp` | object | 否 | 临时层书目数 / 章节 / 字节；`expired_books` 为超过 TTL 未访问的本数；`ttl_days` 为配置的 TTL |
-| `total` | object | 否 | 两层合计；`content_rows` 为 `library_content` 行数 |
+| `collection` | object | 否 | 馆藏层（永久）书目数 / 已缓存章节 / 占用；`bytes` = `text_bytes`（正文 + 图片清单 JSON）+ `image_bytes`（漫画图片原始字节） |
+| `temp` | object | 否 | 临时层书目数 / 章节 / 占用；`expired_books` 为超过 TTL 未访问的本数；`ttl_days` 为配置的 TTL |
+| `total` | object | 否 | 两层合计；`content_rows` 为 `library_content` 行数，`image_rows` 为 `library_images` 行数，`bytes` 含图片 |
 | `disk.free_bytes` / `free_mb` | integer/null | 是 | 数据目录所在卷剩余空间；平台取不到时为 `null` |
 | `disk.floor_bytes` / `floor_mb` | integer | 否 | 磁盘安全阀（`LIBRARY_DISK_FLOOR_MB`，默认 1024 MB） |
 | `disk.download_paused` | boolean | 否 | 剩余空间低于安全阀时为 `true`，后台整本下载暂停（交互阅读不受影响） |
@@ -2235,6 +2235,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
       "origin": "https://example.com",
       "origin_name": "示例源",
       "cover_url": "https://example.com/cover.jpg",
+      "kind": null,
+      "book_source_type": 0,
       "tier": "collection",
       "collected_at": 1763000000000,
       "last_accessed_at": 1763500000000,
@@ -2243,6 +2245,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
       "cached_chapters": 300,
       "content_bytes": 8388608,
       "content_mb": 8.0,
+      "image_bytes": 104857600,
+      "image_mb": 100.0,
       "download_percent": 100
     }
   ],
@@ -2255,7 +2259,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `items[].tier` | string | 否 | `collection` / `temp` |
 | `items[].collected_at` | integer | 是 | 入馆时间（epoch ms），临时层为 `null` |
 | `items[].last_accessed_at` / `checked_at` | integer | 否 | 最近访问 / 最近检查时间（epoch ms） |
-| `items[].cached_chapters` | integer | 否 | 馆藏正文中已缓存章节数 |
+| `items[].cached_chapters` | integer | 否 | 馆藏正文中已缓存章节数；漫画还要求图片全部落盘才算已缓存 |
+| `items[].content_bytes` / `image_bytes` | integer | 否 | 正文（含图片清单 JSON）/ 漫画图片原始字节占用 |
+| `items[].book_source_type` | integer | 否 | `2` 为漫画；前端据此在入馆前做体积预估 |
 | `items[].download_percent` | integer/null | 是 | `cached_chapters / total_chapter_num`；目录未知时为 `null` |
 | `next_cursor` | string/null | 是 | keyset 游标 `<sort_ts>:<book_url>`；没有下一页为 `null` |
 
@@ -2263,7 +2269,53 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 行为：`ORDER BY <sort_expr> DESC, book_url ASC`，用游标续页，**不使用 OFFSET**；不返回总数。
   - `sort=accessed` 用 `last_accessed_at`；`sort=collected` 用 `COALESCE(collected_at, 0)`（临时层没有入馆时间，按 0 排序，分页不会漏行）。
 
-### 6.12.3 `POST /api/library/collect`（管理员）
+### 6.12.3 `POST /api/library/comic/estimate`（管理员）
+
+- 鉴权：登录 + **admin**
+- 用途：漫画入馆前的体积预估。抽样 3 章 × 2 张图，只探测响应头（优先 `Range: bytes=0-0` 读 `Content-Range`，不支持时用 `Content-Length`），不下载整图。
+- 请求体：与 `collect` 相同（`book_url` 必填，`source` 可选）。预检使用**当前管理员的书源登录态**，与后续采购单的 `job.uid` 一致。
+- 成功 `200`（非漫画书返回 `{"ok":true,"comic":false,...}`，前端直接走原入馆流程）：
+
+```json
+{
+  "ok": true,
+  "comic": true,
+  "book_url": "https://example.com/book/123",
+  "source": "https://example.com",
+  "total_chapters": 300,
+  "sampled_chapters": 3,
+  "sampled_images": 6,
+  "avg_images_per_chapter": 42.5,
+  "avg_image_bytes": 3211264,
+  "estimated_bytes": 4093640704,
+  "estimated_low_bytes": 2865548492,
+  "estimated_high_bytes": 5731096985,
+  "estimated_mb": 3904.0,
+  "estimated_low_mb": 2733.0,
+  "estimated_high_mb": 5465.0,
+  "cached_chapters": 12,
+  "disk_free_bytes": 10737418240,
+  "disk_free_mb": 10240,
+  "disk_floor_bytes": 1073741824,
+  "enough_space": true,
+  "note": "抽样估算，以实际下载为准"
+}
+```
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `total_chapters` / `sampled_chapters` / `sampled_images` | integer | 否 | 目录章数 / 实际抽样章数 / 成功探测到的图片数 |
+| `avg_images_per_chapter` / `avg_image_bytes` | number | 是 | 抽样均值；样本不足时为 `null` |
+| `estimated_bytes` / `estimated_low_bytes` / `estimated_high_bytes` | integer/null | 是 | 估算总量及 0.7～1.4 倍区间；无法取样时为 `null` |
+| `cached_chapters` | integer | 否 | 本书图片已全部落盘的章节数 |
+| `disk_free_bytes` / `disk_floor_bytes` | integer/null | 否/是 | 剩余空间与安全阀；剩余取不到时 `null` |
+| `enough_space` | boolean/null | 是 | 剩余空间减去安全阀后能否装下估算上限；无法估算时为 `null` |
+
+- 行为：结果按 `book_url + source + uid` 缓存 30 分钟。只警告不硬拦：即使 `enough_space=false`，管理员仍可继续入馆。
+- 误差来源：每章图片数只能抽样、单图大小波动、加密图解密后大小变化；前端必须展示「抽样估算，以实际下载为准」。
+- 错误：`400`（目录为空 / 书源不可用）；`401`。
+
+### 6.12.4 `POST /api/library/collect`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：把书置为馆藏（永久保存），并排一张后台整本下载任务。
@@ -2285,7 +2337,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 没记录书源且未传 `source` 时仍会入馆，但 `queued=false`、`job_id=null`。
   - 后台下载由 `library_worker` 执行，不依赖前端保持页面打开。
 
-### 6.12.4 `POST /api/library/release`（管理员）
+### 6.12.5 `POST /api/library/release`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：移出馆藏，降级为临时缓存（内容先保留，交给 TTL 或手动删除）。
@@ -2293,28 +2345,28 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 成功 `200`：`{ "ok": true, "book_url": "...", "released": true, "tier": "temp" }`；书不在馆藏时 `released=false`，仍 `200`。
 - 行为：移出时**取消该书未完成的后台下载任务**（已下载章节保留）；已结束的采购单不受影响。
 
-### 6.12.5 `POST /api/library/delete`（管理员）
+### 6.12.6 `POST /api/library/delete`（管理员）
 
 - 鉴权：登录 + **admin**
-- 用途：整本删除书目 + 目录 + 正文。
+- 用途：整本删除书目 + 目录 + 正文 + 已落盘的漫画图片。
 - 请求体：`{ "book_url": "..." }`。
 - 成功 `200`：
 
 ```json
-{ "ok": true, "book_url": "...", "deleted_books": 1, "deleted_chapters": 300, "deleted_contents": 300, "bytes_freed": 8388608 }
+{ "ok": true, "book_url": "...", "deleted_books": 1, "deleted_chapters": 300, "deleted_contents": 300, "deleted_images": 12000, "bytes_freed": 113246208 }
 ```
 
 - 错误：`404 {"error":"馆藏里没有这本书"}`；`400 {"error":"该书仍在馆藏中，请先移出馆藏再删除"}`。
 - 行为：删除与「取消该书未完成任务」在同一事务内完成，避免后台 worker 删除后继续写入。
 
-### 6.12.6 `POST /api/library/temp/clean`（管理员）
+### 6.12.7 `POST /api/library/temp/clean`（管理员）
 
 - 鉴权：登录 + **admin**
 - 用途：立即回收过期临时缓存（与 `POST /api/book/cache/trim` 同一实现，见 6.9.1）。
 - 请求体：无。
-- 成功 `200`：`{ "ok": true, "books": 2, "chapters": 120, "contents": 120, "bytes_freed": 10485760, "ttl_days": 30 }`。
+- 成功 `200`：`{ "ok": true, "books": 2, "chapters": 120, "contents": 120, "images": 340, "bytes_freed": 12582912, "ttl_days": 30 }`。
 
-### 6.12.7 `GET /api/library/jobs`（管理员）
+### 6.12.8 `GET /api/library/jobs`（管理员）
 
 - 鉴权：登录 + **admin**
 - 查询参数：`status`（逗号分隔，如 `queued,running`；缺省全部；未知状态返回 400）、`limit`（默认 100，clamp 1..500）。
@@ -2335,14 +2387,14 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 进度口径：`done` 只计本次新下载的章节；`skipped` 是开工前已缓存、无需再下的章节；`failed` 为本次失败数。前端进度按 `(done + skipped) / total` 计算，三者不重叠。
 - 排序：`created_at DESC`。
 
-### 6.12.8 `POST /api/library/jobs/cancel`（管理员）
+### 6.12.9 `POST /api/library/jobs/cancel`（管理员）
 
 - 鉴权：登录 + **admin**
 - 请求体：`{ "id": "lj1234-7" }`。
 - 成功 `200`：`{ "ok": true, "id": "lj1234-7", "cancelled": true }`；任务已结束时 `cancelled=false`。
 - 行为：worker 在每章开始前检查状态，取消后尽快停止；已下载章节保留在馆藏。
 
-### 6.12.9 后台执行器与安全阀
+### 6.12.10 后台执行器与安全阀
 
 - 独立低优先级通道：默认 1 个任务并发（`LIBRARY_JOB_PARALLEL`），每任务 3 章并发（`LIBRARY_JOB_CHAPTER_PARALLEL`）。
 - 进程重启后把残留 `running` 任务放回队列，按 `library_job_items` 断点续跑。
@@ -2350,6 +2402,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 来源回填：入馆时只带 `source` 的书，在 worker 加载到真实书源后补写 `origin` / `origin_name` / `book_source_type`（只填空字段，不覆盖已有来源）。
 - 磁盘安全阀：数据目录剩余空间低于 `LIBRARY_DISK_FLOOR_MB`（默认 1024 MB）时暂停下载，每 60 秒重试；交互阅读与临时缓存不受影响。
 - 临时缓存 TTL：默认 30 天（`LIBRARY_TEMP_TTL_DAYS`），每小时后台回收一次；馆藏永久保存，不自动淘汰。
+- 漫画图片：只有馆藏漫画由 worker 把图片原始字节写进 `library_images`（BLOB，按 `(url, origin)` 去重），单张超过 2 MiB 只保留清单不落盘；临时层仍走进程内 LRU。图片与正文一起参与整本删除 / TTL 回收 / `cache_clear`。
+- 断点续跑：图片章节的 `images_ready=1` 才算已缓存（`content` 对漫画是空串，不能只看 `content IS NOT NULL`）；`upsert_content` 后清单保留，失败的图片下次续跑补齐。
+- 读取：图片代理优先读 `library_images` 命中回填进程内 LRU；命中时不需要回源，源站 DNS 故障也能离线读已入馆漫画。墨水屏灰度 / WebP 转码变体仍运行时生成，不落盘。
 
 ---
 

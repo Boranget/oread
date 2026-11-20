@@ -3,7 +3,7 @@
 use super::*;
 
 /// 按魔数嗅探解码后的图片类型（加密源上游常返回 application/octet-stream）。
-pub(super) fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> &'static str {
     match image::guess_format(bytes) {
         Ok(image::ImageFormat::Jpeg) => "image/jpeg",
         Ok(image::ImageFormat::Png) => "image/png",
@@ -66,6 +66,180 @@ pub(super) async fn proxy_decoded(
     serve_bytes(decoded, &ct, &etag, false, headers)
 }
 
+/// 馆藏漫画：图片字节已经在 `library_images` 里，命中后完全不走网络。
+///
+/// 输出路径与回源一致（同一套变体 key / ETag），只是字节来源换成本地 BLOB：
+/// 解密源直出、切片、WebP→灰度 JPEG、JPEG→灰度、原图直出。
+async fn proxy_stored(
+    s: &AppState,
+    source: &BookSource,
+    q: &ImageQ,
+    headers: &HeaderMap,
+    stored: crate::library_images::StoredImage,
+    max_bytes: usize,
+) -> Response {
+    let crate::library_images::StoredImage { data, mime, .. } = stored;
+    let ct_base = if mime.trim().is_empty() {
+        sniff_image_mime(&data).to_string()
+    } else {
+        mime
+    };
+    // 解密源的落盘字节已经是明文，直接按真实格式直出，和回源路径同一个 ETag。
+    if web_book::has_image_decode(source) {
+        let etag = etag_of(&format!("{}#decoded", q.url));
+        return serve_bytes(data, &ct_base, &etag, false, headers);
+    }
+    let transcode = wants_webp_transcode(headers);
+    let eink = is_eink_client(headers, q.eink.as_deref());
+    let cfg = eink_config();
+    let profile = EncodeProfile::eink();
+    if eink && s.cfg.comic_slice && slice_requested(q.slice.as_deref()) {
+        let params = SliceParams::from_config(&s.cfg, q.dw, q.vh, q.ov);
+        return slice_from_bytes(
+            q,
+            headers,
+            params,
+            q.i.unwrap_or(0),
+            cfg,
+            profile,
+            data,
+            ct_base,
+        )
+        .await;
+    }
+    let webp_keys = key_pairs(&q.url, false, &cfg);
+    let jpeg_keys = key_pairs(&q.url, true, &cfg);
+    let orig_key = format!("{}#orig", q.url);
+    let orig_etag = etag_of(&orig_key);
+    if eink {
+        if let Some((data, ct, etag)) = cache_lookup(&jpeg_keys) {
+            return serve_bytes(data, &ct, &etag, true, headers);
+        }
+        if let Some((data, ct, etag)) = cache_lookup(&webp_keys) {
+            return serve_bytes(data, &ct, &etag, true, headers);
+        }
+        if !is_webp_content_type(&ct_base) && !is_jpeg_content_type(&ct_base) {
+            return serve_bytes(data, &ct_base, &orig_etag, true, headers);
+        }
+    } else if transcode {
+        if let Some((data, ct, etag)) = cache_lookup(&webp_keys) {
+            return serve_bytes(data, &ct, &etag, true, headers);
+        }
+        if !is_webp_content_type(&ct_base) {
+            return serve_bytes(data, &ct_base, &orig_etag, true, headers);
+        }
+    } else {
+        if data.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&orig_key, data.clone(), ct_base.clone());
+        }
+        return serve_bytes(data, &ct_base, &orig_etag, true, headers);
+    }
+
+    if is_webp_content_type(&ct_base) && (transcode || eink) {
+        let source_bytes = data.len();
+        let started = Instant::now();
+        let decoded = tokio::task::spawn_blocking(move || {
+            transcode_to_jpeg(&data, image::ImageFormat::WebP, profile, cfg)
+        })
+        .await;
+        let (out, dims, quality) = match decoded {
+            Ok(Ok(v)) => v,
+            Ok(Err(msg)) => {
+                return error_body(
+                    StatusCode::BAD_GATEWAY,
+                    "image_transcode_failed",
+                    &format!("WebP 转码失败：{msg}"),
+                )
+            }
+            Err(e) => {
+                return error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &format!("转码任务异常：{e}"),
+                )
+            }
+        };
+        let key = variant_key(&q.url, false, &cfg, quality);
+        let etag = etag_of(&key);
+        if out.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&key, out.clone(), "image/jpeg".to_string());
+        }
+        let label = format!(
+            "webp->jpeg-{}",
+            if profile.grayscale { "gray" } else { "color" }
+        );
+        return serve_transcoded(
+            out,
+            "image/jpeg",
+            &etag,
+            headers,
+            &label,
+            dims,
+            quality,
+            source_bytes,
+            started.elapsed(),
+        );
+    }
+
+    if is_jpeg_content_type(&ct_base) && eink {
+        let source_bytes = data.len();
+        let started = Instant::now();
+        let decoded = tokio::task::spawn_blocking(move || {
+            match transcode_jpeg_to_gray(&data, profile, cfg) {
+                Ok(v) => Ok(v),
+                Err(msg) => Err((msg, data)),
+            }
+        })
+        .await;
+        let (out, dims, quality) = match decoded {
+            Ok(Ok(v)) => v,
+            Ok(Err((msg, raw))) => {
+                let mut res = serve_bytes(raw, &ct_base, &orig_etag, false, headers);
+                if let Ok(v) = HeaderValue::from_str(&format!("jpeg->gray-failed;reason={msg}")) {
+                    res.headers_mut()
+                        .insert(HeaderName::from_static("x-image-transcoded"), v);
+                }
+                return res;
+            }
+            Err(e) => {
+                return error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &format!("转码任务异常：{e}"),
+                )
+            }
+        };
+        let key = variant_key(&q.url, true, &cfg, quality);
+        let etag = etag_of(&key);
+        if out.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&key, out.clone(), "image/jpeg".to_string());
+        }
+        return serve_transcoded(
+            out,
+            "image/jpeg",
+            &etag,
+            headers,
+            "jpeg->gray",
+            dims,
+            quality,
+            source_bytes,
+            started.elapsed(),
+        );
+    }
+
+    if data.len() > max_bytes {
+        return error_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image_too_large",
+            &format!("图片大小 {} 字节，超过上限 {max_bytes} 字节", data.len()),
+        );
+    }
+    if data.len() <= CACHE_ITEM_MAX {
+        image_cache::put(&orig_key, data.clone(), ct_base.clone());
+    }
+    serve_bytes(data, &ct_base, &orig_etag, true, headers)
+}
+
 pub(super) async fn proxy(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -96,6 +270,15 @@ pub(super) async fn proxy(
             )
         }
     };
+    // 馆藏漫画：图片字节已落盘，命中后直接本地出图。
+    // 放在 SSRF 预检之前：命中不需要出站，源站 DNS 挂了也能读。
+    let stored = crate::library_images::load(&s.library, &q.url, &source.book_source_url)
+        .await
+        .ok()
+        .flatten();
+    if let Some(stored) = stored {
+        return proxy_stored(&s, &source, &q, &headers, stored, max_bytes).await;
+    }
     // 先做 SSRF 预检，私网地址在回源前就拒绝（避免把内网请求发出去）
     match url::Url::parse(&q.url) {
         Ok(u) => {

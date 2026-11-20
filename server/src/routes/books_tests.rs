@@ -815,11 +815,23 @@ async fn clear_cache_by_book_and_by_user() {
     for c in [&a, &b, &other] {
         upsert_content(&pool, c).await.unwrap();
     }
+    sqlx::query(
+        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
+         VALUES ('https://x/a/i1', '', 'https://x/a', 'image/jpeg', X'00', 100)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let (deleted, freed) = clear_content_cache(&pool, Some("https://x/a"))
         .await
         .unwrap();
     assert_eq!(deleted, 2);
-    assert_eq!(freed, 7);
+    assert_eq!(freed, 107, "图片字节也应计入释放量");
+    let images_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_images")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(images_left, 0);
     let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
         .fetch_one(&pool)
         .await

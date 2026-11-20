@@ -4,6 +4,12 @@
 //! 删除整本 / 清理临时缓存。入馆会顺带排一张「采购单」（后台整本下载），
 //! 由 `crate::library_worker` 在服务端跑，不依赖前端保持页面打开。
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use futures::stream::StreamExt;
+
 use axum::{
     extract::{Query, State},
     routing::{get, post},
@@ -13,7 +19,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::{ensure_admin, AuthUser};
+use crate::entities::Book;
 use crate::error::{AppError, AppResult};
+use crate::image_fetch;
 use crate::library::{self, LibraryBook};
 use crate::routes::AppState;
 
@@ -21,6 +29,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/library/stats", get(stats))
         .route("/api/library/books", get(books))
+        .route("/api/library/comic/estimate", post(comic_estimate))
         .route("/api/library/collect", post(collect))
         .route("/api/library/release", post(release))
         .route("/api/library/delete", post(delete))
@@ -46,12 +55,16 @@ async fn stats(State(s): State<AppState>, _u: AuthUser) -> AppResult<Json<serde_
             "chapters": st.collection_chapters,
             "bytes": st.collection_bytes,
             "mb": mb(st.collection_bytes),
+            "text_bytes": st.collection_text_bytes,
+            "image_bytes": st.collection_image_bytes,
         },
         "temp": {
             "books": st.temp_books,
             "chapters": st.temp_chapters,
             "bytes": st.temp_bytes,
             "mb": mb(st.temp_bytes),
+            "text_bytes": st.temp_text_bytes,
+            "image_bytes": st.temp_image_bytes,
             "expired_books": st.temp_expired_books,
             "ttl_days": s.cfg.library_temp_ttl_secs / 86_400,
         },
@@ -59,8 +72,11 @@ async fn stats(State(s): State<AppState>, _u: AuthUser) -> AppResult<Json<serde_
             "books": st.collection_books + st.temp_books,
             "chapters": st.total_chapters,
             "content_rows": st.content_rows,
-            "bytes": st.content_bytes,
-            "mb": mb(st.content_bytes),
+            "image_rows": st.image_rows,
+            "text_bytes": st.content_bytes,
+            "image_bytes": st.image_bytes,
+            "bytes": st.total_bytes,
+            "mb": mb(st.total_bytes),
         },
         "disk": {
             "free_bytes": free,
@@ -107,6 +123,8 @@ fn book_item(b: &LibraryBook) -> serde_json::Value {
         "book_url": b.book_url,
         "name": b.name,
         "author": b.author,
+        "kind": b.kind,
+        "book_source_type": b.book_source_type,
         "origin": b.origin,
         "origin_name": b.origin_name,
         "cover_url": b.cover_url,
@@ -118,6 +136,8 @@ fn book_item(b: &LibraryBook) -> serde_json::Value {
         "cached_chapters": b.cached_chapters,
         "content_bytes": b.content_bytes,
         "content_mb": mb(b.content_bytes),
+        "image_bytes": b.image_bytes,
+        "image_mb": mb(b.image_bytes),
         // 下载进度用百分比表示，目录未知时为 null（前端显示「未知」）
         "download_percent": if b.total_chapter_num > 0 {
             Some((b.cached_chapters * 100 / b.total_chapter_num).min(100))
@@ -209,6 +229,273 @@ pub struct BookReq {
     pub source: Option<String>,
 }
 
+/// 体积预检结果缓存：30 分钟，键含 uid（登录态书源预检用的凭证按账号不同）。
+static ESTIMATE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, serde_json::Value)>>> =
+    OnceLock::new();
+const ESTIMATE_TTL: Duration = Duration::from_secs(30 * 60);
+/// 抽样 3 章 × 2 张图：再多是预检本身就把源打爆了。
+const ESTIMATE_CHAPTER_SAMPLES: usize = 3;
+const ESTIMATE_IMAGE_SAMPLES: usize = 2;
+
+fn estimate_cache() -> &'static Mutex<HashMap<String, (Instant, serde_json::Value)>> {
+    ESTIMATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 在 `[0, len)` 里均匀取至多 `max` 个不重复下标（包含首尾）。
+fn sample_indices(len: usize, max: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= max || max <= 1 {
+        return (0..len.min(max.max(1))).collect();
+    }
+    (0..max)
+        .map(|i| i * (len - 1) / (max - 1))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// 漫画入馆前的体积预估（管理员）：抽 3 章 × 2 张图，给出「预计占 X～Y GB」。
+///
+/// 只用预检管理员的书源登录态，与采购单 `job.uid` 一致；结果缓存 30 分钟。
+/// 只探测响应头（优先 `Range: bytes=0-0`），不下载整图；估算标注「以实际下载为准」。
+async fn comic_estimate(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Json(q): Json<BookReq>,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_admin(&u)?;
+    let book_url = q.book_url.trim().to_string();
+    if book_url.is_empty() {
+        return Err(AppError::BadRequest("book_url 不能为空".into()));
+    }
+    let book = library::load_book(&s.library, &book_url).await?;
+    let source_id = q
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| book.as_ref().and_then(|b| b.origin.clone()))
+        .unwrap_or_default();
+    if source_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "缺少 source：无法确定书源登录态".into(),
+        ));
+    }
+
+    let cache_key = format!("{book_url}|{source_id}|{}", u.id);
+    {
+        let cache = estimate_cache();
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, value)) = guard.get(&cache_key) {
+            if at.elapsed() < ESTIMATE_TTL {
+                return Ok(Json(value.clone()));
+            }
+        }
+    }
+
+    let source = crate::routes::sources::load_source(&s.shared, &source_id)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("书源不可用：{e}")))?;
+    if source.book_source_type != 2 {
+        return Ok(Json(json!({
+            "ok": true,
+            "comic": false,
+            "book_url": book_url,
+            "note": "该书不是漫画，无需图片体积预估",
+        })));
+    }
+
+    // 与 worker 一致：借书证里的书源登录态，保证 VIP/登录图也能探到真实大小。
+    let user_pool = crate::auth::get_user_pool(&s, u.id).await?;
+    let store_key = crate::web_book::book_key(&source, &book_url);
+    let store = crate::routes::books::book_store_for(&user_pool, &store_key).await;
+
+    let chapters =
+        estimate_chapters(&s, &source, &user_pool, &store, &book_url, book.as_ref()).await?;
+    if chapters.is_empty() {
+        return Err(AppError::BadRequest("目录为空，无法预估体积".into()));
+    }
+
+    let picks = sample_indices(chapters.len(), ESTIMATE_CHAPTER_SAMPLES);
+    let mut images_per_chapter: Vec<usize> = Vec::with_capacity(picks.len());
+    let mut probes: Vec<(String, String)> = Vec::new();
+    for &idx in &picks {
+        let ch = &chapters[idx];
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT images FROM library_content \
+             WHERE url = ?1 AND origin = ?2 AND content_type = 'image'",
+        )
+        .bind(&ch.url)
+        .bind(&source.book_source_url)
+        .fetch_optional(&s.library)
+        .await?;
+        let imgs = match existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<crate::web_book::ChapterImages>(raw).ok())
+        {
+            Some(v) if !v.images.is_empty() => v,
+            _ => match crate::web_book::chapter_images_book(
+                s.fetcher.as_ref(),
+                &source,
+                ch,
+                Some(&store),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(url = %ch.url, error = %e, "comic estimate: chapter images failed");
+                    continue;
+                }
+            },
+        };
+        if imgs.images.is_empty() {
+            continue;
+        }
+        images_per_chapter.push(imgs.images.len());
+        for i in sample_indices(imgs.images.len(), ESTIMATE_IMAGE_SAMPLES) {
+            let url = imgs.images[i].url.trim();
+            if !url.is_empty() {
+                probes.push((ch.url.clone(), url.to_string()));
+            }
+        }
+    }
+    let _ = crate::routes::books::persist_book_changes(&user_pool, store.take_changes()).await;
+
+    let sizes: Vec<Option<u64>> =
+        futures::stream::iter(probes.into_iter().map(|(chapter_url, url)| {
+            let src = source.clone();
+            async move {
+                image_fetch::probe_size(&src, &url, Some(&chapter_url))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }))
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    let known: Vec<u64> = sizes.into_iter().flatten().collect();
+
+    let sampled_chapters = images_per_chapter.len() as i64;
+    let avg_images = if images_per_chapter.is_empty() {
+        None
+    } else {
+        Some(images_per_chapter.iter().sum::<usize>() as f64 / images_per_chapter.len() as f64)
+    };
+    let avg_bytes = if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().sum::<u64>() as f64 / known.len() as f64)
+    };
+    let total = chapters.len() as f64;
+    let estimate = match (avg_images, avg_bytes) {
+        (Some(i), Some(b)) => Some((i * b * total).round() as i64),
+        _ => None,
+    };
+    let low = estimate.map(|v| (v as f64 * 0.7).round() as i64);
+    let high = estimate.map(|v| (v as f64 * 1.4).round() as i64);
+    let cached_chapters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM library_content WHERE book_url = ?1 \
+         AND content_type = 'image' AND images_ready = 1",
+    )
+    .bind(&book_url)
+    .fetch_one(&s.library)
+    .await?;
+    let free = library::free_bytes(std::path::Path::new(&s.cfg.data_dir));
+    let floor = s.cfg.library_disk_floor_bytes;
+    let enough = match (high, free) {
+        (Some(h), Some(f)) => Some(f.saturating_sub(floor) >= u64::try_from(h).unwrap_or(u64::MAX)),
+        _ => None,
+    };
+
+    let value = json!({
+        "ok": true,
+        "comic": true,
+        "book_url": book_url,
+        "source": source_id,
+        "total_chapters": chapters.len(),
+        "sampled_chapters": sampled_chapters,
+        "sampled_images": known.len(),
+        "avg_images_per_chapter": avg_images,
+        "avg_image_bytes": avg_bytes.map(|b| b.round() as i64),
+        "estimated_bytes": estimate,
+        "estimated_low_bytes": low,
+        "estimated_high_bytes": high,
+        "estimated_mb": estimate.map(mb),
+        "estimated_low_mb": low.map(mb),
+        "estimated_high_mb": high.map(mb),
+        "cached_chapters": cached_chapters,
+        "disk_free_bytes": free,
+        "disk_free_mb": free.map(|b| b / (1024 * 1024)),
+        "disk_floor_bytes": floor,
+        "enough_space": enough,
+        "note": "抽样估算，以实际下载为准",
+    });
+    {
+        let cache = estimate_cache();
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() > 128 {
+            guard.clear();
+        }
+        guard.insert(cache_key, (Instant::now(), value.clone()));
+    }
+    Ok(Json(value))
+}
+
+/// 预估用的目录：优先读馆藏，没有就抓一次（与 worker 同一口径）。
+async fn estimate_chapters(
+    s: &AppState,
+    source: &crate::entities::BookSource,
+    user_pool: &sqlx::SqlitePool,
+    store: &crate::web_book::BookStore,
+    book_url: &str,
+    meta: Option<&LibraryBook>,
+) -> AppResult<Vec<crate::entities::BookChapter>> {
+    let rows: Vec<crate::entities::BookChapter> = sqlx::query_as(
+        "SELECT url, title, is_volume, base_url, book_url, \"index\", is_vip, is_pay, \
+         resource_url, tag, start, \"end\", update_time, word_count FROM library_chapters \
+         WHERE book_url = ?1 ORDER BY \"index\"",
+    )
+    .bind(book_url)
+    .fetch_all(&s.library)
+    .await?;
+    if !rows.is_empty() {
+        return Ok(rows.into_iter().filter(|c| !c.is_volume).collect());
+    }
+    let book = Book {
+        book_url: book_url.to_string(),
+        toc_url: meta.and_then(|m| m.toc_url.clone()),
+        origin: Some(source.book_source_url.clone()),
+        origin_name: Some(source.book_source_name.clone()),
+        book_source_type: source.book_source_type,
+        name: meta.and_then(|m| m.name.clone()),
+        author: meta.and_then(|m| m.author.clone()),
+        ..Default::default()
+    };
+    let chapters =
+        crate::web_book::chapter_list_book(s.fetcher.as_ref(), source, &book, Some(store))
+            .await
+            .map_err(|e| AppError::BadRequest(format!("目录抓取失败：{e}")))?;
+    if chapters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let non_volume: Vec<crate::entities::BookChapter> =
+        chapters.iter().filter(|c| !c.is_volume).cloned().collect();
+    let _ = crate::routes::books::save_chapters(&s.library, book_url, &chapters).await;
+    let _ = crate::routes::books::sync_total_chapter_num(
+        &s.library,
+        user_pool,
+        book_url,
+        chapters.len() as i64,
+    )
+    .await;
+    Ok(non_volume)
+}
+
 /// 入馆：置为永久保存，并排一张后台整本下载任务。仅管理员。
 async fn collect(
     State(s): State<AppState>,
@@ -286,14 +573,15 @@ async fn delete(
         }
         Some(_) => {}
     }
-    let (books, chapters, contents, bytes) = library::delete_book(&s.library, book_url).await?;
+    let report = library::delete_book(&s.library, book_url).await?;
     Ok(Json(json!({
         "ok": true,
         "book_url": book_url,
-        "deleted_books": books,
-        "deleted_chapters": chapters,
-        "deleted_contents": contents,
-        "bytes_freed": bytes,
+        "deleted_books": report.books,
+        "deleted_chapters": report.chapters,
+        "deleted_contents": report.contents,
+        "deleted_images": report.images,
+        "bytes_freed": report.bytes,
     })))
 }
 
@@ -306,6 +594,7 @@ async fn clean_temp(State(s): State<AppState>, u: AuthUser) -> AppResult<Json<se
         "books": report.books,
         "chapters": report.chapters,
         "contents": report.contents,
+        "images": report.images,
         "bytes_freed": report.bytes,
         "ttl_days": s.cfg.library_temp_ttl_secs / 86_400,
     })))
@@ -426,4 +715,16 @@ async fn cancel_job(
     Ok(Json(
         json!({ "ok": true, "id": id, "cancelled": cancelled }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_sampling_is_even_and_bounded() {
+        assert!(sample_indices(0, 3).is_empty());
+        assert_eq!(sample_indices(2, 3), vec![0, 1]);
+        assert_eq!(sample_indices(10, 3), vec![0, 4, 9]);
+    }
 }

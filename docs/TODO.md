@@ -122,7 +122,7 @@
 - 还差：
   - 阅读器保留并渲染正文 HTML 中的 `<img>`（当前 `htmlToParas` 直接丢弃，见 3.8）；
   - 漫画阅读布局：单页/连续滚动、缩放、预加载；
-  - 图片缓存与代理（外链 403/防盗链）；
+  - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`），入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
   - 漫画导出/下载（TXT 导出只覆盖文字）。
 - 依据：[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
@@ -270,7 +270,7 @@
 | `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/pages/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
 | 构建脚本硬编码旧路径 | `已完成待验证` | 两个脚本都以 `$PSScriptRoot` 推导仓库根，并通过 `CARGO_TARGET_DIR` 输出（[build-dev.ps1](../scripts/build-dev.ps1#L28-L45)、[build-release.ps1](../scripts/build-release.ps1#L33-L45)） | 在仓库根与任意工作目录调用都应成功；当前脚本变量为 `OREAD_TARGET_WIN`/`OREAD_TARGET_MUSL`，工程侧改名后为 `BORANLIB_TARGET_*`（本文以现名为准） |
 
-缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。
+缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。馆藏漫画的图片字节落在 `library_images`（[library_images.rs](../server/src/library_images.rs)），按 `(url, origin)` 去重，与正文一起删除/清理；图片代理（[image_proxy.rs](../server/src/routes/image_proxy.rs)）优先读本地 BLOB。管理员入馆漫画前会调用 `POST /api/library/comic/estimate` 抽样预估体积并弹确认框，结果按 `book_url+source+uid` 缓存 30 分钟。
 
 ### 3.13 KPW3 真机约束：`/k` 与漫画阅读器必须遵守红线
 

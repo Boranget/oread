@@ -96,33 +96,6 @@ pub(super) async fn handle_slice(
         .unwrap_or("")
         .to_string();
     let ct_base = ct.split(';').next().unwrap_or("image/*").trim().to_string();
-    // PNG/GIF/BMP 等非 JPEG/WebP 源：image 依赖没有启用这些解码器，整图路径是原样直出。
-    // 切片路径必须同样原样直出，否则 `slice=1` 会对普通图报 502，违反「普通图字节不变」。
-    if !matches!(
-        image_format_of(&ct),
-        Some(image::ImageFormat::Jpeg) | Some(image::ImageFormat::WebP)
-    ) {
-        let raw = match collect_image_body(resp, max_bytes).await {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let orig_key = format!("{}#orig", q.url);
-        let etag = etag_of(&orig_key);
-        if raw.len() <= CACHE_ITEM_MAX {
-            image_cache::put(&orig_key, raw.clone(), ct_base.clone());
-        }
-        return serve_bytes(raw, &ct_base, &etag, false, headers);
-    }
-    let Some(format) = image_format_of(&ct) else {
-        return error_body(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "slice_unsupported",
-            &format!(
-                "切片不支持的图片类型：{}",
-                if ct.is_empty() { "未知" } else { &ct }
-            ),
-        );
-    };
     if let Some(len) = resp.content_length() {
         if len as usize > max_bytes {
             return error_body(
@@ -135,6 +108,50 @@ pub(super) async fn handle_slice(
     let raw = match collect_image_body(resp, max_bytes).await {
         Ok(v) => v,
         Err(r) => return r,
+    };
+    slice_from_bytes(q, headers, params, want, cfg, profile, raw, ct_base).await
+}
+
+/// 切片的后半段：从已拿到的原始字节开始（回源或馆藏落盘都走这里）。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn slice_from_bytes(
+    q: &ImageQ,
+    headers: &HeaderMap,
+    params: SliceParams,
+    want: usize,
+    cfg: EinkConfig,
+    profile: EncodeProfile,
+    raw: Vec<u8>,
+    ct_base: String,
+) -> Response {
+    let plan_key = slice_plan_key(&q.url, &cfg, &params);
+    // PNG/GIF/BMP 等非 JPEG/WebP 源：image 依赖没有启用这些解码器，整图路径是原样直出。
+    // 切片路径必须同样原样直出，否则 `slice=1` 会对普通图报 502，违反「普通图字节不变」。
+    let format = image_format_of(&ct_base);
+    if !matches!(
+        format,
+        Some(image::ImageFormat::Jpeg) | Some(image::ImageFormat::WebP)
+    ) {
+        let orig_key = format!("{}#orig", q.url);
+        let etag = etag_of(&orig_key);
+        if raw.len() <= CACHE_ITEM_MAX {
+            image_cache::put(&orig_key, raw.clone(), ct_base.clone());
+        }
+        return serve_bytes(raw, &ct_base, &etag, false, headers);
+    }
+    let Some(format) = format else {
+        return error_body(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "slice_unsupported",
+            &format!(
+                "切片不支持的图片类型：{}",
+                if ct_base.is_empty() {
+                    "未知"
+                } else {
+                    &ct_base
+                }
+            ),
+        );
     };
     let source_bytes = raw.len();
     let started = Instant::now();

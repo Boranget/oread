@@ -84,9 +84,9 @@ pub fn rss_bytes() -> Option<u64> {
 /// 直接读 `library_books` 的冗余统计，避免每次健康检查都扫整张正文表。
 async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
     sqlx::query_as(
-        "SELECT book_url, COALESCE(name, '') AS name, content_bytes AS total \
-         FROM library_books WHERE content_bytes > 0 \
-         ORDER BY content_bytes DESC LIMIT 5",
+        "SELECT book_url, COALESCE(name, '') AS name, (content_bytes + image_bytes) AS total \
+         FROM library_books WHERE (content_bytes + image_bytes) > 0 \
+         ORDER BY total DESC LIMIT 5",
     )
     .fetch_all(pool)
     .await
@@ -176,7 +176,8 @@ pub async fn healthz_user(
 ) -> AppResult<Json<serde_json::Value>> {
     let stats = crate::library::stats(&state.library, state.cfg.library_temp_ttl_secs).await;
     let books = cache_usage_by_book(&state.library).await;
-    let bytes = stats.content_bytes;
+    // 正文 + 持久化漫画图片（进程内 LRU 单独列在 image_cache_bytes）
+    let bytes = stats.total_bytes;
     let mut v = base_metrics(&state);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ok".into(), json!(true));
@@ -186,6 +187,7 @@ pub async fn healthz_user(
                 "bytes": bytes,
                 "mb": (bytes as f64 / MB as f64 * 100.0).round() / 100.0,
                 "rows": stats.content_rows,
+                "image_rows": stats.image_rows,
                 // 分层监控：馆藏永久保存，临时缓存按 TTL 回收
                 "collection": {
                     "books": stats.collection_books,

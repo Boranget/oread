@@ -16,7 +16,18 @@ use sqlx::SqlitePool;
 
 use crate::entities::{Book, BookChapter, BookContent};
 use crate::library::{self, JobRow};
+use crate::library_images;
 use crate::routes::AppState;
+
+/// 单章内图片下载并发。与章节并发相乘后仍远低于交互阅读的优先级。
+const IMAGE_PARALLEL: usize = 3;
+/// 落盘图片的单张上限：超过只保留清单，不进 `library_images`（与进程内 LRU 一致）。
+const IMAGE_KEEP_MAX: usize = 2 * 1024 * 1024;
+/// 单张图片的抓取结果：`(清单下标, Ok((字节数, 宽, 高)) | Err)`。
+type ImageOutcome = (
+    usize,
+    anyhow::Result<Option<(i64, Option<u32>, Option<u32>)>>,
+);
 
 /// 空闲时的轮询间隔。
 const IDLE_POLL: Duration = Duration::from_secs(5);
@@ -191,16 +202,14 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
         anyhow::bail!("目录为空，无法整本下载");
     }
 
-    let cached: std::collections::HashSet<String> = sqlx::query_scalar(
-        "SELECT url FROM library_content WHERE book_url = ?1 AND content IS NOT NULL \
-         AND cache_version = ?2",
+    // 图片章节的 `content` 是空串，不能只看 content IS NOT NULL；
+    // `cached_chapter_urls` 对漫画额外要求 images_ready=1（图片真的全部落盘）。
+    let cached = library::cached_chapter_urls(
+        &state.library,
+        &job.book_url,
+        crate::routes::books::content_cache_version(),
     )
-    .bind(&job.book_url)
-    .bind(crate::routes::books::content_cache_version())
-    .fetch_all(&state.library)
-    .await?
-    .into_iter()
-    .collect();
+    .await?;
 
     let pending: Vec<BookChapter> = chapters
         .iter()
@@ -370,29 +379,7 @@ async fn fetch_and_store(
     chapter: &BookChapter,
 ) -> anyhow::Result<()> {
     if source.book_source_type == 2 {
-        let imgs = crate::web_book::chapter_images_book(
-            state.fetcher.as_ref(),
-            source,
-            chapter,
-            Some(store),
-        )
-        .await?;
-        if imgs.images.is_empty() {
-            anyhow::bail!("图片列表为空");
-        }
-        let c = BookContent {
-            url: chapter.url.clone(),
-            origin: source.book_source_url.clone(),
-            book_url: book_url.to_string(),
-            title: chapter.title.clone(),
-            content: Some(String::new()),
-            chapter_index: chapter.index,
-            content_type: "image".into(),
-            images_json: Some(serde_json::to_string(&imgs)?),
-            ..Default::default()
-        };
-        crate::routes::books::upsert_content(&state.library, &c).await?;
-        return Ok(());
+        return fetch_comic(state, source, store, book_url, chapter).await;
     }
     let mut c =
         crate::web_book::chapter_content_book(state.fetcher.as_ref(), source, chapter, Some(store))
@@ -409,5 +396,139 @@ async fn fetch_and_store(
         anyhow::bail!("正文为空");
     }
     crate::routes::books::upsert_content(&state.library, &c).await?;
+    Ok(())
+}
+
+/// 漫画章节：抓图片清单 + 把图片原始字节落进 `library_images`。
+///
+/// 续跑时优先复用库里已有的清单，不重新请求目录页；已落盘的图片按
+/// `(url, origin)` 跳过。单张超过 `IMAGE_KEEP_MAX` 的图只保留清单、不落盘。
+/// 任何一张图抓取失败都会让本章保持 `images_ready=0`，任务结束后可重试补齐。
+async fn fetch_comic(
+    state: &AppState,
+    source: &crate::entities::BookSource,
+    store: &crate::web_book::BookStore,
+    book_url: &str,
+    chapter: &BookChapter,
+) -> anyhow::Result<()> {
+    let origin = source.book_source_url.clone();
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT images FROM library_content \
+         WHERE url = ?1 AND origin = ?2 AND content_type = 'image'",
+    )
+    .bind(&chapter.url)
+    .bind(&origin)
+    .fetch_optional(&state.library)
+    .await?;
+    let mut imgs: crate::web_book::ChapterImages = match existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<crate::web_book::ChapterImages>(s).ok())
+    {
+        Some(v) if !v.images.is_empty() => v,
+        _ => {
+            crate::web_book::chapter_images_book(
+                state.fetcher.as_ref(),
+                source,
+                chapter,
+                Some(store),
+            )
+            .await?
+        }
+    };
+    if imgs.images.is_empty() {
+        anyhow::bail!("图片列表为空");
+    }
+
+    let mut c = BookContent {
+        url: chapter.url.clone(),
+        origin: origin.clone(),
+        book_url: book_url.to_string(),
+        title: chapter.title.clone(),
+        content: Some(String::new()),
+        chapter_index: chapter.index,
+        content_type: "image".into(),
+        images_json: Some(serde_json::to_string(&imgs)?),
+        ..Default::default()
+    };
+    // 先落清单（并把完整性标记清零）：中途取消/重启后仍能从清单继续补图。
+    crate::routes::books::upsert_content(&state.library, &c).await?;
+    library_images::mark_chapter_pending(&state.library, &chapter.url, &origin).await?;
+
+    let max_body = state.cfg.image_max_body_bytes.max(1024);
+    let referer = chapter.url.clone();
+    let outcomes: Vec<ImageOutcome> =
+        stream::iter(imgs.images.iter().cloned().enumerate().map(|(i, img)| {
+            let referer = referer.clone();
+            let origin = origin.clone();
+            async move {
+                if img.url.trim().is_empty() {
+                    return (i, Ok(None));
+                }
+                if let Ok(Some(m)) =
+                    library_images::meta_of(&state.library, &img.url, &origin).await
+                {
+                    return (i, Ok(Some((m.size_bytes, m.width, m.height))));
+                }
+                match crate::image_fetch::fetch(source, &img.url, Some(&referer), max_body).await {
+                    Ok(f) if f.data.len() <= IMAGE_KEEP_MAX => {
+                        let saved = library_images::save(
+                            &state.library,
+                            book_url,
+                            &img.url,
+                            &origin,
+                            &f.mime,
+                            &f.data,
+                            f.width,
+                            f.height,
+                        )
+                        .await;
+                        match saved {
+                            Ok(n) => (i, Ok(Some((n, f.width, f.height)))),
+                            Err(e) => (i, Err(e)),
+                        }
+                    }
+                    // 超大图：跳过落盘，但清单里的 URL 仍保留（在线仍可经代理读到）。
+                    Ok(_) => (i, Ok(None)),
+                    Err(e) => (i, Err(e)),
+                }
+            }
+        }))
+        .buffer_unordered(IMAGE_PARALLEL)
+        .collect()
+        .await;
+
+    let mut failed = 0usize;
+    for (i, outcome) in outcomes {
+        match outcome {
+            Ok(Some((size, w, h))) => {
+                let im = &mut imgs.images[i];
+                im.bytes = Some(size.max(0) as u64);
+                if im.width.is_none() {
+                    im.width = w;
+                }
+                if im.height.is_none() {
+                    im.height = h;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    book = %book_url,
+                    chapter = %chapter.url,
+                    image = %imgs.images[i].url,
+                    error = %e,
+                    "library comic image failed"
+                );
+            }
+        }
+    }
+
+    c.images_json = Some(serde_json::to_string(&imgs)?);
+    crate::routes::books::upsert_content(&state.library, &c).await?;
+    if failed > 0 {
+        anyhow::bail!("{failed} 张图片下载失败");
+    }
+    library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
     Ok(())
 }

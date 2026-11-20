@@ -548,6 +548,12 @@ export const api = {
         limit: opts.limit,
       })}`
     ),
+  // 漫画入馆前的体积预估（管理员）：抽样探测，结果缓存 30 分钟
+  libraryComicEstimate: (bookUrl, source = '') =>
+    request('POST', '/library/comic/estimate', {
+      book_url: bookUrl,
+      ...(source ? { source } : {}),
+    }),
   // 入馆（管理员）：置为永久保存并排队后台整本下载
   libraryCollect: (bookUrl, source = '') =>
     request('POST', '/library/collect', { book_url: bookUrl, ...(source ? { source } : {}) }),

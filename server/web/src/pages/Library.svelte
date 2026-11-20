@@ -37,6 +37,7 @@
   let error = '';
   let notice = '';
   let busyUrl = '';
+  let estimatingUrl = '';
   let armedUrl = '';
   let armedTimer = null;
   let jobs = [];
@@ -82,6 +83,16 @@
 
   function tierLabel(t) {
     return t === 'collection' ? '馆藏' : '临时';
+  }
+
+  function isComic(b) {
+    if (Number(b.book_source_type) === 2) return true;
+    const kind = String(b.kind || '').toLowerCase();
+    return kind === 'comic' || kind === 'manga' || kind === '漫画';
+  }
+
+  function fmtSpace(v) {
+    return v == null ? '未知' : fmtBytes(v);
   }
 
   function jobDone(j) {
@@ -175,10 +186,31 @@
 
   async function collect(b) {
     if (!isAdmin) return;
-    busyUrl = b.book_url;
     error = '';
     notice = '';
     disarm();
+    // 漫画先抽样预估：只是提示，不硬拦入馆；小说走原流程。
+    if (isComic(b)) {
+      estimatingUrl = b.book_url;
+      try {
+        const est = await api.libraryComicEstimate(b.book_url, b.origin || '');
+        if (est.comic !== false) {
+          const low = fmtSpace(est.estimated_low_bytes ?? est.estimated_bytes);
+          const high = fmtSpace(est.estimated_high_bytes ?? est.estimated_bytes);
+          const free = fmtSpace(est.disk_free_bytes);
+          const enough = est.enough_space === false ? '\n空间可能不足，建议先清理。' : '';
+          const body = low === '未知'
+            ? '无法取得足够样本，体积只能按实际下载计算。'
+            : `预计占 ${low}～${high}，当前剩余 ${free}。`;
+          if (!window.confirm(`${body}${enough}\n\n抽样估算，以实际下载为准。确定入馆吗？`)) return;
+        }
+      } catch (e) {
+        if (!window.confirm(`体积预检失败：${describeFailure(e, '体积预估')}\n仍要入馆吗？`)) return;
+      } finally {
+        estimatingUrl = '';
+      }
+    }
+    busyUrl = b.book_url;
     try {
       const res = await api.libraryCollect(b.book_url, b.origin || '');
       notice = res.queued
@@ -353,7 +385,7 @@
             {#if b.origin_name}<span class="muted tiny-note">{b.origin_name}</span>{/if}
           </div>
           <div class="muted tiny-note">
-            {b.author || '佚名'} · 已缓存 {b.cached_chapters} / {b.total_chapter_num || '?'} 章 · {fmtBytes(b.content_bytes)}
+            {b.author || '佚名'} · 已缓存 {b.cached_chapters} / {b.total_chapter_num || '?'} 章 · 正文 {fmtBytes(b.content_bytes)}{#if b.image_bytes} · 图片 {fmtBytes(b.image_bytes)}{/if}
             · 最近访问 {fmtDate(b.last_accessed_at)}
             {#if b.tier === 'collection' && b.collected_at} · 入馆 {fmtDate(b.collected_at)}{/if}
           </div>
@@ -366,7 +398,7 @@
             {#if b.tier === 'collection'}
               <button class="ghost" on:click={() => release(b)} disabled={!!busyUrl}>移出馆藏</button>
             {:else}
-              <button on:click={() => collect(b)} disabled={!!busyUrl}>入馆</button>
+              <button on:click={() => collect(b)} disabled={!!busyUrl || estimatingUrl === b.book_url}>{estimatingUrl === b.book_url ? '预估体积…' : '入馆'}</button>
               <button class="ghost" on:click={() => removeBook(b)} disabled={!!busyUrl}>
                 {armedUrl === b.book_url ? '再次点击确认删除' : '删除'}
               </button>

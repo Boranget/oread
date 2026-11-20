@@ -597,7 +597,8 @@ pub(super) async fn cache_all(
 /// 清空正文缓存：`book_id` 有值按书清，缺省清全部临时缓存。
 ///
 /// 馆藏（`tier=collection`）不参与：那些正文只能由管理员「移出馆藏」后再清理，
-/// 避免任意账号把全局共享的馆藏内容删掉。返回 (删除行数, 释放字节数)。
+/// 避免任意账号把全局共享的馆藏内容删掉。漫画图片与正文一起清。
+/// 返回 (删除正文行数, 释放字节数 = 正文 + 图片)。
 pub(crate) async fn clear_content_cache(
     lib: &SqlitePool,
     book_id: Option<&str>,
@@ -614,8 +615,14 @@ pub(crate) async fn clear_content_cache(
             if tier.as_deref() == Some(library::TIER_COLLECTION) {
                 anyhow::bail!("该书已入馆，请先移出馆藏再清理正文");
             }
-            let freed: i64 = sqlx::query_scalar(
+            let content_freed: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let image_freed: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM library_images WHERE book_url = ?1",
             )
             .bind(id)
             .fetch_one(&mut *tx)
@@ -625,20 +632,31 @@ pub(crate) async fn clear_content_cache(
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+            // 漫画图片与正文一起清；保留书目与目录。
+            sqlx::query("DELETE FROM library_images WHERE book_url = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(
-                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0 \
+                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0, image_bytes = 0 \
                  WHERE book_url = ?1",
             )
             .bind(id)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            (deleted, freed)
+            (deleted, content_freed + image_freed)
         }
         None => {
             let mut tx = lib.begin().await?;
-            let freed: i64 = sqlx::query_scalar(
+            let content_freed: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url IN \
+                 (SELECT book_url FROM library_books WHERE tier = 'temp')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let image_freed: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(size_bytes),0) FROM library_images WHERE book_url IN \
                  (SELECT book_url FROM library_books WHERE tier = 'temp')",
             )
             .fetch_one(&mut *tx)
@@ -651,12 +669,19 @@ pub(crate) async fn clear_content_cache(
             .await?
             .rows_affected();
             sqlx::query(
-                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0 WHERE tier = 'temp'",
+                "DELETE FROM library_images WHERE book_url IN \
+                 (SELECT book_url FROM library_books WHERE tier = 'temp')",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0, image_bytes = 0 \
+                 WHERE tier = 'temp'",
             )
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            (deleted, freed)
+            (deleted, content_freed + image_freed)
         }
     };
     // 有界归还空闲页，避免文件只涨不落。
@@ -697,7 +722,7 @@ pub(super) async fn cache_trim(
 ) -> AppResult<Json<serde_json::Value>> {
     let used_before = library::stats(&s.library, s.cfg.library_temp_ttl_secs)
         .await
-        .content_bytes;
+        .total_bytes;
     let report = library::cleanup_temp(&s.library, s.cfg.library_temp_ttl_secs).await?;
     let used_after = library::stats(&s.library, s.cfg.library_temp_ttl_secs)
         .await

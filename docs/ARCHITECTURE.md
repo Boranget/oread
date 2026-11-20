@@ -26,7 +26,9 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | `auth.rs` | 注册/登录/改密、Bearer 鉴权中间件、管理员、用户库连接池 |
 | `db*.rs` / `db_guard*` | `shared.db`、`library.db` 与 `users/<uid>.db` 的建库、迁移、备份、可写探测、崩溃自愈 |
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |
-| `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消 |
+| `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；漫画图片落盘 |
+| `library_images.rs` | 馆藏漫画图片表 `library_images` 的读写（按 `(url, origin)` 去重）、完整性标记 |
+| `image_fetch.rs` | 图片回源的共用入口：整图抓取（worker 落盘）与只取响应头的体积探测（入馆预估） |
 | `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`kindle_*`、`image_*`、`sources_*` 等） |
 | `web_book*` | 书源抓取管线：搜索、详情、目录翻页、正文、图片、探索/榜单；`Fetcher` trait 可注入 |
 | `req*` | HTTP 预算、按源并发槽/限流、Cookie、字符集解码、重试、SSRF 防护 |
@@ -62,7 +64,7 @@ GET /api/book/content
 ## 4. 数据与缓存
 
 - **`shared.db`**：账户、书源、导入账本、体检语料。全局一份。
-- **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总）、`library_chapters`（目录）、`library_content`（正文，键 `(url, origin)`）、`library_jobs`/`library_job_items`（采购单）。
+- **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总，含 `image_bytes`）、`library_chapters`（目录）、`library_content`（正文/图片清单，键 `(url, origin)`，图片章节带 `images_ready`）、`library_images`（漫画图片原始字节 BLOB，键 `(url, origin)`）、`library_jobs`/`library_job_items`（采购单）。
   - `tier=collection`：馆藏，永久保存，不自动淘汰；只有管理员能移出或删除。
   - `tier=temp`：临时缓存，按 `last_accessed_at` 做 TTL 回收（默认 30 天），每小时后台清理。
   - **不设容量上限**，只做占用监控；`/api/healthz` 与 `/api/library/stats` 暴露分层占用。
@@ -73,6 +75,8 @@ GET /api/book/content
   - 回源失败时（正文/目录）回退到库中旧缓存，正文响应带 `stale=true`；完全无缓存才返回错误。
 - **采购单**：入馆时排队，`library_worker` 在服务端整本下载（默认 1 任务 × 3 章并发），进程重启后把 `running` 放回队列断点续跑；剩余磁盘低于 `LIBRARY_DISK_FLOOR_MB`（默认 1 GiB）时暂停，交互阅读不受影响。
 - **冷却与来源回填**：任务开始前查 `source_health.cooldown_until`，冷却中的书源把任务推迟到冷却结束（`library_jobs.updated_at` 即「下次可执行时间」），先跑别的书；worker 加载到真实书源后回填馆藏书目缺失的 `origin` / `origin_name` / `book_source_type`。
+- **漫画图片**：只有馆藏漫画由 worker 把解密后的原始字节写进 `library_images`（BLOB，单张 > 2 MiB 只留清单不落盘），按 `(url, origin)` 去重，随正文一起删除/TTL 回收；临时层仍走进程内 LRU。`/api/book/image` 命中本地 BLOB 后回填 LRU，不再回源；墨水屏灰度/WebP 转码变体仍运行时生成，不落盘。
+- **体积预估**：`POST /api/library/comic/estimate` 抽 3 章 × 2 图，只探测响应头（`Range: bytes=0-0` 优先），按 `book_url + source + uid` 缓存 30 分钟；估算只警告不硬拦，前端展示区间与「抽样估算，以实际下载为准」。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文分开预算。
 - **规则缓存**：`<data_dir>/cache/rule/`，仅 `cache.getFile/putFile` 可写。
 - **搜索任务（`shared.db`.`search_jobs`）**：两段式搜索的元数据与最终快照。运行期进度以进程内注册表（`books_search_job`）为准；任务收尾时把 `books/errors` 写入 `snapshot_json`。内存只保留运行中 + 最近 20 个已完成任务（完成后再留 10 分钟），数据库保留每用户最近 50 个。`/api/search/result` 内存未命中时回退数据库快照，游标翻页继续复用 `rank_bucket/rank_seq`。进程启动时把上次遗留的 `running` 行标为 `interrupted`，避免前端永远轮询一个不会动的任务。
