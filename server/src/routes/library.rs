@@ -86,14 +86,20 @@ pub struct BooksQ {
     pub sort: Option<String>,
 }
 
-fn parse_cursor(raw: Option<&str>) -> (i64, String) {
+fn parse_cursor(raw: Option<&str>) -> AppResult<(i64, String)> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (i64::MAX, String::new());
+        return Ok((i64::MAX, String::new()));
     };
-    match raw.split_once(':') {
-        Some((ts, url)) => (ts.parse::<i64>().unwrap_or(i64::MAX), url.to_string()),
-        None => (i64::MAX, String::new()),
+    let (ts, url) = raw
+        .split_once(':')
+        .ok_or_else(|| AppError::BadRequest("cursor 格式应为 <sort_ts>:<book_url>".into()))?;
+    let ts = ts
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest("cursor 的时间戳不是整数".into()))?;
+    if url.is_empty() {
+        return Err(AppError::BadRequest("cursor 缺少 book_url".into()));
     }
+    Ok((ts, url.to_string()))
 }
 
 fn book_item(b: &LibraryBook) -> serde_json::Value {
@@ -148,7 +154,7 @@ async fn books(
             ))
         }
     };
-    let (ts, after_url) = parse_cursor(q.cursor.as_deref());
+    let (ts, after_url) = parse_cursor(q.cursor.as_deref())?;
     let like =
         q.q.as_deref()
             .map(str::trim)
@@ -347,6 +353,22 @@ async fn jobs(
                 .collect()
         })
         .unwrap_or_default();
+    const JOB_STATUSES: [&str; 6] = [
+        library::JOB_QUEUED,
+        library::JOB_RUNNING,
+        library::JOB_DONE,
+        library::JOB_PARTIAL,
+        library::JOB_FAILED,
+        library::JOB_CANCELLED,
+    ];
+    if let Some(bad) = statuses
+        .iter()
+        .find(|s| !JOB_STATUSES.contains(&s.as_str()))
+    {
+        return Err(AppError::BadRequest(format!(
+            "未知任务状态 {bad}；可选 queued/running/done/partial/failed/cancelled"
+        )));
+    }
     // 状态过滤用 IN (...) 动态占位；空列表时退化为全量。
     let mut sql = String::from(
         "SELECT id, book_url, source, status, total, done, failed, skipped, error, \

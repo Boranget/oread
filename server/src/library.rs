@@ -177,6 +177,52 @@ pub async fn refresh_rollup(pool: &SqlitePool, book_url: &str) -> anyhow::Result
     Ok(())
 }
 
+/// 写入正文后的「确保书目 + 刷新冗余统计」：一条语句完成。
+///
+/// 与 `ensure_book` + `refresh_rollup` 相比少一次写事务，是逐章落库的热路径。
+pub async fn upsert_rollup(pool: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO library_books (book_url, last_accessed_at, cached_chapters, content_bytes) \
+         VALUES (?1, ?2, \
+           (SELECT COUNT(*) FROM library_content WHERE book_url = ?1), \
+           (SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1)) \
+         ON CONFLICT(book_url) DO UPDATE SET \
+           cached_chapters = excluded.cached_chapters, \
+           content_bytes = excluded.content_bytes, \
+           last_accessed_at = excluded.last_accessed_at",
+    )
+    .bind(book_url)
+    .bind(now_ms())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 用书源补齐馆藏书目的来源字段（缺什么补什么，不覆盖已有值）。
+///
+/// 入馆时可能只传了 `source`，书目里还没有 `origin` / `origin_name`；
+/// 后台 worker 拿到真实书源后回填，列表页与后续缓存读取才有源可用。
+pub async fn adopt_source(
+    pool: &SqlitePool,
+    book_url: &str,
+    source: &crate::entities::BookSource,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE library_books SET \
+           origin = COALESCE(origin, ?2), \
+           origin_name = COALESCE(origin_name, ?3), \
+           book_source_type = CASE WHEN book_source_type = 0 THEN ?4 ELSE book_source_type END \
+         WHERE book_url = ?1",
+    )
+    .bind(book_url)
+    .bind(&source.book_source_url)
+    .bind(&source.book_source_name)
+    .bind(source.book_source_type)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 清理 / 删除
 // ---------------------------------------------------------------------------
@@ -223,49 +269,90 @@ pub async fn cleanup_temp(pool: &SqlitePool, ttl_secs: i64) -> anyhow::Result<Cl
 }
 
 /// 整本删除（正文 + 目录 + 书目行）。返回 `(删除书目行, 目录行, 正文行, 释放字节)`。
+///
+/// 删除与「取消该书的未完成任务」在同一事务里完成，避免后台 worker 在删除后
+/// 继续写入、把刚删掉的书重新变出来。已在抓取中的单章仍可能落库一次，
+/// 但任务已取消，后续章节会立即停止。
 pub async fn delete_book(
     pool: &SqlitePool,
     book_url: &str,
 ) -> anyhow::Result<(u64, u64, u64, i64)> {
+    let mut tx = pool.begin().await?;
+    cancel_jobs_for_book_tx(&mut tx, book_url).await?;
     let bytes: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
     )
     .bind(book_url)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     let contents = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
         .bind(book_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     let chapters = sqlx::query("DELETE FROM library_chapters WHERE book_url = ?1")
         .bind(book_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     let books = sqlx::query("DELETE FROM library_books WHERE book_url = ?1")
         .bind(book_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+    tx.commit().await?;
     Ok((books, chapters, contents, bytes))
 }
 
 /// 只删正文，保留书目与目录（「清空这本书的缓存」）。
 pub async fn clear_content(pool: &SqlitePool, book_url: &str) -> anyhow::Result<(u64, i64)> {
+    let mut tx = pool.begin().await?;
     let bytes: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
     )
     .bind(book_url)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     let deleted = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
         .bind(book_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-    refresh_rollup(pool, book_url).await.ok();
+    sqlx::query(
+        "UPDATE library_books SET cached_chapters = 0, content_bytes = 0, last_accessed_at = ?2 \
+         WHERE book_url = ?1",
+    )
+    .bind(book_url)
+    .bind(now_ms())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok((deleted, bytes))
+}
+
+/// 取消某本书所有未完成任务（queued / running）。
+pub async fn cancel_jobs_for_book(pool: &SqlitePool, book_url: &str) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let changed = cancel_jobs_for_book_tx(&mut tx, book_url).await?;
+    tx.commit().await?;
+    Ok(changed)
+}
+
+async fn cancel_jobs_for_book_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    book_url: &str,
+) -> anyhow::Result<u64> {
+    let now = now_ms();
+    let changed = sqlx::query(
+        "UPDATE library_jobs SET status = 'cancelled', updated_at = ?2, finished_at = ?2 \
+         WHERE book_url = ?1 AND status IN ('queued','running')",
+    )
+    .bind(book_url)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,16 +376,23 @@ pub async fn collect(pool: &SqlitePool, book_url: &str) -> anyhow::Result<bool> 
 }
 
 /// 移出馆藏：降级为临时缓存，内容先留着，交给 TTL 或手动删除。
+///
+/// 同时取消该书的后台整本下载：已经移出馆藏，就不该继续占用下载通道。
 pub async fn release(pool: &SqlitePool, book_url: &str) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE library_books SET tier = 'temp', collected_at = NULL, last_accessed_at = ?2 \
          WHERE book_url = ?1 AND tier = 'collection'",
     )
     .bind(book_url)
     .bind(now_ms())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    if changed > 0 {
+        cancel_jobs_for_book_tx(&mut tx, book_url).await?;
+    }
+    tx.commit().await?;
     Ok(changed > 0)
 }
 
@@ -379,36 +473,66 @@ pub fn new_job_id() -> String {
 /// 入队一本书的整本下载任务。
 ///
 /// 同一本书已有 `queued`/`running` 任务时不重复创建，直接返回已有 ID（幂等）。
+/// 用单条 `INSERT ... WHERE NOT EXISTS` 保证并发入馆不会产生两张采购单。
 pub async fn enqueue_job(
     pool: &SqlitePool,
     book_url: &str,
     source: &str,
     uid: i64,
 ) -> anyhow::Result<String> {
-    let existing: Option<String> = sqlx::query_scalar(
+    for _ in 0..3 {
+        let id = new_job_id();
+        let now = now_ms();
+        let inserted = sqlx::query(
+            "INSERT INTO library_jobs (id, book_url, source, uid, status, created_at, updated_at) \
+             SELECT ?1, ?2, ?3, ?4, 'queued', ?5, ?5 \
+             WHERE NOT EXISTS (SELECT 1 FROM library_jobs \
+                               WHERE book_url = ?2 AND status IN ('queued','running'))",
+        )
+        .bind(&id)
+        .bind(book_url)
+        .bind(source)
+        .bind(uid)
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            return Ok(id);
+        }
+        // 没插进去说明已存在活动任务；极小概率它在两条语句之间刚好结束，重试一次。
+        if let Some(existing) = active_job_id(pool, book_url).await? {
+            return Ok(existing);
+        }
+    }
+    anyhow::bail!("排队采购单失败：并发竞争未能取得任务 ID")
+}
+
+async fn active_job_id(pool: &SqlitePool, book_url: &str) -> anyhow::Result<Option<String>> {
+    let id = sqlx::query_scalar(
         "SELECT id FROM library_jobs WHERE book_url = ?1 AND status IN ('queued','running') \
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(book_url)
     .fetch_optional(pool)
     .await?;
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-    let id = new_job_id();
-    let now = now_ms();
-    sqlx::query(
-        "INSERT INTO library_jobs (id, book_url, source, uid, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?5)",
-    )
-    .bind(&id)
-    .bind(book_url)
-    .bind(source)
-    .bind(uid)
-    .bind(now)
-    .execute(pool)
-    .await?;
     Ok(id)
+}
+
+/// 推迟任务：`queued` 任务的 `updated_at` 兼作「下次可执行时间」，
+/// 书源冷却时用它把任务让给其它书，冷却结束自动重新参与调度。
+pub async fn defer_job(pool: &SqlitePool, id: &str, not_before_ms: i64) -> anyhow::Result<bool> {
+    let changed = sqlx::query(
+        "UPDATE library_jobs SET updated_at = ?2, error = ?3 \
+         WHERE id = ?1 AND status = 'queued'",
+    )
+    .bind(id)
+    .bind(not_before_ms)
+    .bind("书源冷却中，等待自动重试")
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(changed > 0)
 }
 
 /// 取消任务：只允许取消 `queued`/`running`。
@@ -446,12 +570,17 @@ pub struct JobRow {
     pub uid: i64,
 }
 
-/// 取最早入队的一条任务（不改变状态；调用方负责 CAS 到 running）。
+/// 取最早入队且已到可执行时间的一条任务（不改变状态；调用方负责 CAS 到 running）。
+///
+/// `queued` 任务的 `updated_at` 兼作「下次可执行时间」：书源冷却时由
+/// [`defer_job`] 推后，避免一个冷却源占住唯一的后台下载通道。
 pub async fn next_queued_job(pool: &SqlitePool) -> anyhow::Result<Option<JobRow>> {
     let row = sqlx::query_as::<_, JobRow>(
         "SELECT id, book_url, source, uid FROM library_jobs \
-         WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
+         WHERE status = 'queued' AND updated_at <= ?1 \
+         ORDER BY created_at ASC LIMIT 1",
     )
+    .bind(now_ms())
     .fetch_optional(pool)
     .await?;
     Ok(row)
@@ -460,7 +589,7 @@ pub async fn next_queued_job(pool: &SqlitePool) -> anyhow::Result<Option<JobRow>
 /// 抢占任务：只有仍处于 `queued` 时才成功，避免多 worker 重复执行。
 pub async fn claim_job(pool: &SqlitePool, id: &str) -> anyhow::Result<bool> {
     let changed = sqlx::query(
-        "UPDATE library_jobs SET status = 'running', updated_at = ?2 \
+        "UPDATE library_jobs SET status = 'running', updated_at = ?2, error = NULL \
          WHERE id = ?1 AND status = 'queued'",
     )
     .bind(id)
@@ -540,3 +669,7 @@ pub async fn finish_job(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "library_tests.rs"]
+mod tests;

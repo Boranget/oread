@@ -581,10 +581,11 @@ pub(crate) async fn clear_content_cache(
     let scope = book_id.map(str::trim).filter(|s| !s.is_empty());
     let (deleted, freed) = match scope {
         Some(id) => {
+            let mut tx = lib.begin().await?;
             let tier: Option<String> =
                 sqlx::query_scalar("SELECT tier FROM library_books WHERE book_url = ?1")
                     .bind(id)
-                    .fetch_optional(lib)
+                    .fetch_optional(&mut *tx)
                     .await?;
             if tier.as_deref() == Some(library::TIER_COLLECTION) {
                 anyhow::bail!("该书已入馆，请先移出馆藏再清理正文");
@@ -593,35 +594,44 @@ pub(crate) async fn clear_content_cache(
                 "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
             )
             .bind(id)
-            .fetch_one(lib)
+            .fetch_one(&mut *tx)
             .await?;
             let deleted = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
                 .bind(id)
-                .execute(lib)
+                .execute(&mut *tx)
                 .await?
                 .rows_affected();
-            library::refresh_rollup(lib, id).await.ok();
+            sqlx::query(
+                "UPDATE library_books SET cached_chapters = 0, content_bytes = 0 \
+                 WHERE book_url = ?1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             (deleted, freed)
         }
         None => {
+            let mut tx = lib.begin().await?;
             let freed: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url IN \
                  (SELECT book_url FROM library_books WHERE tier = 'temp')",
             )
-            .fetch_one(lib)
+            .fetch_one(&mut *tx)
             .await?;
             let deleted = sqlx::query(
                 "DELETE FROM library_content WHERE book_url IN \
                  (SELECT book_url FROM library_books WHERE tier = 'temp')",
             )
-            .execute(lib)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
-            let _ = sqlx::query(
+            sqlx::query(
                 "UPDATE library_books SET cached_chapters = 0, content_bytes = 0 WHERE tier = 'temp'",
             )
-            .execute(lib)
-            .await;
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             (deleted, freed)
         }
     };

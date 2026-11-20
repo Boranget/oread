@@ -360,9 +360,11 @@ pub(crate) async fn save_chapters(
     book_url: &str,
     chapters: &[BookChapter],
 ) -> anyhow::Result<()> {
+    // 整本替换放在一个事务里：抓取/解析中途失败时不会留下半份目录。
+    let mut tx = lib.begin().await?;
     sqlx::query("DELETE FROM library_chapters WHERE book_url = ?")
         .bind(book_url)
-        .execute(lib)
+        .execute(&mut *tx)
         .await?;
     for c in chapters {
         sqlx::query(
@@ -390,7 +392,7 @@ pub(crate) async fn save_chapters(
         .bind(c.end)
         .bind(&c.update_time)
         .bind(c.word_count)
-        .execute(lib)
+        .execute(&mut *tx)
         .await?;
     }
     let total = chapters.len() as i64;
@@ -406,8 +408,9 @@ pub(crate) async fn save_chapters(
     .bind(book_url)
     .bind(total)
     .bind(library::now_ms())
-    .execute(lib)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -656,8 +659,7 @@ pub(crate) async fn upsert_content(lib: &SqlitePool, c: &BookContent) -> anyhow:
     .execute(lib)
     .await;
     if !c.book_url.trim().is_empty() {
-        library::ensure_book(lib, &c.book_url).await.ok();
-        library::refresh_rollup(lib, &c.book_url).await.ok();
+        library::upsert_rollup(lib, &c.book_url).await?;
     }
     Ok(())
 }

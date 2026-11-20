@@ -145,8 +145,7 @@
       items = reset ? page : items.concat(page);
       nextCursor = res.next_cursor || null;
     } catch (e) {
-      if (reset) error = describeFailure(e, '读取馆藏');
-      else jobsErr = describeFailure(e, '加载更多');
+      error = describeFailure(e, reset ? '读取馆藏' : '加载更多');
     } finally {
       loading = false;
       loadingMore = false;
@@ -204,6 +203,7 @@
       await api.libraryRelease(b.book_url);
       notice = '已移出馆藏，转为临时缓存（按 TTL 回收或手动删除）';
       await reload();
+      if (isAdmin) loadJobs();
     } catch (e) {
       error = describeFailure(e, '移出馆藏');
     } finally {
@@ -227,6 +227,7 @@
       const res = await api.libraryDelete(b.book_url);
       notice = `已删除：${res.deleted_chapters} 章目录 / ${res.deleted_contents} 章正文，释放 ${fmtBytes(res.bytes_freed)}`;
       await reload();
+      if (isAdmin) loadJobs();
     } catch (e) {
       error = describeFailure(e, '删除馆藏');
     } finally {

@@ -80,26 +80,13 @@ pub fn rss_bytes() -> Option<u64> {
     None
 }
 
-/// 馆藏正文占用（字节 + 行数）
-async fn cache_usage(pool: &SqlitePool) -> (i64, i64) {
-    let bytes: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes),0) FROM library_content")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-    (bytes, rows)
-}
-
 /// 按书占用（前 5 本），用于定位馆藏空间被谁占住。
-/// `name` 取自 `library_books`，缺失时前端回退显示 `book_url`。
+/// 直接读 `library_books` 的冗余统计，避免每次健康检查都扫整张正文表。
 async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
     sqlx::query_as(
-        "SELECT c.book_url, COALESCE(b.name, '') AS name, COALESCE(SUM(c.size_bytes),0) AS total \
-         FROM library_content c LEFT JOIN library_books b ON b.book_url = c.book_url \
-         GROUP BY c.book_url ORDER BY total DESC LIMIT 5",
+        "SELECT book_url, COALESCE(name, '') AS name, content_bytes AS total \
+         FROM library_books WHERE content_bytes > 0 \
+         ORDER BY content_bytes DESC LIMIT 5",
     )
     .fetch_all(pool)
     .await
@@ -187,9 +174,9 @@ pub async fn healthz_user(
     _u: AuthUser,
     _db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (bytes, rows) = cache_usage(&state.library).await;
-    let books = cache_usage_by_book(&state.library).await;
     let stats = crate::library::stats(&state.library, state.cfg.library_temp_ttl_secs).await;
+    let books = cache_usage_by_book(&state.library).await;
+    let bytes = stats.content_bytes;
     let mut v = base_metrics(&state);
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ok".into(), json!(true));
@@ -198,7 +185,7 @@ pub async fn healthz_user(
             json!({
                 "bytes": bytes,
                 "mb": (bytes as f64 / MB as f64 * 100.0).round() / 100.0,
-                "rows": rows,
+                "rows": stats.content_rows,
                 // 分层监控：馆藏永久保存，临时缓存按 TTL 回收
                 "collection": {
                     "books": stats.collection_books,

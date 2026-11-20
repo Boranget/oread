@@ -43,6 +43,26 @@ async fn worker_loop(state: AppState, idx: usize) {
     loop {
         match library::next_queued_job(&state.library).await {
             Ok(Some(job)) => {
+                // 书源冷却时不占着通道硬跑：把任务推到冷却结束，先处理别的书。
+                if let Some(until) = cooling_until(&state, &job.source).await {
+                    match library::defer_job(&state.library, &job.id, until).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                worker = idx,
+                                job = %job.id,
+                                source = %job.source,
+                                until,
+                                "library job deferred: source cooling"
+                            );
+                        }
+                        Ok(false) => tokio::time::sleep(IDLE_POLL).await,
+                        Err(e) => {
+                            tracing::warn!(job = %job.id, error = %e, "defer library job failed");
+                            tokio::time::sleep(IDLE_POLL).await;
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(true) = library::claim_job(&state.library, &job.id).await {
                     tracing::info!(
                         worker = idx,
@@ -101,6 +121,22 @@ async fn cleanup_loop(state: AppState) {
     }
 }
 
+/// 书源冷却结束时间（epoch ms）；不在冷却中返回 `None`。
+async fn cooling_until(state: &AppState, source: &str) -> Option<i64> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    let until: Option<i64> =
+        sqlx::query_scalar("SELECT cooldown_until FROM source_health WHERE source_url = ?1")
+            .bind(source)
+            .fetch_optional(&state.shared)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    until.filter(|t| *t > library::now_ms())
+}
+
 async fn job_cancelled(state: &AppState, job_id: &str) -> bool {
     let status: Option<String> =
         sqlx::query_scalar("SELECT status FROM library_jobs WHERE id = ?1")
@@ -140,6 +176,8 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
     let source = crate::routes::sources::load_source(&state.shared, &job.source)
         .await
         .map_err(|e| anyhow::anyhow!("书源不可用：{e}"))?;
+    // 入馆时可能只带了 source：把来源字段补进馆藏书目，列表与后续读取才有源可用。
+    library::adopt_source(&state.library, &job.book_url, &source).await?;
 
     // 借书证里的书源登录态（登录态书源也能后台抓）。
     let user_pool: SqlitePool = crate::auth::get_user_pool(state, job.uid)

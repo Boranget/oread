@@ -2288,6 +2288,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 用途：移出馆藏，降级为临时缓存（内容先保留，交给 TTL 或手动删除）。
 - 请求体：`{ "book_url": "..." }`（别名 `book_id`）。
 - 成功 `200`：`{ "ok": true, "book_url": "...", "released": true, "tier": "temp" }`；书不在馆藏时 `released=false`，仍 `200`。
+- 行为：移出时**取消该书未完成的后台下载任务**（已下载章节保留）；已结束的采购单不受影响。
 
 ### 6.12.5 `POST /api/library/delete`（管理员）
 
@@ -2301,6 +2302,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ```
 
 - 错误：`404 {"error":"馆藏里没有这本书"}`；`400 {"error":"该书仍在馆藏中，请先移出馆藏再删除"}`。
+- 行为：删除与「取消该书未完成任务」在同一事务内完成，避免后台 worker 删除后继续写入。
 
 ### 6.12.6 `POST /api/library/temp/clean`（管理员）
 
@@ -2312,7 +2314,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ### 6.12.7 `GET /api/library/jobs`（管理员）
 
 - 鉴权：登录 + **admin**
-- 查询参数：`status`（逗号分隔，如 `queued,running`；缺省全部）、`limit`（默认 100，clamp 1..500）。
+- 查询参数：`status`（逗号分隔，如 `queued,running`；缺省全部；未知状态返回 400）、`limit`（默认 100，clamp 1..500）。
 - 成功 `200`：
 
 ```json
@@ -2341,6 +2343,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 独立低优先级通道：默认 1 个任务并发（`LIBRARY_JOB_PARALLEL`），每任务 3 章并发（`LIBRARY_JOB_CHAPTER_PARALLEL`）。
 - 进程重启后把残留 `running` 任务放回队列，按 `library_job_items` 断点续跑。
+- 书源冷却：任务开始前查 `source_health.cooldown_until`，冷却中的书源把任务推迟到冷却结束（写 `library_jobs.updated_at` 作为「下次可执行时间」），先处理其它书，不占住唯一的下载通道。
+- 来源回填：入馆时只带 `source` 的书，在 worker 加载到真实书源后补写 `origin` / `origin_name` / `book_source_type`（只填空字段，不覆盖已有来源）。
 - 磁盘安全阀：数据目录剩余空间低于 `LIBRARY_DISK_FLOOR_MB`（默认 1024 MB）时暂停下载，每 60 秒重试；交互阅读与临时缓存不受影响。
 - 临时缓存 TTL：默认 30 天（`LIBRARY_TEMP_TTL_DAYS`），每小时后台回收一次；馆藏永久保存，不自动淘汰。
 
