@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub enum Format {
     Txt,
     Cbz,
+    Epub,
 }
 
 impl Format {
@@ -18,6 +19,7 @@ impl Format {
         match self {
             Format::Txt => "txt",
             Format::Cbz => "cbz",
+            Format::Epub => "epub",
         }
     }
 
@@ -26,6 +28,7 @@ impl Format {
         match self {
             Format::Txt => "txt",
             Format::Cbz => "cbz",
+            Format::Epub => "epub",
         }
     }
 
@@ -35,6 +38,7 @@ impl Format {
             Format::Txt => "text/plain; charset=utf-8",
             // CBZ 就是 ZIP；带 charset 反而让部分阅读器误判
             Format::Cbz => "application/vnd.comicbook+zip",
+            Format::Epub => "application/epub+zip",
         }
     }
 }
@@ -55,6 +59,10 @@ pub struct BookMeta {
     pub intro: Option<String>,
     /// 展示用来源名（`origin_name` 优先，回落 `origin`）
     pub source: Option<String>,
+    /// `(scheme, value)`，如 `("isbn", "978...")`；全局内容层字段
+    pub identifiers: Vec<(String, String)>,
+    /// 全局标签（与用户私人标签不同）
+    pub tags: Vec<String>,
 }
 
 /// 章节内容类型。漫画章节的正文为空，图片清单在 `library_content.images`。
@@ -94,12 +102,26 @@ pub struct BookInput {
     pub missing_chapters: i64,
     /// 已缓存正文的 `size_bytes` 之和（不含图片）
     pub cached_bytes: i64,
+    /// 正文章节数（不含分卷与漫画章节）——TXT/EPUB 的实际可写章节数
+    pub text_chapters: i64,
+    /// 已缓存正文的正文章节数（不含漫画章节）
+    pub cached_text_chapters: i64,
 }
 
 impl BookInput {
     /// 是否所有正文章节都已缓存（分卷行不计）。
     pub fn complete(&self) -> bool {
         self.cached_chapters >= self.total_chapters
+    }
+
+    /// 文本导出（TXT/EPUB）是否所有正文章节都已缓存。
+    pub fn text_complete(&self) -> bool {
+        self.cached_text_chapters >= self.text_chapters
+    }
+
+    /// 文本导出还缺多少章。
+    pub fn text_missing_chapters(&self) -> i64 {
+        (self.text_chapters - self.cached_text_chapters).max(0)
     }
 
     /// 漫画章节（按目录顺序）。

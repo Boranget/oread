@@ -28,7 +28,7 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |
 | `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；漫画图片落盘 |
 | `library_images.rs` | 馆藏漫画图片表 `library_images` 的读写（按 `(url, origin)` 去重）、完整性标记 |
-| `ebook/` | 导出/转换领域层：`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`source`（只读馆藏 + 按章正文/按页图片读取器）、`pipeline`（`ChapterReader` / `FormatWriter`）、`format/txt`、`format/cbz`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
+| `ebook/` | 导出/转换领域层：`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`source`（只读馆藏 + 按章正文/按页图片读取器）、`pipeline`（`ChapterReader` / `FormatWriter`）、`html`（正文 HTML → 语义块）、`xml`（共用转义）、`format/txt`、`format/cbz`、`format/epub`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
 | `image_fetch.rs` | 图片回源的共用入口：整图抓取（worker 落盘）与只取响应头的体积探测（入馆预估） |
 | `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`kindle_*`、`image_*`、`sources_*` 等） |
 | `web_book*` | 书源抓取管线：搜索、详情、目录翻页、正文、图片、探索/榜单；`Fetcher` trait 可注入 |
@@ -77,9 +77,17 @@ GET /api/book/export/cbz
  → ebook::format::cbz::CbzWriter：原样打包 + 最小 ComicInfo.xml
  → ebook::zip::ZipWriter：store-only、确定性时间戳（不压缩已压缩的图片）
  → routes/export：同样的临时文件流式回传
+
+GET /api/book/export/epub
+ → ebook::source::load_book_input：正文页 + 文本章节统计（漫画章不计入）
+ → ebook::source::LibraryReader：按章读 library_content
+ → ebook::html::to_blocks：HTML / 纯文本 → 标题与段落
+ → ebook::format::epub::EpubWriter：XHTML + OPF + nav + CSS
+ → ebook::zip::ZipWriter：mimetype 首条 store，其余条目同样不压缩
+ → routes/export：同样的临时文件流式回传
 ```
 
-换格式只替换 `FormatWriter`；`Format` 枚举与 `WriteReport` 是格式间唯一共享的契约。`ebook` 层不碰 `data_dir` 布局，产物路径由路由决定。
+换格式只替换 `FormatWriter`；`Format` 枚举与 `WriteReport` 是格式间唯一共享的契约。`ebook` 层不碰 `data_dir` 布局，产物路径由路由决定。TXT/EPUB 读正文，CBZ 读图片；三者共用 `cleanup_stale` 与 16 KiB 回传通道。
 
 ## 4. 数据与缓存
 

@@ -1,5 +1,5 @@
 <script>
-  // 导出弹窗：TXT（已缓存正文）或 CBZ（已落盘漫画页）。
+  // 导出弹窗：TXT / EPUB（已缓存正文）或 CBZ（已落盘漫画页）。
   // 先拉对应的 export/info 展示缓存状态，用户确认后再 fetch 下载。
   // 不能直接用 <a download> 直链——那样带不上 Authorization: Bearer。
   import { createEventDispatcher, onMount } from 'svelte';
@@ -10,8 +10,9 @@
 
   const dispatch = createEventDispatcher();
 
-  let format = 'txt'; // txt | cbz
+  let format = 'txt'; // txt | epub | cbz
   let info = null;
+  let epubInfo = null;
   let cbzInfo = null;
   let loading = false;
   let infoErr = '';
@@ -21,9 +22,11 @@
 
   const ILLEGAL = /[/\\:*?"<>|]/g;
 
-  // 文件名用「书名.txt / 书名.cbz」；后端 sanitize 规则在本地再兜一层
+  // 文件名用「书名.txt / 书名.epub / 书名.cbz」；后端 sanitize 规则在本地再兜一层
   function downloadName() {
-    const raw = (format === 'cbz' ? cbzInfo && cbzInfo.name : info && info.name) || name || 'book';
+    const current = format === 'cbz' ? cbzInfo : format === 'epub' ? epubInfo : info;
+    const ext = format === 'cbz' ? '.cbz' : format === 'epub' ? '.epub' : '.txt';
+    const raw = (current && current.name) || name || 'book';
     const cleaned = raw
       .replace(/[\u0000-\u001f\u007f]/g, '_')
       .replace(ILLEGAL, '_')
@@ -31,7 +34,7 @@
       .replace(/\.+$/, '')
       .trim()
       .slice(0, 60);
-    return (cleaned || 'book') + (format === 'cbz' ? '.cbz' : '.txt');
+    return (cleaned || 'book') + ext;
   }
 
   function fmtBytes(n) {
@@ -81,17 +84,39 @@
     }
   }
 
+  async function loadEpubInfo() {
+    if (!bookUrl) {
+      infoErr = '缺少书籍地址，请从书架重新打开这本书';
+      return;
+    }
+    loading = true;
+    infoErr = '';
+    try {
+      epubInfo = await api.exportEpubInfo(bookUrl);
+    } catch (e) {
+      if (e && e.status === 409 && /目录未缓存|book\/toc/.test(String(e.message || ''))) {
+        infoErr = '这本书还没有缓存目录，暂时无法导出。请先在阅读器打开这本书（拉取目录）后再试。';
+      } else {
+        infoErr = describeFailure(e, '读取 EPUB 导出信息');
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
   function setFormat(f) {
     if (exporting || format === f) return;
     format = f;
     err = '';
     done = null;
     if (f === 'cbz' && !cbzInfo) loadCbzInfo();
+    if (f === 'epub' && !epubInfo) loadEpubInfo();
     if (f === 'txt' && !info) loadInfo();
   }
 
   function refresh() {
     if (format === 'cbz') loadCbzInfo();
+    else if (format === 'epub') loadEpubInfo();
     else loadInfo();
   }
 
@@ -114,7 +139,10 @@
         return '导出失败：这本书还没有缓存目录。请先在阅读器打开目录（或重新打开这本书）后再导出。';
       }
       if (/没有图片章节|没有已落盘/.test(msg)) {
-        return '导出失败：' + msg + '。请先在阅读器缓存漫画页，或改用 TXT。';
+        return '导出失败：' + msg + '。请先在阅读器缓存漫画页，或改用 TXT / EPUB。';
+      }
+      if (/没有可导出的正文章节/.test(msg)) {
+        return '导出失败：' + msg + '。纯漫画书请改用 CBZ；文字书请先在阅读器打开章节。';
       }
       return '导出失败：' + msg + '。请按提示处理后重试。';
     }
@@ -131,7 +159,12 @@
     done = null;
     let objectUrl = '';
     try {
-      const r = format === 'cbz' ? await api.exportCbz(bookUrl) : await api.exportTxt(bookUrl);
+      const r =
+        format === 'cbz'
+          ? await api.exportCbz(bookUrl)
+          : format === 'epub'
+            ? await api.exportEpub(bookUrl)
+            : await api.exportTxt(bookUrl);
       const filename = downloadName();
       objectUrl = URL.createObjectURL(r.blob);
       const a = document.createElement('a');
@@ -174,6 +207,7 @@
 
     <div class="seg" role="tablist">
       <button class:on={format === 'txt'} on:click={() => setFormat('txt')}>TXT 正文</button>
+      <button class:on={format === 'epub'} on:click={() => setFormat('epub')}>EPUB 电子书</button>
       <button class:on={format === 'cbz'} on:click={() => setFormat('cbz')}>CBZ 漫画</button>
     </div>
 
@@ -200,6 +234,32 @@
           <div class="warn-title">缺 {info.missing_chapters} 章，导出的不是全本</div>
           <div>
             缺失章节在 TXT 里会写成【未缓存】占位并附上章节地址，不会静默丢章。
+            想导出全本，请先在阅读器打开这些章节，或执行「缓存全部」后再来导出。
+          </div>
+        </div>
+      {/if}
+    {:else if format === 'epub' && epubInfo}
+      <p class="exp-name">《{epubInfo.name}》{epubInfo.author && epubInfo.author !== '未知' ? ' · ' + epubInfo.author : ''}</p>
+      {#if epubInfo.source}<p class="muted tiny-note">书源：{epubInfo.source}</p>{/if}
+
+      <p class="exp-line">
+        正文 <b>{epubInfo.text_chapters}</b> 章 · 已缓存 <b>{epubInfo.cached_chapters}</b>/
+        {epubInfo.text_chapters} 章，缺 {epubInfo.missing_chapters} 章
+        · 正文 {fmtBytes(epubInfo.cached_bytes)}
+      </p>
+
+      {#if epubInfo.text_chapters === 0}
+        <div class="warn-box">
+          <div class="warn-title">这本书没有正文章节</div>
+          <div>EPUB 只适用于文字书；漫画书请切换到「CBZ 漫画」。</div>
+        </div>
+      {:else if epubInfo.complete}
+        <p class="ok-line">全部正文章节已缓存，EPUB 含完整内容。</p>
+      {:else}
+        <div class="warn-box">
+          <div class="warn-title">缺 {epubInfo.missing_chapters} 章，EPUB 不完整</div>
+          <div>
+            缺失章节在 EPUB 里会写成占位段落，不会静默丢章。
             想导出全本，请先在阅读器打开这些章节，或执行「缓存全部」后再来导出。
           </div>
         </div>
@@ -272,6 +332,20 @@
       </div>
       <p class="muted tiny-note" style="margin-top:10px">
         导出只读取已缓存正文，不会临时抓取网络；文件按「书名.txt」保存。
+      </p>
+    {:else if format === 'epub' && epubInfo}
+      <div class="row" style="margin-top:12px">
+        <button
+          on:click={doExport}
+          disabled={exporting || epubInfo.text_chapters === 0}
+          style="flex:1"
+        >
+          {exporting ? '正在导出…' : done ? '再次导出' : '导出 EPUB'}
+        </button>
+        <button class="ghost" on:click={loadEpubInfo} disabled={exporting}>刷新缓存状态</button>
+      </div>
+      <p class="muted tiny-note" style="margin-top:10px">
+        正文转成 XHTML，附目录与元数据（EPUB 3）；文件按「书名.epub」保存。
       </p>
     {:else if format === 'cbz' && cbzInfo}
       <div class="row" style="margin-top:12px">

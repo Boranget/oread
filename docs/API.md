@@ -264,6 +264,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `GET /api/search/result` | 从 1 开始；`unwrap_or(1).max(1)` | 可选，`clamp(1, 200)` | 默认 30 | 已完成源去重排序后的条数，最多 400；**随源完成而增长** |
 | `GET /api/book/export/info` | 无 | 无 | 无 | 返回全书统计，不分页 |
 | `GET /api/book/export/txt` | 无 | 无 | 无 | 流式返回整本 TXT（可能含未缓存占位），不分页 |
+| `GET /api/book/export/{cbz,epub}/info` | 无 | 无 | 无 | 返回对应格式的整本统计，不分页 |
+| `GET /api/book/export/{cbz,epub}` | 无 | 无 | 无 | 流式返回整本 CBZ / EPUB，不分页 |
 | 其余接口 | 无分页参数 | 无 | 无 | 返回全量 |
 
 `GET /api/search` 与 `GET /api/search/aggregate` 的分页实现（2026-11-02 20:0x 复核，源码已更新）：
@@ -2100,7 +2102,12 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 每次实时统计，不使用导出缓存。
   - `is_pay=true` 不做特殊处理；导出统计按“正文是否已缓存”计算。**`is_pay=true` 的真实样本链路仅单测，未验证。**
 
-### 6.11 `GET /api/book/export/txt`
+### 6.11 导出（TXT / CBZ / EPUB）
+
+> 三个格式共用同一个只读馆藏视图与临时文件回传通道；差异只在 writer。
+> TXT / EPUB 读正文，CBZ 读 `library_images` 里的已落盘图片。全部**不联网抓取**。
+
+#### 6.11.1 `GET /api/book/export/txt`
 
 - 鉴权：登录
 - 验证状态：**已验证**（HTTP `:3000`，新二进制 14:46:58）：`200 text/plain; charset=utf-8` + 附件头 + 5 个 `x-*` 头；文件头字段、`【未缓存】` 占位、页脚计数齐全；72 章样本 **78,718 B / 15 ms**。
@@ -2117,7 +2124,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 头 | 值 | 说明 |
 |---|---|---|
 | `Content-Type` | `text/plain; charset=utf-8` | UTF-8 文本 |
-| `Content-Disposition` | `attachment; filename="export.txt"; filename*=UTF-8''<编码后文件名>` | ASCII 兜底名 + RFC 5987 UTF-8 名，兼容中文书名 |
+| `Content-Disposition` | `attachment; filename="<ASCII 兜底名>"; filename*=UTF-8''<编码后文件名>` | ASCII 兜底名（非 ASCII 字符替换为 `_`）+ RFC 5987 UTF-8 名，兼容中文书名 |
 | `x-total-chapters` | 整数 | 正文章节总数（不含分卷） |
 | `x-cached-chapters` | 整数 | 计划写入的已缓存章节数 |
 | `x-missing-chapters` | 整数 | `max(total - cached, 0)` |
@@ -2159,7 +2166,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - **分卷行**（`is_volume=1` 或 `url` 以 `volume:` 开头）只写 `【分卷】<title>` 分隔，**不计入** `total`，也不占章节序号。
   - 正文按 `trim()` 后写入；只有空白的内容按“未缓存”处理。
   - **多本导出不提供 zip**：由调用方对每本书各请求一次本接口，得到多个独立 TXT；服务端没有批量打包接口。
-  - **前端入口（2026-11-03 复核）**：`ExportDialog.svelte` 先调 6.10 `export/info` 展示缓存/缺失章节，再下载本接口；书架页与阅读器均有入口，并已接入 `api.exportInfo`/`api.exportTxt`。
+  - **前端入口**：`ExportDialog.svelte` 可在 TXT / EPUB / CBZ 间切换，先调对应 `*/info` 展示缓存/缺失，再下载；书架页与阅读器均有入口，并已接入 `api.exportInfo` / `api.exportEpubInfo` / `api.exportCbzInfo`。
 - 错误：
   - 缺 `book_url` → `400` 纯文本：``Failed to deserialize query string: missing field `book_url` ``
   - `book_url=""` → `400 {"error":"book_url 不能为空"}`
@@ -2175,7 +2182,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ---
 
-### 6.11.1 `GET /api/book/export/cbz/info`
+#### 6.11.2 `GET /api/book/export/cbz/info`
 
 - 鉴权：登录
 - 用途：漫画导出前预览：图片章节数、声明页数、已落盘页数、缺页与体积。**只读馆藏库，不联网。**
@@ -2211,7 +2218,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 错误：`400`（缺参 / 空参）；`409`（目录未缓存）；`401`；`500`。
 
-### 6.11.2 `GET /api/book/export/cbz`
+#### 6.11.3 `GET /api/book/export/cbz`
 
 - 鉴权：登录
 - 用途：把馆藏中**已落盘**的漫画页打包成 CBZ；不重编码、不联网。
@@ -2242,6 +2249,88 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 实现/资源（低内存约束）：
   - 一次只在内存持有一页；按章顺序流式写临时文件（`{DATA_DIR}/exports/{uid}/`），随后 16 KiB 分块回传，读完删除。
   - 中断残留文件与 TXT 导出共用 1 小时清理。
+
+#### 6.11.4 `GET /api/book/export/epub/info`
+
+- 鉴权：登录
+- 用途：EPUB 导出前预览：**正文章节**总数、已缓存数、缺章与正文字节；漫画章节不计入。**只读馆藏库，不联网。**
+- 查询参数：`book_url`（必填，空串 → `400`）
+- 成功 `200`：
+
+```json
+{
+  "book_url": "https://example.com/book/1",
+  "name": "示例书名",
+  "author": "示例作者",
+  "source": "示例书源",
+  "text_chapters": 120,
+  "cached_chapters": 80,
+  "missing_chapters": 40,
+  "cached_bytes": 1048576,
+  "complete": false,
+  "export_url": "/api/book/export/epub?book_url=https%3A%2F%2Fexample.com%2Fbook%2F1"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `name` / `author` / `source` | string | 口径同 6.10（`author` 已剥掉“作者：”标签） |
+| `text_chapters` | integer | 非分卷、非漫画章的正文章节数 |
+| `cached_chapters` | integer | 已缓存正文的正文章节数（纯空白不算） |
+| `missing_chapters` | integer | `max(text_chapters - cached_chapters, 0)` |
+| `cached_bytes` | integer | 已缓存正文的 `size_bytes` 合计 |
+| `complete` | boolean | `cached_chapters >= text_chapters` |
+| `export_url` | string | 相对路径，已对 `book_url` 做 URL 编码；需带登录态 |
+
+- 错误：`400`（缺参 / 空参）；`409`（目录未缓存）；`401`；`500`。
+- 注意：`text_chapters=0` 的纯漫画书 info 仍返回 `200`，下载接口才用 `409` 拒绝。
+
+#### 6.11.5 `GET /api/book/export/epub`
+
+- 鉴权：登录
+- 用途：把已缓存正文按章转成 XHTML，打包为 **EPUB 3**；不联网、不内联外部图片（漫画走 CBZ）。
+- 查询参数：`book_url`（必填）
+- 成功 `200` 响应头：
+
+| 头 | 值 | 说明 |
+|---|---|---|
+| `Content-Type` | `application/epub+zip` | EPUB 3 |
+| `Content-Disposition` | `attachment; ...` | 文件名 `<清洗后的书名>-YYYYMMDD-HHMMSS.epub` |
+| `x-text-chapters` | 整数 | 正文章节总数 |
+| `x-cached-chapters` | 整数 | 导出前已缓存的正文章节数 |
+| `x-missing-chapters` | 整数 | 缺章数 |
+| `x-written-chapters` | 整数 | 实际写入的已缓存章节数 |
+| `x-file-bytes` | 整数 | EPUB 最终字节数 |
+
+- 包内结构（OCF / EPUB 3 最小合规集）：
+  - `mimetype`：**必须是第一条且 store**（`application/epub+zip`）；
+  - `META-INF/container.xml`：指向 `OEBPS/content.opf`；
+  - `OEBPS/content.opf`：`version="3.0"` 的 package，含 metadata / manifest / spine；
+  - `OEBPS/nav.xhtml`：EPUB 3 目录；
+  - `OEBPS/style.css`：最小排版样式；
+  - `OEBPS/ch001.xhtml ...`：一章一文件。
+- 正文归一化（`ebook::html`）：
+  - `h1`–`h6` 保留标题层级；`p` / `div` / `li` / `blockquote` / 表格单元等块级元素各成段；
+  - `<br>` 与文本换行断段；行内标签只取文字；
+  - `script` / `style` / `img` / `svg` / 音视频直接丢弃，避免 EPUB 里出现外链资源；
+  - 未缓存章节写占位段落，不静默丢章。
+- 元数据：
+  - `dc:title` / `dc:language`（空则 `und`）/ `dc:creator`（剥“作者：”标签）；
+  - `dc:publisher` / `dc:date` / `dc:description`；
+  - 全局标签 → `dc:subject`；
+  - `library_identifiers` → `dc:identifier`（`isbn` → `urn:isbn:`，其余 `urn:<scheme>:`；没有标识时用 `urn:sha256:<book_url 的 SHA-256>`）；
+  - 系列 → `belongs-to-collection` + `group-position`；
+  - `dcterms:modified` 取生成时刻（EPUB 3 必填）。
+- 错误：
+  - `400`（缺参 / 空参）；`409`（目录未缓存 / 没有可导出的正文章节）；`401`；`500`。
+  - ZIP 条目超过 65535 或总偏移超过 4 GiB → `500`（当前不自动分卷）。
+- 实现/资源（低内存约束）：
+  - 逐章读取、逐章写入 ZIP，临时文件位于 `{DATA_DIR}/exports/{uid}/`，一次只持有一章正文；
+  - 采用 store-only ZIP，减少 KPW3 的 CPU 开销；
+  - 中断残留文件与 TXT / CBZ 共用 1 小时清理。
+- **未验证**：
+  - KPW3 真机打开与排版效果（设备当前不可达）。
+  - 正文图片内联、脚注/注释、封面图（当前版本不输出）。
 
 ---
 
@@ -3499,17 +3588,19 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ### 12.1 覆盖统计
 
-- **实际存在并已注册的 JSON HTTP 接口：65 个**（另有 `/k/*` 8 个 HTML 路由，不计入）
+- **实际存在并已注册的 JSON HTTP 接口：78 个**（另有 `/k/*` 8 个 HTML 路由，不计入）
   - 鉴权 3 个（register / login / **password**）
   - 管理员 2 个（**users / users/status**）
   - 书源 14 个（原 9 个 + **health/check、health、health/reset、prune、quarantine**）
   - 搜索与发现 6 个（含两段式 **search/start** 与 **search/result**）
-  - 书籍与正文 10 个（info / toc / **toc/batch** / content / **book/search** / **cache-all** / **cache/clear** / switch-source / **export/info** / **export/txt**）
+  - 书籍与正文 14 个（info / toc / **toc/batch** / content / **book/search** / **cache-all** / **cache/clear** / switch-source / **export/info** / **export/txt** / **export/cbz{,/info}** / **export/epub{,/info}**）
   - 书架/分组/进度/批量 12 个（含 **bookshelf/batch**；`DELETE /api/bookshelf/groups` 与 `/groups/delete` 是两个注册路径、同一 handler）
   - 书签 3 个（**GET/POST `/api/bookmarks`、DELETE `/api/bookmarks/delete`**）
   - 替换规则 6 个（CRUD + 导出/导入/预览）
   - 设置 2 个
   - 统计 2 个
+  - 缓存维护 1 个（`POST /api/book/cache/trim`）
+  - 馆藏 8 个（stats / books / collect / release / delete / temp/clean / jobs / jobs/cancel）
   - 健康检查 3 个（`/api/health`、`/healthz`、`/api/healthz`）
   - K 埋点 2 个（`/api/k/metrics`、`/api/k/metrics/export`，仅管理员）
 - 计数口径：按“方法 + 路径”计；`/api/bookshelf` 的 GET/POST/DELETE 算 3 个，`/api/bookmarks` 的 GET/POST 算 2 个。
@@ -3518,6 +3609,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 当前 `:3000` 实例运行的是工程侧旧构建名的 `legado-server.exe`（对外发布名 `boranlib.exe`）：**9,315,840 B / mtime 2026-11-03 14:46:58 / sha256 `B498BB42…`**（99 项单测通过）；#55~#56 的复测与 #57~#58 的实测均基于该实例。
   - #40~#43（export/import/preview/check-updates）与 #44~#54 的主要成功/错误路径均已验证；#55~#56（两段式搜索）已于 2026-11-03 14:0x / 15:0x 在 `:3000` 上 HTTP 实测（字段、中间态、分页 clamp、404、`source_ids`、淘汰顺序）；#57~#58（导出）已实测 `info` 与 `txt`（含文件头/占位/x-* 头）。覆盖明细见开头复核表。
   - **#59~#63（健康巡检 / 汇总 / 重置 / prune / quarantine）已在 2026-11-04 于隔离端口 `:3061` 完成 HTTP 实测**（隔离数据目录复制自 `server/data`，未触碰 `:3000/:3500`）；覆盖连续 3 次失败进入冷却、默认搜索跳过与 `include_cooled=1` 放行、`FAIL_ENGINE` 不冷却、导入体检三态、`prune` 预览/确认、`quarantine` 与复用复活、导出排除隔离区。`cargo test` 默认线程 **186 passed / 0 failed**。
+  - **#75~#78（CBZ / EPUB 导出）为 2026-11-20 新增**：`cargo test` 与路由冒烟通过；CBZ/EPUB 的 ZIP 结构、`mimetype` 首条 store、XML 可解析性已用 Python `zipfile` + `ElementTree` 本地校验。**尚未做 HTTP 实例实测与 KPW3 真机阅读验证。**
   - 仍无 HTTP 证据的关键项：`book/search` 超时 504（实测 200 / 1 ms 未触发）、`toc` 分卷行真实数据渲染、用 `volume:` URL 请求正文、`toc/batch` 并发 3、`admin/status` 最后管理员保护、`preview` 5 MiB / 15 s 预算、`@js` 200ms 超预算、DOM 桥上限、`search` 单源 200 / 总 400 截断、`export` 的 `is_pay=true` 真实样本与 10k+ 章压力。
 - **待确认**：`latest_chapter_time`/`start`/`end` 的数值语义、部署时区对 `day` 的影响、SQLite `disk I/O error` 根因、`Book.can_update` 默认 false 是否预期（见 14 节）。
 
@@ -3599,6 +3691,10 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 72 | POST | `/api/library/temp/clean` | JWT | **是** | — | `{ok,books,chapters,contents,bytes_freed,ttl_days}` |
 | 73 | GET | `/api/library/jobs` | JWT | **是** | `status?,limit?` | `{ok,items[]}` |
 | 74 | POST | `/api/library/jobs/cancel` | JWT | **是** | `id` | `{ok,id,cancelled}` |
+| 75 | GET | `/api/book/export/cbz/info` | JWT | 否 | `book_url` | `{book_url,name,author,source,image_chapters,total_pages,available_pages,missing_pages,available_bytes,complete,export_url}` |
+| 76 | GET | `/api/book/export/cbz` | JWT | 否 | `book_url` | `application/vnd.comicbook+zip` 附件 + `x-total-pages`、`x-available-pages`、`x-missing-pages`、`x-written-chapters`、`x-written-pages`、`x-file-bytes` |
+| 77 | GET | `/api/book/export/epub/info` | JWT | 否 | `book_url` | `{book_url,name,author,source,text_chapters,cached_chapters,missing_chapters,cached_bytes,complete,export_url}` |
+| 78 | GET | `/api/book/export/epub` | JWT | 否 | `book_url` | `application/epub+zip` 附件 + `x-text/cached/missing/written-chapters`、`x-file-bytes` |
 
 ---
 

@@ -211,6 +211,8 @@ mod tests {
             cached_chapters: 1,
             missing_chapters: 1,
             cached_bytes: 4,
+            text_chapters: 2,
+            cached_text_chapters: 1,
         };
         let reader = MapReader(HashMap::from([(
             "https://x/c1".to_string(),

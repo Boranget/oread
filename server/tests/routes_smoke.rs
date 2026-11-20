@@ -1281,6 +1281,113 @@ async fn comic_cbz_export_info_and_download() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// EPUB 导出：info 报正文章节，epub 返回 ZIP；漫画书用 409 明确拒绝。
+#[tokio::test]
+async fn epub_export_info_and_download() {
+    let dir = temp_dir("export-epub");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let user = register(&app, "epubuser").await;
+
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, author, tier, collected_at, last_accessed_at) \
+         VALUES ('https://e.test/book', '文字书', '作者：作者甲', 'collection', 1, 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    for (url, title, idx) in [
+        ("https://e.test/c1", "第一章", 0),
+        ("https://e.test/c2", "第二章", 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+             VALUES ('https://e.test/book', ?1, ?2, 0, ?3)",
+        )
+        .bind(url)
+        .bind(title)
+        .bind(idx)
+        .execute(&library)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO library_content (url, origin, book_url, content, size_bytes) \
+         VALUES ('https://e.test/c1', 'src', 'https://e.test/book', '第一章正文', 15)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/epub/info?book_url=https%3A%2F%2Fe.test%2Fbook",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = body_json(resp).await;
+    assert_eq!(info["text_chapters"], 2, "{info}");
+    assert_eq!(info["cached_chapters"], 1);
+    assert_eq!(info["missing_chapters"], 1);
+    assert_eq!(info["complete"], false);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/epub?book_url=https%3A%2F%2Fe.test%2Fbook",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/epub+zip");
+    assert_eq!(resp.headers()["x-written-chapters"], "1");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"PK\x03\x04"), "EPUB 必须是 ZIP");
+
+    // 只有漫画章节的书没有正文，明确 409。
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, tier, last_accessed_at) \
+         VALUES ('https://e.test/comic', '漫画书', 'collection', 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+         VALUES ('https://e.test/comic', 'https://e.test/comic/1', '第一话', 0, 0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
+         VALUES ('https://e.test/comic/1', 'src', 'https://e.test/comic', 'image', \
+         '{\"images\":[{\"url\":\"https://e.test/p1\"}]}', 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/epub?book_url=https%3A%2F%2Fe.test%2Fcomic",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 元数据读写：普通账号可读、只有管理员能改；空补丁与非法值返回 400。
 #[tokio::test]
 async fn library_metadata_read_and_admin_write() {

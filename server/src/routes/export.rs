@@ -30,6 +30,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::auth::AuthUser;
 use crate::ebook::format::cbz::CbzWriter;
+use crate::ebook::format::epub::EpubWriter;
 use crate::ebook::format::txt::{normalize_author, TxtWriter};
 use crate::ebook::pipeline::FormatWriter;
 use crate::ebook::source::{load_book_input, load_comic_input, LibraryReader};
@@ -43,6 +44,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/book/export/txt", get(export_txt))
         .route("/api/book/export/cbz/info", get(export_cbz_info))
         .route("/api/book/export/cbz", get(export_cbz))
+        .route("/api/book/export/epub/info", get(export_epub_info))
+        .route("/api/book/export/epub", get(export_epub))
 }
 
 #[derive(Deserialize)]
@@ -50,6 +53,7 @@ pub struct ExportQ {
     pub book_url: String,
 }
 
+#[derive(Debug)]
 struct ExportFile {
     path: PathBuf,
     input: BookInput,
@@ -85,7 +89,17 @@ fn sanitize_filename(raw: &str) -> String {
 /// RFC 5987 编码：ASCII 兜底名 + UTF-8 原名，兼容老浏览器与中文书名。
 fn content_disposition(filename: &str) -> String {
     let encoded: String = url::form_urlencoded::byte_serialize(filename.as_bytes()).collect();
-    format!("attachment; filename=\"export.txt\"; filename*=UTF-8''{encoded}")
+    let fallback: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 /// 清理 1 小时前的导出残留（客户端中断时流式删除不会执行，靠这里兜底）。
@@ -127,6 +141,45 @@ async fn write_export(
 
     let reader = LibraryReader::new(pool, book_url);
     let report = TxtWriter.write(&input, &reader, &path).await?;
+
+    Ok(ExportFile {
+        path,
+        input,
+        written_cached: report.written_chapters,
+        size_bytes: report.size_bytes,
+    })
+}
+
+/// EPUB 与 TXT 共用同一套临时文件与统计口径；没有正文的漫画书明确 409。
+async fn write_epub(
+    pool: &SqlitePool,
+    data_dir: &str,
+    uid: i64,
+    book_url: &str,
+) -> AppResult<ExportFile> {
+    let input = build_plan(pool, book_url).await?;
+    if input.text_chapters == 0 {
+        return Err(AppError::Conflict(
+            "这本书没有可导出的正文章节，无法生成 EPUB".into(),
+        ));
+    }
+
+    let dir = Path::new(data_dir).join("exports").join(uid.to_string());
+    fs::create_dir_all(&dir).await?;
+    cleanup_stale(&dir).await;
+
+    let seq = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "{}-{}.epub",
+        sanitize_filename(&input.meta.name),
+        seq
+    ));
+
+    let reader = LibraryReader::new(pool, book_url);
+    let report = EpubWriter.write(&input, &reader, &path).await?;
 
     Ok(ExportFile {
         path,
@@ -352,6 +405,68 @@ async fn export_cbz(
     Ok(res)
 }
 
+async fn export_epub_info(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    Query(q): Query<ExportQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let plan = build_plan(&s.library, &q.book_url).await?;
+    let export_url = format!(
+        "/api/book/export/epub?book_url={}",
+        url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()
+    );
+    Ok(Json(json!({
+        "book_url": q.book_url.trim(),
+        "name": plan.meta.name,
+        "author": normalize_author(&plan.meta.author),
+        "source": plan.meta.source.clone().unwrap_or_default(),
+        "text_chapters": plan.text_chapters,
+        "cached_chapters": plan.cached_text_chapters,
+        "missing_chapters": plan.text_missing_chapters(),
+        "cached_bytes": plan.cached_bytes,
+        "complete": plan.text_complete(),
+        "export_url": export_url,
+    })))
+}
+
+async fn export_epub(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<ExportQ>,
+) -> AppResult<Response> {
+    let out = write_epub(&s.library, &s.cfg.data_dir, u.id, &q.book_url).await?;
+
+    let filename = format!(
+        "{}-{}.epub",
+        sanitize_filename(&out.input.meta.name),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let mut res =
+        temp_file_response(out.path.clone(), &filename, Format::Epub.content_type()).await?;
+    let h = res.headers_mut();
+    h.insert(
+        "x-text-chapters",
+        HeaderValue::from_str(&out.input.text_chapters.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-cached-chapters",
+        HeaderValue::from_str(&out.input.cached_text_chapters.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-missing-chapters",
+        HeaderValue::from_str(&out.input.text_missing_chapters().to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-written-chapters",
+        HeaderValue::from_str(&out.written_cached.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-file-bytes",
+        HeaderValue::from_str(&out.size_bytes.to_string()).expect("数字 header"),
+    );
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +510,20 @@ mod tests {
             "CREATE TABLE library_images (url TEXT NOT NULL, origin TEXT NOT NULL, \
              book_url TEXT NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL, \
              size_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (url, origin))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_identifiers (book_url TEXT NOT NULL, scheme TEXT NOT NULL, \
+             value TEXT NOT NULL, PRIMARY KEY (book_url, scheme, value))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_tags (book_url TEXT NOT NULL, tag TEXT NOT NULL, \
+             PRIMARY KEY (book_url, tag))",
         )
         .execute(&pool)
         .await
@@ -676,6 +805,51 @@ mod tests {
         let dir = temp_dir("cbz-none");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let err = write_cbz(&pool, dir.to_str().unwrap(), 42, "https://x/book")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn epub_export_writes_zip_and_text_chapters() {
+        let pool = export_pool().await;
+        let book = "https://x/book";
+        insert_book(&pool, book).await;
+        let dir = temp_dir("epub");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let out = write_epub(&pool, dir.to_str().unwrap(), 42, book)
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(&out.path).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        assert_eq!(out.input.text_chapters, 3);
+        assert_eq!(out.input.cached_text_chapters, 2);
+        assert_eq!(out.written_cached, 2);
+        assert_eq!(out.size_bytes, bytes.len() as u64);
+        assert!(bytes.starts_with(b"PK\x03\x04"), "EPUB 必须是 ZIP");
+        // mimetype 是 OCF 要求的第一条，且必须 store（method=0）
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        assert_eq!(&bytes[30..30 + name_len], b"mimetype");
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 0);
+        assert!(text.contains("META-INF/container.xml"));
+        assert!(text.contains("OEBPS/content.opf"));
+        assert!(text.contains("OEBPS/nav.xhtml"));
+        assert!(text.contains("<dc:title>测试书</dc:title>"));
+        assert!(text.contains("第一章正文"));
+        assert!(text.contains("本章正文尚未缓存"), "未缓存章节必须显式占位");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn epub_export_rejects_comic_only_book() {
+        let pool = export_pool().await;
+        insert_comic(&pool).await;
+        let dir = temp_dir("epub-none");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let err = write_epub(&pool, dir.to_str().unwrap(), 42, "https://c/book")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)));

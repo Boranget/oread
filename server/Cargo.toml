@@ -27,6 +27,7 @@ libc = "0.2"               # 磁盘剩余空间（statvfs）；Windows 走 kerne
 
 # ---- 规则引擎 ----
 scraper = "0.20"            # CSS 选择器 / JSoup 等价
+ego-tree = "0.6"            # scraper 的 DOM 树；ebook 正文归一化需要遍历文本节点
 jsonpath-rust = "0.7"       # JsonPath
 sxd-xpath = "0.4"           # XPath（XML 响应）
 sxd-document = "0.3"        # sxd-xpath 的 XML 文档模型

@@ -48,6 +48,19 @@ pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<Boo
     .await?;
     let meta_row = meta_row.unwrap_or_default();
 
+    let identifiers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT scheme, value FROM library_identifiers WHERE book_url = ?1 \
+         ORDER BY scheme, value",
+    )
+    .bind(book_url)
+    .fetch_all(pool)
+    .await?;
+    let tags: Vec<String> =
+        sqlx::query_scalar("SELECT tag FROM library_tags WHERE book_url = ?1 ORDER BY tag")
+            .bind(book_url)
+            .fetch_all(pool)
+            .await?;
+
     let mut chapters = Vec::with_capacity(rows.len());
     let mut seq = 0i64;
     for (url, title, is_volume, content_type) in rows {
@@ -89,6 +102,23 @@ pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<Boo
     .fetch_one(pool)
     .await?;
 
+    // 文本导出专用统计：漫画章节没有正文，不能算进 TXT/EPUB 的完成度。
+    // 多 origin 同一章时用 DISTINCT 防止重复计数。
+    let (text_chapters, cached_text_chapters): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT c.url), \
+                COUNT(DISTINCT CASE WHEN ct.url IS NOT NULL THEN c.url END) \
+         FROM library_chapters c LEFT JOIN library_content ct \
+           ON ct.url = c.url AND ct.book_url = c.book_url \
+              AND ct.content IS NOT NULL AND length(trim(ct.content)) > 0 \
+         WHERE c.book_url = ?1 AND c.is_volume = 0 AND c.url NOT LIKE 'volume:%' \
+           AND NOT EXISTS (SELECT 1 FROM library_content ci \
+                           WHERE ci.url = c.url AND ci.book_url = c.book_url \
+                             AND ci.content_type = 'image')",
+    )
+    .bind(book_url)
+    .fetch_one(pool)
+    .await?;
+
     let name = meta_row
         .name
         .filter(|s| !s.trim().is_empty())
@@ -110,12 +140,16 @@ pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<Boo
             series_index: meta_row.series_index,
             intro: meta_row.intro.filter(|s| !s.trim().is_empty()),
             source,
+            identifiers,
+            tags,
         },
         chapters,
         total_chapters,
         cached_chapters,
         missing_chapters: (total_chapters - cached_chapters).max(0),
         cached_bytes,
+        text_chapters,
+        cached_text_chapters,
     })
 }
 
@@ -303,6 +337,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_identifiers (book_url TEXT NOT NULL, scheme TEXT NOT NULL, \
+             value TEXT NOT NULL, PRIMARY KEY (book_url, scheme, value))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_tags (book_url TEXT NOT NULL, tag TEXT NOT NULL, \
+             PRIMARY KEY (book_url, tag))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
     }
 
@@ -378,6 +426,9 @@ mod tests {
         assert_eq!(input.missing_chapters, 1);
         assert_eq!(input.cached_bytes, 6, "只统计非空正文的字节");
         assert!(!input.complete());
+        assert_eq!(input.text_chapters, 2);
+        assert_eq!(input.cached_text_chapters, 1);
+        assert!(!input.text_complete());
     }
 
     #[tokio::test]
@@ -395,6 +446,8 @@ mod tests {
         assert!(input.meta.author.is_empty());
         assert_eq!(input.total_chapters, 1);
         assert_eq!(input.cached_chapters, 0);
+        assert_eq!(input.text_chapters, 1);
+        assert_eq!(input.cached_text_chapters, 0);
     }
 
     #[tokio::test]
@@ -493,6 +546,8 @@ mod tests {
         assert_eq!(input.available_pages, 3);
         assert_eq!(input.missing_pages(), 1);
         assert!(!input.complete());
+        assert_eq!(input.book.text_chapters, 0, "漫画章不计入文本导出");
+        assert_eq!(input.book.cached_text_chapters, 0);
     }
 
     #[tokio::test]

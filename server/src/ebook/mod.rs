@@ -9,9 +9,11 @@
 //! - 产物路径由调用方决定，格式模块不碰 `data_dir` 布局。
 
 pub mod format;
+mod html;
 pub mod model;
 pub mod pipeline;
 pub mod source;
+mod xml;
 mod zip;
 
 pub use model::{

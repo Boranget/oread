@@ -109,11 +109,17 @@
 
 ### 2.6 EPUB / PDF 导出
 
-- 状态：`延后`
+- 状态：`部分完成`（EPUB 已实现；PDF 延后）
 - 为什么：Kindle 的替代路径之一是生成 EPUB 推送到设备，绕开浏览器能力限制（KPW3 上无 JS / 无 WebView 富文本）；PDF 的字体嵌入与版面成本更高，先不做。
-- 排期：优先级**低于** `/k` 极简页（见 3.2.1）；前置依赖是正文分段（HTML → 段落）与图片处理（下载、内联、尺寸约束），这两项在正文管线里尚未定型。
-- **TXT 导出已完成**（`/api/book/export/info` + `/api/book/export/txt`，见 [API.md](../docs/API.md) 6.10/6.11），写入逻辑已迁入 `server/src/ebook/`（见 2.9）；EPUB/PDF 仍延后，前置依赖是正文分段与图片处理。
-- 依据：`/api/book/content` 返回文本/HTML 混合正文（见 [API.md](../docs/API.md) 6.3），当前没有 EPUB/PDF 打包依赖。
+- **TXT 导出已完成**（`/api/book/export/info` + `/api/book/export/txt`，见 [API.md](API.md) 6.10/6.11.1）。
+- **EPUB 导出已完成**（`/api/book/export/epub/info` + `/api/book/export/epub`，见 [API.md](API.md) 6.11.4/6.11.5）：
+  - 正文经 `ebook::html` 归一化为标题/段落，再生成 EPUB 3 XHTML；
+  - 复用 `ebook::zip` 写 store-only ZIP，`mimetype` 首条且不压缩；
+  - OPF 消费 Phase 0 元数据（系列、标签、语言、出版信息、标识）；
+  - 未缓存章节写占位段落；漫画书返回 409，引导改用 CBZ。
+- PDF 仍延后：字体嵌入与分页版面成本高，且 KPW3 上 EPUB 已覆盖主要需求。
+- 还差：EPUB 内联正文图片与封面；KPW3 真机阅读验证。
+- 依据：`/api/book/content` 返回文本/HTML 混合正文（见 [API.md](API.md) 6.3）；实现落在 `server/src/ebook/`（见 2.9）。
 
 ### 2.7 漫画链路（`处理中`）
 
@@ -124,29 +130,33 @@
   - 漫画阅读布局：单页/连续滚动、缩放、预加载；
   - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`），入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
-  - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.2 与 TODO 2.9。
+  - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.3 与 TODO 2.9。
 - 依据：[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
 
 ### 2.8 书模型与可交换元数据（`进行中`）
 
 - 状态：`进行中`。Phase 0 已完成：迁移 `0003_metadata.sql` + `GET/POST /api/library/book/meta`。
 - 已完成：`language` / `publisher` / `pubdate` / `series_name` / `series_index` 入库；`library_identifiers`（ISBN 等 `scheme/value`）与 `library_tags` 独立成表；全局（内容层）与个人（用户库）边界见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 4 节。
-- 还差：EPUB/OPDS 消费这些字段（Phase 1–3）、从书源详情页自动映射系列/标签、前端编辑入口。
+- 已消费：EPUB 的 OPF 已输出系列、标签、语言、出版信息与标识（见 2.9 / API 6.11.5）。
+- 还差：OPDS 消费这些字段、从书源详情页自动映射系列/标签、前端编辑入口。
 - 参考：calibre 的 `Metadata` / OPF 字段体系（只学语义与规范，不复制 GPL 代码）。
 
 ### 2.9 电子书管线（`进行中`）
 
-- 状态：`进行中`。Phase 1（TXT 迁入）与 Phase 2（CBZ）已完成。
+- 状态：`进行中`。Phase 1（TXT）、Phase 2（CBZ）、Phase 3（EPUB）已完成。
 - 已完成：
-  - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；
+  - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；`BookInput` 区分总章节与文本章节，漫画章不计入 TXT/EPUB 完成度；
   - `source`：只读馆藏组装书视图（目录缺失 → 409），`LibraryReader` 按章读正文、按章取图片清单、按页读 `library_images`；空白正文视为未缓存；
   - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
+  - `html`：正文 HTML → 语义块（标题层级、块级段落、`br`/换行断段；丢弃脚本、样式、图片与音视频）；
+  - `xml`：ComicInfo 与 OPF/XHTML 共用的最小 XML 转义；
   - `format/txt`：与旧导出逐字一致（头部、分卷、`[n/N]` 标题、未缓存占位、结尾统计），逐章流式写盘；
   - `format/cbz` + `zip`：漫画页原样打包（store，不重编码），页面名 `{章:04}-{页:03}.{ext}`，附最小 `ComicInfo.xml`；只含已落盘页，缺页计入 `x-missing-pages`；一次一页、确定性时间戳；
-  - 接口：`/api/book/export/cbz/info` 与 `/api/book/export/cbz`（登录可读，不联网）。
+  - `format/epub`：EPUB 3（`mimetype` 首条 store + container + OPF + nav + CSS + 一章一 XHTML）；OPF 输出标题/语言/作者/出版信息/标签/系列/标识，未缓存章节写占位段落；
+  - 接口：`/api/book/export/cbz{,/info}` 与 `/api/book/export/epub{,/info}`（登录可读、不联网），前端导出弹窗已支持三格式切换。
 - 还差：
-  - `library_artifacts` 表与内容 hash 复用：CBZ 目前一次性生成、读完即删；多账号重复导出同一本时才值得做缓存；
-  - EPUB（Phase 3）：复用 `zip`（`mimetype` 必须 store 且首条）+ 正文 HTML → 语义分段 + 图片内联；
+  - `library_artifacts` 表与内容 hash 复用：CBZ/EPUB 目前一次性生成、读完即删；多账号重复导出同一本时才值得做缓存；
+  - EPUB 的正文图片内联、封面图与脚注；
   - OPDS（Phase 4）与可选 AZW3/推送（Phase 5）。
 - 纪律：`ebook` 层只读馆藏、不抓网络、不决定 `data_dir` 布局；GPL 代码不复制，只按公开规范独立实现。
 

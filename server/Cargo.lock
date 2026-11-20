@@ -391,6 +391,7 @@ dependencies = [
  "boa_engine",
  "cbc",
  "chrono",
+ "ego-tree",
  "encoding_rs",
  "futures",
  "getrandom 0.2.17",

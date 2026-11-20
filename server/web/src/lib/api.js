@@ -138,6 +138,10 @@ async function downloadCbz(bookUrl, opts = {}) {
   return downloadExport(`/book/export/cbz?${buildQuery({ book_url: bookUrl })}`, opts);
 }
 
+async function downloadEpub(bookUrl, opts = {}) {
+  return downloadExport(`/book/export/epub?${buildQuery({ book_url: bookUrl })}`, opts);
+}
+
 async function downloadExport(path, opts = {}) {
   const headers = {};
   const token = getToken();
@@ -492,6 +496,16 @@ export const api = {
       { timeout: 20000, noAuthReload: true }
     ),
   exportCbz: (bookUrl) => downloadCbz(bookUrl),
+
+  // ---- 导出 EPUB（正文章节 → XHTML；同样只读缓存）----
+  exportEpubInfo: (bookUrl) =>
+    request(
+      'GET',
+      `/book/export/epub/info?${buildQuery({ book_url: bookUrl })}`,
+      undefined,
+      { timeout: 20000, noAuthReload: true }
+    ),
+  exportEpub: (bookUrl) => downloadEpub(bookUrl),
 
   // ---- bookshelf ----
   bookshelf: (group = '') => request('GET', `/bookshelf?${buildQuery({ group })}`),

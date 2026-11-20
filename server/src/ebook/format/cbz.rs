@@ -12,6 +12,7 @@ use tokio::fs::File;
 use crate::ebook::format::txt::normalize_author;
 use crate::ebook::model::{BookInput, BookMeta, Format, WriteReport};
 use crate::ebook::pipeline::{ChapterReader, FormatWriter};
+use crate::ebook::xml::xml_escape;
 use crate::ebook::zip::ZipWriter;
 
 /// CBZ 写入器。
@@ -144,22 +145,6 @@ fn format_index(index: f64) -> String {
     } else {
         format!("{index}")
     }
-}
-
-/// XML 文本转义（ComicInfo 只用到文本节点与属性值这两种场景）。
-pub(crate) fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
