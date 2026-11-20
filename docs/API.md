@@ -2054,7 +2054,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 鉴权：登录
 - 验证状态：**已验证**（HTTP `:3000`，新二进制 14:46:58）：72 章样本返回 `total_chapters=72 / cached_chapters=5 / missing_chapters=67 / complete=false`；缺参、空参、无目录均 400。
-- 用途：导出前预览：这本书有多少章、已缓存多少、还缺多少、预计导出多大。**只读当前用户库，不联网。**
+- 用途：导出前预览：这本书有多少章、已缓存多少、还缺多少、预计导出多大。**只读馆藏库，不联网。**
 - 查询参数：
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -2094,7 +2094,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：
   - 缺 `book_url` → `400` 纯文本：``Failed to deserialize query string: missing field `book_url` ``
   - `book_url=""` → `400 {"error":"book_url 不能为空"}`
-  - 目录未缓存（`library_chapters` 无行）→ `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
+  - 目录未缓存（`library_chapters` 无行）→ `409 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
   - `401`；`500`
 - 行为：
   - 每次实时统计，不使用导出缓存。
@@ -2163,7 +2163,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：
   - 缺 `book_url` → `400` 纯文本：``Failed to deserialize query string: missing field `book_url` ``
   - `book_url=""` → `400 {"error":"book_url 不能为空"}`
-  - 目录未缓存 → `400 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
+  - 目录未缓存 → `409 {"error":"目录未缓存，请先调用 GET /api/book/toc"}`
   - `401`；`500`
 - 实现/资源（低内存约束）：
   - 逐章查询、逐章写入临时文件（`{DATA_DIR}/exports/{uid}/`），**一次只在内存持有一章正文**；随后 16 KiB 分块流式回传，读完删除临时文件。
@@ -2172,6 +2172,76 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - **未验证**：
   - 超大书压力样本：本轮仅 72 章，未做 10k+ 章 / GB 级文件。
   - `is_pay=true` 章节：导出不做付费过滤（只要已缓存就导出），真实付费样本链路仅单测。
+
+---
+
+### 6.11.1 `GET /api/book/export/cbz/info`
+
+- 鉴权：登录
+- 用途：漫画导出前预览：图片章节数、声明页数、已落盘页数、缺页与体积。**只读馆藏库，不联网。**
+- 查询参数：`book_url`（必填，空串 → `400`）
+- 成功 `200`：
+
+```json
+{
+  "book_url": "https://example.com/comic/1",
+  "name": "示例漫画",
+  "author": "示例作者",
+  "source": "示例书源",
+  "image_chapters": 12,
+  "total_pages": 240,
+  "available_pages": 238,
+  "missing_pages": 2,
+  "available_bytes": 52428800,
+  "complete": false,
+  "export_url": "/api/book/export/cbz?book_url=https%3A%2F%2Fexample.com%2Fcomic%2F1"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `name` / `author` / `source` | string | 口径同 6.10（`author` 已剥掉“作者：”标签） |
+| `image_chapters` | integer | 目录中内容类型为 `image` 的章节数 |
+| `total_pages` | integer | 图片清单 JSON 里声明的页数合计（含未落盘） |
+| `available_pages` | integer | `library_images` 中实际可读的页数 |
+| `missing_pages` | integer | `max(total_pages - available_pages, 0)` |
+| `available_bytes` | integer | 已落盘图片的原始字节合计 |
+| `complete` | boolean | `total_pages > 0 && available_pages >= total_pages` |
+| `export_url` | string | 相对路径，已对 `book_url` 做 URL 编码；需带登录态 |
+
+- 错误：`400`（缺参 / 空参）；`409`（目录未缓存）；`401`；`500`。
+
+### 6.11.2 `GET /api/book/export/cbz`
+
+- 鉴权：登录
+- 用途：把馆藏中**已落盘**的漫画页打包成 CBZ；不重编码、不联网。
+- 查询参数：`book_url`（必填）
+- 成功 `200` 响应头：
+
+| 头 | 值 | 说明 |
+|---|---|---|
+| `Content-Type` | `application/vnd.comicbook+zip` | CBZ（标准 ZIP） |
+| `Content-Disposition` | `attachment; ...` | 文件名 `<清洗后的书名>-YYYYMMDD-HHMMSS.cbz` |
+| `x-total-pages` | 整数 | 清单声明页数 |
+| `x-available-pages` | 整数 | 导出前可读页数 |
+| `x-missing-pages` | 整数 | 实际缺页数（含导出途中被并发清理的页） |
+| `x-written-chapters` | 整数 | 至少写入一页的章节数 |
+| `x-written-pages` | 整数 | 实际写入的页数 |
+| `x-file-bytes` | 整数 | CBZ 最终字节数 |
+
+- 包内结构：
+  - `{:04}-{:03}.{ext}`：章序号-页序号，扩展名取自保存时的真实 MIME（`jpg` / `png` / `webp` / `gif` / `avif` / `bmp`，未知为 `bin`）；
+  - `ComicInfo.xml`：最小元数据（`Title` / `Series` / `Number` / `Writer` / `Summary` / `LanguageISO` / `PageCount`），空字段省略；
+  - 只做 store（不压缩）：漫画页本身已压缩，deflate 只会浪费 KPW3 的 CPU；同时让 EPUB 的 `mimetype` 规则可复用。
+- 语义：
+  - 只包含 `library_images` 里真正有字节的页；缺页计入 `x-missing-pages`，不伪造占位图。
+  - 图片原样入包，不改宽度/质量；墨水屏转码仍由 `/api/book/image` 运行时完成。
+- 错误：
+  - `400`（缺参 / 空参）；`409`（目录未缓存 / 没有图片章节 / 一页都没落盘）；`401`；`500`。
+  - 单文件或总偏移超过 4 GiB、条目超过 65535 → `500`，提示按卷分批导出（当前不自动分卷）。
+- 实现/资源（低内存约束）：
+  - 一次只在内存持有一页；按章顺序流式写临时文件（`{DATA_DIR}/exports/{uid}/`），随后 16 KiB 分块回传，读完删除。
+  - 中断残留文件与 TXT 导出共用 1 小时清理。
 
 ---
 

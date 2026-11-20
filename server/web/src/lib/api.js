@@ -131,7 +131,14 @@ function filenameFromDisposition(v) {
 // 返回 { blob, bytes, headers }，文件名由调用方按「书名.txt」决定，
 // objectURL 的创建与释放也在调用方完成，避免这里泄漏。
 async function downloadTxt(bookUrl, opts = {}) {
-  const path = `/book/export/txt?${buildQuery({ book_url: bookUrl })}`;
+  return downloadExport(`/book/export/txt?${buildQuery({ book_url: bookUrl })}`, opts);
+}
+
+async function downloadCbz(bookUrl, opts = {}) {
+  return downloadExport(`/book/export/cbz?${buildQuery({ book_url: bookUrl })}`, opts);
+}
+
+async function downloadExport(path, opts = {}) {
   const headers = {};
   const token = getToken();
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -189,6 +196,10 @@ async function downloadTxt(bookUrl, opts = {}) {
       cached: h('x-cached-chapters'),
       missing: h('x-missing-chapters'),
       written: h('x-written-chapters'),
+      totalPages: h('x-total-pages'),
+      availablePages: h('x-available-pages'),
+      missingPages: h('x-missing-pages'),
+      writtenPages: h('x-written-pages'),
       fileBytes,
     },
     filename: filenameFromDisposition(res.headers.get('content-disposition')),
@@ -471,6 +482,16 @@ export const api = {
     ),
   // 导出正文：fetch + Bearer + Blob，返回响应头供对账（见 downloadTxt）
   exportTxt: (bookUrl) => downloadTxt(bookUrl),
+
+  // ---- 导出 CBZ（漫画页原样打包；同样只读缓存）----
+  exportCbzInfo: (bookUrl) =>
+    request(
+      'GET',
+      `/book/export/cbz/info?${buildQuery({ book_url: bookUrl })}`,
+      undefined,
+      { timeout: 20000, noAuthReload: true }
+    ),
+  exportCbz: (bookUrl) => downloadCbz(bookUrl),
 
   // ---- bookshelf ----
   bookshelf: (group = '') => request('GET', `/bookshelf?${buildQuery({ group })}`),

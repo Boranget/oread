@@ -1154,6 +1154,133 @@ async fn library_browse_and_admin_actions() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 漫画导出：info 报页数，cbz 返回 ZIP；纯文本书用 409 明确拒绝。
+#[tokio::test]
+async fn comic_cbz_export_info_and_download() {
+    let dir = temp_dir("export-cbz");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let user = register(&app, "cbzuser").await;
+
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, author, tier, collected_at, last_accessed_at) \
+         VALUES ('https://c.test/book', '漫画书', '作者：画师', 'collection', 1, 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    for (url, idx) in [("https://c.test/ch1", 0), ("https://c.test/ch2", 1)] {
+        sqlx::query(
+            "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+             VALUES ('https://c.test/book', ?1, ?1, 0, ?2)",
+        )
+        .bind(url)
+        .bind(idx)
+        .execute(&library)
+        .await
+        .unwrap();
+    }
+    for (ch, images) in [
+        (
+            "https://c.test/ch1",
+            r#"{"images":[{"url":"https://c.test/p1"},{"url":"https://c.test/p2"}]}"#,
+        ),
+        (
+            "https://c.test/ch2",
+            r#"{"images":[{"url":"https://c.test/p3"}]}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
+             VALUES (?1, 'src', 'https://c.test/book', 'image', ?2, 1)",
+        )
+        .bind(ch)
+        .bind(images)
+        .execute(&library)
+        .await
+        .unwrap();
+    }
+    for (url, data) in [
+        ("https://c.test/p1", b"one".as_slice()),
+        ("https://c.test/p2", b"two".as_slice()),
+        ("https://c.test/p3", b"three".as_slice()),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
+             VALUES (?1, 'src', 'https://c.test/book', 'image/jpeg', ?2, ?3)",
+        )
+        .bind(url)
+        .bind(data)
+        .bind(data.len() as i64)
+        .execute(&library)
+        .await
+        .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/cbz/info?book_url=https%3A%2F%2Fc.test%2Fbook",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = body_json(resp).await;
+    assert_eq!(info["total_pages"], 3, "{info}");
+    assert_eq!(info["available_pages"], 3);
+    assert_eq!(info["image_chapters"], 2);
+    assert_eq!(info["complete"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/cbz?book_url=https%3A%2F%2Fc.test%2Fbook",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/vnd.comicbook+zip"
+    );
+    assert_eq!(resp.headers()["x-written-pages"], "3");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"PK\x03\x04"), "CBZ 必须是 ZIP");
+
+    // 纯文本书（没有图片章节）明确 409。
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, tier, last_accessed_at) \
+         VALUES ('https://c.test/text', '文字书', 'collection', 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+         VALUES ('https://c.test/text', 'https://c.test/text/1', '第一章', 0, 0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            "/api/book/export/cbz?book_url=https%3A%2F%2Fc.test%2Ftext",
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// 元数据读写：普通账号可读、只有管理员能改；空补丁与非法值返回 400。
 #[tokio::test]
 async fn library_metadata_read_and_admin_write() {

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
     Txt,
+    Cbz,
 }
 
 impl Format {
@@ -16,6 +17,7 @@ impl Format {
     pub fn as_str(self) -> &'static str {
         match self {
             Format::Txt => "txt",
+            Format::Cbz => "cbz",
         }
     }
 
@@ -23,6 +25,7 @@ impl Format {
     pub fn extension(self) -> &'static str {
         match self {
             Format::Txt => "txt",
+            Format::Cbz => "cbz",
         }
     }
 
@@ -30,6 +33,8 @@ impl Format {
     pub fn content_type(self) -> &'static str {
         match self {
             Format::Txt => "text/plain; charset=utf-8",
+            // CBZ 就是 ZIP；带 charset 反而让部分阅读器误判
+            Format::Cbz => "application/vnd.comicbook+zip",
         }
     }
 }
@@ -52,6 +57,20 @@ pub struct BookMeta {
     pub source: Option<String>,
 }
 
+/// 章节内容类型。漫画章节的正文为空，图片清单在 `library_content.images`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChapterKind {
+    #[default]
+    Text,
+    Image,
+}
+
+impl ChapterKind {
+    pub fn is_image(self) -> bool {
+        matches!(self, ChapterKind::Image)
+    }
+}
+
 /// 目录中的一章。分卷行也保留，writer 自行决定怎么输出。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChapterRef {
@@ -60,6 +79,7 @@ pub struct ChapterRef {
     /// 正文章节序号（从 1 开始）；分卷行为 0
     pub seq: i64,
     pub is_volume: bool,
+    pub kind: ChapterKind,
 }
 
 /// 一本书的导出输入：元数据 + 目录 + 缓存统计。
@@ -81,6 +101,42 @@ impl BookInput {
     pub fn complete(&self) -> bool {
         self.cached_chapters >= self.total_chapters
     }
+
+    /// 漫画章节（按目录顺序）。
+    pub fn image_chapters(&self) -> impl Iterator<Item = &ChapterRef> {
+        self.chapters
+            .iter()
+            .filter(|c| !c.is_volume && c.kind.is_image())
+    }
+}
+
+/// 一张已落盘页面的字节与 MIME。MIME 由保存时原样记录，writer 据此选扩展名。
+#[derive(Debug, Clone)]
+pub struct PageData {
+    pub data: Vec<u8>,
+    pub mime: String,
+}
+
+/// 漫画导出的可读视图：书目 + 页数统计。实际页面字节由 reader 按需读取。
+#[derive(Debug, Clone, Default)]
+pub struct ComicInput {
+    pub book: BookInput,
+    /// 图片清单里声明的页数（含尚未落盘的）
+    pub total_pages: i64,
+    /// `library_images` 中实际可读的页数
+    pub available_pages: i64,
+    /// 已落盘图片的原始字节合计
+    pub available_bytes: i64,
+}
+
+impl ComicInput {
+    pub fn missing_pages(&self) -> i64 {
+        (self.total_pages - self.available_pages).max(0)
+    }
+
+    pub fn complete(&self) -> bool {
+        self.total_pages > 0 && self.available_pages >= self.total_pages
+    }
 }
 
 /// 一次写入的结果。
@@ -88,6 +144,10 @@ impl BookInput {
 pub struct WriteReport {
     /// 实际写入的已缓存章节数（并发清理时可能略小于计划值）
     pub written_chapters: i64,
+    /// 实际写入的图片页数（TXT 为 0）
+    pub written_pages: i64,
+    /// 声明了但没读到字节的页数（CBZ 为缺页数，TXT 为 0）
+    pub missing_pages: i64,
     pub size_bytes: u64,
 }
 

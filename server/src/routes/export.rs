@@ -29,17 +29,20 @@ use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;
 
 use crate::auth::AuthUser;
+use crate::ebook::format::cbz::CbzWriter;
 use crate::ebook::format::txt::{normalize_author, TxtWriter};
 use crate::ebook::pipeline::FormatWriter;
-use crate::ebook::source::{load_book_input, LibraryReader};
-use crate::ebook::BookInput;
-use crate::error::AppResult;
+use crate::ebook::source::{load_book_input, load_comic_input, LibraryReader};
+use crate::ebook::{BookInput, ComicInput, Format, WriteReport};
+use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/book/export/info", get(export_info))
         .route("/api/book/export/txt", get(export_txt))
+        .route("/api/book/export/cbz/info", get(export_cbz_info))
+        .route("/api/book/export/cbz", get(export_cbz))
 }
 
 #[derive(Deserialize)]
@@ -133,6 +136,92 @@ async fn write_export(
     })
 }
 
+#[derive(Debug)]
+struct CbzExportFile {
+    path: PathBuf,
+    input: ComicInput,
+    report: WriteReport,
+}
+
+/// 逐页读取已落盘图片并打包 CBZ：内存峰值 ≈ 单页 + 16 KiB 回传缓冲。
+async fn write_cbz(
+    pool: &SqlitePool,
+    data_dir: &str,
+    uid: i64,
+    book_url: &str,
+) -> AppResult<CbzExportFile> {
+    let input = load_comic_input(pool, book_url).await?;
+    if input.total_pages == 0 {
+        return Err(AppError::Conflict(
+            "这本书没有图片章节，无法导出 CBZ".into(),
+        ));
+    }
+    if input.available_pages == 0 {
+        return Err(AppError::Conflict(
+            "没有已落盘的漫画图片，请先缓存全书".into(),
+        ));
+    }
+
+    let dir = Path::new(data_dir).join("exports").join(uid.to_string());
+    fs::create_dir_all(&dir).await?;
+    cleanup_stale(&dir).await;
+
+    let seq = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "{}-{}.cbz",
+        sanitize_filename(&input.book.meta.name),
+        seq
+    ));
+
+    let reader = LibraryReader::new(pool, &input.book.meta.book_url);
+    let report = CbzWriter.write(&input.book, &reader, &path).await?;
+    Ok(CbzExportFile {
+        path,
+        input,
+        report,
+    })
+}
+
+/// 把临时文件 16 KiB 一块地流式回传，正常读完即删；中断时靠 [`cleanup_stale`] 兜底。
+async fn temp_file_response(
+    path: PathBuf,
+    filename: &str,
+    content_type: &'static str,
+) -> AppResult<Response> {
+    let file = File::open(&path).await?;
+    let body_stream = stream::try_unfold((file, path), |(mut file, path)| async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => {
+                let _ = fs::remove_file(&path).await;
+                Ok(None)
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some((Bytes::from(buf), (file, path))))
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&path).await;
+                Err(e)
+            }
+        }
+    });
+
+    let mut res = Response::new(Body::from_stream(body_stream));
+    *res.status_mut() = StatusCode::OK;
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(filename))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"export.bin\"")),
+    );
+    Ok(res)
+}
+
 async fn export_info(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -170,38 +259,9 @@ async fn export_txt(
         sanitize_filename(&out.input.meta.name),
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
-    let file = File::open(&out.path).await?;
-    // 流式回传：读一块写一块；正常读完即删临时文件；中断时靠 cleanup_stale 兜底。
-    let body_stream = stream::try_unfold((file, out.path.clone()), |(mut file, path)| async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        match file.read(&mut buf).await {
-            Ok(0) => {
-                let _ = fs::remove_file(&path).await;
-                Ok(None)
-            }
-            Ok(n) => {
-                buf.truncate(n);
-                Ok(Some((Bytes::from(buf), (file, path))))
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&path).await;
-                Err(e)
-            }
-        }
-    });
-
-    let mut res = Response::new(Body::from_stream(body_stream));
-    *res.status_mut() = StatusCode::OK;
+    let mut res =
+        temp_file_response(out.path.clone(), &filename, Format::Txt.content_type()).await?;
     let h = res.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    h.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&content_disposition(&filename))
-            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"export.txt\"")),
-    );
     h.insert(
         "x-total-chapters",
         HeaderValue::from_str(&out.input.total_chapters.to_string()).expect("数字 header"),
@@ -225,10 +285,76 @@ async fn export_txt(
     Ok(res)
 }
 
+async fn export_cbz_info(
+    State(s): State<AppState>,
+    _u: AuthUser,
+    Query(q): Query<ExportQ>,
+) -> AppResult<Json<serde_json::Value>> {
+    let input = load_comic_input(&s.library, &q.book_url).await?;
+    let export_url = format!(
+        "/api/book/export/cbz?book_url={}",
+        url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()
+    );
+    Ok(Json(json!({
+        "book_url": q.book_url.trim(),
+        "name": input.book.meta.name,
+        "author": normalize_author(&input.book.meta.author),
+        "source": input.book.meta.source.clone().unwrap_or_default(),
+        "image_chapters": input.book.image_chapters().count(),
+        "total_pages": input.total_pages,
+        "available_pages": input.available_pages,
+        "missing_pages": input.missing_pages(),
+        "available_bytes": input.available_bytes,
+        "complete": input.complete(),
+        "export_url": export_url,
+    })))
+}
+
+async fn export_cbz(
+    State(s): State<AppState>,
+    u: AuthUser,
+    Query(q): Query<ExportQ>,
+) -> AppResult<Response> {
+    let out = write_cbz(&s.library, &s.cfg.data_dir, u.id, &q.book_url).await?;
+
+    let filename = format!(
+        "{}-{}.cbz",
+        sanitize_filename(&out.input.book.meta.name),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let mut res =
+        temp_file_response(out.path.clone(), &filename, Format::Cbz.content_type()).await?;
+    let h = res.headers_mut();
+    h.insert(
+        "x-total-pages",
+        HeaderValue::from_str(&out.input.total_pages.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-available-pages",
+        HeaderValue::from_str(&out.input.available_pages.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-missing-pages",
+        HeaderValue::from_str(&out.report.missing_pages.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-written-chapters",
+        HeaderValue::from_str(&out.report.written_chapters.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-written-pages",
+        HeaderValue::from_str(&out.report.written_pages.to_string()).expect("数字 header"),
+    );
+    h.insert(
+        "x-file-bytes",
+        HeaderValue::from_str(&out.report.size_bytes.to_string()).expect("数字 header"),
+    );
+    Ok(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::AppError;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn export_pool() -> SqlitePool {
@@ -256,6 +382,18 @@ mod tests {
         sqlx::query(
             "CREATE TABLE library_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
              book_url TEXT NOT NULL, title TEXT, content TEXT, \
+             content_type TEXT NOT NULL DEFAULT 'text', images TEXT, \
+             size_bytes INTEGER NOT NULL DEFAULT 0, \
+             images_ready INTEGER NOT NULL DEFAULT 0, \
+             updated_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00', \
+             PRIMARY KEY (url, origin))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_images (url TEXT NOT NULL, origin TEXT NOT NULL, \
+             book_url TEXT NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL, \
              size_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (url, origin))",
         )
         .execute(&pool)
@@ -449,6 +587,98 @@ mod tests {
         assert_eq!(plan.total_chapters, out.input.total_chapters);
         assert_eq!(plan.cached_chapters, out.input.cached_chapters);
         assert_eq!(plan.cached_bytes, out.input.cached_bytes);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    async fn insert_comic(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO library_books (book_url, name, author, series_name, series_index) \
+             VALUES ('https://c/book', '漫画书', '作者：画师', '漫画系列', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (url, idx) in [("https://c/ch1", 0), ("https://c/ch2", 1)] {
+            sqlx::query(
+                "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+                 VALUES ('https://c/book', ?1, ?1, 0, ?2)",
+            )
+            .bind(url)
+            .bind(idx)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO library_content (url, origin, book_url, content_type, images, \
+             images_ready) VALUES ('https://c/ch1', 'src', 'https://c/book', 'image', \
+             '{\"images\":[{\"url\":\"https://c/p1\"},{\"url\":\"https://c/p2\"}]}', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO library_content (url, origin, book_url, content_type, images, \
+             images_ready) VALUES ('https://c/ch2', 'src', 'https://c/book', 'image', \
+             '{\"images\":[{\"url\":\"https://c/p3\"}]}', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        for (url, data) in [
+            ("https://c/p1", b"one".as_slice()),
+            ("https://c/p2", b"two".as_slice()),
+            ("https://c/p3", b"three".as_slice()),
+        ] {
+            sqlx::query(
+                "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
+                 VALUES (?1, 'src', 'https://c/book', 'image/jpeg', ?2, ?3)",
+            )
+            .bind(url)
+            .bind(data)
+            .bind(data.len() as i64)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cbz_export_packages_pages_and_comicinfo() {
+        let pool = export_pool().await;
+        insert_comic(&pool).await;
+        let dir = temp_dir("cbz");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let out = write_cbz(&pool, dir.to_str().unwrap(), 42, "https://c/book")
+            .await
+            .unwrap();
+        let bytes = tokio::fs::read(&out.path).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        assert_eq!(out.input.total_pages, 3);
+        assert_eq!(out.report.written_pages, 3);
+        assert_eq!(out.report.written_chapters, 2);
+        assert_eq!(out.report.missing_pages, 0);
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        assert!(text.contains("0001-001.jpg"));
+        assert!(text.contains("0002-001.jpg"));
+        assert!(text.contains("ComicInfo.xml"));
+        assert!(text.contains("<Title>漫画书</Title>"));
+        assert!(text.contains("<Writer>画师</Writer>"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cbz_export_rejects_text_only_book() {
+        let pool = export_pool().await;
+        insert_book(&pool, "https://x/book").await;
+        let dir = temp_dir("cbz-none");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let err = write_cbz(&pool, dir.to_str().unwrap(), 42, "https://x/book")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

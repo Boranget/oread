@@ -1,5 +1,6 @@
 <script>
-  // 导出 TXT 弹窗：先拉 /api/book/export/info 展示缓存/缺失章节，用户确认后再 fetch 下载。
+  // 导出弹窗：TXT（已缓存正文）或 CBZ（已落盘漫画页）。
+  // 先拉对应的 export/info 展示缓存状态，用户确认后再 fetch 下载。
   // 不能直接用 <a download> 直链——那样带不上 Authorization: Bearer。
   import { createEventDispatcher, onMount } from 'svelte';
   import { api, describeFailure } from './api.js';
@@ -9,7 +10,9 @@
 
   const dispatch = createEventDispatcher();
 
+  let format = 'txt'; // txt | cbz
   let info = null;
+  let cbzInfo = null;
   let loading = false;
   let infoErr = '';
   let exporting = false;
@@ -18,9 +21,9 @@
 
   const ILLEGAL = /[/\\:*?"<>|]/g;
 
-  // 文件名用「书名.txt」；后端 sanitize 规则在本地再兜一层，防止非法字符导致下载失败
+  // 文件名用「书名.txt / 书名.cbz」；后端 sanitize 规则在本地再兜一层
   function downloadName() {
-    const raw = (info && info.name) || name || 'book';
+    const raw = (format === 'cbz' ? cbzInfo && cbzInfo.name : info && info.name) || name || 'book';
     const cleaned = raw
       .replace(/[\u0000-\u001f\u007f]/g, '_')
       .replace(ILLEGAL, '_')
@@ -28,7 +31,7 @@
       .replace(/\.+$/, '')
       .trim()
       .slice(0, 60);
-    return (cleaned || 'book') + '.txt';
+    return (cleaned || 'book') + (format === 'cbz' ? '.cbz' : '.txt');
   }
 
   function fmtBytes(n) {
@@ -48,7 +51,7 @@
     try {
       info = await api.exportInfo(bookUrl);
     } catch (e) {
-      if (e && e.status === 400 && /目录未缓存|book\/toc/.test(String(e.message || ''))) {
+      if (e && e.status === 409 && /目录未缓存|book\/toc/.test(String(e.message || ''))) {
         infoErr = '这本书还没有缓存目录，暂时无法导出。请先在阅读器打开这本书（拉取目录）后再试。';
       } else {
         infoErr = describeFailure(e, '读取导出信息');
@@ -56,6 +59,40 @@
     } finally {
       loading = false;
     }
+  }
+
+  async function loadCbzInfo() {
+    if (!bookUrl) {
+      infoErr = '缺少书籍地址，请从书架重新打开这本书';
+      return;
+    }
+    loading = true;
+    infoErr = '';
+    try {
+      cbzInfo = await api.exportCbzInfo(bookUrl);
+    } catch (e) {
+      if (e && e.status === 409 && /目录未缓存|book\/toc/.test(String(e.message || ''))) {
+        infoErr = '这本书还没有缓存目录，暂时无法导出。请先在阅读器打开这本书（拉取目录）后再试。';
+      } else {
+        infoErr = describeFailure(e, '读取漫画导出信息');
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
+  function setFormat(f) {
+    if (exporting || format === f) return;
+    format = f;
+    err = '';
+    done = null;
+    if (f === 'cbz' && !cbzInfo) loadCbzInfo();
+    if (f === 'txt' && !info) loadInfo();
+  }
+
+  function refresh() {
+    if (format === 'cbz') loadCbzInfo();
+    else loadInfo();
   }
 
   // 401 / 404 / 网络中断分开说明，避免一句“导出失败”让人无从下手
@@ -72,9 +109,12 @@
       }
       return '导出失败：网络中断，导出请求没有完成。请检查网络后重试。';
     }
-    if (status === 400 || status === 422) {
+    if (status === 400 || status === 422 || status === 409) {
       if (/目录未缓存|book\/toc/.test(msg)) {
         return '导出失败：这本书还没有缓存目录。请先在阅读器打开目录（或重新打开这本书）后再导出。';
+      }
+      if (/没有图片章节|没有已落盘/.test(msg)) {
+        return '导出失败：' + msg + '。请先在阅读器缓存漫画页，或改用 TXT。';
       }
       return '导出失败：' + msg + '。请按提示处理后重试。';
     }
@@ -91,7 +131,7 @@
     done = null;
     let objectUrl = '';
     try {
-      const r = await api.exportTxt(bookUrl);
+      const r = format === 'cbz' ? await api.exportCbz(bookUrl) : await api.exportTxt(bookUrl);
       const filename = downloadName();
       objectUrl = URL.createObjectURL(r.blob);
       const a = document.createElement('a');
@@ -125,11 +165,16 @@
 </script>
 
 <div class="modal-mask" on:click|self={() => dispatch('close')}>
-  <div class="modal export-modal" role="dialog" aria-label="导出 TXT">
+  <div class="modal export-modal" role="dialog" aria-label="导出书籍">
     <div class="row" style="margin-bottom:8px">
-      <strong style="font-size:15px">导出 TXT</strong>
+      <strong style="font-size:15px">导出</strong>
       <div class="spacer"></div>
       <button class="ghost" on:click={() => dispatch('close')}>关闭</button>
+    </div>
+
+    <div class="seg" role="tablist">
+      <button class:on={format === 'txt'} on:click={() => setFormat('txt')}>TXT 正文</button>
+      <button class:on={format === 'cbz'} on:click={() => setFormat('cbz')}>CBZ 漫画</button>
     </div>
 
     {#if loading}
@@ -137,9 +182,9 @@
     {:else if infoErr}
       <p class="err">{infoErr}</p>
       <div class="row">
-        <button on:click={loadInfo}>重试</button>
+        <button on:click={refresh}>重试</button>
       </div>
-    {:else if info}
+    {:else if format === 'txt' && info}
       <p class="exp-name">《{info.name}》{info.author && info.author !== '未知' ? ' · ' + info.author : ''}</p>
       {#if info.source}<p class="muted tiny-note">书源：{info.source}</p>{/if}
 
@@ -159,33 +204,66 @@
           </div>
         </div>
       {/if}
+    {:else if format === 'cbz' && cbzInfo}
+      <p class="exp-name">《{cbzInfo.name}》{cbzInfo.author && cbzInfo.author !== '未知' ? ' · ' + cbzInfo.author : ''}</p>
+      {#if cbzInfo.source}<p class="muted tiny-note">书源：{cbzInfo.source}</p>{/if}
 
-      {#if exporting}
-        <div class="exp-progress">
-          <span class="exp-spin" aria-hidden="true"></span>
-          <span>正在导出…（逐章写盘，章节较多时需要一会儿）</span>
+      <p class="exp-line">
+        已落盘 <b>{cbzInfo.available_pages}</b>/{cbzInfo.total_pages} 页
+        · {cbzInfo.image_chapters} 章 · 图片 {fmtBytes(cbzInfo.available_bytes)}
+      </p>
+
+      {#if cbzInfo.total_pages === 0}
+        <div class="warn-box">
+          <div class="warn-title">这本书没有图片章节</div>
+          <div>CBZ 只适用于漫画/图片书源；文字书请切换到「TXT 正文」。</div>
+        </div>
+      {:else if cbzInfo.complete}
+        <p class="ok-line">全部漫画页已落盘，CBZ 含完整页集。</p>
+      {:else}
+        <div class="warn-box">
+          <div class="warn-title">缺 {cbzInfo.missing_pages} 页，CBZ 不完整</div>
+          <div>
+            CBZ 只打包 library_images 里已有字节的页，不生成占位图。
+            想导出全本，请先在阅读器缓存漫画页，或把书加入馆藏后等待后台下载完成。
+          </div>
         </div>
       {/if}
+    {/if}
 
-      {#if err}<p class="err">{err}</p>{/if}
+    {#if exporting}
+      <div class="exp-progress">
+        <span class="exp-spin" aria-hidden="true"></span>
+        <span>正在导出…（{format === 'cbz' ? '逐页打包' : '逐章写盘'}，内容较多时需要一会儿）</span>
+      </div>
+    {/if}
 
-      {#if done}
-        <p class="ok-line">已开始下载《{done.filename}》，{fmtBytes(done.bytes)}（{done.bytes} 字节）</p>
-        <p class="muted tiny-note">
-          字节对账：响应头 x-file-bytes {done.headers.fileBytes} · 实际收包 {done.blobBytes}
-          {#if done.mismatch}
-            （不一致，可能被代理截断，请核对文件完整性）
-          {:else}
-            （一致）
-          {/if}
-        </p>
-        {#if done.headers.written !== undefined && done.headers.written !== done.headers.cached}
+    {#if err}<p class="err">{err}</p>{/if}
+
+    {#if done}
+      <p class="ok-line">已开始下载《{done.filename}》，{fmtBytes(done.bytes)}（{done.bytes} 字节）</p>
+      <p class="muted tiny-note">
+        字节对账：响应头 x-file-bytes {done.headers.fileBytes} · 实际收包 {done.blobBytes}
+        {#if done.mismatch}
+          （不一致，可能被代理截断，请核对文件完整性）
+        {:else}
+          （一致）
+        {/if}
+      </p>
+      {#if format === 'cbz'}
+        {#if done.headers.writtenPages !== undefined && done.headers.writtenPages !== done.headers.availablePages}
           <p class="muted tiny-note">
-            写入 {done.headers.written} 章 / 已缓存 {done.headers.cached} 章（导出期间缓存有并发变动）
+            写入 {done.headers.writtenPages} 页 / 已落盘 {done.headers.availablePages} 页（导出期间缓存有并发变动）
           </p>
         {/if}
+      {:else if done.headers.written !== undefined && done.headers.written !== done.headers.cached}
+        <p class="muted tiny-note">
+          写入 {done.headers.written} 章 / 已缓存 {done.headers.cached} 章（导出期间缓存有并发变动）
+        </p>
       {/if}
+    {/if}
 
+    {#if format === 'txt' && info}
       <div class="row" style="margin-top:12px">
         <button on:click={doExport} disabled={exporting} style="flex:1">
           {exporting ? '正在导出…' : done ? '再次导出' : '导出 TXT'}
@@ -194,6 +272,20 @@
       </div>
       <p class="muted tiny-note" style="margin-top:10px">
         导出只读取已缓存正文，不会临时抓取网络；文件按「书名.txt」保存。
+      </p>
+    {:else if format === 'cbz' && cbzInfo}
+      <div class="row" style="margin-top:12px">
+        <button
+          on:click={doExport}
+          disabled={exporting || cbzInfo.available_pages === 0}
+          style="flex:1"
+        >
+          {exporting ? '正在导出…' : done ? '再次导出' : '导出 CBZ'}
+        </button>
+        <button class="ghost" on:click={loadCbzInfo} disabled={exporting}>刷新缓存状态</button>
+      </div>
+      <p class="muted tiny-note" style="margin-top:10px">
+        漫画页原样打包（不重编码、不压缩），附 ComicInfo.xml；文件按「书名.cbz」保存。
       </p>
     {/if}
   </div>

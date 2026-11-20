@@ -109,6 +109,7 @@ impl FormatWriter for TxtWriter {
         Ok(WriteReport {
             written_chapters,
             size_bytes,
+            ..Default::default()
         })
     }
 }
@@ -136,7 +137,7 @@ pub(crate) fn normalize_author(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{normalize_author, TxtWriter};
-    use crate::ebook::model::{BookInput, BookMeta, ChapterRef};
+    use crate::ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef};
     use crate::ebook::pipeline::{ChapterReader, FormatWriter};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -189,18 +190,21 @@ mod tests {
                     title: "第一卷".into(),
                     seq: 0,
                     is_volume: true,
+                    kind: ChapterKind::Text,
                 },
                 ChapterRef {
                     url: "https://x/c1".into(),
                     title: "第一章".into(),
                     seq: 1,
                     is_volume: false,
+                    kind: ChapterKind::Text,
                 },
                 ChapterRef {
                     url: "https://x/c2".into(),
                     title: "第二章".into(),
                     seq: 2,
                     is_volume: false,
+                    kind: ChapterKind::Text,
                 },
             ],
             total_chapters: 2,

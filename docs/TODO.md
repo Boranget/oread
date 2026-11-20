@@ -124,7 +124,7 @@
   - 漫画阅读布局：单页/连续滚动、缩放、预加载；
   - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`），入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
-  - 漫画导出/下载（TXT 导出只覆盖文字）。
+  - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.2 与 TODO 2.9。
 - 依据：[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
 
 ### 2.8 书模型与可交换元数据（`进行中`）
@@ -136,16 +136,17 @@
 
 ### 2.9 电子书管线（`进行中`）
 
-- 状态：`进行中`。Phase 1 已完成：`server/src/ebook/` 领域层 + TXT 导出迁入。
+- 状态：`进行中`。Phase 1（TXT 迁入）与 Phase 2（CBZ）已完成。
 - 已完成：
-  - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；
-  - `source`：只读馆藏组装书视图（目录缺失 → 409），`LibraryReader` 按章读取、空白正文视为未缓存；
+  - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；
+  - `source`：只读馆藏组装书视图（目录缺失 → 409），`LibraryReader` 按章读正文、按章取图片清单、按页读 `library_images`；空白正文视为未缓存；
   - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
-  - `format/txt`：与旧导出逐字一致（头部、分卷、`[n/N]` 标题、未缓存占位、结尾统计），逐章流式写盘。
+  - `format/txt`：与旧导出逐字一致（头部、分卷、`[n/N]` 标题、未缓存占位、结尾统计），逐章流式写盘；
+  - `format/cbz` + `zip`：漫画页原样打包（store，不重编码），页面名 `{章:04}-{页:03}.{ext}`，附最小 `ComicInfo.xml`；只含已落盘页，缺页计入 `x-missing-pages`；一次一页、确定性时间戳；
+  - 接口：`/api/book/export/cbz/info` 与 `/api/book/export/cbz`（登录可读，不联网）。
 - 还差：
-  - `library_artifacts` 表与内容 hash 复用：TXT 含导出时间戳、且是临时文件，收益低；等 CBZ/EPUB（确定性产物）再做；
-  - CBZ（Phase 2）：消费 `library_images`，复用同一 `FormatWriter`；
-  - EPUB（Phase 3）：前置是正文 HTML → 语义分段与图片内联；
+  - `library_artifacts` 表与内容 hash 复用：CBZ 目前一次性生成、读完即删；多账号重复导出同一本时才值得做缓存；
+  - EPUB（Phase 3）：复用 `zip`（`mimetype` 必须 store 且首条）+ 正文 HTML → 语义分段 + 图片内联；
   - OPDS（Phase 4）与可选 AZW3/推送（Phase 5）。
 - 纪律：`ebook` 层只读馆藏、不抓网络、不决定 `data_dir` 布局；GPL 代码不复制，只按公开规范独立实现。
 
