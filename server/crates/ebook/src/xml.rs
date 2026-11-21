@@ -1,7 +1,7 @@
 //! 最小 XML 转义（ComicInfo 与 EPUB 的 XHTML/OPF 共用）。
 
 /// 转义文本节点与属性值里必须处理的五个字符。
-pub(crate) fn xml_escape(s: &str) -> String {
+pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

@@ -10,7 +10,7 @@
 //! OEBPS/ch001.xhtml ...        (一章一文件)
 //! ```
 //!
-//! 正文先经 [`crate::ebook::html::to_blocks`] 归一化为语义段落，再生成良构 XHTML；
+//! 正文先经 [`crate::html::to_blocks`] 归一化为语义段落，再生成良构 XHTML；
 //! 未缓存章节写占位段落，与 TXT 导出口径一致，不静默丢章。
 //! 图片暂不内联（漫画走 CBZ；文字书图片后续单独做）。
 
@@ -19,12 +19,12 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 
-use crate::ebook::format::txt::normalize_author;
-use crate::ebook::html::{to_blocks, Block};
-use crate::ebook::model::{BookInput, BookMeta, ChapterRef, Format, WriteReport};
-use crate::ebook::pipeline::{ChapterReader, FormatWriter};
-use crate::ebook::xml::xml_escape;
-use crate::ebook::zip::ZipWriter;
+use crate::format::txt::normalize_author;
+use crate::html::{to_blocks, Block};
+use crate::model::{BookInput, BookMeta, ChapterRef, Format, WriteReport};
+use crate::pipeline::{ChapterReader, FormatWriter};
+use crate::xml::xml_escape;
+use crate::zip::ZipWriter;
 
 const STYLE_CSS: &str = "\
 body { margin: 0 1em; line-height: 1.7; }
@@ -38,7 +38,7 @@ blockquote { margin: 0.6em 1em; }
 /// EPUB 写入器。
 pub struct EpubWriter;
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl FormatWriter for EpubWriter {
     fn format(&self) -> Format {
         Format::Epub
@@ -335,14 +335,14 @@ fn format_index(index: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{content_opf, EpubWriter};
-    use crate::ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef, Format, WriteReport};
-    use crate::ebook::pipeline::{ChapterReader, FormatWriter};
+    use crate::model::{BookInput, BookMeta, ChapterKind, ChapterRef, Format, WriteReport};
+    use crate::pipeline::{ChapterReader, FormatWriter};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     struct MapReader(HashMap<String, String>);
 
-    #[axum::async_trait]
+    #[async_trait::async_trait]
     impl ChapterReader for MapReader {
         async fn chapter_text(&self, url: &str) -> anyhow::Result<Option<String>> {
             Ok(self.0.get(url).cloned())

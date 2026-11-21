@@ -18,6 +18,18 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 
 `server/src/lib.rs` 是库入口，集成测试（`tests/routes_smoke.rs`、`tests/rule_engine_fixtures.rs`）直接调用公开 API；`main.rs` 只做进程装配。
 
+### Cargo workspace
+
+`server/Cargo.toml` 是 workspace 根，同时也是 `boranlib` 二进制包。依赖严格单向：
+
+```
+boranlib (server)  →  boranlib-ebook (server/crates/ebook)
+                   →  （规则引擎、馆藏、路由仍在 server 包内，后续继续拆出）
+```
+
+`boranlib-ebook` 的硬约束：**不出现 `sqlx`、不出现 `axum`、不碰 `data_dir` 布局**。它只认识书的数据结构
+和「按章/按页读取」的 trait，存储与 HTTP 由调用方注入。这样做是为了让「格式层与存储层解耦」从注释变成编译错误。
+
 ## 2. 模块地图（server/src）
 
 | 模块 | 职责 |
@@ -28,7 +40,8 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |
 | `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；漫画图片落盘 |
 | `library_images.rs` | 馆藏漫画图片表 `library_images` 的读写（按 `(url, origin)` 去重）、完整性标记 |
-| `ebook/` | 导出/转换领域层：`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`source`（只读馆藏 + 按章正文/按页图片读取器）、`pipeline`（`ChapterReader` / `FormatWriter`）、`html`（正文 HTML → 语义块）、`xml`（共用转义）、`format/txt`、`format/cbz`、`format/epub`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
+| `ebook_source.rs` | 只读馆藏 + 按章正文/按页图片读取器（`LibraryReader`、`load_book_input`、`load_comic_input`）；存储实现留在服务端 |
+| `boranlib-ebook` crate | `server/crates/ebook`：导出/转换领域层，**不依赖 sqlx/axum**。`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`pipeline`（`ChapterReader` / `FormatWriter`）、`html`（正文 HTML → 语义块）、`xml`（共用转义）、`format/txt`、`format/cbz`、`format/epub`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
 | `image_fetch.rs` | 图片回源的共用入口：整图抓取（worker 落盘）与只取响应头的体积探测（入馆预估） |
 | `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`opds`、`kindle_*`、`image_*`、`sources_*` 等） |
 | `web_book*` | 书源抓取管线：搜索、详情、目录翻页、正文、图片、探索/榜单；`Fetcher` trait 可注入 |

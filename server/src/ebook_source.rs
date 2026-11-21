@@ -10,8 +10,8 @@ use sqlx::SqlitePool;
 
 use crate::error::{AppError, AppResult};
 
-use super::model::{BookInput, BookMeta, ChapterKind, ChapterRef, ComicInput, PageData};
-use super::pipeline::ChapterReader;
+use boranlib_ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef, ComicInput, PageData};
+use boranlib_ebook::pipeline::ChapterReader;
 
 /// 一次取齐书目与目录，组装成导出输入。正文按章懒读（见 [`LibraryReader`]）。
 pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<BookInput> {

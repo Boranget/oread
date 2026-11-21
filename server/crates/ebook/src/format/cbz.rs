@@ -9,16 +9,16 @@ use std::path::Path;
 
 use tokio::fs::File;
 
-use crate::ebook::format::txt::normalize_author;
-use crate::ebook::model::{BookInput, BookMeta, Format, WriteReport};
-use crate::ebook::pipeline::{ChapterReader, FormatWriter};
-use crate::ebook::xml::xml_escape;
-use crate::ebook::zip::ZipWriter;
+use crate::format::txt::normalize_author;
+use crate::model::{BookInput, BookMeta, Format, WriteReport};
+use crate::pipeline::{ChapterReader, FormatWriter};
+use crate::xml::xml_escape;
+use crate::zip::ZipWriter;
 
 /// CBZ 写入器。
 pub struct CbzWriter;
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl FormatWriter for CbzWriter {
     fn format(&self) -> Format {
         Format::Cbz
@@ -150,10 +150,8 @@ fn format_index(index: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{comic_info_xml, ext_for_mime, xml_escape, CbzWriter};
-    use crate::ebook::model::{
-        BookInput, BookMeta, ChapterKind, ChapterRef, PageData, WriteReport,
-    };
-    use crate::ebook::pipeline::{ChapterReader, FormatWriter};
+    use crate::model::{BookInput, BookMeta, ChapterKind, ChapterRef, PageData, WriteReport};
+    use crate::pipeline::{ChapterReader, FormatWriter};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -162,7 +160,7 @@ mod tests {
         data: HashMap<String, (Vec<u8>, &'static str)>,
     }
 
-    #[axum::async_trait]
+    #[async_trait::async_trait]
     impl ChapterReader for MapReader {
         async fn chapter_text(&self, _url: &str) -> anyhow::Result<Option<String>> {
             Ok(None)

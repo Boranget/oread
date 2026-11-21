@@ -33,8 +33,8 @@ use crate::ebook::format::cbz::CbzWriter;
 use crate::ebook::format::epub::EpubWriter;
 use crate::ebook::format::txt::{normalize_author, TxtWriter};
 use crate::ebook::pipeline::FormatWriter;
-use crate::ebook::source::{load_book_input, load_comic_input, LibraryReader};
 use crate::ebook::{BookInput, ComicInput, Format, WriteReport};
+use crate::ebook_source::{load_book_input, load_comic_input, LibraryReader};
 use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
 

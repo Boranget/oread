@@ -10,15 +10,15 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
-use crate::ebook::model::{BookInput, Format, WriteReport};
-use crate::ebook::pipeline::{ChapterReader, FormatWriter};
+use crate::model::{BookInput, Format, WriteReport};
+use crate::pipeline::{ChapterReader, FormatWriter};
 
 const PLACEHOLDER_TITLE: &str = "【未缓存】";
 
 /// TXT 写入器。
 pub struct TxtWriter;
 
-#[axum::async_trait]
+#[async_trait::async_trait]
 impl FormatWriter for TxtWriter {
     fn format(&self) -> Format {
         Format::Txt
@@ -116,7 +116,7 @@ impl FormatWriter for TxtWriter {
 
 /// 规范化书源里的作者字段：书源常自带 `作者：` / `作 者：` / `Authors:` 等标签，
 /// 导出时统一剥掉标签与首尾空白，空值回落为“未知”。
-pub(crate) fn normalize_author(raw: &str) -> String {
+pub fn normalize_author(raw: &str) -> String {
     let mut s = raw.trim();
     for label in ["作者", "作 者", "Authors", "authors", "AUTHOR", "AUTHORS"] {
         if let Some(rest) = s.strip_prefix(label) {
@@ -137,8 +137,8 @@ pub(crate) fn normalize_author(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{normalize_author, TxtWriter};
-    use crate::ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef};
-    use crate::ebook::pipeline::{ChapterReader, FormatWriter};
+    use crate::model::{BookInput, BookMeta, ChapterKind, ChapterRef};
+    use crate::pipeline::{ChapterReader, FormatWriter};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -156,7 +156,7 @@ mod tests {
 
     struct MapReader(HashMap<String, String>);
 
-    #[axum::async_trait]
+    #[async_trait::async_trait]
     impl ChapterReader for MapReader {
         async fn chapter_text(&self, url: &str) -> anyhow::Result<Option<String>> {
             Ok(self.0.get(url).cloned())

@@ -10,7 +10,7 @@ use super::model::{BookInput, Format, PageData, WriteReport};
 /// 按章读取正文与漫画页。实现方负责缓存/存储细节，writer 只关心内容。
 ///
 /// 图片方法有默认实现（空），纯文本 reader 不必实现它们。
-#[axum::async_trait]
+#[async_trait::async_trait]
 pub trait ChapterReader: Send + Sync {
     /// 返回 `None` 表示该章未缓存或正文为空白（writer 应显式占位，不能静默丢章）。
     async fn chapter_text(&self, url: &str) -> anyhow::Result<Option<String>>;
@@ -29,7 +29,7 @@ pub trait ChapterReader: Send + Sync {
 }
 
 /// 格式写入器。
-#[axum::async_trait]
+#[async_trait::async_trait]
 pub trait FormatWriter: Send + Sync {
     fn format(&self) -> Format;
 

@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/ebook"]
+resolver = "2"
+
 [package]
 name = "boranlib"
 version = "1.0.0"
@@ -8,6 +12,7 @@ name = "boranlib"
 path = "src/main.rs"
 
 [dependencies]
+boranlib-ebook = { path = "crates/ebook" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }

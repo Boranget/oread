@@ -1,0 +1,17 @@
+[package]
+name = "boranlib-ebook"
+version = "1.0.0"
+edition = "2021"
+description = "oread 电子书领域层：书模型、正文归一化、TXT/CBZ/EPUB 导出"
+
+# 纪律：本 crate 不依赖 sqlx / axum / 任何存储实现。
+# 它只认识「书的数据」和「如何按章/按页读取」的 trait。
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
+scraper = "0.20"
+ego-tree = "0.6"
+sha2 = "0.10"
