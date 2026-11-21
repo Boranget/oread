@@ -2620,6 +2620,61 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 断点续跑：图片章节的 `images_ready=1` 才算已缓存（`content` 对漫画是空串，不能只看 `content IS NOT NULL`）；`upsert_content` 后清单保留，失败的图片下次续跑补齐。
 - 读取：图片代理优先读 `library_images` 命中回填进程内 LRU；命中时不需要回源，源站 DNS 故障也能离线读已入馆漫画。墨水屏灰度 / WebP 转码变体仍运行时生成，不落盘。
 
+### 6.13 OPDS 1.2 目录（`/opds*`）
+
+给 KOReader、Moon+ Reader 等阅读器用的标准 Atom 目录。**不是 JSON 接口**，响应统一为
+`application/atom+xml;profile=opds-catalog;kind=navigation|acquisition`。
+
+- 鉴权：`/opds` 前缀接受 **HTTP Basic**（用户名 + 口令，bcrypt 校验后注入与 JWT 相同的
+  `AuthUser` / `UserDb` / `LibraryDb`）。阅读器通常不支持 Bearer，所以未带 Bearer 时
+  未认证请求返回 `401` + `WWW-Authenticate: Basic realm="oread OPDS"`；带合法 Bearer 时
+  仍按 JWT 处理。`/opds/` 与 `/opds` 等价。
+- 范围：只列 `tier=collection` 的永久馆藏；`tier=temp` 的临时缓存不进入目录。
+- Basic 校验结果在进程内缓存 5 分钟；命中后仍实时查 `users`，禁用立即生效，改密会递增
+  `token_version` 使旧口令缓存失效。
+
+#### 6.13.1 `GET /opds`
+
+导航 feed。返回「全部馆藏 / 漫画 / 文字书 / 最近入藏」四个 `rel="subsection"` 入口，
+链接指向 `/opds/books`。成功 `200`，`kind=navigation`。
+
+#### 6.13.2 `GET /opds/books`
+
+acquisition feed，keyset 分页（`sort_ts DESC, book_url ASC`，不返回总数）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `kind` | string | 否 | `all`（默认）/ `text` / `comic` |
+| `sort` | string | 否 | `accessed`（默认，最近阅读）/ `collected`（入藏时间）；`recent` 等价 `accessed` |
+| `cursor` | string | 否 | 上一页 `rel="next"` 给出的 `<sort_ts>:<book_url>` |
+| `limit` | integer | 否 | 默认 50，范围 1–100 |
+
+条目映射：
+
+- `<title>` 书名（缺失时回落 `book_url`），`<author>` 剥掉「作者：」前缀，`<summary>` 简介（最多 500 字）；
+- `dc:language` / `dc:publisher` / `dc:issued` 来自 6.12.3 的 OPF 语义字段；
+- 标签输出为 `<category term="标签">`，系列输出为 `<category term="series:系列" label="系列 #序号">`；
+- 有封面时输出 `http://opds-spec.org/image` 与 `image/thumbnail`，指向
+  `/opds/cover?book_url=...`（无书源时直接给源站封面地址）；
+- **acquisition 只在内容已缓存时出现**：有非空文本章节 → EPUB
+  （`application/epub+zip`）；有已落盘漫画页 → CBZ（`application/vnd.comicbook+zip`）。
+  两者都没有的条目仍会列出，但不带下载链接。
+
+#### 6.13.3 `GET /opds/download/epub?book_url=...`
+
+复用浏览器导出的同一实现（`export::epub_download`）：逐章写临时文件、16 KiB 分块回传、
+读完即删。响应头与 6.11.5 相同；没有正文章节时 `409`。
+
+#### 6.13.4 `GET /opds/download/cbz?book_url=...`
+
+复用 `export::cbz_download`，响应头与 6.11.3 相同；没有已落盘图片时 `409`。
+
+#### 6.13.5 `GET /opds/cover?book_url=...`
+
+读取馆藏书目的 `cover_url` 并复用 `/api/book/image` 的代理逻辑（按书源带 Referer/UA/
+Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `book_url` 解析；目录无封面
+`404`；书目无 `origin` 时无法带 Referer，返回 `302` 到源站封面。
+
 ---
 
 ## 7. 书架与进度
@@ -3603,6 +3658,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - 馆藏 8 个（stats / books / collect / release / delete / temp/clean / jobs / jobs/cancel）
   - 健康检查 3 个（`/api/health`、`/healthz`、`/api/healthz`）
   - K 埋点 2 个（`/api/k/metrics`、`/api/k/metrics/export`，仅管理员）
+- **另有 OPDS 1.2 路由 5 个**（`/opds`、`/opds/books`、`/opds/download/epub`、`/opds/download/cbz`、`/opds/cover`），响应为 Atom XML / 文件流，不计入上面的 JSON 接口数；鉴权为 HTTP Basic（也接受 Bearer）。
 - 计数口径：按“方法 + 路径”计；`/api/bookshelf` 的 GET/POST/DELETE 算 3 个，`/api/bookmarks` 的 GET/POST 算 2 个。
 - **确认口径**：
   - 已在 `:3000` 上对**回归所用二进制（9,224,704 B / mtime 2026-11-03 11:08:53 / sha256 `F24B000C…`）**完成 HTTP 冒烟与回归；证据来源 `report-20261103-1108.md`：旧用例 75/75、新接口 46/46、`/k` 10/10，零失败。
@@ -3695,6 +3751,11 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 76 | GET | `/api/book/export/cbz` | JWT | 否 | `book_url` | `application/vnd.comicbook+zip` 附件 + `x-total-pages`、`x-available-pages`、`x-missing-pages`、`x-written-chapters`、`x-written-pages`、`x-file-bytes` |
 | 77 | GET | `/api/book/export/epub/info` | JWT | 否 | `book_url` | `{book_url,name,author,source,text_chapters,cached_chapters,missing_chapters,cached_bytes,complete,export_url}` |
 | 78 | GET | `/api/book/export/epub` | JWT | 否 | `book_url` | `application/epub+zip` 附件 + `x-text/cached/missing/written-chapters`、`x-file-bytes` |
+| 79 | GET | `/opds` | Basic / JWT | 否 | — | Atom 导航 feed（`kind=navigation`） |
+| 80 | GET | `/opds/books` | Basic / JWT | 否 | `kind?,sort?,cursor?,limit?` | Atom acquisition feed（`kind=acquisition`） |
+| 81 | GET | `/opds/download/epub` | Basic / JWT | 否 | `book_url` | 同 #78（EPUB 附件） |
+| 82 | GET | `/opds/download/cbz` | Basic / JWT | 否 | `book_url` | 同 #76（CBZ 附件） |
+| 83 | GET | `/opds/cover` | Basic / JWT | 否 | `book_url` | 封面图片 / `302` 源站 / `404` |
 
 ---
 

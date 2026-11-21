@@ -23,14 +23,14 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 | 模块 | 职责 |
 |---|---|
 | `config*` | 环境变量（`BORANLIB_` 优先、`LEGADO_` 兼容）、生产校验、预算解析 |
-| `auth.rs` | 注册/登录/改密、Bearer 鉴权中间件、管理员、用户库连接池 |
+| `auth.rs` | 注册/登录/改密、Bearer 鉴权中间件、管理员、用户库连接池；`/opds` 前缀的 HTTP Basic 校验与 challenge |
 | `db*.rs` / `db_guard*` | `shared.db`、`library.db` 与 `users/<uid>.db` 的建库、迁移、备份、可写探测、崩溃自愈 |
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |
 | `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；漫画图片落盘 |
 | `library_images.rs` | 馆藏漫画图片表 `library_images` 的读写（按 `(url, origin)` 去重）、完整性标记 |
 | `ebook/` | 导出/转换领域层：`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`source`（只读馆藏 + 按章正文/按页图片读取器）、`pipeline`（`ChapterReader` / `FormatWriter`）、`html`（正文 HTML → 语义块）、`xml`（共用转义）、`format/txt`、`format/cbz`、`format/epub`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
 | `image_fetch.rs` | 图片回源的共用入口：整图抓取（worker 落盘）与只取响应头的体积探测（入馆预估） |
-| `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`kindle_*`、`image_*`、`sources_*` 等） |
+| `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`opds`、`kindle_*`、`image_*`、`sources_*` 等） |
 | `web_book*` | 书源抓取管线：搜索、详情、目录翻页、正文、图片、探索/榜单；`Fetcher` trait 可注入 |
 | `req*` | HTTP 预算、按源并发槽/限流、Cookie、字符集解码、重试、SSRF 防护 |
 | `rule_engine*` | 规则解释器：CSS/XPath/JSONPath/`@js:`（boa）、替换与变量；JS 资源与 DOM 桥独立文件 |
@@ -88,6 +88,27 @@ GET /api/book/export/epub
 ```
 
 换格式只替换 `FormatWriter`；`Format` 枚举与 `WriteReport` 是格式间唯一共享的契约。`ebook` 层不碰 `data_dir` 布局，产物路径由路由决定。TXT/EPUB 读正文，CBZ 读图片；三者共用 `cleanup_stale` 与 16 KiB 回传通道。
+
+## 3.2 一次 OPDS 请求
+
+```
+GET /opds/books?kind=text
+ → auth_middleware：`/opds` 前缀且无 Bearer → HTTP Basic
+      → users 实时校验收/禁用 → bcrypt（5 分钟进程内缓存）→ 注入 AuthUser/UserDb/LibraryDb
+      失败 → 401 + WWW-Authenticate: Basic realm="oread OPDS"
+ → routes/opds::books：只查 tier=collection，keyset 分页（sort_ts DESC, book_url ASC）
+      每行顺带统计已缓存文本章节数 / 已落盘漫画页数 → 决定是否输出 acquisition 链接
+      标签批量查 library_tags，元数据复用 language/publisher/pubdate/series_*
+ → Atom acquisition feed（相对链接以 Host / X-Forwarded-Proto 补成绝对地址）
+
+GET /opds/download/epub
+ → export::epub_download → ebook 管线 → 临时文件 → 16 KiB 流式回传 → 读完即删
+GET /opds/cover
+ → library_books.cover_url → image 代理（书源 Referer/UA/Cookie、本地 BLOB、墨水屏转码）
+```
+
+OPDS 与网页端共用同一套导出 writer 和图片代理，不复制第二份文件/图片逻辑；也可直接用
+Bearer 访问 `/opds*`，便于调试。
 
 ## 4. 数据与缓存
 

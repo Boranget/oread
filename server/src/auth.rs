@@ -1,11 +1,13 @@
 use axum::http::request::Parts;
 use axum::{
+    body::Body,
     extract::{FromRequestParts, Request, State},
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{header, header::AUTHORIZATION, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
     Json,
 };
+use base64::Engine as _;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -197,6 +199,149 @@ fn cookie_token(req: &Request) -> Option<String> {
         })
 }
 
+// ---------------------------------------------------------------------------
+// OPDS：HTTP Basic
+// ---------------------------------------------------------------------------
+
+/// OPDS 阅读器通常只支持 HTTP Basic。bcrypt 校验很贵，这里缓存「用户名+口令 →
+/// uid/令牌版本」5 分钟；命中后仍查一次 `users`，禁用立即生效，改密会递增
+/// `token_version` 从而让缓存失效。只影响 `/opds` 前缀，不扩大 Bearer 的认证面。
+const BASIC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const BASIC_CACHE_MAX: usize = 128;
+
+struct BasicCacheEntry {
+    uid: i64,
+    token_version: i64,
+    username: String,
+    at: std::time::Instant,
+}
+
+fn basic_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u64, BasicCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, BasicCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn basic_key(username: &str, password: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    username.hash(&mut h);
+    password.hash(&mut h);
+    h.finish()
+}
+
+/// 解析 `Authorization: Basic base64(user:pass)`；缺字段或编码非法一律当作未提供。
+fn basic_credentials(req: &Request) -> Option<(String, String)> {
+    let raw = req.headers().get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, encoded) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (username, password) = text.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+/// 校验 Basic 口令。成功返回 uid 与账号实时状态，失败返回 `None`（统一 401，
+/// 不区分「用户不存在」与「口令错误」）。
+async fn basic_auth_account(
+    state: &AppState,
+    username: &str,
+    password: &str,
+) -> AppResult<Option<(i64, AccountRow)>> {
+    let key = basic_key(username, password);
+    let cached = {
+        let cache = basic_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(&key)
+            .filter(|e| e.username == username && e.at.elapsed() < BASIC_CACHE_TTL)
+            .map(|e| (e.uid, e.token_version))
+    };
+    if let Some((uid, ver)) = cached {
+        if let Some(account) = lookup_account(&state.shared, uid).await? {
+            if !account.disabled && account.token_version == ver && account.username == username {
+                return Ok(Some((uid, account)));
+            }
+        }
+    }
+
+    let row: Option<(i64, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, password_hash, role, disabled, token_version FROM users WHERE username = ?",
+    )
+    .bind(username)
+    .fetch_optional(&state.shared)
+    .await?;
+    let Some((id, pw_hash, role, disabled, ver)) = row else {
+        return Ok(None);
+    };
+    if disabled != 0 || !verify(password, &pw_hash).map_err(AppError::Bcrypt)? {
+        return Ok(None);
+    }
+    {
+        let mut cache = basic_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= BASIC_CACHE_MAX {
+            cache.retain(|_, e| e.at.elapsed() < BASIC_CACHE_TTL);
+            if cache.len() >= BASIC_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            BasicCacheEntry {
+                uid: id,
+                token_version: ver,
+                username: username.to_string(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+    Ok(Some((
+        id,
+        AccountRow {
+            username: username.to_string(),
+            role,
+            disabled: false,
+            token_version: ver,
+        },
+    )))
+}
+
+/// 401 + `WWW-Authenticate`：没有 challenge，阅读器不会弹账号框。
+fn basic_challenge() -> Response {
+    let mut res = Response::new(Body::from(
+        "OPDS 需要登录：请使用账号口令进行 HTTP Basic 认证\n",
+    ));
+    *res.status_mut() = StatusCode::UNAUTHORIZED;
+    res.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"oread OPDS\", charset=\"UTF-8\""),
+    );
+    res
+}
+
+/// 把已认证用户注入请求扩展，与 Bearer 分支保持同一组提取器。
+async fn attach_user(
+    state: &AppState,
+    req: &mut Request,
+    uid: i64,
+    account: AccountRow,
+) -> AppResult<()> {
+    let pool = get_user_pool(state, uid).await?;
+    req.extensions_mut().insert(UserDb(pool));
+    req.extensions_mut()
+        .insert(crate::library::LibraryDb(state.library.clone()));
+    req.extensions_mut().insert(AuthUser {
+        id: uid,
+        username: account.username,
+        role: account.role,
+    });
+    Ok(())
+}
+
 fn redirect_login() -> Response {
     let mut res = Response::new(axum::body::Body::empty());
     *res.status_mut() = StatusCode::SEE_OTHER;
@@ -322,6 +467,20 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|v| v.to_string());
+
+    // OPDS：阅读器通常只支持 HTTP Basic。只对 `/opds` 前缀接受 Basic，未带 Bearer
+    // 时一律返回 401 + WWW-Authenticate，客户端才会弹出账号框。
+    let is_opds = path == "/opds" || path.starts_with("/opds/");
+    if is_opds && bearer.is_none() {
+        if let Some((username, password)) = basic_credentials(&req) {
+            if let Some((uid, account)) = basic_auth_account(&state, &username, &password).await? {
+                attach_user(&state, &mut req, uid, account).await?;
+                return Ok(next.run(req).await);
+            }
+        }
+        return Ok(basic_challenge());
+    }
+
     // Kindle /k 页内的 <img> 由浏览器直接发起，带不上 Authorization 头，只会有 k_session Cookie
     // 自报探针与书图一样由浏览器直接发起，只带 k_session Cookie，带不上 Authorization
     let cookie_fallback =
@@ -537,6 +696,33 @@ mod tests {
         assert!(!valid_username("中文 名"), "全角/半角空白应拒绝");
         // 前端传入前后空格时，register 先 trim 再校验
         assert!(valid_username("  ab  ".trim()));
+    }
+
+    #[test]
+    fn basic_credentials_parses_header() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:secret:123");
+        let req = Request::builder()
+            .header(AUTHORIZATION, format!("basic {encoded}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            basic_credentials(&req),
+            Some(("alice".to_string(), "secret:123".to_string())),
+            "口令里允许冒号，只按第一个冒号切分"
+        );
+
+        let bearer = Request::builder()
+            .header(AUTHORIZATION, "Bearer token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(basic_credentials(&bearer).is_none());
+
+        let broken = Request::builder()
+            .header(AUTHORIZATION, "Basic !!!")
+            .body(Body::empty())
+            .unwrap();
+        assert!(basic_credentials(&broken).is_none());
     }
 
     /// 用内存库 + 最小 users 表构造 AppState，验证 register 的实际行为。

@@ -368,7 +368,15 @@ async fn export_cbz(
     u: AuthUser,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Response> {
-    let out = write_cbz(&s.library, &s.cfg.data_dir, u.id, &q.book_url).await?;
+    cbz_download(&s, u.id, &q.book_url).await
+}
+
+/// CBZ 下载的 HTTP 产物（文件名 / 流式回传 / 统计头）。
+///
+/// OPDS 的 acquisition 链接复用同一入口，保证浏览器导出与阅读器下载的文件名、
+/// 头字段、临时文件清理完全一致。
+pub(crate) async fn cbz_download(s: &AppState, uid: i64, book_url: &str) -> AppResult<Response> {
+    let out = write_cbz(&s.library, &s.cfg.data_dir, uid, book_url).await?;
 
     let filename = format!(
         "{}-{}.cbz",
@@ -434,7 +442,12 @@ async fn export_epub(
     u: AuthUser,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Response> {
-    let out = write_epub(&s.library, &s.cfg.data_dir, u.id, &q.book_url).await?;
+    epub_download(&s, u.id, &q.book_url).await
+}
+
+/// EPUB 下载的 HTTP 产物；OPDS 与浏览器导出共用（见 [`cbz_download`]）。
+pub(crate) async fn epub_download(s: &AppState, uid: i64, book_url: &str) -> AppResult<Response> {
+    let out = write_epub(&s.library, &s.cfg.data_dir, uid, book_url).await?;
 
     let filename = format!(
         "{}-{}.epub",

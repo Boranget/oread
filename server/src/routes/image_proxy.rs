@@ -240,7 +240,7 @@ async fn proxy_stored(
     serve_bytes(data, &ct_base, &orig_etag, true, headers)
 }
 
-pub(super) async fn proxy(
+pub(crate) async fn proxy(
     State(s): State<AppState>,
     _u: AuthUser,
     headers: HeaderMap,

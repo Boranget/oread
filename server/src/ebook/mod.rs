@@ -13,7 +13,7 @@ mod html;
 pub mod model;
 pub mod pipeline;
 pub mod source;
-mod xml;
+pub(crate) mod xml;
 mod zip;
 
 pub use model::{

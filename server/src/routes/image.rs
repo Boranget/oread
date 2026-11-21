@@ -108,6 +108,7 @@ pub(crate) use image_meta::{probe_dims, source_referer};
 #[path = "image_proxy.rs"]
 mod image_proxy;
 pub use image_proxy::allowed_content_type;
+pub(crate) use image_proxy::proxy as proxy_image;
 pub(crate) use image_proxy::sniff_image_mime;
 use image_proxy::*;
 

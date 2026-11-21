@@ -137,8 +137,8 @@
 
 - 状态：`进行中`。Phase 0 已完成：迁移 `0003_metadata.sql` + `GET/POST /api/library/book/meta`。
 - 已完成：`language` / `publisher` / `pubdate` / `series_name` / `series_index` 入库；`library_identifiers`（ISBN 等 `scheme/value`）与 `library_tags` 独立成表；全局（内容层）与个人（用户库）边界见 [ARCHITECTURE.md](ARCHITECTURE.md) 第 4 节。
-- 已消费：EPUB 的 OPF 已输出系列、标签、语言、出版信息与标识（见 2.9 / API 6.11.5）。
-- 还差：OPDS 消费这些字段、从书源详情页自动映射系列/标签、前端编辑入口。
+- 已消费：EPUB 的 OPF 已输出系列、标签、语言、出版信息与标识（见 2.9 / API 6.11.5）；OPDS 书单也已输出这些字段（见 2.10）。
+- 还差：从书源详情页自动映射系列/标签、前端编辑入口。
 - 参考：calibre 的 `Metadata` / OPF 字段体系（只学语义与规范，不复制 GPL 代码）。
 
 ### 2.9 电子书管线（`进行中`）
@@ -157,8 +157,26 @@
 - 还差：
   - `library_artifacts` 表与内容 hash 复用：CBZ/EPUB 目前一次性生成、读完即删；多账号重复导出同一本时才值得做缓存；
   - EPUB 的正文图片内联、封面图与脚注；
-  - OPDS（Phase 4）与可选 AZW3/推送（Phase 5）。
+  - 可选 AZW3/推送（Phase 5）。
 - 纪律：`ebook` 层只读馆藏、不抓网络、不决定 `data_dir` 布局；GPL 代码不复制，只按公开规范独立实现。
+
+### 2.10 OPDS 1.2 目录（`已完成`）
+
+- 状态：`已完成`（Phase 4）。给 KOReader / Moon+ Reader 等阅读器提供标准 Atom 目录。
+- 接口（见 [API.md](API.md) 6.13）：
+  - `GET /opds`：导航 feed（全部 / 漫画 / 文字书 / 最近入藏）；
+  - `GET /opds/books?kind=&sort=&cursor=&limit=`：馆藏 acquisition feed，keyset 分页；
+  - `GET /opds/download/{epub,cbz}`：复用浏览器导出管线（逐章/逐页写临时文件后流式回传）；
+  - `GET /opds/cover`：复用图片代理，按书源带 Referer/UA/Cookie。
+- 鉴权：`/opds` 前缀接受 HTTP Basic（bcrypt + 5 分钟进程内缓存，禁用/改密实时失效），
+  未认证返回 `401` + `WWW-Authenticate`；带 Bearer 时仍按 JWT 处理。
+- 范围：只列 `tier=collection`；acquisition 链接只在内容已缓存时出现（文本 → EPUB，
+  漫画页 → CBZ），与导出接口的 409 语义一致。
+- 验证：OPDS 单测（Atom 时间/游标/转义/相对封面）+ 路由冒烟（401 challenge、Basic 成功、
+  nav/书单元数据、分页 next、EPUB 下载 ZIP 魔数）。
+- 后续可选：OPDS 搜索（OpenSearch）、按系列/标签的导航分组、分页 `start`/`up` 细化。
+- 依据：`server/src/routes/opds.rs`、`auth::auth_middleware` 的 `/opds` 分支；参考 calibre
+  的 OPDS 字段口径，只按公开规范独立实现。
 
 ---
 

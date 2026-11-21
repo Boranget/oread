@@ -1480,3 +1480,210 @@ async fn library_metadata_read_and_admin_write() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// OPDS 只接受 HTTP Basic；导航/书单/下载都走同一账号，且只列 `tier=collection`。
+#[tokio::test]
+async fn opds_requires_basic_and_exposes_collection() {
+    use base64::Engine as _;
+
+    fn basic_get(uri: &str, user: &str, pass: &str) -> Request<Body> {
+        let raw = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Basic {raw}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    let dir = temp_dir("opds");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let _ = register(&app, "opdsuser").await;
+
+    // 未带凭据：401 且必须给 WWW-Authenticate，否则阅读器不会弹账号框。
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/opds").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .contains("Basic"));
+
+    // 错口令：同样 401，不区分用户不存在/口令错误。
+    let resp = app
+        .clone()
+        .oneshot(basic_get("/opds", "opdsuser", "wrong-pass"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 正确口令：导航 feed。
+    let resp = app
+        .clone()
+        .oneshot(basic_get("/opds", "opdsuser", "secret123"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("kind=navigation"));
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let nav = String::from_utf8(body.to_vec()).unwrap();
+    assert!(nav.contains("/opds/books?kind=all"), "{nav}");
+    assert!(nav.contains("全部馆藏"), "{nav}");
+
+    // 两本馆藏 + 一本临时缓存；临时书不得出现在 OPDS 目录。
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, author, origin, tier, collected_at, \
+         last_accessed_at, language, publisher, pubdate, series_name, series_index) \
+         VALUES ('https://o.test/text', '文字 & 书', '作者：张三', 'https://src.test', \
+         'collection', 10, 100, 'zh', '出版社', '2024-01-02', '系列', 2.0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, tier, collected_at, last_accessed_at) \
+         VALUES ('https://o.test/comic', '漫画书', 'collection', 20, 200)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, tier, last_accessed_at) \
+         VALUES ('https://o.test/temp', '临时书', 'temp', 300)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+         VALUES ('https://o.test/text', 'https://o.test/text/1', '第一章', 0, 0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_content (url, origin, book_url, content, size_bytes) \
+         VALUES ('https://o.test/text/1', 'src', 'https://o.test/text', '正文', 6)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
+         VALUES ('https://o.test/comic', 'https://o.test/comic/1', '第一话', 0, 0)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
+         VALUES ('https://o.test/comic/1', 'src', 'https://o.test/comic', 'image', \
+         '{\"images\":[{\"url\":\"https://o.test/p1\"}]}', 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
+         VALUES ('https://o.test/p1', 'src', 'https://o.test/comic', 'image/jpeg', X'FFD8FF', 3)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO library_tags (book_url, tag) VALUES ('https://o.test/text', '科幻')")
+        .execute(&library)
+        .await
+        .unwrap();
+
+    // 第一页 limit=1：最近阅读的漫画在前，且给出 next 游标。
+    let resp = app
+        .clone()
+        .oneshot(basic_get(
+            "/opds/books?kind=all&limit=1",
+            "opdsuser",
+            "secret123",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("kind=acquisition"));
+    let first = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(first.contains("漫画书"), "{first}");
+    assert!(!first.contains("临时书"), "临时缓存不得进 OPDS: {first}");
+    assert!(first.contains("rel=\"next\""), "{first}");
+    assert!(first.contains("/opds/download/cbz?book_url="), "{first}");
+    assert!(!first.contains("/opds/download/epub"), "{first}");
+
+    // 文字书：IP 元数据、标签、EPUB acquisition 都要出现。
+    let resp = app
+        .clone()
+        .oneshot(basic_get("/opds/books?kind=text", "opdsuser", "secret123"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("<title>文字 &amp; 书</title>"), "{text}");
+    assert!(
+        text.contains("<author><name>张三</name></author>"),
+        "{text}"
+    );
+    assert!(text.contains("<dc:language>zh</dc:language>"), "{text}");
+    assert!(
+        text.contains("<dc:publisher>出版社</dc:publisher>"),
+        "{text}"
+    );
+    assert!(text.contains("<dc:issued>2024-01-02</dc:issued>"), "{text}");
+    assert!(
+        text.contains("<category term=\"series:系列\" label=\"系列 #2\"/>"),
+        "{text}"
+    );
+    assert!(text.contains("<category term=\"科幻\""), "{text}");
+    assert!(
+        text.contains("/opds/download/epub?book_url=https%3A%2F%2Fo.test%2Ftext"),
+        "{text}"
+    );
+
+    // 下载复用导出管线：Basic 通过后返回真正的 EPUB。
+    let resp = app
+        .clone()
+        .oneshot(basic_get(
+            "/opds/download/epub?book_url=https%3A%2F%2Fo.test%2Ftext",
+            "opdsuser",
+            "secret123",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/epub+zip");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"PK\x03\x04"), "EPUB 必须是 ZIP");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
