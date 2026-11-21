@@ -61,6 +61,8 @@ struct OldContent {
 struct OldImage {
     mime: String,
     data: Vec<u8>,
+    width: Option<i64>,
+    height: Option<i64>,
 }
 
 pub async fn migrate_from_db(pool: &SqlitePool, store: &Store) -> anyhow::Result<MigrateReport> {
@@ -258,24 +260,82 @@ async fn migrate_comic(
     chapters: &[OldChapter],
     report: &mut MigrateReport,
 ) -> anyhow::Result<()> {
+    use super::comic::{ComicChapter, ComicMeta, ComicPage};
+
     let dir = store.dir_for(tier, &book.book_url);
     std::fs::create_dir_all(&dir)?;
+
+    let title = book.name.as_deref().unwrap_or(&book.book_url);
+    let mut meta = ComicMeta::new(&book.book_url, title);
+    meta.author = book.author.clone();
+    meta.language = book.language.clone();
+    meta.publisher = book.publisher.clone();
+    meta.pubdate = book.pubdate.clone();
+    meta.description = book.intro.clone();
+    meta.series = book.series_name.clone();
+    meta.series_index = book.series_index;
+    meta.subjects =
+        sqlx::query_scalar("SELECT tag FROM library_tags WHERE book_url = ?1 ORDER BY tag")
+            .bind(&book.book_url)
+            .fetch_all(pool)
+            .await?;
+
     let mut page_count = 0u32;
     for (ci, ch) in chapters.iter().enumerate() {
-        let Some(content) = load_content(pool, &ch.url, &book.book_url).await? else {
-            continue;
+        let no = ci + 1;
+        let is_volume = ch.is_volume != 0;
+        let title = ch
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| format!("第 {no} 章"));
+        let mut chapter = ComicChapter {
+            id: if is_volume {
+                format!("vol-{no:04}")
+            } else {
+                format!("ch-{no:04}")
+            },
+            title,
+            url: Some(ch.url.clone()),
+            is_volume,
+            pages: Vec::new(),
         };
-        let urls = image_urls(content.images.as_deref());
-        for (pi, url) in urls.iter().enumerate() {
-            let Some(img) = load_image(pool, url, &book.book_url).await? else {
-                continue;
-            };
-            let name = format!("{:04}-{:03}.{}", ci + 1, pi + 1, ext_for_mime(&img.mime));
-            super::atomic_write(&dir.join(&name), &img.data).await?;
-            page_count += 1;
-            report.images += 1;
+        // 分卷标题没有图片；未缓存的章节也保留空页列表，保证目录顺序与阅读进度不错位。
+        if !is_volume {
+            if let Some(content) = load_content(pool, &ch.url, &book.book_url).await? {
+                let urls = image_urls(content.images.as_deref());
+                for (pi, url) in urls.iter().enumerate() {
+                    let Some(img) = load_image(pool, url, &book.book_url).await? else {
+                        continue;
+                    };
+                    let name = format!("{no:04}-{:03}.{}", pi + 1, ext_for_mime(&img.mime));
+                    let path = dir.join(&name);
+                    super::atomic_write(&path, &img.data).await?;
+                    // 旧库可能没存宽高：迁移时顺手读一次图片头，KPW3 切片与一屏一页都要用。
+                    let width = img.width.and_then(|v| u32::try_from(v).ok());
+                    let height = img.height.and_then(|v| u32::try_from(v).ok());
+                    let dims = match (width, height) {
+                        (Some(w), Some(h)) => Some((w, h)),
+                        _ => super::comic::page_dims(&path),
+                    };
+                    chapter.pages.push(ComicPage {
+                        href: name,
+                        mime: img.mime.clone(),
+                        width: dims.map(|(w, _)| w).or(width),
+                        height: dims.map(|(_, h)| h).or(height),
+                        bytes: Some(img.data.len() as u64),
+                        source_url: Some(url.clone()),
+                    });
+                    page_count += 1;
+                    report.images += 1;
+                }
+            }
         }
+        meta.chapters.push(chapter);
     }
+
+    meta.bump();
+    super::comic::write_meta(&dir, &meta).await?;
     let comic_info = comic_info_xml(book, page_count);
     super::atomic_write(&dir.join("ComicInfo.xml"), comic_info.as_bytes()).await?;
     Ok(())
@@ -306,7 +366,7 @@ async fn load_image(
     book_url: &str,
 ) -> anyhow::Result<Option<OldImage>> {
     Ok(sqlx::query_as(
-        "SELECT mime, data FROM library_images \
+        "SELECT mime, data, width, height FROM library_images \
          WHERE url = ?1 AND book_url = ?2 LIMIT 1",
     )
     .bind(url)
@@ -427,11 +487,10 @@ pub fn verify_tree(store: &Store, report: &mut MigrateReport) {
                 continue;
             }
             let epub = path.join("OEBPS/content.opf");
-            let comic = path.join("ComicInfo.xml");
-            if !epub.is_file() && !comic.is_file() {
+            if !epub.is_file() && !super::comic::is_comic_dir(&path) {
                 report.fail(
                     path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
-                    "目录里既没有 OEBPS/content.opf 也没有 ComicInfo.xml",
+                    "目录里既没有 OEBPS/content.opf 也没有漫画元数据",
                 );
             }
         }
@@ -440,7 +499,7 @@ pub fn verify_tree(store: &Store, report: &mut MigrateReport) {
 
 /// 只给测试与 doctor 用：判断某个目录是否是漫画目录。
 pub fn is_comic_dir(dir: &Path) -> bool {
-    dir.join("ComicInfo.xml").is_file()
+    super::comic::is_comic_dir(dir)
 }
 
 #[cfg(test)]

@@ -9,6 +9,21 @@ pub(super) async fn ensure_chapters(
     source_url: &str,
     book_url: &str,
 ) -> AppResult<(BookSource, Vec<BookChapter>)> {
+    // 目录即书的漫画：章节来自 oread.json，书源不存在也能读。
+    if let Ok(Some(opened)) = s.store().open_comic(book_url).await {
+        let chapters = crate::ebook_source::comic_book_chapters(book_url, &opened.meta);
+        if !chapters.is_empty() {
+            let source = load_source(&s.shared, source_url)
+                .await
+                .unwrap_or_else(|_| BookSource {
+                    book_source_url: source_url.to_string(),
+                    book_source_name: "馆藏漫画".into(),
+                    book_source_type: 2,
+                    ..Default::default()
+                });
+            return Ok((source, chapters));
+        }
+    }
     let source = load_source(&s.shared, source_url).await?;
     if let Some(chaps) = load_cached_chapters(&s.library, book_url, s.cfg.toc_ttl_secs).await? {
         return Ok((source, chaps));

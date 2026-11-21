@@ -2105,7 +2105,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 ### 6.11 导出（TXT / CBZ / EPUB）
 
 > 三个格式共用同一个只读馆藏视图与临时文件回传通道；差异只在 writer。
-> TXT / EPUB 读正文，CBZ 读 `library_images` 里的已落盘图片。全部**不联网抓取**。
+> TXT / EPUB 读正文，CBZ 读已落盘图片（书目录优先，未迁移时回退 `library_images`）。全部**不联网抓取**。
 
 #### 6.11.1 `GET /api/book/export/txt`
 
@@ -2618,7 +2618,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 临时缓存 TTL：默认 30 天（`LIBRARY_TEMP_TTL_DAYS`），每小时后台回收一次；馆藏永久保存，不自动淘汰。
 - 漫画图片：只有馆藏漫画由 worker 把图片原始字节写进 `library_images`（BLOB，按 `(url, origin)` 去重），单张超过 2 MiB 只保留清单不落盘；临时层仍走进程内 LRU。图片与正文一起参与整本删除 / TTL 回收 / `cache_clear`。
 - 断点续跑：图片章节的 `images_ready=1` 才算已缓存（`content` 对漫画是空串，不能只看 `content IS NOT NULL`）；`upsert_content` 后清单保留，失败的图片下次续跑补齐。
-- 读取：图片代理优先读 `library_images` 命中回填进程内 LRU；命中时不需要回源，源站 DNS 故障也能离线读已入馆漫画。墨水屏灰度 / WebP 转码变体仍运行时生成，不落盘。
+- 读取：图片代理优先读书目录（`oread-img://<sha256(book_url)>/<文件名>`），再读 `library_images`，命中都回填进程内 LRU；命中时不需要回源，源站 DNS 故障也能离线读已入馆漫画。墨水屏灰度 / WebP 转码变体仍运行时生成，不落盘。
+- 目录即书的漫画读路径：`GET /api/comic/source`、`GET /api/book/toc`、`GET /api/comic/chapter` 命中书目录后不再要求书源；章节图片返回 `oread-img://` 本地地址，响应带 `local=true`。`/api/book/image` 与 `POST /api/book/images/meta` 识别该 scheme 后直读文件，`source` 参数可省略。
 
 ### 6.13 OPDS 1.2 目录（`/opds*`）
 

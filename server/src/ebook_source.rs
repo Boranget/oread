@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
-use crate::entities::BookContent;
+use crate::entities::{BookChapter, BookContent};
 use crate::error::{AppError, AppResult};
-use crate::library_store::{read as store_read, Store};
+use crate::library_store::{comic, read as store_read, Store};
 
 use boranlib_ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef, ComicInput, PageData};
 use boranlib_ebook::pipeline::ChapterReader;
@@ -18,6 +18,65 @@ use boranlib_ebook::pipeline::ChapterReader;
 /// 目录里没有书源 URL 的章节（管理员新建等）用稳定合成 URL，保证阅读进度与搜索可引用。
 pub fn local_chapter_url(book_url: &str, id: &str) -> String {
     format!("local:{book_url}#{id}")
+}
+
+/// 从合成 URL 取回章节 id；不是本书的合成 URL 返回 `None`。
+pub fn local_chapter_id<'a>(book_url: &str, url: &'a str) -> Option<&'a str> {
+    url.trim()
+        .strip_prefix("local:")?
+        .strip_prefix(book_url.trim())?
+        .strip_prefix('#')
+        .filter(|id| !id.is_empty())
+}
+
+/// 目录书的章节列表：文字书读 OPF spine，漫画读书目录边车。
+///
+/// 返回 `None` 表示没有可用的书目录（调用方回退旧 `library.db`）；返回空列表
+/// 表示目录存在但确实没有章节，调用方不应再回源抓取。
+pub async fn load_dir_toc(store: &Store, book_url: &str) -> AppResult<Option<Vec<BookChapter>>> {
+    if let Some(book) = store.open_book(book_url).await? {
+        return Ok(Some(
+            book.meta
+                .chapters
+                .iter()
+                .enumerate()
+                .map(|(i, c)| BookChapter {
+                    url: c
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| local_chapter_url(book_url, &c.id)),
+                    title: Some(c.title.clone()),
+                    is_volume: c.is_volume,
+                    book_url: Some(book_url.to_string()),
+                    index: i as i64,
+                    ..Default::default()
+                })
+                .collect(),
+        ));
+    }
+    if let Some(book) = store.open_comic(book_url).await? {
+        return Ok(Some(comic_book_chapters(book_url, &book.meta)));
+    }
+    Ok(None)
+}
+
+/// 漫画边车 → 与 `/api/book/toc` 一致的章节行。
+pub fn comic_book_chapters(book_url: &str, meta: &comic::ComicMeta) -> Vec<BookChapter> {
+    meta.chapters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| BookChapter {
+            url: c
+                .url
+                .clone()
+                .unwrap_or_else(|| local_chapter_url(book_url, &c.id)),
+            title: Some(c.title.clone()),
+            is_volume: c.is_volume,
+            book_url: Some(book_url.to_string()),
+            index: i as i64,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// 一次取齐书目与目录，组装成导出输入。正文按章懒读（见 [`LibraryReader`]）。
@@ -299,7 +358,7 @@ pub async fn load_dir_content(
     };
     let Some((pos, item)) = opened
         .meta
-        .chapter_index_by_url(chapter_url)
+        .chapter_index_by_ref(book_url, chapter_url)
         .map(|i| (i, &opened.meta.chapters[i]))
     else {
         return Ok(None);

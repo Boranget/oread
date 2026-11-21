@@ -18,6 +18,7 @@
 //! - 同一本书的保存串行化（[`lock_book`]）；
 //! - 先写正文/图片，最后写 `content.opf`，任何时刻目录都是一本合法的书。
 
+pub mod comic;
 pub mod migrate;
 pub mod opf;
 pub mod read;
@@ -91,8 +92,17 @@ impl Store {
 
     /// 先找馆藏、再找临时区。返回实际层（层是路径事实，不是字段）。
     pub fn find(&self, book_url: &str) -> Option<(Tier, PathBuf)> {
+        self.find_by_id(&Self::book_id(book_url))
+    }
+
+    /// 按目录名（sha256 十六进制）查找。本地图片 URL 只带目录名，不带书源 URL。
+    pub fn find_by_id(&self, id: &str) -> Option<(Tier, PathBuf)> {
+        let id = id.trim();
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         for tier in [Tier::Collection, Tier::Temp] {
-            let dir = self.dir_for(tier, book_url);
+            let dir = self.root.join(tier.as_str()).join(id);
             if dir.is_dir() {
                 return Some((tier, dir));
             }

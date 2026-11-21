@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use boranlib_ebook::html::{to_blocks, Block};
 use boranlib_ebook::xml::xml_escape;
 
-use super::{is_pending_html, ChapterItem, OpfMeta, Store, Tier};
+use super::{comic, is_pending_html, ChapterItem, OpfMeta, Store, Tier};
 
 /// 一本已经打开的书：目录路径 + 解析后的 OPF。
 #[derive(Debug, Clone)]
@@ -17,6 +17,14 @@ pub struct OpenedBook {
     pub tier: Tier,
     pub dir: PathBuf,
     pub meta: OpfMeta,
+}
+
+/// 一本已经打开的漫画：目录路径 + `oread.json`（或反推出来的）目录语义。
+#[derive(Debug, Clone)]
+pub struct OpenedComic {
+    pub tier: Tier,
+    pub dir: PathBuf,
+    pub meta: comic::ComicMeta,
 }
 
 impl Store {
@@ -31,6 +39,33 @@ impl Store {
         let meta = self.read_opf(&dir).await?;
         Ok(Some(OpenedBook { tier, dir, meta }))
     }
+
+    /// 打开一本漫画目录；不是漫画（没有 ComicInfo.xml / oread.json）时返回 `None`。
+    pub async fn open_comic(&self, book_url: &str) -> io::Result<Option<OpenedComic>> {
+        let Some((tier, dir)) = self.find(book_url) else {
+            return Ok(None);
+        };
+        if !comic::is_comic_dir(&dir) {
+            return Ok(None);
+        }
+        let meta = comic::read_meta(&dir, book_url).await?;
+        Ok(Some(OpenedComic { tier, dir, meta }))
+    }
+}
+
+impl OpenedComic {
+    /// 按书源章节 URL 或本地合成 URL（`local:<book>#<id>`）找章节。
+    pub fn chapter_by_ref(
+        &self,
+        book_url: &str,
+        chapter_url: &str,
+    ) -> Option<&comic::ComicChapter> {
+        let chapter_url = chapter_url.trim();
+        self.meta.chapter_by_url(chapter_url).or_else(|| {
+            let id = crate::ebook_source::local_chapter_id(book_url, chapter_url)?;
+            self.meta.chapter_by_id(id)
+        })
+    }
 }
 
 impl OpfMeta {
@@ -44,6 +79,18 @@ impl OpfMeta {
 
     pub fn chapter_by_url(&self, url: &str) -> Option<&ChapterItem> {
         self.chapter_index_by_url(url).map(|i| &self.chapters[i])
+    }
+
+    pub fn chapter_index_by_id(&self, id: &str) -> Option<usize> {
+        self.chapters.iter().position(|c| c.id == id)
+    }
+
+    /// 按书源 URL 或本地合成 URL（`local:<book>#<id>`）定位章节。
+    pub fn chapter_index_by_ref(&self, book_url: &str, url: &str) -> Option<usize> {
+        self.chapter_index_by_url(url).or_else(|| {
+            let id = crate::ebook_source::local_chapter_id(book_url, url)?;
+            self.chapter_index_by_id(id)
+        })
     }
 }
 

@@ -127,7 +127,7 @@ GET /opds/books?kind=text
 GET /opds/download/epub
  → export::epub_download → ebook 管线 → 临时文件 → 16 KiB 流式回传 → 读完即删
 GET /opds/cover
- → library_books.cover_url → image 代理（书源 Referer/UA/Cookie、本地 BLOB、墨水屏转码）
+ → library_books.cover_url → image 代理（书源 Referer/UA/Cookie、本地目录/BLOB、墨水屏转码）
 ```
 
 OPDS 与网页端共用同一套导出 writer 和图片代理，不复制第二份文件/图片逻辑；也可直接用
@@ -136,15 +136,17 @@ Bearer 访问 `/opds*`，便于调试。
 ## 4. 数据与缓存
 
 > **存储正在迁移中**：目标形态是「每本书一个解压目录 + 可重建索引」，见 §4.1。
-> `boranlib migrate-store` 把旧库导出成目录；**文字书的读路径已优先走目录**
-> （阅读、书内搜索、TXT/EPUB 导出），未迁移或目录缺失时回退 `library.db`。
-> 写路径与漫画读路径仍走旧表，后续切换。
+> `boranlib migrate-store` 把旧库导出成目录；**文字书与漫画的读路径都已优先走目录**
+> （阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 漫画页、图片代理），未迁移或目录缺失时
+> 回退 `library.db`。写路径仍走旧表，后续切换。
 
 ### 4.1 目标存储：目录即书
 
 - `data_dir/library/{collection,temp,trash}/<sha256(book_url)>/`
   - 文字书：解压后的 EPUB 3（`mimetype` + `META-INF/container.xml` + `OEBPS/`）。
-  - 漫画：解压后的 CBZ（扁平图片 + `ComicInfo.xml`）。
+  - 漫画：解压后的 CBZ（扁平图片 + 标准 `ComicInfo.xml` + 目录边车 `oread.json`）。
+    `oread.json` 只保存章节标题/章节 URL/卷标记/页范围与图片尺寸，不复制图片字节；
+    缺失时按 `NNNN-MMM.ext` 文件名前缀反推章节，手工放入的 CBZ 也能直接读。
 - **`content.opf` 是元数据权威**；`index.db` 只存可重建的派生字段，靠 `oread:revision` 判脏自愈。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
@@ -154,6 +156,11 @@ Bearer 访问 `/opds*`，便于调试。
 - 读路径：`Store::open_book` 解析 OPF，按 `oread:chapter-url` 定位章节文件；`<body>` 还原成
   段落 HTML（去掉与 OPF 重复的首行标题）。未抓取的章节写成带 `oread-pending` 标记的占位文件，
   读路径见到标记按“未缓存”处理，不会被当成正文返回或计入完成度。
+- 漫画读路径：`Store::open_comic` 解析 `oread.json`（或反推 CBZ），页地址统一为
+  `oread-img://<sha256(book_url)>/<文件名>`。`/api/comic/chapter` 直接返回这些本地地址，
+  `/api/book/image` 在解析书源之前先识别该 scheme 并直读目录文件，因此**没有书源、源站
+  下线也能读已入馆漫画**；`/api/book/images/meta`、`/k` 漫画页与 `/api/book/toc` 同样目录优先。
+  图片代理的 WebP→灰度 JPEG、长条切片与 ETag 逻辑与数据库图片完全共用。
 
 ### 4.2 现状（迁移前）
 

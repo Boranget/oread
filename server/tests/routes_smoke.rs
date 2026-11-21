@@ -1281,6 +1281,115 @@ async fn comic_cbz_export_info_and_download() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 目录即书：漫画目录命中后，source/toc/chapter/图片代理/meta 全走本地，不需要书源。
+#[tokio::test]
+async fn comic_reads_from_local_dir_without_source() {
+    use boranlib::library_store::{comic, Store, Tier};
+
+    let dir = temp_dir("comic-dir-read");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let user = register(&app, "comicdir").await;
+
+    let book_url = "https://local.test/comic";
+    let store = Store::new(&dir);
+    store.create_layout().unwrap();
+    let book_dir = store.dir_for(Tier::Temp, book_url);
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::write(book_dir.join("0001-001.jpg"), b"one").unwrap();
+    let mut meta = comic::ComicMeta::new(book_url, "本地漫画");
+    meta.author = Some("作者".into());
+    meta.chapters.push(comic::ComicChapter {
+        id: "ch-0001".into(),
+        title: "第一话".into(),
+        url: None,
+        is_volume: false,
+        pages: vec![comic::ComicPage {
+            href: "0001-001.jpg".into(),
+            mime: "image/jpeg".into(),
+            width: Some(100),
+            height: Some(200),
+            bytes: Some(3),
+            source_url: None,
+        }],
+    });
+    comic::write_meta(&book_dir, &meta).await.unwrap();
+    let encoded = "https%3A%2F%2Flocal.test%2Fcomic";
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/comic/source?book_url={encoded}"),
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["comic"], true);
+    assert_eq!(v["local"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/book/toc?source=&book_url={encoded}"),
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let toc = body_json(resp).await;
+    assert_eq!(toc.as_array().unwrap().len(), 1);
+    assert_eq!(toc[0]["title"], "第一话");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/comic/chapter?book_url={encoded}&index=1"),
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let chapter = body_json(resp).await;
+    assert_eq!(chapter["local"], true);
+    assert_eq!(chapter["chapter_title"], "第一话");
+    assert_eq!(chapter["count"], 1);
+    let local_url = chapter["images"][0]["url"].as_str().unwrap().to_string();
+    assert!(local_url.starts_with("oread-img://"), "{local_url}");
+
+    // 图片代理直读目录文件：不需要 source，也不需要回源。
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/book/image?url={local_url}"),
+            &user,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/jpeg");
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert_eq!(&bytes[..], b"one");
+
+    // 批量 meta 同样支持本地 URL。
+    let body = format!(r#"{{"urls":["{local_url}"]}}"#);
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/book/images/meta", &body, &user))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let meta = body_json(resp).await;
+    assert_eq!(meta["count"], 1);
+    assert_eq!(meta["items"][0]["ok"], true);
+    assert_eq!(meta["items"][0]["bytes"], 3);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// EPUB 导出：info 报正文章节，epub 返回 ZIP；漫画书用 409 明确拒绝。
 #[tokio::test]
 async fn epub_export_info_and_download() {

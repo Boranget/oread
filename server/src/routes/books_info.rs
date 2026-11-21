@@ -93,43 +93,70 @@ pub(super) async fn toc(
     Query(q): Query<BookQ>,
 ) -> AppResult<Json<Vec<BookChapter>>> {
     let use_replace = resolve_use_replace(q.use_replace.as_deref(), &db.0).await;
-    let mut chapters = if let Some(chaps) =
-        load_cached_chapters(&s.library, &q.book_url, s.cfg.toc_ttl_secs).await?
-    {
-        // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
-        // 不必等缓存过期重抓。
-        let _ = sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64).await;
-        chaps
-    } else {
-        match fetch_toc(&s, &db, &q).await {
-            Ok(chapters) => {
-                save_chapters(&s.library, &q.book_url, &chapters).await?;
-                // 目录落库时同步总章节数，供进度百分比与书架完成度使用
-                sync_total_chapter_num(&s.library, &db.0, &q.book_url, chapters.len() as i64)
-                    .await?;
-                // 记录目录总数变化（首次建基线不出角标）
-                crate::routes::bookshelf::record_toc_delta(
-                    &db.0,
-                    &q.book_url,
-                    chapters.len() as i64,
-                )
-                .await;
-                // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-                let _ = backfill_word_counts(&s.library, &q.book_url).await;
-                chapters
-            }
-            // 回源失败：库里还有旧目录就先返回，避免书源失效后整本书打不开。
-            Err(e) => match super::books_store::load_any_chapters(&s.library, &q.book_url).await? {
-                Some(chaps) => {
-                    tracing::warn!(
-                        book = %q.book_url,
-                        error = %e,
-                        "toc fetch failed; serving cached toc"
-                    );
-                    chaps
+    // 目录即书：书目录里的 spine/边车就是权威目录，命中后不再看缓存表、也不回源。
+    let dir_chapters = match crate::ebook_source::load_dir_toc(&s.store(), &q.book_url).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(book = %q.book_url, error = %err, "read toc from dir failed");
+            None
+        }
+    };
+    let mut chapters = match dir_chapters {
+        Some(chaps) => {
+            // 目录书是权威：顺手把总章节数回写，供书架进度百分比使用。
+            let _ =
+                sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64).await;
+            chaps
+        }
+        None => {
+            if let Some(chaps) =
+                load_cached_chapters(&s.library, &q.book_url, s.cfg.toc_ttl_secs).await?
+            {
+                // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
+                // 不必等缓存过期重抓。
+                let _ = sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64)
+                    .await;
+                chaps
+            } else {
+                match fetch_toc(&s, &db, &q).await {
+                    Ok(chapters) => {
+                        save_chapters(&s.library, &q.book_url, &chapters).await?;
+                        // 目录落库时同步总章节数，供进度百分比与书架完成度使用
+                        sync_total_chapter_num(
+                            &s.library,
+                            &db.0,
+                            &q.book_url,
+                            chapters.len() as i64,
+                        )
+                        .await?;
+                        // 记录目录总数变化（首次建基线不出角标）
+                        crate::routes::bookshelf::record_toc_delta(
+                            &db.0,
+                            &q.book_url,
+                            chapters.len() as i64,
+                        )
+                        .await;
+                        // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
+                        let _ = backfill_word_counts(&s.library, &q.book_url).await;
+                        chapters
+                    }
+                    // 回源失败：库里还有旧目录就先返回，避免书源失效后整本书打不开。
+                    Err(e) => {
+                        match super::books_store::load_any_chapters(&s.library, &q.book_url).await?
+                        {
+                            Some(chaps) => {
+                                tracing::warn!(
+                                    book = %q.book_url,
+                                    error = %e,
+                                    "toc fetch failed; serving cached toc"
+                                );
+                                chaps
+                            }
+                            None => return Err(e),
+                        }
+                    }
                 }
-                None => return Err(e),
-            },
+            }
         }
     };
     if use_replace && !chapters.is_empty() {

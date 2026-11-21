@@ -162,6 +162,25 @@ pub(super) async fn load_comic_images(
     chapter: &BookChapter,
     book_url: &str,
 ) -> Result<Vec<BookImage>, String> {
+    // 目录即书：漫画目录命中后，图片地址全部指向本地文件。
+    if let Ok(Some(opened)) = s.store().open_comic(book_url).await {
+        if let Some(ch) = opened.chapter_by_ref(book_url, &chapter.url) {
+            let book_id = crate::library_store::Store::book_id(book_url);
+            return Ok(ch
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(i, page)| BookImage {
+                    index: i as i64 + 1,
+                    url: crate::library_store::comic::local_image_url(&book_id, &page.href),
+                    width: page.width,
+                    height: page.height,
+                    bytes: page.bytes,
+                    priority: Some(if i < 3 { "high" } else { "normal" }.into()),
+                })
+                .collect());
+        }
+    }
     if let Ok(Some(c)) = crate::routes::comic::load_cached_images(
         &s.library,
         &chapter.url,

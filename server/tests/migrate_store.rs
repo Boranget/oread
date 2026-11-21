@@ -232,6 +232,48 @@ async fn migrates_comic_into_flat_cbz_dir() {
     assert!(info.contains("<PageCount>2</PageCount>"));
     assert!(info.contains("<Title>漫画</Title>"));
 
+    // 目录边车：章节标题/URL/页范围都保留，读路径不依赖旧库。
+    let opened = store
+        .open_comic("https://s/comic/1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened.meta.title, "漫画");
+    assert_eq!(opened.meta.author.as_deref(), Some("漫画家"));
+    assert_eq!(opened.meta.chapters.len(), 1);
+    let ch = &opened.meta.chapters[0];
+    assert_eq!(ch.title, "第1话");
+    assert_eq!(ch.url.as_deref(), Some("https://s/comic/1/1"));
+    assert_eq!(ch.pages.len(), 2);
+    assert_eq!(ch.pages[0].href, "0001-001.jpg");
+    assert_eq!(ch.pages[0].mime, "image/jpeg");
+    assert_eq!(ch.pages[1].href, "0001-002.png");
+    assert_eq!(
+        boranlib::library_store::comic::read_page(&book, &ch.pages[0].href)
+            .await
+            .unwrap()
+            .unwrap(),
+        vec![1u8, 2, 3, 4]
+    );
+
+    let local = boranlib::library_store::comic::local_image_url(
+        &Store::book_id("https://s/comic/1"),
+        &ch.pages[0].href,
+    );
+    let (id, href) = boranlib::library_store::comic::parse_local_image_url(&local).unwrap();
+    assert_eq!(id, Store::book_id("https://s/comic/1"));
+    assert_eq!(href, "0001-001.jpg");
+    assert!(store.find_by_id(id).is_some());
+
+    // 目录优先的 TOC：漫画章节从边车来，不再查 library_chapters。
+    let toc = boranlib::ebook_source::load_dir_toc(&store, "https://s/comic/1")
+        .await
+        .unwrap()
+        .expect("漫画目录应提供 TOC");
+    assert_eq!(toc.len(), 1);
+    assert_eq!(toc[0].title.as_deref(), Some("第1话"));
+    assert_eq!(toc[0].url, "https://s/comic/1/1");
+
     pool.close().await;
     std::fs::remove_dir_all(dir).ok();
 }

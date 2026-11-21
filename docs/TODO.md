@@ -128,7 +128,7 @@
 - 还差：
   - 阅读器保留并渲染正文 HTML 中的 `<img>`（当前 `htmlToParas` 直接丢弃，见 3.8）；
   - 漫画阅读布局：单页/连续滚动、缩放、预加载；
-  - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`），入馆前有体积预估；待真机复测；
+  - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`）；迁移后的目录书直接读 CBZ 文件（`oread-img://`），入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
   - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.3 与 TODO 2.9。
 - 依据：[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
@@ -147,8 +147,11 @@
 - 已完成：
   - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；`BookInput` 区分总章节与文本章节，漫画章不计入 TXT/EPUB 完成度；
   - `source`：只读馆藏组装书视图（目录缺失 → 409）；文字书优先读目录 OPF/章节文件，
-    目录缺失时回退 `library.db`。`LibraryReader` 有目录时按章读 XHTML，否则按章读
-    `library_content`、按页读 `library_images`；占位章与空白正文都视为未缓存；
+    漫画优先读 CBZ 目录 + `oread.json` 边车，目录缺失时回退 `library.db`。`LibraryReader`
+    有目录时按章读 XHTML，否则按章读 `library_content`、按页读 `library_images`；
+    占位章与空白正文都视为未缓存；
+  - 漫画读路径：`/api/book/toc`、`/api/comic/{source,chapter}`、`/k` 漫画页与图片代理都目录优先；
+    页地址为 `oread-img://<sha256(book_url)>/<文件名>`，无书源也能读已入馆漫画；
   - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
   - `html`：正文 HTML → 语义块（标题层级、块级段落、`br`/换行断段；丢弃脚本、样式、图片与音视频）；
   - `xml`：ComicInfo 与 OPF/XHTML 共用的最小 XML 转义；

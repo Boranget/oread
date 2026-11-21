@@ -1,6 +1,7 @@
 //! 图片代理的 proxy 部分（move-only 从 image.rs 拆出）。
 
 use super::*;
+use crate::library_store::comic;
 
 /// 按魔数嗅探解码后的图片类型（加密源上游常返回 application/octet-stream）。
 pub(crate) fn sniff_image_mime(bytes: &[u8]) -> &'static str {
@@ -240,6 +241,59 @@ async fn proxy_stored(
     serve_bytes(data, &ct_base, &orig_etag, true, headers)
 }
 
+/// 本地漫画页：`oread-img://<书目录名>/<文件>`。
+///
+/// 完全不走网络，也不需要书源；后面复用 [`proxy_stored`] 的缓存/切片/灰度逻辑，
+/// 因此 KPW3 的 WebP 转码、长条切片与 ETag 行为和数据库图片一致。
+async fn proxy_local(
+    s: &AppState,
+    q: &ImageQ,
+    headers: &HeaderMap,
+    book_id: &str,
+    href: &str,
+    max_bytes: usize,
+) -> Response {
+    let Some((_tier, dir)) = s.store().find_by_id(book_id) else {
+        return error_body(
+            StatusCode::NOT_FOUND,
+            "local_book_missing",
+            "本地书目录不存在",
+        );
+    };
+    let data = match comic::read_page(&dir, href).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return error_body(
+                StatusCode::NOT_FOUND,
+                "local_image_missing",
+                "本地图片不存在",
+            )
+        }
+        Err(e) => {
+            return error_body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "local_image_error",
+                &format!("读取本地图片失败: {e}"),
+            )
+        }
+    };
+    let mime = comic::page_mime(href);
+    let mime = if mime == "application/octet-stream" {
+        sniff_image_mime(&data).to_string()
+    } else {
+        mime.to_string()
+    };
+    // 本地目录没有书源规则，用空 BookSource 走同一套直出/转码路径。
+    let source = BookSource::default();
+    let stored = crate::library_images::StoredImage {
+        data,
+        mime,
+        width: None,
+        height: None,
+    };
+    proxy_stored(s, &source, q, headers, stored, max_bytes).await
+}
+
 pub(crate) async fn proxy(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -247,6 +301,10 @@ pub(crate) async fn proxy(
     Query(q): Query<ImageQ>,
 ) -> Response {
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
+    // 本地图片 URL 先处理：不需要书源，也不做 SSRF 预检。
+    if let Some((book_id, href)) = comic::parse_local_image_url(&q.url) {
+        return proxy_local(&s, &q, &headers, book_id, href, max_bytes).await;
+    }
     let source_id = q
         .source
         .as_deref()

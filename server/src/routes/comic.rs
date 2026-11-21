@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use crate::auth::{AuthUser, UserDb};
 use crate::entities::{BookChapter, BookContent, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
+use crate::library_store::{comic, Store};
 use crate::routes::books::{load_book_meta, save_content_cached};
 use crate::routes::image;
 use crate::routes::sources::load_source;
@@ -208,6 +209,21 @@ async fn source_type(
     db: UserDb,
     Query(q): Query<SourceQ>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // 目录即书：漫画目录存在时不需要书源也能进入漫画阅读器。
+    if let Some(book_url) = clean(q.book_url.as_deref()) {
+        if matches!(s.store().open_comic(book_url).await, Ok(Some(_))) {
+            return Ok(Json(json!({
+                "source": clean(q.source.as_deref()).unwrap_or(""),
+                "source_name": "馆藏漫画",
+                "type": 2,
+                "type_name": crate::entities::source_type_name(2),
+                "content_type": "image",
+                "comic": true,
+                "supported": true,
+                "local": true,
+            })));
+        }
+    }
     let id = resolve_source_id(
         &s.library,
         &db.0,
@@ -231,6 +247,12 @@ async fn chapter_images(
     let book_url = clean(q.book_url.as_deref())
         .ok_or_else(|| AppError::BadRequest("缺少 book_url".into()))?
         .to_string();
+    // 目录即书：漫画目录命中时直接返回本地图片 URL，不查缓存表、不回源。
+    if let Some(value) =
+        comic_chapter_from_dir(&s, &book_url, q.chapter_url.as_deref(), q.index).await?
+    {
+        return Ok(Json(value));
+    }
     let source_id = resolve_source_id(
         &s.library,
         &db.0,
@@ -330,6 +352,118 @@ async fn chapter_images(
         "cached": from_cache,
         "placeholder_suspected": placeholder_suspected,
         // 单图代理路径：前端按此拼 `?source=&url=&chapter_url=`
+        "image_proxy": "/api/book/image",
+    })))
+}
+
+/// 目录即书的漫画章节：从 `oread.json` 取页表，返回 `oread-img://` 本地 URL。
+/// 目录不存在/章节不在目录里返回 `None`，调用方继续走旧缓存与回源。
+async fn comic_chapter_from_dir(
+    s: &AppState,
+    book_url: &str,
+    chapter_url: Option<&str>,
+    index: Option<i64>,
+) -> AppResult<Option<serde_json::Value>> {
+    let opened = match s.store().open_comic(book_url).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            tracing::warn!(book_url, error = %err, "open comic dir failed; falling back");
+            return Ok(None);
+        }
+    };
+    let pos = match clean(chapter_url) {
+        Some(cu) => {
+            if cu.starts_with("volume:") {
+                return Err(AppError::BadRequest(
+                    "该条为分卷标题，请从目录选择章节".into(),
+                ));
+            }
+            let Some(pos) = opened.meta.chapters.iter().position(|c| {
+                c.url.as_deref().map(str::trim) == Some(cu)
+                    || crate::ebook_source::local_chapter_id(book_url, cu)
+                        .map(|id| id == c.id)
+                        .unwrap_or(false)
+            }) else {
+                return Ok(None);
+            };
+            pos
+        }
+        None => {
+            let idx = index.unwrap_or(1).max(1) - 1;
+            let Ok(idx) = usize::try_from(idx) else {
+                return Ok(None);
+            };
+            if idx >= opened.meta.chapters.len() {
+                return Ok(None);
+            }
+            idx
+        }
+    };
+    let chapter = &opened.meta.chapters[pos];
+    if chapter.is_volume {
+        return Err(AppError::BadRequest(
+            "该序号是分卷标题，请从目录选择章节".into(),
+        ));
+    }
+
+    let book_id = Store::book_id(book_url);
+    let mut images = Vec::with_capacity(chapter.pages.len());
+    for (i, page) in chapter.pages.iter().enumerate() {
+        let mut width = page.width.filter(|v| *v > 0);
+        let mut height = page.height.filter(|v| *v > 0);
+        // 边车缺尺寸时只读本地图片头补齐，切片预判与 KPW3 一屏一页都依赖它。
+        if width.is_none() || height.is_none() {
+            if let Some((w, h)) = comic::page_dims_async(opened.dir.join(&page.href)).await {
+                width = Some(w);
+                height = Some(h);
+            }
+        }
+        images.push(BookImage {
+            index: i as i64 + 1,
+            url: comic::local_image_url(&book_id, &page.href),
+            width,
+            height,
+            bytes: page.bytes,
+            priority: Some(if i < 3 { "high" } else { "normal" }.into()),
+        });
+    }
+
+    let slice_params = image::SliceParams::from_config(&s.cfg, None, None, None);
+    let images_out: Vec<serde_json::Value> = images
+        .iter()
+        .map(|im| {
+            let n = match (im.width, im.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 && s.cfg.comic_slice => {
+                    image::slice_count_window(w, h, &slice_params)
+                }
+                _ => 1,
+            };
+            let mut v = serde_json::to_value(im).unwrap_or_else(|_| json!({}));
+            v["slices"] = json!(if n > 1 { n } else { 0 });
+            v
+        })
+        .collect();
+    let chapter_ref = chapter
+        .url
+        .clone()
+        .unwrap_or_else(|| crate::ebook_source::local_chapter_url(book_url, &chapter.id));
+    Ok(Some(json!({
+        "book_url": book_url,
+        "source": "",
+        "source_name": "馆藏漫画",
+        "source_type": 2,
+        "chapter_url": chapter_ref,
+        "chapter_title": chapter.title,
+        "chapter_index": pos + 1,
+        "chapter_count": opened.meta.chapters.len(),
+        "content_type": "image",
+        "images": images_out,
+        "count": images.len(),
+        "truncated": false,
+        "cached": true,
+        "local": true,
+        "placeholder_suspected": false,
         "image_proxy": "/api/book/image",
     })))
 }

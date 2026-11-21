@@ -1,6 +1,7 @@
 //! 图片代理的 meta 部分（move-only 从 image.rs 拆出）。
 
 use super::*;
+use crate::library_store::comic;
 
 pub(super) fn err_item(url: &str, code: &str, message: &str) -> serde_json::Value {
     json!({
@@ -119,35 +120,48 @@ pub(crate) async fn fetch_image_meta(
     v
 }
 
+/// 本地漫画页的元数据：只读文件头与大小，不经过网络。
+async fn local_image_meta(s: &AppState, url: &str) -> serde_json::Value {
+    let Some((book_id, href)) = comic::parse_local_image_url(url) else {
+        return err_item(url, "invalid_url", "不是本地图片 URL");
+    };
+    let Some((_tier, dir)) = s.store().find_by_id(book_id) else {
+        return err_item(url, "local_book_missing", "本地书目录不存在");
+    };
+    let path = match crate::library_store::safe_join(&dir, href) {
+        Ok(v) => v,
+        Err(e) => return err_item(url, "invalid_url", &e.to_string()),
+    };
+    let bytes = match tokio::fs::metadata(&path).await {
+        Ok(m) if m.is_file() => Some(m.len()),
+        Ok(_) => None,
+        Err(_) => return err_item(url, "local_image_missing", "本地图片不存在"),
+    };
+    let dims = comic::page_dims_async(path).await;
+    let mut v = json!({
+        "url": url,
+        "ok": true,
+        "supported": true,
+        "content_type": comic::page_mime(href),
+        "bytes": bytes,
+    });
+    if let Some((w, h)) = dims {
+        v["width"] = json!(w);
+        v["height"] = json!(h);
+        let p = SliceParams::default();
+        let n = slice_count_window(w, h, &p);
+        v["slices"] = json!(if n > 1 { n } else { 0 });
+        v["slice_h"] = json!(slice_display_heights(w, h, &p));
+    }
+    v
+}
+
 /// `POST /api/book/images/meta`：一次返回整批图片的宽高/字节数，避免每图一次额外请求。
 pub(super) async fn images_meta(
     State(s): State<AppState>,
     _u: AuthUser,
     Json(req): Json<ImageMetaReq>,
 ) -> Response {
-    let source_id = req
-        .source
-        .as_deref()
-        .or(req.book_url.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(source_id) = source_id else {
-        return error_body(
-            StatusCode::BAD_REQUEST,
-            "missing_source",
-            "缺少 book_url（书源 id）",
-        );
-    };
-    let source = match load_source(&s.shared, source_id).await {
-        Ok(v) => v,
-        Err(_) => {
-            return error_body(
-                StatusCode::NOT_FOUND,
-                "source_not_found",
-                "书源不存在，无法确定 Referer/UA/Cookie",
-            )
-        }
-    };
     if req.urls.is_empty() {
         return Json(json!({"count": 0, "items": []})).into_response();
     }
@@ -158,19 +172,67 @@ pub(super) async fn images_meta(
             &format!("单批最多 {MAX_META_BATCH} 个 URL"),
         );
     }
-    let hdrs = source_referer(&source, req.chapter_url.as_deref(), req.book_url.as_deref());
+    let needs_remote = req
+        .urls
+        .iter()
+        .any(|u| comic::parse_local_image_url(u).is_none());
+    let source = if needs_remote {
+        let source_id = req
+            .source
+            .as_deref()
+            .or(req.book_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(source_id) = source_id else {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "missing_source",
+                "缺少 book_url（书源 id）",
+            );
+        };
+        match load_source(&s.shared, source_id).await {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return error_body(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "书源不存在，无法确定 Referer/UA/Cookie",
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let hdrs = source
+        .as_ref()
+        .map(|src| source_referer(src, req.chapter_url.as_deref(), req.book_url.as_deref()))
+        .unwrap_or_default();
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
-    let timeout = req::source_timeout(&source);
-    let source_limit = req::source_limit(&source);
+    let timeout = source.as_ref().and_then(req::source_timeout);
+    let source_limit = source
+        .as_ref()
+        .map(req::source_limit)
+        .unwrap_or_else(|| req::SourceLimit::concurrency_only(0));
+    let source_key = source.as_ref().map(|s| s.book_source_url.clone());
     let items: Vec<serde_json::Value> = futures::stream::iter(req.urls.into_iter().map(|u| {
-        fetch_image_meta(
-            u,
-            hdrs.clone(),
-            max_bytes,
-            timeout,
-            Some(&source.book_source_url),
-            source_limit,
-        )
+        let hdrs = hdrs.clone();
+        let source_key = source_key.clone();
+        let st = s.clone();
+        async move {
+            if comic::parse_local_image_url(&u).is_some() {
+                local_image_meta(&st, &u).await
+            } else {
+                fetch_image_meta(
+                    u,
+                    hdrs,
+                    max_bytes,
+                    timeout,
+                    source_key.as_deref(),
+                    source_limit,
+                )
+                .await
+            }
+        }
     }))
     .buffer_unordered(4)
     .collect()
@@ -216,6 +278,7 @@ pub(super) const DIM_CACHE_MAX: usize = 2000;
 /// 批量探测原始图片宽高：只预读图片头，不下载整图；返回与 `urls` 等长、同序的结果。
 /// 单批并发 8，命中进程内缓存的不再回源。
 pub(crate) async fn probe_dims(
+    store: &crate::library_store::Store,
     source: &BookSource,
     chapter_url: Option<&str>,
     book_url: Option<&str>,
@@ -247,6 +310,17 @@ pub(crate) async fn probe_dims(
             let h = hdrs.clone();
             let sk = source_key.clone();
             async move {
+                // 本地漫画页只读文件头，不经过网络；其余仍走回源探测。
+                if let Some((book_id, href)) = comic::parse_local_image_url(&u) {
+                    let d = match store.find_by_id(book_id) {
+                        Some((_tier, dir)) => match crate::library_store::safe_join(&dir, href) {
+                            Ok(path) => comic::page_dims_async(path).await,
+                            Err(_) => None,
+                        },
+                        None => None,
+                    };
+                    return (i, d);
+                }
                 let v = fetch_image_meta(u, h, max_bytes, timeout, Some(&sk), source_limit).await;
                 let d = v
                     .get("width")

@@ -39,6 +39,7 @@ pub(super) async fn comic_read(
         .collect();
     if !missing.is_empty() {
         let probed = image::probe_dims(
+            &s.store(),
             source,
             Some(&chapter.url),
             Some(&q.book),
