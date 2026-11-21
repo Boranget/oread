@@ -135,6 +135,24 @@ Bearer 访问 `/opds*`，便于调试。
 
 ## 4. 数据与缓存
 
+> **存储正在迁移中**：目标形态是「每本书一个解压目录 + 可重建索引」，见 §4.1。
+> 当前线上读写仍走 `library.db` 的正文/图片表；`boranlib migrate-store` 已能把旧库
+> 导出成目录，后续再切换读写路径。
+
+### 4.1 目标存储：目录即书
+
+- `data_dir/library/{collection,temp,trash}/<sha256(book_url)>/`
+  - 文字书：解压后的 EPUB 3（`mimetype` + `META-INF/container.xml` + `OEBPS/`）。
+  - 漫画：解压后的 CBZ（扁平图片 + `ComicInfo.xml`）。
+- **`content.opf` 是元数据权威**；`index.db` 只存可重建的派生字段，靠 `oread:revision` 判脏自愈。
+- 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
+- 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
+- 章节正文是归一化后的「标题 + 段落」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。
+- `promote`（临时→馆藏）= 目录 `rename`；失败记 `promote_pending` 后台重试，期间仍算临时书。
+- 迁移命令：`boranlib migrate-store`（只读旧表、只写目录，已存在的书目录跳过）。
+
+### 4.2 现状（迁移前）
+
 - **`shared.db`**：账户、书源、导入账本、体检语料。全局一份。
 - **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总，含 `image_bytes`）、`library_chapters`（目录）、`library_content`（正文/图片清单，键 `(url, origin)`，图片章节带 `images_ready`）、`library_images`（漫画图片原始字节 BLOB，键 `(url, origin)`）、`library_identifiers` / `library_tags`（OPF 语义扩展，键 `book_url`）、`library_jobs`/`library_job_items`（采购单）。
   - `tier=collection`：馆藏，永久保存，不自动淘汰；只有管理员能移出或删除。

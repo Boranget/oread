@@ -48,7 +48,43 @@ fn main() -> anyhow::Result<()> {
         .max_blocking_threads(4)
         .enable_all()
         .build()?;
-    rt.block_on(run(cfg))?;
+
+    // 运维子命令：一次性把旧库正文导出成「目录即书」。服务本身不带业务参数。
+    match std::env::args().nth(1).as_deref() {
+        Some("migrate-store") => rt.block_on(run_migrate_store(cfg))?,
+        Some(other) => {
+            eprintln!("未知子命令: {other}\n可用: migrate-store");
+            std::process::exit(2);
+        }
+        None => rt.block_on(run(cfg))?,
+    }
+    Ok(())
+}
+
+/// `boranlib migrate-store`：把 `library_content` / `library_images` 导出成书目录。
+///
+/// 只读旧表、只写目录，不删任何数据；已存在的书目录会跳过。
+async fn run_migrate_store(cfg: Config) -> anyhow::Result<()> {
+    let library = db::init_library(&cfg).await?;
+    let store = boranlib::library_store::Store::new(&cfg.data_dir);
+    tracing::info!(root = %store.root().display(), "migrating library store");
+    let mut report = boranlib::library_store::migrate::migrate_from_db(&library, &store).await?;
+    boranlib::library_store::migrate::verify_tree(&store, &mut report);
+    tracing::info!(
+        books = report.books,
+        skipped = report.skipped,
+        chapters = report.chapters,
+        images = report.images,
+        comics = report.comics,
+        failures = report.failures.len(),
+        "migrate-store done"
+    );
+    for failure in &report.failures {
+        eprintln!("失败: {failure}");
+    }
+    if !report.failures.is_empty() {
+        anyhow::bail!("{} 本书迁移失败", report.failures.len());
+    }
     Ok(())
 }
 

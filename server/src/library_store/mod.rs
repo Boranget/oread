@@ -18,6 +18,7 @@
 //! - 同一本书的保存串行化（[`lock_book`]）；
 //! - 先写正文/图片，最后写 `content.opf`，任何时刻目录都是一本合法的书。
 
+pub mod migrate;
 pub mod opf;
 
 use std::collections::HashMap;

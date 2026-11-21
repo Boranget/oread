@@ -431,6 +431,18 @@ cd server; & '<local-tools>\cache\target-dev\debug\boranlib.exe'
 
 `/k` 埋点写在 `DATA_DIR/logs/k-metrics-YYYYMMDD.jsonl`（`DATA_DIR` 即 `BORANLIB_DATA_DIR`，默认 `data`）；管理员可用 `GET /api/k/metrics?date=YYYY-MM-DD` 看聚合、`GET /api/k/metrics/export?date=YYYY-MM-DD` 导出原始 JSONL（接口细节见 `docs/API.md` §11.5）。
 
+### 5.1 一次性迁移：旧库 → 目录即书
+
+```powershell
+$env:BORANLIB_DATA_DIR='.\data'
+cd server
+& '<local-tools>\cache\target-dev\debug\boranlib.exe' migrate-store
+```
+
+只读 `library.db` 的正文/图片表，把每本书导出成 `data\library\{collection,temp}\<sha256(book_url)>/`
+（文字书 = 解压 EPUB 目录，漫画 = 解压 CBZ 目录）。**不删除任何数据库行**；已存在的书目录会跳过，
+因此可重复执行。结束后会打印书/章/图数量与失败清单；有失败时退出码非 0。
+
 部署到板子（绝不在板上 `cargo build`，链接期会 OOM）：
 
 ```powershell
