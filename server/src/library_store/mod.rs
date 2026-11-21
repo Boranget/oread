@@ -20,6 +20,7 @@
 
 pub mod migrate;
 pub mod opf;
+pub mod read;
 
 use std::collections::HashMap;
 use std::io;
@@ -132,7 +133,8 @@ impl Store {
         if !pending.exists() && meta.chapters.is_empty() {
             atomic_write(
                 &pending,
-                chapter_xhtml(&meta.language, "待缓存", &["本书内容尚未缓存".into()]).as_bytes(),
+                pending_chapter_xhtml(&meta.language, "待缓存", &["本书内容尚未缓存".into()])
+                    .as_bytes(),
             )
             .await?;
         }
@@ -166,11 +168,40 @@ impl Store {
         item: &ChapterItem,
         paragraphs: &[String],
     ) -> io::Result<()> {
+        self.write_chapter_marked(dir, language, item, paragraphs, false)
+            .await
+    }
+
+    /// 写「尚未抓取」的占位章：正文带 [`PENDING_CLASS`] 标记，读路径据此回源，
+    /// 不会被当成真实内容返回。
+    pub async fn write_pending_chapter(
+        &self,
+        dir: &Path,
+        language: &str,
+        item: &ChapterItem,
+        paragraphs: &[String],
+    ) -> io::Result<()> {
+        self.write_chapter_marked(dir, language, item, paragraphs, true)
+            .await
+    }
+
+    async fn write_chapter_marked(
+        &self,
+        dir: &Path,
+        language: &str,
+        item: &ChapterItem,
+        paragraphs: &[String],
+        pending: bool,
+    ) -> io::Result<()> {
         let path = dir.join("OEBPS").join(&item.href);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let html = chapter_xhtml(language, &item.title, paragraphs);
+        let html = if pending {
+            pending_chapter_xhtml(language, &item.title, paragraphs)
+        } else {
+            chapter_xhtml(language, &item.title, paragraphs)
+        };
         atomic_write(&path, html.as_bytes()).await
     }
 
@@ -319,9 +350,31 @@ async fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
 // 正文 XHTML
 // ---------------------------------------------------------------------------
 
+/// 占位章段落上的 class：读路径见到它就知道「这一章还没抓」。
+pub const PENDING_CLASS: &str = "oread-pending";
+
+/// 判断一份章节 XHTML 是否是占位章。
+pub fn is_pending_html(html: &str) -> bool {
+    html.contains(PENDING_CLASS)
+}
+
 /// 生成一章规范 XHTML。段落一律是纯文本，序列化时统一转义，
 /// 因此段落编辑「想写出非法文件」在结构上就不可能。
 pub fn chapter_xhtml(language: &str, title: &str, paragraphs: &[String]) -> String {
+    chapter_xhtml_marked(language, title, paragraphs, false)
+}
+
+/// 占位章：结构与正文一致，只是段落带 [`PENDING_CLASS`]。
+pub fn pending_chapter_xhtml(language: &str, title: &str, paragraphs: &[String]) -> String {
+    chapter_xhtml_marked(language, title, paragraphs, true)
+}
+
+fn chapter_xhtml_marked(
+    language: &str,
+    title: &str,
+    paragraphs: &[String],
+    pending: bool,
+) -> String {
     use std::fmt::Write as _;
     let lang = if language.trim().is_empty() {
         opf::DEFAULT_LANGUAGE
@@ -355,7 +408,15 @@ pub fn chapter_xhtml(language: &str, title: &str, paragraphs: &[String]) -> Stri
         if text.is_empty() {
             continue;
         }
-        let _ = writeln!(s, "<p>{}</p>", boranlib_ebook::xml::xml_escape(text));
+        if pending {
+            let _ = writeln!(
+                s,
+                "<p class=\"{PENDING_CLASS}\">{}</p>",
+                boranlib_ebook::xml::xml_escape(text)
+            );
+        } else {
+            let _ = writeln!(s, "<p>{}</p>", boranlib_ebook::xml::xml_escape(text));
+        }
     }
     s.push_str("</body>\n</html>\n");
     s

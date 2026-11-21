@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::library;
+use crate::library_store::read as store_read;
 
 /// 正文：命中缓存（TTL 内）直接返回；否则抓取、落库、按总量上限淘汰最久未读的章节，
 /// 最后统一应用用户替换规则（标题/正文分别受 scope_title / scope_content 控制）。
@@ -23,63 +24,105 @@ pub(super) async fn content(
             "该条为分卷标题，请从目录选择章节".into(),
         ));
     }
-    let mut stale = false;
-    let mut c = match super::books_store::peek_cached_content(
-        &s.library,
-        &q.chapter_url,
-        &q.source,
-        s.cfg.content_ttl_secs,
-    )
-    .await?
+    // 目录即书：书目录里已有这一章就直接读磁盘，不查缓存、不回源。
+    let book_hint = match q
+        .book_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
+        Some(v) => Some(v.to_string()),
+        None => sqlx::query_scalar(
+            "SELECT book_url FROM library_chapters WHERE url = ?1 AND book_url <> '' LIMIT 1",
+        )
+        .bind(&q.chapter_url)
+        .fetch_optional(&s.library)
+        .await
+        .ok()
+        .flatten(),
+    };
+    let dir_content = match book_hint.as_deref() {
+        Some(book_url) => match crate::ebook_source::load_dir_content(
+            &s.store(),
+            &s.library,
+            book_url,
+            &q.chapter_url,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    book_url,
+                    url = %q.chapter_url,
+                    error = %err,
+                    "read chapter from dir failed; falling back to cache"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut stale = false;
+    let mut c = match dir_content {
         Some(c) => c,
-        None => {
-            // 同用户同章节并发未命中只抓取一次：等待者拿到闸门后先重查缓存。
-            let _flight = crate::routes::inflight::acquire(format!(
-                "{}|{}|{}",
-                u.id, q.source, q.chapter_url
-            ))
-            .await;
-            if let Some(c) = super::books_store::peek_cached_content(
-                &s.library,
-                &q.chapter_url,
-                &q.source,
-                s.cfg.content_ttl_secs,
-            )
-            .await?
-            {
-                c
-            } else {
-                // 真正触发抓取时才记一次 miss；并发等待者只记 hit，命中率不被稀释。
-                crate::cache_metrics::record_miss();
-                match fetch_content(&s, &db, &q).await {
-                    Ok(c) => {
-                        // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
-                        save_content_cached(&s.library, &c).await?;
-                        c
-                    }
-                    // 回源失败：库里还有旧正文就先用着，别让已下载的书因源失效而打不开。
-                    Err(e) => match super::books_store::load_stale_content(
-                        &s.library,
-                        &q.chapter_url,
-                        &q.source,
-                    )
-                    .await?
-                    {
-                        Some(c) => {
-                            stale = true;
-                            tracing::warn!(
-                                url = %q.chapter_url,
-                                error = %e,
-                                "content fetch failed; serving stale cache"
-                            );
+        None => match super::books_store::peek_cached_content(
+            &s.library,
+            &q.chapter_url,
+            &q.source,
+            s.cfg.content_ttl_secs,
+        )
+        .await?
+        {
+            Some(c) => c,
+            None => {
+                // 同用户同章节并发未命中只抓取一次：等待者拿到闸门后先重查缓存。
+                let _flight = crate::routes::inflight::acquire(format!(
+                    "{}|{}|{}",
+                    u.id, q.source, q.chapter_url
+                ))
+                .await;
+                if let Some(c) = super::books_store::peek_cached_content(
+                    &s.library,
+                    &q.chapter_url,
+                    &q.source,
+                    s.cfg.content_ttl_secs,
+                )
+                .await?
+                {
+                    c
+                } else {
+                    // 真正触发抓取时才记一次 miss；并发等待者只记 hit，命中率不被稀释。
+                    crate::cache_metrics::record_miss();
+                    match fetch_content(&s, &db, &q).await {
+                        Ok(c) => {
+                            // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
+                            save_content_cached(&s.library, &c).await?;
                             c
                         }
-                        None => return Err(e),
-                    },
+                        // 回源失败：库里还有旧正文就先用着，别让已下载的书因源失效而打不开。
+                        Err(e) => match super::books_store::load_stale_content(
+                            &s.library,
+                            &q.chapter_url,
+                            &q.source,
+                        )
+                        .await?
+                        {
+                            Some(c) => {
+                                stale = true;
+                                tracing::warn!(
+                                    url = %q.chapter_url,
+                                    error = %e,
+                                    "content fetch failed; serving stale cache"
+                                );
+                                c
+                            }
+                            None => return Err(e),
+                        },
+                    }
                 }
             }
-        }
+        },
     };
     if c.content_type.trim().is_empty() {
         c.content_type = "text".into();
@@ -326,6 +369,17 @@ pub(super) async fn book_search(
     }
     let limit = q.limit.unwrap_or(20).clamp(1, 50);
     let started = Instant::now();
+    // 目录即书：直接扫本书的章节文件，不依赖缓存表。
+    let opened = match s.store().open_book(book_id).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(book_id, error = %err, "open book dir for search failed");
+            None
+        }
+    };
+    if let Some(book) = opened {
+        return search_book_dir(&book, book_id, query, limit, started).await;
+    }
     let pattern = escape_like(query);
     let rows_fut = sqlx::query_as::<_, ContentSearchRow>(
         "SELECT url, title, chapter_index, content FROM library_content \
@@ -380,6 +434,86 @@ pub(super) async fn book_search(
         "已覆盖全部缓存章节"
     } else {
         "仅搜索已缓存章节，未缓存章节未参与检索"
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "book_id": book_id,
+        "query": query,
+        "limit": limit,
+        "truncated": truncated,
+        "hits": hits,
+        "total_chapters": total,
+        "cached_chapters": cached,
+        "uncached_chapters": uncached,
+        "complete": complete,
+        "note": note,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })))
+}
+
+/// 目录书的书内搜索：逐章读文件、按纯文本命中。只统计已落盘的实体章节，
+/// 占位章不算「已覆盖」，避免把部分结果误报为完整结果。
+async fn search_book_dir(
+    book: &store_read::OpenedBook,
+    book_id: &str,
+    query: &str,
+    limit: usize,
+    started: Instant,
+) -> AppResult<Json<serde_json::Value>> {
+    let scan = async {
+        let mut hits: Vec<serde_json::Value> = Vec::new();
+        let mut total = 0i64;
+        let mut cached = 0i64;
+        let mut truncated = false;
+        for (pos, item) in book.meta.chapters.iter().enumerate() {
+            if item.is_volume {
+                continue;
+            }
+            total += 1;
+            let Some(body) = store_read::load_chapter(&book.dir, item)
+                .await
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            cached += 1;
+            if hits.len() >= limit {
+                truncated = true;
+                continue;
+            }
+            let Some((snippet, offset, match_count)) = find_snippet(&body.text, query) else {
+                continue;
+            };
+            hits.push(json!({
+                "chapter_index": pos,
+                "chapter_url": item.url.clone().unwrap_or_else(|| {
+                    crate::ebook_source::local_chapter_url(book_id, &item.id)
+                }),
+                "chapter_title": item.title,
+                "match_count": match_count,
+                "offset": offset,
+                "snippet": snippet,
+            }));
+        }
+        (hits, total, cached, truncated)
+    };
+    let (hits, total, cached, truncated) =
+        tokio::time::timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS), scan)
+            .await
+            .map_err(|_| {
+                AppError::Timeout(format!(
+                    "书内搜索超过 {SEARCH_TIMEOUT_SECS}s 预算，请缩短关键词"
+                ))
+            })?;
+    let uncached = (total - cached).max(0);
+    let complete = uncached == 0 && total > 0;
+    let note = if total == 0 {
+        "目录为空，无法判断是否覆盖全书"
+    } else if uncached == 0 {
+        "已覆盖全部章节"
+    } else {
+        "仅搜索已落盘章节，未抓取章节未参与检索"
     };
     Ok(Json(json!({
         "ok": true,

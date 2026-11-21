@@ -34,7 +34,7 @@ use crate::ebook::format::epub::EpubWriter;
 use crate::ebook::format::txt::{normalize_author, TxtWriter};
 use crate::ebook::pipeline::FormatWriter;
 use crate::ebook::{BookInput, ComicInput, Format, WriteReport};
-use crate::ebook_source::{load_book_input, load_comic_input, LibraryReader};
+use crate::ebook_source::{load_comic_input, LibraryReader};
 use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
 
@@ -62,9 +62,30 @@ struct ExportFile {
     size_bytes: u64,
 }
 
-/// 导出前的计划 = 只读的书视图（元数据 + 目录 + 缓存统计）。
-async fn build_plan(pool: &SqlitePool, book_url: &str) -> AppResult<BookInput> {
-    load_book_input(pool, book_url).await
+/// 导出前的计划 = 只读的书视图（元数据 + 目录 + 缓存统计）。目录优先。
+async fn build_plan(
+    pool: &SqlitePool,
+    store: &crate::library_store::Store,
+    book_url: &str,
+) -> AppResult<BookInput> {
+    crate::ebook_source::load_book_input_with_store(store, pool, book_url).await
+}
+
+/// 有书目录时让 writer 直接读磁盘；否则保持旧 `library_content` 读取。
+async fn export_reader<'a>(
+    pool: &'a SqlitePool,
+    store: &crate::library_store::Store,
+    book_url: &'a str,
+) -> LibraryReader<'a> {
+    let reader = LibraryReader::new(pool, book_url);
+    match store.open_book(book_url).await {
+        Ok(Some(book)) => reader.with_dir(book),
+        Ok(None) => reader,
+        Err(err) => {
+            tracing::warn!(book_url, error = %err, "open book dir failed; export falls back to db");
+            reader
+        }
+    }
 }
 
 /// 去掉路径分隔符与控制字符，避免书名被当成目录/文件名注入；过长时截断。
@@ -124,7 +145,8 @@ async fn write_export(
     uid: i64,
     book_url: &str,
 ) -> AppResult<ExportFile> {
-    let input = build_plan(pool, book_url).await?;
+    let store = crate::library_store::Store::new(data_dir);
+    let input = build_plan(pool, &store, book_url).await?;
     let dir = Path::new(data_dir).join("exports").join(uid.to_string());
     fs::create_dir_all(&dir).await?;
     cleanup_stale(&dir).await;
@@ -139,7 +161,7 @@ async fn write_export(
         seq
     ));
 
-    let reader = LibraryReader::new(pool, book_url);
+    let reader = export_reader(pool, &store, book_url).await;
     let report = TxtWriter.write(&input, &reader, &path).await?;
 
     Ok(ExportFile {
@@ -157,7 +179,8 @@ async fn write_epub(
     uid: i64,
     book_url: &str,
 ) -> AppResult<ExportFile> {
-    let input = build_plan(pool, book_url).await?;
+    let store = crate::library_store::Store::new(data_dir);
+    let input = build_plan(pool, &store, book_url).await?;
     if input.text_chapters == 0 {
         return Err(AppError::Conflict(
             "这本书没有可导出的正文章节，无法生成 EPUB".into(),
@@ -178,7 +201,7 @@ async fn write_epub(
         seq
     ));
 
-    let reader = LibraryReader::new(pool, book_url);
+    let reader = export_reader(pool, &store, book_url).await;
     let report = EpubWriter.write(&input, &reader, &path).await?;
 
     Ok(ExportFile {
@@ -280,7 +303,7 @@ async fn export_info(
     _u: AuthUser,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let plan = build_plan(&s.library, &q.book_url).await?;
+    let plan = build_plan(&s.library, &s.store(), &q.book_url).await?;
     let export_url = format!(
         "/api/book/export/txt?book_url={}",
         url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()
@@ -418,7 +441,7 @@ async fn export_epub_info(
     _u: AuthUser,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let plan = build_plan(&s.library, &q.book_url).await?;
+    let plan = build_plan(&s.library, &s.store(), &q.book_url).await?;
     let export_url = format!(
         "/api/book/export/epub?book_url={}",
         url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()
@@ -484,6 +507,13 @@ pub(crate) async fn epub_download(s: &AppState, uid: i64, book_url: &str) -> App
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    /// 只用来证明「目录不存在时回退数据库」；不创建任何书目录。
+    fn empty_store() -> crate::library_store::Store {
+        crate::library_store::Store::new(
+            std::env::temp_dir().join(format!("oread-export-empty-{}", std::process::id())),
+        )
+    }
 
     async fn export_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -648,7 +678,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let plan = build_plan(&pool, book).await.unwrap();
+        let plan = build_plan(&pool, &empty_store(), book).await.unwrap();
         assert_eq!(plan.cached_chapters, 1, "空白正文按缺失统计");
         assert_eq!(plan.total_chapters, 3);
     }
@@ -656,7 +686,10 @@ mod tests {
     #[tokio::test]
     async fn empty_toc_is_rejected_with_conflict() {
         let pool = export_pool().await;
-        let err = build_plan(&pool, "https://x/none").await.err().unwrap();
+        let err = build_plan(&pool, &empty_store(), "https://x/none")
+            .await
+            .err()
+            .unwrap();
         assert!(
             matches!(err, AppError::Conflict(_)),
             "目录未缓存应映射 409，而不是 400"
@@ -725,7 +758,7 @@ mod tests {
         let out = write_export(&pool, dir.to_str().unwrap(), 42, book)
             .await
             .unwrap();
-        let plan = build_plan(&pool, book).await.unwrap();
+        let plan = build_plan(&pool, &empty_store(), book).await.unwrap();
         assert_eq!(plan.total_chapters, out.input.total_chapters);
         assert_eq!(plan.cached_chapters, out.input.cached_chapters);
         assert_eq!(plan.cached_bytes, out.input.cached_bytes);

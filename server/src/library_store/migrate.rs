@@ -222,6 +222,7 @@ async fn migrate_text_book(
         };
         // 目录里的每一章都要有文件：未缓存的显式占位，卷标题只写标题，
         // 绝不静默丢章——否则阅读进度与目录会错位。
+        let pending = !item.is_volume && content.is_none();
         let paragraphs = if item.is_volume {
             Vec::new()
         } else {
@@ -230,9 +231,15 @@ async fn migrate_text_book(
                 None => vec!["本章内容尚未缓存".to_string()],
             }
         };
-        store
-            .write_chapter(&dir, &meta.language, &item, &paragraphs)
-            .await?;
+        if pending {
+            store
+                .write_pending_chapter(&dir, &meta.language, &item, &paragraphs)
+                .await?;
+        } else {
+            store
+                .write_chapter(&dir, &meta.language, &item, &paragraphs)
+                .await?;
+        }
         meta.chapters.push(item);
         report.chapters += 1;
     }

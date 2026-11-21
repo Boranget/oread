@@ -56,7 +56,8 @@ async fn migrates_text_book_into_valid_epub_dir() {
     sqlx::query(
         "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
          VALUES ('https://s/book/1', 'https://s/book/1/1', '开端', 0, 0), \
-                ('https://s/book/1', 'https://s/book/1/2', '第一卷', 1, 1)",
+                ('https://s/book/1', 'https://s/book/1/2', '第一卷', 1, 1), \
+                ('https://s/book/1', 'https://s/book/1/3', '未缓存', 0, 2)",
     )
     .execute(&pool)
     .await
@@ -73,7 +74,7 @@ async fn migrates_text_book_into_valid_epub_dir() {
     let store = Store::new(&dir);
     let report = migrate::migrate_from_db(&pool, &store).await.unwrap();
     assert_eq!(report.books, 1);
-    assert_eq!(report.chapters, 2);
+    assert_eq!(report.chapters, 3);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 
     let book = store.find("https://s/book/1").unwrap();
@@ -94,10 +95,16 @@ async fn migrates_text_book_into_valid_epub_dir() {
     assert_eq!(reparse.title, "测试书");
     assert_eq!(reparse.series.as_deref(), Some("系列"));
     assert_eq!(reparse.series_index, Some(2.0));
-    assert_eq!(reparse.chapters.len(), 2);
+    assert_eq!(reparse.chapters.len(), 3);
     assert_eq!(reparse.chapters[0].href, "chapters/ch-0001.xhtml");
     assert!(reparse.chapters[1].is_volume);
     assert_eq!(reparse.chapters[1].href, "chapters/vol-0002.xhtml");
+    let pending = store
+        .read_chapter(&book.1, &reparse.chapters[2].href)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(boranlib::library_store::is_pending_html(&pending));
 
     let html = store
         .read_chapter(&book.1, &reparse.chapters[0].href)
@@ -106,6 +113,56 @@ async fn migrates_text_book_into_valid_epub_dir() {
         .unwrap();
     assert!(html.contains("<p>第一段</p>"));
     assert!(html.contains("第二段 &amp; 更多"));
+
+    // 读路径：目录优先，不再看 library_content。
+    let input =
+        boranlib::ebook_source::load_book_input_with_store(&store, &pool, "https://s/book/1")
+            .await
+            .unwrap();
+    assert_eq!(input.meta.name, "测试书");
+    assert_eq!(input.meta.author, "作者");
+    assert_eq!(input.meta.tags, vec!["玄幻".to_string()]);
+    assert_eq!(input.total_chapters, 2);
+    assert_eq!(input.cached_chapters, 1);
+    assert_eq!(input.chapters.len(), 3);
+    assert!(input.chapters[1].is_volume);
+
+    let opened = store.open_book("https://s/book/1").await.unwrap().unwrap();
+    let reader =
+        boranlib::ebook_source::LibraryReader::new(&pool, "https://s/book/1").with_dir(opened);
+    let body =
+        boranlib::ebook::pipeline::ChapterReader::chapter_text(&reader, "https://s/book/1/1")
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(body.contains("<p>第一段</p>"));
+    assert!(
+        !body.contains("开端"),
+        "OPF 标题不应重复出现在正文里: {body}"
+    );
+
+    let hit = boranlib::ebook_source::load_dir_content(
+        &store,
+        &pool,
+        "https://s/book/1",
+        "https://s/book/1/1",
+    )
+    .await
+    .unwrap()
+    .expect("已缓存章应命中目录");
+    assert_eq!(hit.content_type, "text");
+    assert_eq!(hit.book_url, "https://s/book/1");
+    assert!(hit.content.unwrap().contains("第二段"));
+
+    let miss = boranlib::ebook_source::load_dir_content(
+        &store,
+        &pool,
+        "https://s/book/1",
+        "https://s/book/1/3",
+    )
+    .await
+    .unwrap();
+    assert!(miss.is_none(), "占位章必须回退回源，而不是当正文返回");
 
     // 再跑一次：已存在的目录跳过，不覆盖。
     let again = migrate::migrate_from_db(&pool, &store).await.unwrap();

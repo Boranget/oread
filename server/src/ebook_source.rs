@@ -8,10 +8,17 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
+use crate::entities::BookContent;
 use crate::error::{AppError, AppResult};
+use crate::library_store::{read as store_read, Store};
 
 use boranlib_ebook::model::{BookInput, BookMeta, ChapterKind, ChapterRef, ComicInput, PageData};
 use boranlib_ebook::pipeline::ChapterReader;
+
+/// 目录里没有书源 URL 的章节（管理员新建等）用稳定合成 URL，保证阅读进度与搜索可引用。
+pub fn local_chapter_url(book_url: &str, id: &str) -> String {
+    format!("local:{book_url}#{id}")
+}
 
 /// 一次取齐书目与目录，组装成导出输入。正文按章懒读（见 [`LibraryReader`]）。
 pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<BookInput> {
@@ -153,6 +160,168 @@ pub async fn load_book_input(pool: &SqlitePool, book_url: &str) -> AppResult<Boo
     })
 }
 
+/// 目录优先的导出视图：书目录存在且是文字书时读 OPF，否则回退到旧 `library.db`。
+///
+/// 迁移期两套数据并存：目录是目标形态，数据库保证尚未迁移/尚未抓取的书仍可导出。
+pub async fn load_book_input_with_store(
+    store: &Store,
+    pool: &SqlitePool,
+    book_url: &str,
+) -> AppResult<BookInput> {
+    match dir_book_input(store, pool, book_url).await {
+        Ok(Some(input)) => Ok(input),
+        Ok(None) => load_book_input(pool, book_url).await,
+        Err(err) => {
+            tracing::warn!(
+                book_url,
+                error = %err,
+                "book dir unreadable; falling back to library.db"
+            );
+            load_book_input(pool, book_url).await
+        }
+    }
+}
+
+async fn dir_book_input(
+    store: &Store,
+    pool: &SqlitePool,
+    book_url: &str,
+) -> AppResult<Option<BookInput>> {
+    let Some(opened) = store.open_book(book_url).await? else {
+        return Ok(None);
+    };
+    if opened.meta.chapters.is_empty() {
+        return Ok(None);
+    }
+
+    // 目录是元数据权威；书源字段只保留 OPF 没有的展示信息。
+    let source: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT origin, origin_name FROM library_books WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_optional(pool)
+            .await?;
+    let (origin, origin_name) = source.unwrap_or_default();
+
+    let mut chapters = Vec::with_capacity(opened.meta.chapters.len());
+    let mut seq = 0i64;
+    for item in &opened.meta.chapters {
+        if item.is_volume {
+            chapters.push(ChapterRef {
+                url: item
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| local_chapter_url(book_url, &item.id)),
+                title: item.title.clone(),
+                seq: 0,
+                is_volume: true,
+                kind: ChapterKind::Text,
+            });
+        } else {
+            seq += 1;
+            chapters.push(ChapterRef {
+                url: item
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| local_chapter_url(book_url, &item.id)),
+                title: item.title.clone(),
+                seq,
+                is_volume: false,
+                kind: ChapterKind::Text,
+            });
+        }
+    }
+
+    let mut cached_chapters = 0i64;
+    let mut cached_bytes = 0i64;
+    for item in &opened.meta.chapters {
+        if item.is_volume {
+            continue;
+        }
+        match store_read::read_chapter_file(&opened.dir, &item.href).await {
+            Ok(Some(xhtml)) => {
+                if store_read::parse_chapter(&xhtml, &item.title).is_some() {
+                    cached_chapters += 1;
+                    cached_bytes += xhtml.len() as i64;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                book_url,
+                href = %item.href,
+                error = %err,
+                "chapter file unreadable"
+            ),
+        }
+    }
+
+    let total_chapters = seq;
+    let meta = BookMeta {
+        book_url: book_url.to_string(),
+        name: opened.meta.title.clone(),
+        author: opened.meta.author.clone().unwrap_or_default(),
+        language: Some(opened.meta.language.clone()).filter(|s| !s.trim().is_empty()),
+        publisher: opened.meta.publisher.clone(),
+        pubdate: opened.meta.pubdate.clone(),
+        series_name: opened.meta.series.clone(),
+        series_index: opened.meta.series_index,
+        intro: opened.meta.description.clone(),
+        source: origin_name.filter(|s| !s.trim().is_empty()).or(origin),
+        identifiers: opened
+            .meta
+            .isbn
+            .clone()
+            .map(|isbn| vec![("isbn".to_string(), isbn)])
+            .unwrap_or_default(),
+        tags: opened.meta.subjects.clone(),
+    };
+
+    Ok(Some(BookInput {
+        meta,
+        chapters,
+        total_chapters,
+        cached_chapters,
+        missing_chapters: (total_chapters - cached_chapters).max(0),
+        cached_bytes,
+        text_chapters: total_chapters,
+        cached_text_chapters: cached_chapters,
+    }))
+}
+
+/// 读路径的单章视图：目录命中返回归一化正文，未命中/占位返回 `None`。
+pub async fn load_dir_content(
+    store: &Store,
+    pool: &SqlitePool,
+    book_url: &str,
+    chapter_url: &str,
+) -> AppResult<Option<BookContent>> {
+    let Some(opened) = store.open_book(book_url).await? else {
+        return Ok(None);
+    };
+    let Some((pos, item)) = opened
+        .meta
+        .chapter_index_by_url(chapter_url)
+        .map(|i| (i, &opened.meta.chapters[i]))
+    else {
+        return Ok(None);
+    };
+    if item.is_volume {
+        return Ok(None);
+    }
+    let Some(body) = store_read::load_chapter(&opened.dir, item).await? else {
+        return Ok(None);
+    };
+    let _ = crate::library::touch_book(pool, book_url).await;
+    Ok(Some(BookContent {
+        book_url: book_url.to_string(),
+        url: chapter_url.to_string(),
+        title: Some(item.title.clone()),
+        content: Some(body.html),
+        chapter_index: pos as i64,
+        content_type: "text".into(),
+        ..Default::default()
+    }))
+}
+
 /// 漫画导出视图：在 [`load_book_input`] 上补页数统计（声明页数 / 已落盘页数）。
 pub async fn load_comic_input(pool: &SqlitePool, book_url: &str) -> AppResult<ComicInput> {
     let book = load_book_input(pool, book_url).await?;
@@ -209,9 +378,12 @@ struct MetaRow {
 }
 
 /// 馆藏正文读取器：writer 只看到「按 URL 取一章 / 取一页」，不知道 SQLite 结构。
+///
+/// 有书目录时优先读目录（目标形态）；没有时读旧 `library_content`。
 pub struct LibraryReader<'a> {
     pool: &'a SqlitePool,
     book_url: &'a str,
+    dir_book: Option<store_read::OpenedBook>,
 }
 
 impl<'a> LibraryReader<'a> {
@@ -219,13 +391,29 @@ impl<'a> LibraryReader<'a> {
         Self {
             pool,
             book_url: book_url.trim(),
+            dir_book: None,
         }
+    }
+
+    /// 绑定一份已打开的目录，此后章节正文从磁盘读。
+    pub fn with_dir(mut self, book: store_read::OpenedBook) -> Self {
+        self.dir_book = Some(book);
+        self
     }
 }
 
 #[axum::async_trait]
 impl ChapterReader for LibraryReader<'_> {
     async fn chapter_text(&self, url: &str) -> anyhow::Result<Option<String>> {
+        if let Some(book) = &self.dir_book {
+            let Some(item) = book.meta.chapter_by_url(url) else {
+                return Ok(None);
+            };
+            let Some(body) = store_read::load_chapter(&book.dir, item).await? else {
+                return Ok(None);
+            };
+            return Ok(Some(body.html));
+        }
         // LIMIT 1：同 URL 同书的重复行不会读进内存。
         let body: Option<String> = sqlx::query_scalar(
             "SELECT content FROM library_content \

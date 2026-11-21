@@ -56,6 +56,13 @@ pub struct AppState {
     pub fetcher: Arc<dyn crate::web_book::Fetcher>,
 }
 
+impl AppState {
+    /// 馆藏目录句柄（只含路径，按需构造；克隆便宜）。
+    pub fn store(&self) -> crate::library_store::Store {
+        crate::library_store::Store::new(&self.cfg.data_dir)
+    }
+}
+
 /// 构造进程级状态。后台任务（馆藏采购单）与 HTTP 路由必须共用同一份状态，
 /// 这样用户库连接池缓存只有一份。
 pub fn app_state(

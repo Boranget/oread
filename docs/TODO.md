@@ -146,7 +146,9 @@
 - 状态：`进行中`。Phase 1（TXT）、Phase 2（CBZ）、Phase 3（EPUB）已完成。
 - 已完成：
   - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；`BookInput` 区分总章节与文本章节，漫画章不计入 TXT/EPUB 完成度；
-  - `source`：只读馆藏组装书视图（目录缺失 → 409），`LibraryReader` 按章读正文、按章取图片清单、按页读 `library_images`；空白正文视为未缓存；
+  - `source`：只读馆藏组装书视图（目录缺失 → 409）；文字书优先读目录 OPF/章节文件，
+    目录缺失时回退 `library.db`。`LibraryReader` 有目录时按章读 XHTML，否则按章读
+    `library_content`、按页读 `library_images`；占位章与空白正文都视为未缓存；
   - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
   - `html`：正文 HTML → 语义块（标题层级、块级段落、`br`/换行断段；丢弃脚本、样式、图片与音视频）；
   - `xml`：ComicInfo 与 OPF/XHTML 共用的最小 XML 转义；
