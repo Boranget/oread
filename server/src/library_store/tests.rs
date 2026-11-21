@@ -175,6 +175,119 @@ async fn promote_moves_temp_to_collection() {
 }
 
 #[tokio::test]
+async fn demote_moves_collection_back_to_temp() {
+    let root = temp_root("demote");
+    let store = Store::at(root.join("library"));
+    store.create_layout().unwrap();
+    let meta = OpfMeta::new("https://example.com/book/4", "书");
+    store
+        .ensure_skeleton(Tier::Collection, &meta)
+        .await
+        .unwrap();
+
+    let (tier, dir) = store.demote(&meta.book_url).await.unwrap().unwrap();
+    assert_eq!(tier, Tier::Temp);
+    assert!(dir.join("OEBPS/content.opf").is_file());
+    assert_eq!(store.find(&meta.book_url).unwrap().0, Tier::Temp);
+
+    // 已经是临时书：幂等，不再搬。
+    let again = store.demote(&meta.book_url).await.unwrap().unwrap();
+    assert_eq!(again.0, Tier::Temp);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn move_to_trash_takes_dir_out_of_library() {
+    let root = temp_root("trash");
+    let store = Store::at(root.join("library"));
+    store.create_layout().unwrap();
+    let meta = OpfMeta::new("https://example.com/book/5", "书");
+    let dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+
+    assert!(store.move_to_trash(&meta.book_url).await.unwrap());
+    assert!(!dir.exists());
+    assert!(store.find(&meta.book_url).is_none());
+    let trash: Vec<_> = std::fs::read_dir(root.join("library/trash"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(trash.len(), 1);
+    assert!(trash[0].contains(&Store::book_id(&meta.book_url)));
+
+    // 目录不在了：返回 false，而不是报错。
+    assert!(!store.move_to_trash(&meta.book_url).await.unwrap());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn promote_marker_is_retried_by_maintenance() {
+    let root = temp_root("promote-marker");
+    let store = Store::at(root.join("library"));
+    store.create_layout().unwrap();
+    let meta = OpfMeta::new("https://example.com/book/6", "书");
+    let temp_dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+
+    store.mark_promote_pending(&meta.book_url).await.unwrap();
+    assert!(temp_dir.join(PROMOTE_MARKER).is_file());
+
+    let moved = store.retry_pending_promotions().await.unwrap();
+    assert_eq!(moved, 1);
+    let (tier, dir) = store.find(&meta.book_url).unwrap();
+    assert_eq!(tier, Tier::Collection);
+    assert!(!dir.join(PROMOTE_MARKER).exists());
+    assert!(!temp_dir.exists());
+
+    // 没有标记时什么也不做。
+    assert_eq!(store.retry_pending_promotions().await.unwrap(), 0);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn promote_prefers_real_temp_book_over_empty_collection_skeleton() {
+    let root = temp_root("promote-empty");
+    let store = Store::at(root.join("library"));
+    store.create_layout().unwrap();
+    let meta = OpfMeta::new("https://example.com/book/7", "书");
+    let temp_dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+    // 入馆失败后 TOC 又在 collection 建了空骨架：没有 OPF，不算一本书。
+    let empty = store
+        .ensure_dirs(Tier::Collection, &meta.book_url)
+        .await
+        .unwrap();
+    assert!(!empty.join("OEBPS/content.opf").exists());
+
+    // 读路径不能被空骨架挡住。
+    assert_eq!(store.find(&meta.book_url).unwrap().0, Tier::Temp);
+
+    let (tier, dir) = store.promote(&meta.book_url).await.unwrap().unwrap();
+    assert_eq!(tier, Tier::Collection);
+    assert_eq!(dir, empty);
+    assert!(dir.join("OEBPS/content.opf").is_file());
+    assert!(!temp_dir.exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn demote_keeps_real_temp_book_when_collection_is_empty_skeleton() {
+    let root = temp_root("demote-empty");
+    let store = Store::at(root.join("library"));
+    store.create_layout().unwrap();
+    let meta = OpfMeta::new("https://example.com/book/8", "书");
+    let temp_dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+    let empty = store
+        .ensure_dirs(Tier::Collection, &meta.book_url)
+        .await
+        .unwrap();
+
+    let (tier, dir) = store.demote(&meta.book_url).await.unwrap().unwrap();
+    assert_eq!(tier, Tier::Temp);
+    assert_eq!(dir, temp_dir);
+    assert!(dir.join("OEBPS/content.opf").is_file());
+    assert!(!empty.exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn atomic_write_replaces_and_leaves_no_temp_files() {
     let root = temp_root("atomic");
     let path = root.join("OEBPS").join("content.opf");

@@ -406,6 +406,10 @@ async fn comic_chapter_from_dir(
             "该序号是分卷标题，请从目录选择章节".into(),
         ));
     }
+    // 本地页表为空 = 这一章还没缓存到目录：回退 DB / 回源，而不是返回空图片列表。
+    if chapter.pages.is_empty() {
+        return Ok(None);
+    }
 
     let book_id = Store::book_id(book_url);
     let mut images = Vec::with_capacity(chapter.pages.len());

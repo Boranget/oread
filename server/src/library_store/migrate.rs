@@ -8,8 +8,9 @@ use std::path::Path;
 
 use sqlx::SqlitePool;
 
+use super::comic::ext_for_mime;
+use super::write::markup_to_paragraphs;
 use super::{opf, ChapterItem, CoverItem, OpfMeta, Store, Tier};
-use boranlib_ebook::html::{to_blocks, Block};
 
 #[derive(Debug, Default, Clone)]
 pub struct MigrateReport {
@@ -280,7 +281,6 @@ async fn migrate_comic(
             .fetch_all(pool)
             .await?;
 
-    let mut page_count = 0u32;
     for (ci, ch) in chapters.iter().enumerate() {
         let no = ci + 1;
         let is_volume = ch.is_volume != 0;
@@ -326,7 +326,6 @@ async fn migrate_comic(
                         bytes: Some(img.data.len() as u64),
                         source_url: Some(url.clone()),
                     });
-                    page_count += 1;
                     report.images += 1;
                 }
             }
@@ -336,8 +335,7 @@ async fn migrate_comic(
 
     meta.bump();
     super::comic::write_meta(&dir, &meta).await?;
-    let comic_info = comic_info_xml(book, page_count);
-    super::atomic_write(&dir.join("ComicInfo.xml"), comic_info.as_bytes()).await?;
+    super::comic::write_comic_info(&dir, &meta).await?;
     Ok(())
 }
 
@@ -391,88 +389,6 @@ fn image_urls(raw: Option<&str>) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // 归一化
 // ---------------------------------------------------------------------------
-
-/// 旧正文 HTML → 段落。标题块并入段落（章节标题已在 OPF 里，避免重复）。
-pub fn markup_to_paragraphs(html: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for block in to_blocks(html) {
-        match block {
-            Block::Paragraph(text) => {
-                if !text.trim().is_empty() {
-                    out.push(text);
-                }
-            }
-            Block::Heading(_, text) => {
-                if !text.trim().is_empty() {
-                    out.push(text);
-                }
-            }
-        }
-    }
-    out
-}
-
-fn ext_for_mime(mime: &str) -> &'static str {
-    let m = mime.to_ascii_lowercase();
-    if m.contains("png") {
-        "png"
-    } else if m.contains("webp") {
-        "webp"
-    } else if m.contains("gif") {
-        "gif"
-    } else if m.contains("avif") {
-        "avif"
-    } else {
-        "jpg"
-    }
-}
-
-fn comic_info_xml(book: &OldBook, pages: u32) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::from(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-         <ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
-         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n",
-    );
-    if let Some(title) = book.name.as_deref().filter(|t| !t.trim().is_empty()) {
-        let _ = writeln!(
-            s,
-            "  <Title>{}</Title>",
-            boranlib_ebook::xml::xml_escape(title)
-        );
-    }
-    if let Some(author) = book.author.as_deref().filter(|t| !t.trim().is_empty()) {
-        let _ = writeln!(
-            s,
-            "  <Writer>{}</Writer>",
-            boranlib_ebook::xml::xml_escape(author)
-        );
-    }
-    if let Some(series) = book.series_name.as_deref().filter(|t| !t.trim().is_empty()) {
-        let _ = writeln!(
-            s,
-            "  <Series>{}</Series>",
-            boranlib_ebook::xml::xml_escape(series)
-        );
-    }
-    if let Some(intro) = book.intro.as_deref().filter(|t| !t.trim().is_empty()) {
-        let _ = writeln!(
-            s,
-            "  <Summary>{}</Summary>",
-            boranlib_ebook::xml::xml_escape(intro)
-        );
-    }
-    if let Some(lang) = book.language.as_deref().filter(|t| !t.trim().is_empty()) {
-        let _ = writeln!(
-            s,
-            "  <LanguageISO>{}</LanguageISO>",
-            boranlib_ebook::xml::xml_escape(lang)
-        );
-    }
-    let _ = writeln!(s, "  <PageCount>{pages}</PageCount>");
-    s.push_str("</ComicInfo>\n");
-    s
-}
 
 /// 迁移后扫描一遍目录，确认每本书至少有一份可打开的入口文件。
 pub fn verify_tree(store: &Store, report: &mut MigrateReport) {

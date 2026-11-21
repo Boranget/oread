@@ -149,6 +149,55 @@ pub async fn write_meta(dir: &Path, meta: &ComicMeta) -> io::Result<()> {
     atomic_write(&dir.join(META_FILE), text.as_bytes()).await
 }
 
+/// 图片 MIME → 文件扩展名；未知按 jpg 处理（与迁移口径一致）。
+pub fn ext_for_mime(mime: &str) -> &'static str {
+    let m = mime.to_ascii_lowercase();
+    if m.contains("png") {
+        "png"
+    } else if m.contains("webp") {
+        "webp"
+    } else if m.contains("gif") {
+        "gif"
+    } else if m.contains("avif") {
+        "avif"
+    } else {
+        "jpg"
+    }
+}
+
+/// 生成标准 `ComicInfo.xml`。`PageCount` 按当前页表合计，只写我们真正拥有的字段。
+pub fn to_comic_info(meta: &ComicMeta) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n",
+    );
+    let mut field = |name: &str, value: Option<&str>| {
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            let _ = writeln!(
+                s,
+                "  <{name}>{}</{name}>",
+                boranlib_ebook::xml::xml_escape(v)
+            );
+        }
+    };
+    field("Title", Some(meta.title.as_str()));
+    field("Writer", meta.author.as_deref());
+    field("Series", meta.series.as_deref());
+    field("Summary", meta.description.as_deref());
+    field("LanguageISO", meta.language.as_deref());
+    let pages: usize = meta.chapters.iter().map(|c| c.pages.len()).sum();
+    let _ = writeln!(s, "  <PageCount>{pages}</PageCount>");
+    s.push_str("</ComicInfo>\n");
+    s
+}
+
+/// 写出 `ComicInfo.xml`。标准阅读器只看这个文件，因此每次目录/页表变化都刷新。
+pub async fn write_comic_info(dir: &Path, meta: &ComicMeta) -> io::Result<()> {
+    atomic_write(&dir.join(COMIC_INFO_FILE), to_comic_info(meta).as_bytes()).await
+}
+
 /// 读 `oread.json`；不存在时按 CBZ 文件名与 ComicInfo.xml 反推一份。
 pub async fn read_meta(dir: &Path, book_url_hint: &str) -> io::Result<ComicMeta> {
     match tokio::fs::read_to_string(dir.join(META_FILE)).await {

@@ -35,6 +35,8 @@ const IDLE_POLL: Duration = Duration::from_secs(5);
 const DISK_WAIT: Duration = Duration::from_secs(60);
 /// 临时缓存 TTL 清理周期。
 const CLEANUP_EVERY: Duration = Duration::from_secs(3600);
+/// 入馆 rename 失败后的重试周期。
+const PROMOTE_RETRY: Duration = Duration::from_secs(60);
 
 /// 启动后台执行器与定期清理任务。进程生命周期内常驻。
 pub fn spawn(state: AppState) {
@@ -47,6 +49,10 @@ pub fn spawn(state: AppState) {
     let st = state.clone();
     tokio::spawn(async move {
         cleanup_loop(st).await;
+    });
+    let st = state.clone();
+    tokio::spawn(async move {
+        promote_loop(st).await;
     });
 }
 
@@ -118,16 +124,39 @@ async fn worker_loop(state: AppState, idx: usize) {
 async fn cleanup_loop(state: AppState) {
     loop {
         tokio::time::sleep(CLEANUP_EVERY).await;
-        match library::cleanup_temp(&state.library, state.cfg.library_temp_ttl_secs).await {
-            Ok(r) if r.books > 0 => {
+        match library::cleanup_temp_books(&state.library, state.cfg.library_temp_ttl_secs).await {
+            Ok(r) if r.report.books > 0 => {
+                let mut trashed = 0u64;
+                for book_url in &r.books {
+                    match state.store().move_to_trash(book_url).await {
+                        Ok(true) => trashed += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(book = %book_url, error = %e, "trash expired book dir failed")
+                        }
+                    }
+                }
                 tracing::info!(
-                    books = r.books,
-                    bytes = r.bytes,
+                    books = r.report.books,
+                    trashed,
+                    bytes = r.report.bytes,
                     "library temp cache cleaned"
                 );
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "library temp cleanup failed"),
+        }
+    }
+}
+
+/// 入馆时目录 rename 可能被占用（Windows 阅读器/杀软）；标记文件在这里被重试。
+async fn promote_loop(state: AppState) {
+    loop {
+        tokio::time::sleep(PROMOTE_RETRY).await;
+        match state.store().retry_pending_promotions().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(books = n, "pending library promotions completed"),
+            Err(e) => tracing::warn!(error = %e, "retry pending promotions failed"),
         }
     }
 }
@@ -360,6 +389,16 @@ async fn ensure_chapters(
         return Ok(chapters);
     }
     crate::routes::books::save_chapters(&state.library, &job.book_url, &chapters).await?;
+    if let Err(e) = crate::library_store::write::sync_toc(
+        &state.library,
+        &state.store(),
+        &job.book_url,
+        &chapters,
+    )
+    .await
+    {
+        tracing::warn!(book = %job.book_url, error = %e, "sync toc to book dir failed");
+    }
     let _ = crate::routes::books::sync_total_chapter_num(
         &state.library,
         user_pool,
@@ -396,6 +435,19 @@ async fn fetch_and_store(
         anyhow::bail!("正文为空");
     }
     crate::routes::books::upsert_content(&state.library, &c).await?;
+    // 目录优先：TOC 已经建过目录时，把归一化后的正文同步落盘。
+    let paragraphs =
+        crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
+    if let Err(e) = crate::library_store::write::save_text_chapter(
+        &state.store(),
+        book_url,
+        &chapter.url,
+        &paragraphs,
+    )
+    .await
+    {
+        tracing::warn!(book = %book_url, url = %chapter.url, error = %e, "write chapter to dir failed");
+    }
     Ok(())
 }
 
@@ -498,6 +550,7 @@ async fn fetch_comic(
         .await;
 
     let mut failed = 0usize;
+    let mut missing = 0usize;
     for (i, outcome) in outcomes {
         match outcome {
             Ok(Some((size, w, h))) => {
@@ -510,7 +563,12 @@ async fn fetch_comic(
                     im.height = h;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // 超大图只留清单；空 URL 是源页本身没有这一页。
+                if !imgs.images[i].url.trim().is_empty() {
+                    missing += 1;
+                }
+            }
             Err(e) => {
                 failed += 1;
                 tracing::warn!(
@@ -530,5 +588,40 @@ async fn fetch_comic(
         anyhow::bail!("{failed} 张图片下载失败");
     }
     library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
+    // 整章图片都落库后才写书目录：部分成功不写页表，读路径继续回退 DB。
+    if missing == 0 {
+        if let Err(e) = write_comic_chapter_dir(state, book_url, chapter, &imgs, &origin).await {
+            tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "write comic pages to dir failed");
+        }
+    }
+    Ok(())
+}
+
+/// 把刚下载完的一章漫画从 `library_images` 读回，写进书目录（`oread.json` 页表）。
+async fn write_comic_chapter_dir(
+    state: &AppState,
+    book_url: &str,
+    chapter: &BookChapter,
+    imgs: &crate::web_book::ChapterImages,
+    origin: &str,
+) -> anyhow::Result<()> {
+    let mut pages = Vec::with_capacity(imgs.images.len());
+    for img in &imgs.images {
+        if img.url.trim().is_empty() {
+            continue;
+        }
+        let Some(stored) = library_images::load(&state.library, &img.url, origin).await? else {
+            anyhow::bail!("图片尚未落盘: {}", img.url);
+        };
+        pages.push(crate::library_store::write::ComicPageInput {
+            data: stored.data,
+            mime: stored.mime,
+            width: stored.width.or(img.width),
+            height: stored.height.or(img.height),
+            source_url: Some(img.url.clone()),
+        });
+    }
+    crate::library_store::write::save_comic_pages(&state.store(), book_url, &chapter.url, &pages)
+        .await?;
     Ok(())
 }

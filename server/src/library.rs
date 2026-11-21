@@ -442,6 +442,24 @@ pub struct ClearReport {
 ///
 /// 馆藏（`tier=collection`）永不参与，只能由管理员移出后再回收。
 pub async fn cleanup_temp(pool: &SqlitePool, ttl_secs: i64) -> anyhow::Result<CleanupReport> {
+    Ok(cleanup_temp_books(pool, ttl_secs).await?.report)
+}
+
+/// 一次 TTL 清理的结果：统计 + 被删书的 `book_url`。
+///
+/// 目录即书之后，调用方还要按 `book_url` 把书目录移进 `trash/`；
+/// 只返回统计会让磁盘上的目录变成孤儿。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupOutcome {
+    pub report: CleanupReport,
+    pub books: Vec<String>,
+}
+
+/// 同 [`cleanup_temp`]，额外返回被删除的 `book_url` 列表。
+pub async fn cleanup_temp_books(
+    pool: &SqlitePool,
+    ttl_secs: i64,
+) -> anyhow::Result<CleanupOutcome> {
     let cutoff = now_ms() - ttl_secs.max(0) * 1000;
     let expired: Vec<(String,)> = sqlx::query_as(
         "SELECT book_url FROM library_books WHERE tier = 'temp' AND last_accessed_at < ?1",
@@ -449,26 +467,27 @@ pub async fn cleanup_temp(pool: &SqlitePool, ttl_secs: i64) -> anyhow::Result<Cl
     .bind(cutoff)
     .fetch_all(pool)
     .await?;
-    let mut report = CleanupReport::default();
+    let mut out = CleanupOutcome::default();
     for (book_url,) in expired {
         let r = delete_book(pool, &book_url).await?;
-        report.books += 1;
-        report.chapters += r.chapters;
-        report.contents += r.contents;
-        report.images += r.images;
-        report.bytes += r.bytes;
+        out.report.books += 1;
+        out.report.chapters += r.chapters;
+        out.report.contents += r.contents;
+        out.report.images += r.images;
+        out.report.bytes += r.bytes;
+        out.books.push(book_url);
     }
-    if report.books > 0 {
+    if out.report.books > 0 {
         tracing::info!(
-            books = report.books,
-            contents = report.contents,
-            bytes = report.bytes,
+            books = out.report.books,
+            contents = out.report.contents,
+            bytes = out.report.bytes,
             ttl_secs,
             "library temp cache expired"
         );
         let _ = crate::db::reclaim_pages(pool, 1024).await;
     }
-    Ok(report)
+    Ok(out)
 }
 
 /// 整本删除（正文 + 图片 + 目录 + 书目行）。

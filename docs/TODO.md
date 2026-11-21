@@ -183,6 +183,25 @@
 - 依据：`server/src/routes/opds.rs`、`auth::auth_middleware` 的 `/opds` 分支；参考 calibre
   的 OPDS 字段口径，只按公开规范独立实现。
 
+### 2.11 目录即书写路径（`进行中`）
+
+- 状态：`进行中`。读路径（文字书 / 漫画 / 导出 / 图片代理）与一次性迁移已完成；
+  写路径 v1 已接上，`index.db` 与旧表删除尚未开始。
+- 已完成：
+  - `library_store::write`：TOC 合并（按 URL 保留章节 id/href、新章追加、删除只移出 spine）、
+    文字章节正文落盘、漫画整章页表与 `ComicInfo.xml` 落盘；
+  - TOC 抓取（单本 / 批量 / worker）与正文、漫画页抓取成功后自动同步目录；
+  - 入馆 / 移出 / 删除 / TTL 清理 = 目录 `promote` / `demote` / `move_to_trash`；
+    `promote` 失败留 `.oread-promote` 标记，后台 60 s 重试；
+  - 元数据以 `content.opf` / `oread.json` 为权威，DB 只补空字段，不覆盖管理员编辑。
+- 还差：
+  - `index.db`：章节 href / `oread:revision` / 书目检索字段的派生索引，以及
+    `doctor --rebuild-index`；
+  - 导出直接打包目录（不再逐章重新生成）；
+  - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退；
+  - 管理员编辑：改正文段落、改元数据、换封面、换漫画单页（v1 不做增删/拆分/合并章节）。
+- 纪律：章节文件名序号创建后永不复用/改名；顺序只存 spine；目录是唯一权威。
+
 ---
 
 ## 三、已知缺陷与缺口

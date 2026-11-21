@@ -98,6 +98,35 @@ pub(super) async fn content(
                         Ok(c) => {
                             // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
                             save_content_cached(&s.library, &c).await?;
+                            // 目录优先：TOC 已建目录时把正文同步落盘；失败只记日志。
+                            let bu = {
+                                let b = c.book_url.trim();
+                                if b.is_empty() {
+                                    book_hint.clone().filter(|v| !v.trim().is_empty())
+                                } else {
+                                    Some(b.to_string())
+                                }
+                            };
+                            if let Some(bu) = bu {
+                                let paragraphs = crate::library_store::write::markup_to_paragraphs(
+                                    c.content.as_deref().unwrap_or(""),
+                                );
+                                if let Err(err) = crate::library_store::write::save_text_chapter(
+                                    &s.store(),
+                                    &bu,
+                                    &q.chapter_url,
+                                    &paragraphs,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        book = %bu,
+                                        url = %q.chapter_url,
+                                        error = %err,
+                                        "write chapter to dir failed"
+                                    );
+                                }
+                            }
                             c
                         }
                         // 回源失败：库里还有旧正文就先用着，别让已下载的书因源失效而打不开。

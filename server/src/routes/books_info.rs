@@ -121,6 +121,22 @@ pub(super) async fn toc(
                 match fetch_toc(&s, &db, &q).await {
                     Ok(chapters) => {
                         save_chapters(&s.library, &q.book_url, &chapters).await?;
+                        // 目录落库后同步进书目录（OPF/oread.json）；失败只记日志，
+                        // 读路径仍可回退 DB。
+                        if let Err(err) = crate::library_store::write::sync_toc(
+                            &s.library,
+                            &s.store(),
+                            &q.book_url,
+                            &chapters,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                book = %q.book_url,
+                                error = %err,
+                                "sync toc to book dir failed"
+                            );
+                        }
                         // 目录落库时同步总章节数，供进度百分比与书架完成度使用
                         sync_total_chapter_num(
                             &s.library,
@@ -306,10 +322,12 @@ pub(super) async fn toc_batch(
     let pool = db.0.clone();
     let lib = s.library.clone();
     let shared = s.shared.clone();
+    let store = s.store();
     let done: Vec<TocBatchOutcome> = stream::iter(urls.into_iter().map(|book_url| {
         let pool = pool.clone();
         let lib = lib.clone();
         let shared = shared.clone();
+        let store = store.clone();
         let source_override = source_override.clone();
         async move {
             let meta = match load_book_meta(&lib, &pool, &book_url).await {
@@ -421,6 +439,11 @@ pub(super) async fn toc_batch(
                     before_total,
                     ..Default::default()
                 };
+            }
+            if let Err(e) =
+                crate::library_store::write::sync_toc(&lib, &store, &book_url, &chapters).await
+            {
+                tracing::warn!(book = %book_url, error = %e, "sync toc to book dir failed");
             }
             let _ = sync_total_chapter_num(&lib, &pool, &book_url, chapters.len() as i64).await;
             let _ = backfill_word_counts(&lib, &book_url).await;

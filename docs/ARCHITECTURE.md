@@ -138,7 +138,8 @@ Bearer 访问 `/opds*`，便于调试。
 > **存储正在迁移中**：目标形态是「每本书一个解压目录 + 可重建索引」，见 §4.1。
 > `boranlib migrate-store` 把旧库导出成目录；**文字书与漫画的读路径都已优先走目录**
 > （阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 漫画页、图片代理），未迁移或目录缺失时
-> 回退 `library.db`。写路径仍走旧表，后续切换。
+> 回退 `library.db`。写路径也已切到目录：TOC/正文/漫画页抓取成功后直接落盘，
+> `library.db` 仍同步写一份作为回退；`index.db` 尚未建立。
 
 ### 4.1 目标存储：目录即书
 
@@ -151,8 +152,16 @@ Bearer 访问 `/opds*`，便于调试。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。
-- `promote`（临时→馆藏）= 目录 `rename`；失败记 `promote_pending` 后台重试，期间仍算临时书。
+- `promote`（临时→馆藏）= 目录 `rename`；失败写 `.oread-promote` 标记（内容是 `book_url`），
+  后台每 60 s 重试；期间读路径优先选有内容的目录，不被空馆藏骨架挡住。`demote` / `move_to_trash`
+  同理，删除与 TTL 清理都把目录移进 `trash/`。
 - 迁移命令：`boranlib migrate-store`（只读旧表、只写目录，已存在的书目录跳过）。
+- 写路径（`library_store::write`）：TOC 抓取成功后 `sync_toc` 按章节 URL 合并 spine——
+  旧章保留 id/href 只更新标题，新章追加新序号，目录变短只移出 spine、不删文件也不复用序号；
+  正文抓取成功后 `save_text_chapter` 写归一化段落（首段等于章节标题时去掉，避免重复）；
+  漫画整章所有页都拿到才 `save_comic_pages` 写页表与 `ComicInfo.xml`，部分成功不写，
+  读路径继续回退 DB；页数变少时删除旧的多余页文件。所有写入先章节/图片、再 `nav.xhtml`、
+  最后 `content.opf`，并受每本书一把写锁保护。
 - 读路径：`Store::open_book` 解析 OPF，按 `oread:chapter-url` 定位章节文件；`<body>` 还原成
   段落 HTML（去掉与 OPF 重复的首行标题）。未抓取的章节写成带 `oread-pending` 标记的占位文件，
   读路径见到标记按“未缓存”处理，不会被当成正文返回或计入完成度。

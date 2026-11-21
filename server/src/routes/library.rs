@@ -705,6 +705,14 @@ async fn collect(
         return Err(AppError::BadRequest("book_url 不能为空".into()));
     }
     let created = library::collect(&s.library, &book_url).await?;
+    // 目录即书：整目录搬进 collection/。搬不动（Windows 占用等）就留标记，
+    // 后台维护循环重试；DB 已是 collection，读路径不受影响。
+    if let Err(e) = s.store().promote(&book_url).await {
+        tracing::warn!(book = %book_url, error = %e, "promote book dir failed; retry later");
+        if let Err(e2) = s.store().mark_promote_pending(&book_url).await {
+            tracing::warn!(book = %book_url, error = %e2, "write promote marker failed");
+        }
+    }
     let book = library::load_book(&s.library, &book_url).await?;
     let source = q
         .source
@@ -740,11 +748,14 @@ async fn release(
     if book_url.is_empty() {
         return Err(AppError::BadRequest("book_url 不能为空".into()));
     }
+    // 先搬目录再改 DB：搬不动就保持原状，避免「DB 说临时、目录还在馆藏」。
+    let demoted = s.store().demote(book_url).await?;
     let changed = library::release(&s.library, book_url).await?;
     Ok(Json(json!({
         "ok": true,
         "book_url": book_url,
         "released": changed,
+        "moved_to_temp": demoted.is_some(),
         "tier": library::TIER_TEMP,
     })))
 }
@@ -770,10 +781,13 @@ async fn delete(
         }
         Some(_) => {}
     }
+    // 目录先移进回收站：即使随后 DB 删除失败，正文也还在，可人工恢复。
+    let trashed = s.store().move_to_trash(book_url).await?;
     let report = library::delete_book(&s.library, book_url).await?;
     Ok(Json(json!({
         "ok": true,
         "book_url": book_url,
+        "trashed": trashed,
         "deleted_books": report.books,
         "deleted_chapters": report.chapters,
         "deleted_contents": report.contents,
@@ -785,10 +799,23 @@ async fn delete(
 /// 立即回收过期临时缓存（不等定期任务）。仅管理员。
 async fn clean_temp(State(s): State<AppState>, u: AuthUser) -> AppResult<Json<serde_json::Value>> {
     ensure_admin(&u)?;
-    let report = library::cleanup_temp(&s.library, s.cfg.library_temp_ttl_secs).await?;
+    let outcome = library::cleanup_temp_books(&s.library, s.cfg.library_temp_ttl_secs).await?;
+    // DB 行删掉后，书目录也要移进回收站，否则磁盘上留下无主目录。
+    let mut trashed = 0u64;
+    for book_url in &outcome.books {
+        match s.store().move_to_trash(book_url).await {
+            Ok(true) => trashed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(book = %book_url, error = %e, "move expired book dir to trash failed")
+            }
+        }
+    }
+    let report = outcome.report;
     Ok(Json(json!({
         "ok": true,
         "books": report.books,
+        "trashed": trashed,
         "chapters": report.chapters,
         "contents": report.contents,
         "images": report.images,
