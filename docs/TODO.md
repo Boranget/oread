@@ -18,7 +18,7 @@
 - 主要依据：
   - 路由与服务：[mod.rs](../server/src/routes/mod.rs)、[sources.rs](../server/src/routes/sources.rs)、[books.rs](../server/src/routes/books.rs)、[bookshelf.rs](../server/src/routes/bookshelf.rs)、[replace.rs](../server/src/routes/replace.rs)、[stats.rs](../server/src/routes/stats.rs)、[health.rs](../server/src/routes/health.rs)
   - 基础能力：[auth.rs](../server/src/auth.rs)、[config.rs](../server/src/config.rs)、[main.rs](../server/src/main.rs)、[web_book.rs](../server/src/web_book.rs)、[rule_engine.rs](../server/src/rule_engine.rs)
-  - 前端消费：[api.js](../server/web/src/lib/api.js)、[Reader.svelte](../server/web/src/pages/Reader.svelte)、[Settings.svelte](../server/web/src/pages/Settings.svelte)
+  - 前端消费：[api.js](../server/web/src/lib/api.js)、[Reader.svelte](../server/web/src/reader/Reader.svelte)、[Settings.svelte](../server/web/src/pages/Settings.svelte)
   - 构建/工程：[build-dev.ps1](../scripts/build-dev.ps1)、[build-release.ps1](../scripts/build-release.ps1)、[server/Cargo.toml](../server/Cargo.toml)、[rust-toolchain.toml](../rust-toolchain.toml)、[ci.yml](../.github/workflows/ci.yml)
 
 ## 状态图例
@@ -131,7 +131,7 @@
   - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`），入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
   - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.3 与 TODO 2.9。
-- 依据：[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
+- 依据：[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
 
 ### 2.8 书模型与可交换元数据（`进行中`）
 
@@ -246,7 +246,7 @@
 ### 3.4 P1：统计前端已接入（已关闭）
 
 - 状态：`已完成`
-- 结论：`api.js` 已有 `recordReading`/`statsOverview`/`shelfStats`；[Reader.svelte](../server/web/src/pages/Reader.svelte#L231) 定时上报，[Stats.svelte](../server/web/src/pages/Stats.svelte#L21) 消费 `/api/stats/overview?days=7|30`。原“前端完全未接入”作废。
+- 结论：`api.js` 已有 `recordReading`/`statsOverview`/`shelfStats`；[Reader.svelte](../server/web/src/reader/Reader.svelte#L231) 定时上报，[Stats.svelte](../server/web/src/pages/Stats.svelte#L21) 消费 `/api/stats/overview?days=7|30`。原“前端完全未接入”作废。
 - 剩余：`/api/bookshelf/stats` 仍只有 `api.js` 封装、书架页未展示；另缺“启用记录”开关（模块 10 #3）。
 
 ### 3.5 P1：页面入口仍缺（api.js 已封装，UI 未接）
@@ -278,7 +278,7 @@
 ### 3.8 P2：正文 HTML/图片的渲染口径不一致（漫画链路的关键缺口）
 
 - 状态：`处理中`（漫画纳入范围后从“待确认”上调）
-- 现象：规则引擎默认抽取返回 `inner_html()`（[rule_engine.rs](../server/src/rule_engine.rs#L378-L426)），后端会按 `image_style` 改写 `<img>`（[replace.rs](../server/src/routes/replace.rs#L241-L274)）；但阅读器把正文按 `\n` 切段、以纯文本渲染（[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L199)、[Reader.svelte](../server/web/src/pages/Reader.svelte#L784-L786)），没有 `{@html}` 或图片渲染。
+- 现象：规则引擎默认抽取返回 `inner_html()`（[rule_engine.rs](../server/src/rule_engine.rs#L378-L426)），后端会按 `image_style` 改写 `<img>`（[replace.rs](../server/src/routes/replace.rs#L241-L274)）；但阅读器把正文按 `\n` 切段、以纯文本渲染（[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L199)、[Reader.svelte](../server/web/src/reader/Reader.svelte#L784-L786)），没有 `{@html}` 或图片渲染。
 - 影响：若书源规则返回 HTML，页面会直接显示标签文本；`image_style` 的三种模式用户看不到差异；图片一律不显示。
 - 建议：明确正文格式契约（纯文本 or 受控 HTML）；若保留 HTML，前端用白名单 sanitize 后 `{@html}` 渲染；若走纯文本，服务端统一去标签并把图片转成占位文案。漫画链路（2.7）依赖此处的图片渲染结论。
 - 为什么：这决定“正文长什么样”，不确认会让前后端各自猜；漫画能否落地也取决于它。
@@ -318,7 +318,7 @@
 | `bookshelf` 缺 `group` 字段与“移入分组”接口 | `已完成待验证` | 迁移已加 `"group"`；`POST /api/bookshelf/group` 支持 `book_id`/`book_ids`，空 group 移出（[bookshelf.rs](../server/src/routes/bookshelf.rs#L18-L24)、[bookshelf.rs](../server/src/routes/bookshelf.rs#L157-L186)） | 单本/批量移入、移出、书架列表分组筛选；`book_meta.group` 同步 |
 | 阅读统计表已建但无路由 | `已完成待验证` | `/api/stats/reading`、`/api/stats/overview` 已实现并注册（[stats.rs](../server/src/routes/stats.rs)、[mod.rs](../server/src/routes/mod.rs)） | 上报后 `reading_stats` 累加、`book_stats.read_chapters` 取最大值、streak 跨天逻辑；前端接入见 3.4 |
 | `image_style` 未处理图片 | `已完成待验证` | 后端 `apply_image_style` 已按 0/1/2/3 改写或删除 `<img>`（[replace.rs](../server/src/routes/replace.rs#L241-L274)） | 需前端实际渲染图片才能看到效果，见 3.8 |
-| `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/pages/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/pages/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
+| `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/reader/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
 | 构建脚本硬编码旧路径 | `已完成待验证` | 两个脚本都以 `$PSScriptRoot` 推导仓库根，并通过 `CARGO_TARGET_DIR` 输出（[build-dev.ps1](../scripts/build-dev.ps1#L28-L45)、[build-release.ps1](../scripts/build-release.ps1#L33-L45)） | 在仓库根与任意工作目录调用都应成功；当前脚本变量为 `OREAD_TARGET_WIN`/`OREAD_TARGET_MUSL`，工程侧改名后为 `BORANLIB_TARGET_*`（本文以现名为准） |
 
 缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。馆藏漫画的图片字节落在 `library_images`（[library_images.rs](../server/src/library_images.rs)），按 `(url, origin)` 去重，与正文一起删除/清理；图片代理（[image_proxy.rs](../server/src/routes/image_proxy.rs)）优先读本地 BLOB。管理员入馆漫画前会调用 `POST /api/library/comic/estimate` 抽样预估体积并弹确认框，结果按 `book_url+source+uid` 缓存 30 分钟。

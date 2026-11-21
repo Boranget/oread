@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node --test src/lib/readerContent.test.js src/lib/readerHtml.test.js src/lib/readerImages.test.js src/lib/readerStats.test.js src/lib/readerAuto.test.js src/lib/readerMath.test.js src/lib/readerProgress.test.js src/lib/readerGestures.test.js src/lib/apiErrors.test.js src/lib/apiUrl.test.js src/lib/searchJobsModel.test.js",
+    "test": "node --test src/reader/readerContent.test.js src/reader/readerHtml.test.js src/reader/readerImages.test.js src/reader/readerStats.test.js src/reader/readerAuto.test.js src/reader/readerMath.test.js src/reader/readerProgress.test.js src/reader/readerGestures.test.js src/lib/apiErrors.test.js src/lib/apiUrl.test.js src/lib/searchJobsModel.test.js",
     "check": "svelte-check --tsconfig ./jsconfig.json",
+    "check:reader": "node ../../scripts/check-reader-boundary.mjs",
     "preview": "vite preview"
   },
   "devDependencies": {

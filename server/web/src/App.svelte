@@ -162,7 +162,7 @@
   function loadComicReader() {
     if (ComicReader || comicLoading) return comicLoading;
     comicError = '';
-    comicLoading = import('./pages/ComicReader.svelte')
+    comicLoading = import('./reader/ComicReader.svelte')
       .then((mod) => {
         ComicReader = mod.default;
       })
@@ -178,7 +178,7 @@
   function loadReader() {
     if (Reader || readerLoading) return readerLoading;
     readerError = '';
-    readerLoading = import('./pages/Reader.svelte')
+    readerLoading = import('./reader/Reader.svelte')
       .then((mod) => {
         Reader = mod.default;
       })

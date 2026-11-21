@@ -90,6 +90,11 @@ jobs:
       - name: Svelte check
         run: npm run check
 
+      # 阅读器边界：reader/ 只许依赖 ./ 与 ../lib/，防止管理端样式污染墨水屏。
+      - name: Reader boundary gate
+        working-directory: .
+        run: node scripts/check-reader-boundary.mjs
+
       # 首屏体积门禁：口径 = 入口 chunk + 其静态 import 的 chunk（gzip），
       # 不是 dist/*.js 总量。阈值在 scripts/budget.json；
       # 脚本在仓库根目录，需显式把工作目录切回根。
