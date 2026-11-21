@@ -23,18 +23,28 @@ main.rs                 读取 Config → 校验 → 固定 tokio/req/JS/图片�
 `server/Cargo.toml` 是 workspace 根，同时也是 `boranlib` 二进制包。依赖严格单向：
 
 ```
-boranlib (server)  →  boranlib-ebook (server/crates/ebook)
-                   →  （规则引擎、馆藏、路由仍在 server 包内，后续继续拆出）
+boranlib (server)  →  boranlib-ebook    (server/crates/ebook)
+                   →  boranlib-rule-core (server/crates/rule-core)
+                   →  （馆藏与路由仍在 server 包内，后续继续拆出）
 ```
 
 `boranlib-ebook` 的硬约束：**不出现 `sqlx`、不出现 `axum`、不碰 `data_dir` 布局**。它只认识书的数据结构
 和「按章/按页读取」的 trait，存储与 HTTP 由调用方注入。这样做是为了让「格式层与存储层解耦」从注释变成编译错误。
 
+`boranlib-rule-core` 收纳书源引擎内核：`config`（抓取/搜索限额）、`req*`（HTTP 预算、Cookie、字符集解码）、
+`rule_engine*`（CSS/XPath/JSONPath/JS）、`entities`（书源与书目结构体）、`crypto`（源规则用到的加解密）。
+默认构建**不含 `sqlx`/`axum`**，可以脱离服务端单独编译与测试；只有服务端显式开启 `sqlx-row` feature 时，
+`entities` 才派生 `sqlx::FromRow`，避免重复定义实体。`web_book*`、`source_*`、`query_class` 因依赖馆藏库
+与体检记录，暂时留在 server 包内。
+
 ## 2. 模块地图（server/src）
+
+> `config`、`crypto`、`entities`、`req*`、`rule_engine*`、`serde_util`、`search_rank`、`title_filter`
+> 已移入 `boranlib-rule-core`，这里通过 `pub use` 保留同名模块路径。
 
 | 模块 | 职责 |
 |---|---|
-| `config*` | 环境变量（`BORANLIB_` 优先、`LEGADO_` 兼容）、生产校验、预算解析 |
+| `config*`（rule-core） | 环境变量（`BORANLIB_` 优先、`LEGADO_` 兼容）、生产校验、预算解析 |
 | `auth.rs` | 注册/登录/改密、Bearer 鉴权中间件、管理员、用户库连接池；`/opds` 前缀的 HTTP Basic 校验与 challenge |
 | `db*.rs` / `db_guard*` | `shared.db`、`library.db` 与 `users/<uid>.db` 的建库、迁移、备份、可写探测、崩溃自愈 |
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |

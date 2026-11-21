@@ -242,7 +242,8 @@ pub struct ContentRule {
 
 // ============ 核心业务实体 ============
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "sqlx-row", derive(sqlx::FromRow))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Book {
     #[serde(default)]
@@ -279,10 +280,10 @@ pub struct Book {
     pub latest_chapter_title: Option<String>,
     #[serde(default)]
     pub latest_chapter_time: i64,
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default)]
     pub last_check_time: i64,
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default)]
     pub last_check_count: i64,
     #[serde(default)]
@@ -368,7 +369,8 @@ pub struct SearchBook {
     pub rank_seq: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "sqlx-row", derive(sqlx::FromRow))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BookChapter {
     #[serde(default)]
@@ -402,12 +404,13 @@ pub struct BookChapter {
     #[serde(default)]
     pub word_count: i64,
     /// 所属分卷标题：分卷行返回自身标题，普通章节返回最近的前置分卷（目录分组用）
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default)]
     pub volume_title: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "sqlx-row", derive(sqlx::FromRow))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BookContent {
     #[serde(default)]
@@ -415,7 +418,7 @@ pub struct BookContent {
     #[serde(default)]
     pub url: String,
     /// 来源书源 URL（缓存键的一部分）；旧缓存行为空串。
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default, skip)]
     pub origin: String,
     #[serde(default)]
@@ -429,15 +432,15 @@ pub struct BookContent {
     #[serde(default)]
     pub is_local: bool,
     /// `text`（默认）或 `image`；老缓存行由迁移填 `text`
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default)]
     pub content_type: String,
     /// 图片章节缓存（`{images:[...], truncated}` 的 JSON）；文本章节为 None
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(skip)]
     pub images_json: Option<String>,
     /// 写入时的解析管线指纹；旧记录为 None，读取时视为未命中并重建
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(skip)]
     pub cache_version: Option<String>,
 }
@@ -612,7 +615,8 @@ pub struct BookGroup {
     pub book_sort: i64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+#[cfg_attr(feature = "sqlx-row", derive(sqlx::FromRow))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ReplaceRule {
     #[serde(default)]
@@ -637,7 +641,7 @@ pub struct ReplaceRule {
     pub is_enabled: bool,
     #[serde(default)]
     pub is_regex: bool,
-    #[sqlx(default)]
+    #[cfg_attr(feature = "sqlx-row", sqlx(default))]
     #[serde(default)]
     pub timeout_millisecond: i64,
     #[serde(default)]

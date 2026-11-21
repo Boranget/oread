@@ -390,6 +390,7 @@ dependencies = [
  "bcrypt",
  "boa_engine",
  "boranlib-ebook",
+ "boranlib-rule-core",
  "cbc",
  "chrono",
  "ego-tree",
@@ -432,6 +433,33 @@ dependencies = [
  "scraper",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "boranlib-rule-core"
+version = "1.0.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "boa_engine",
+ "cbc",
+ "encoding_rs",
+ "futures",
+ "jsonpath-rust",
+ "md-5",
+ "once_cell",
+ "regex",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "sxd-document",
+ "sxd-xpath",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

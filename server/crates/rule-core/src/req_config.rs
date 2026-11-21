@@ -402,7 +402,7 @@ pub fn search_slots(scope: SearchScope) -> usize {
 }
 
 /// 漫画槽数量：并发的 1/4（至少 1 个）。默认 16 → 4 个。
-pub(crate) fn comic_slot_count(slots: usize) -> usize {
+pub fn comic_slot_count(slots: usize) -> usize {
     (slots / 4).max(1)
 }
 
