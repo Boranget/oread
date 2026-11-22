@@ -429,28 +429,50 @@ async fn books(
         }
     };
     let (ts, after_url) = parse_cursor(q.cursor.as_deref())?;
-    let like =
-        q.q.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("%{}%", s.replace('%', "\\%").replace('_', "\\_")));
+    let term = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let like = term.map(|s| format!("%{}%", s.replace('%', "\\%").replace('_', "\\_")));
+
+    // index.db 扩展搜索：除书名/作者外还匹配系列、主题与简介；索引不可用时
+    // 只退回 library.db 的 name/author，不影响旧书（尚未建目录）被搜到。
+    let mut index_urls: Vec<String> = Vec::new();
+    if let Some(term) = term {
+        let store = s.store();
+        match crate::library_store::index::shared(store.root()).await {
+            Ok(index) => match index.search(term, 2000).await {
+                Ok(urls) => index_urls = urls,
+                Err(e) => tracing::warn!(error = %e, "index.db search failed"),
+            },
+            Err(e) => tracing::warn!(error = %e, "index.db open failed; search falls back to db"),
+        }
+    }
+    let index_filter = if index_urls.is_empty() {
+        String::new()
+    } else {
+        let placeholders = (6..6 + index_urls.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" OR book_url IN ({placeholders})")
+    };
 
     let sql = format!(
         "SELECT * FROM library_books \
          WHERE (?1 = 'all' OR tier = ?1) \
-           AND (?2 = '' OR name LIKE ?2 ESCAPE '\\' OR author LIKE ?2 ESCAPE '\\') \
+           AND (?2 = '' OR name LIKE ?2 ESCAPE '\\' OR author LIKE ?2 ESCAPE '\\'{index_filter}) \
            AND ({col} < ?3 OR ({col} = ?3 AND book_url > ?4)) \
          ORDER BY {col} DESC, book_url ASC LIMIT ?5",
         col = sort_expr
     );
-    let rows: Vec<LibraryBook> = sqlx::query_as(&sql)
+    let mut query = sqlx::query_as(&sql)
         .bind(tier_filter)
         .bind(like.clone().unwrap_or_default())
         .bind(ts)
         .bind(&after_url)
-        .bind(limit + 1)
-        .fetch_all(&s.library)
-        .await?;
+        .bind(limit + 1);
+    for url in &index_urls {
+        query = query.bind(url);
+    }
+    let rows: Vec<LibraryBook> = query.fetch_all(&s.library).await?;
     let has_more = rows.len() as i64 > limit;
     let page: Vec<&LibraryBook> = rows.iter().take(limit as usize).collect();
     let next_cursor = if has_more {

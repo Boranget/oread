@@ -152,6 +152,9 @@ Bearer 访问 `/opds*`，便于调试。
   修订号/章页计数/封面 href），靠 `oread:revision` 判脏。`index.db` 放在
   `data_dir/library/index.db`，删掉不会丢内容：进程启动时后台全量重建，
   `boranlib doctor --rebuild-index` 可手动重建。
+- 馆藏搜索（`GET /api/library/books?q=`）先查 `index.db`（书名/作者/系列/主题/简介），
+  再与 `library.db` 的 `name`/`author` 取并集；写路径（TOC/正文/元数据/封面/漫画页/
+  入馆/移出/删除/迁移）在落盘后增量刷新索引。排序与分页仍用 `library.db` 的访问时间。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。

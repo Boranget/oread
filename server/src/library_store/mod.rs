@@ -270,6 +270,7 @@ impl Store {
         let to = self.dir_for(Tier::Collection, book_url);
         if !temp.is_dir() {
             if to.is_dir() {
+                index::sync_book(self, book_url).await;
                 return Ok(Some((Tier::Collection, to)));
             }
             return Ok(None);
@@ -287,6 +288,7 @@ impl Store {
         rename_retry(&temp, &to).await?;
         // 入馆成功：顺手清掉「待重试」标记（标记随目录一起搬过来）。
         let _ = tokio::fs::remove_file(to.join(PROMOTE_MARKER)).await;
+        index::sync_book(self, book_url).await;
         Ok(Some((Tier::Collection, to)))
     }
 
@@ -296,31 +298,35 @@ impl Store {
         let from = self.dir_for(Tier::Collection, book_url);
         let c_ok = from.is_dir();
         let t_ok = temp.is_dir();
-        match (c_ok, t_ok) {
-            (false, false) => Ok(None),
-            (false, true) => Ok(Some((Tier::Temp, temp))),
+        let out = match (c_ok, t_ok) {
+            (false, false) => None,
+            (false, true) => Some((Tier::Temp, temp)),
             // 馆藏目录只是入馆失败时留下的空骨架：保留临时目录里的正文。
             (true, true) if !has_content(&from) && has_content(&temp) => {
                 let aside = self.trash_target(book_url, "demote-empty");
                 tokio::fs::create_dir_all(self.root.join(TRASH_DIR)).await?;
                 rename_retry(&from, &aside).await?;
-                Ok(Some((Tier::Temp, temp)))
+                Some((Tier::Temp, temp))
             }
             (true, true) => {
                 let aside = self.trash_target(book_url, "demote-dup");
                 tokio::fs::create_dir_all(self.root.join(TRASH_DIR)).await?;
                 rename_retry(&temp, &aside).await?;
                 rename_retry(&from, &temp).await?;
-                Ok(Some((Tier::Temp, temp)))
+                Some((Tier::Temp, temp))
             }
             (true, false) => {
                 if let Some(parent) = temp.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 rename_retry(&from, &temp).await?;
-                Ok(Some((Tier::Temp, temp)))
+                Some((Tier::Temp, temp))
             }
+        };
+        if out.is_some() {
+            index::sync_book(self, book_url).await;
         }
+        Ok(out)
     }
 
     /// 删除一本：把 `collection/` 与 `temp/` 里同 id 的目录都移到
@@ -338,6 +344,9 @@ impl Store {
             tokio::fs::create_dir_all(self.root.join(TRASH_DIR)).await?;
             rename_retry(&from, &to).await?;
             moved = true;
+        }
+        if moved {
+            index::forget_book(self, book_url).await;
         }
         Ok(moved)
     }

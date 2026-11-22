@@ -2379,7 +2379,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 |---|---|---|---|
 | `tier` | string | `collection` | `collection` / `temp` / `all` |
 | `sort` | string | `accessed` | `accessed`（最近访问） / `collected`（入馆时间） |
-| `q` | string | — | 书名或作者模糊匹配（`%`/`_` 已转义为字面量） |
+| `q` | string | — | 模糊匹配：`library.db` 的书名/作者 + `index.db` 的书名/作者/系列/主题/简介（`%`/`_` 已转义为字面量） |
 | `cursor` | string | — | keyset 游标，原样回传上一页的 `next_cursor`；首页不传 |
 | `limit` | integer | 50 | clamp 1..200 |
 
@@ -2439,6 +2439,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：`400`（`tier`/`sort` 非法）；`401`；`500`。
 - 行为：`ORDER BY <sort_expr> DESC, book_url ASC`，用游标续页，**不使用 OFFSET**；不返回总数。
   - `sort=accessed` 用 `last_accessed_at`；`sort=collected` 用 `COALESCE(collected_at, 0)`（临时层没有入馆时间，按 0 排序，分页不会漏行）。
+  - 搜索先查 `index.db`（书名/作者/系列/主题/简介，最多 2000 条命中），再与 `library.db`
+    的 `name`/`author` 匹配取并集：尚未建目录的旧书仍能被搜到；索引不可用时自动只走 DB。
+    索引在启动时重建，正文/元数据/封面/漫画页保存后增量刷新，因此搜索结果与目录一致。
 
 ### 6.12.3 单书元数据：`GET` / `POST /api/library/book/meta`
 

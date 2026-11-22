@@ -250,6 +250,7 @@ async fn migrate_text_book(
     meta.bump();
     store.write_opf(&dir, &meta).await?;
     store.write_nav(&dir, &meta).await?;
+    super::index::sync_book(store, &meta.book_url).await;
     Ok(())
 }
 
@@ -336,6 +337,7 @@ async fn migrate_comic(
     meta.bump();
     super::comic::write_meta(&dir, &meta).await?;
     super::comic::write_comic_info(&dir, &meta).await?;
+    super::index::sync_book(store, &meta.book_url).await;
     Ok(())
 }
 

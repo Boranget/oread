@@ -187,6 +187,7 @@ pub async fn save_text_meta(
     apply_text(&mut meta, fields)?;
     meta.bump();
     store.write_opf(&opened.dir, &meta).await?;
+    super::index::sync_book(store, book_url).await;
     Ok(meta)
 }
 
@@ -209,6 +210,7 @@ pub async fn save_comic_meta(
     meta.bump();
     comic::write_meta(&opened.dir, &meta).await?;
     comic::write_comic_info(&opened.dir, &meta).await?;
+    super::index::sync_book(store, book_url).await;
     Ok(meta)
 }
 
@@ -286,6 +288,7 @@ pub async fn save_chapter(
     meta.bump();
     store.write_nav(&opened.dir, &meta).await?;
     store.write_opf(&opened.dir, &meta).await?;
+    super::index::sync_book(store, book_url).await;
     Ok(meta)
 }
 
@@ -337,6 +340,7 @@ pub async fn replace_cover(
     meta.cover = Some(cover.clone());
     meta.bump();
     store.write_opf(&opened.dir, &meta).await?;
+    super::index::sync_book(store, book_url).await;
     // 旧封面文件名不同（例如 png → jpg）时删掉，避免目录里留孤儿文件。
     if let Some(old) = old {
         if old.href != href {
@@ -432,6 +436,7 @@ pub async fn replace_page(
     meta.bump();
     comic::write_meta(&opened.dir, &meta).await?;
     comic::write_comic_info(&opened.dir, &meta).await?;
+    super::index::sync_book(store, book_url).await;
     Ok((meta, page))
 }
 

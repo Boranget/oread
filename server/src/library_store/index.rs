@@ -10,10 +10,11 @@
 //! v1 不在每次写盘时同步索引：索引只服务诊断与后续的列表加速，允许短暂滞后，
 //! 需要精确结果时用 `doctor` 重建。这样写路径不必为了缓存再引入一个事务点。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use once_cell::sync::Lazy;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
@@ -162,6 +163,34 @@ impl Index {
         Ok(rows.into_iter().map(row_from_sql).collect())
     }
 
+    /// 跨书名/作者/系列/主题/简介搜索，返回匹配的 `book_url`（按书名排序）。
+    ///
+    /// 只做 `LIKE` 子串匹配：个人馆藏规模下足够快，也不引入 FTS 的写放大。
+    pub async fn search(&self, term: &str, limit: i64) -> anyhow::Result<Vec<String>> {
+        let term = term.trim();
+        if term.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!(
+            "%{}%",
+            term.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let rows = sqlx::query_scalar(
+            "SELECT book_url FROM book_index \
+             WHERE book_url <> '' AND (title LIKE ?1 ESCAPE '\\' OR author LIKE ?1 ESCAPE '\\' \
+               OR series LIKE ?1 ESCAPE '\\' OR subjects LIKE ?1 ESCAPE '\\' \
+               OR description LIKE ?1 ESCAPE '\\') \
+             ORDER BY title, book_url LIMIT ?2",
+        )
+        .bind(pattern)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// 刷新一本书；目录不存在时返回 `None` 并删除旧行。
     pub async fn upsert(&self, store: &Store, book_url: &str) -> anyhow::Result<Option<IndexRow>> {
         let Some(row) = row_for_url(store, book_url).await? else {
@@ -210,13 +239,19 @@ impl Index {
             .fetch_all(&self.pool)
             .await?;
         for id in existing {
-            if !seen.contains(&id) {
-                sqlx::query("DELETE FROM book_index WHERE book_id = ?1")
-                    .bind(&id)
-                    .execute(&self.pool)
-                    .await?;
-                report.removed += 1;
+            if seen.contains(&id) {
+                continue;
             }
+            // 目录还在（例如扫描之后才写入，或暂时解析失败）就保留旧行，
+            // 宁可索引滞后，也不要删掉一本真实存在的书。
+            if store.find_by_id(&id).is_some() {
+                continue;
+            }
+            sqlx::query("DELETE FROM book_index WHERE book_id = ?1")
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+            report.removed += 1;
         }
         Ok(report)
     }
@@ -328,6 +363,49 @@ impl Index {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+/// 进程内按库根缓存索引句柄：写路径每章都要刷新，不能每次都新建连接池。
+static SHARED: Lazy<tokio::sync::Mutex<HashMap<PathBuf, Index>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// 取共享索引句柄（首次打开时建表）。测试/多数据目录按 root 区分。
+pub async fn shared(root: &Path) -> anyhow::Result<Index> {
+    let mut map = SHARED.lock().await;
+    if let Some(index) = map.get(root) {
+        return Ok(index.clone());
+    }
+    let index = Index::open(root).await?;
+    map.insert(root.to_path_buf(), index.clone());
+    Ok(index)
+}
+
+/// 写路径的增量刷新：失败只记日志，不影响已经落盘的保存结果。
+pub async fn sync_book(store: &Store, book_url: &str) {
+    let index = match shared(store.root()).await {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::warn!(error = %e, "index.db open failed; skip sync");
+            return;
+        }
+    };
+    if let Err(e) = index.upsert(store, book_url).await {
+        tracing::warn!(book = %book_url, error = %e, "index.db sync failed");
+    }
+}
+
+/// 删除/移出后清掉索引行；失败同样只记日志。
+pub async fn forget_book(store: &Store, book_url: &str) {
+    let index = match shared(store.root()).await {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::warn!(error = %e, "index.db open failed; skip forget");
+            return;
+        }
+    };
+    if let Err(e) = index.remove(book_url).await {
+        tracing::warn!(book = %book_url, error = %e, "index.db forget failed");
     }
 }
 
@@ -598,8 +676,8 @@ mod tests {
             .unwrap()
             .is_some());
 
-        store
-            .move_to_trash("https://example.com/c/2")
+        // 模拟目录被外部删掉（不经过 Store 的 forget），rebuild 应清掉残留行。
+        tokio::fs::remove_dir_all(store.dir_for(Tier::Temp, "https://example.com/c/2"))
             .await
             .unwrap();
         let report = index.rebuild(&store).await.unwrap();
@@ -614,6 +692,59 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn search_matches_subjects_and_escapes_like_wildcards() {
+        let root = temp_root("search");
+        let store = Store::at(root.clone());
+        store.create_layout().unwrap();
+        let mut meta = OpfMeta::new("https://example.com/s/1", "100% 指南");
+        meta.description = Some("讲三体问题的科普".into());
+        meta.subjects = vec!["科幻".into()];
+        store
+            .ensure_skeleton(Tier::Collection, &meta)
+            .await
+            .unwrap();
+
+        let index = Index::open(&root).await.unwrap();
+        index.rebuild(&store).await.unwrap();
+
+        let by_subject = index.search("科幻", 10).await.unwrap();
+        assert_eq!(by_subject, vec!["https://example.com/s/1"]);
+        let by_desc = index.search("三体", 10).await.unwrap();
+        assert_eq!(by_desc, vec!["https://example.com/s/1"]);
+        assert!(index.search("不存在", 10).await.unwrap().is_empty());
+        // `%` 按字面匹配，而不是当成 LIKE 通配符。
+        let by_percent = index.search("%", 10).await.unwrap();
+        assert_eq!(by_percent, vec!["https://example.com/s/1"]);
+    }
+
+    #[tokio::test]
+    async fn sync_book_follows_edits_and_deletes() {
+        let root = temp_root("sync");
+        let store = Store::at(root.clone());
+        store.create_layout().unwrap();
+        let book_url = "https://example.com/sync/1";
+        let dir = text_book(&store, book_url, "原标题").await;
+
+        sync_book(&store, book_url).await;
+        let index = Index::open(&root).await.unwrap();
+        assert_eq!(index.get(book_url).await.unwrap().unwrap().title, "原标题");
+
+        // 直接改 OPF（模拟管理员/外部编辑），再同步应看到新标题。
+        let mut meta = store.read_opf(&dir).await.unwrap();
+        meta.title = "新标题".into();
+        meta.bump();
+        store.write_opf(&dir, &meta).await.unwrap();
+        sync_book(&store, book_url).await;
+        let row = index.get(book_url).await.unwrap().unwrap();
+        assert_eq!(row.title, "新标题");
+        assert_eq!(row.revision, meta.revision);
+
+        // 删除（移进 trash）后索引行应被清掉。
+        store.move_to_trash(book_url).await.unwrap();
+        assert!(index.get(book_url).await.unwrap().is_none());
     }
 
     #[tokio::test]

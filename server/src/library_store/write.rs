@@ -310,7 +310,9 @@ pub async fn sync_text_toc(
     meta.bump();
     // 顺序固定：章节文件（上面已写）→ nav → opf。
     store.write_nav(&dir, &meta).await?;
-    store.write_opf(&dir, &meta).await
+    store.write_opf(&dir, &meta).await?;
+    super::index::sync_book(store, &meta.book_url).await;
+    Ok(())
 }
 
 async fn merge_text_chapters(
@@ -518,7 +520,9 @@ pub async fn sync_comic_toc(
     meta.chapters = out;
     meta.bump();
     comic::write_meta(&dir, &meta).await?;
-    comic::write_comic_info(&dir, &meta).await
+    comic::write_comic_info(&dir, &meta).await?;
+    super::index::sync_book(store, &meta.book_url).await;
+    Ok(())
 }
 
 /// 漫画版「只补空字段」，口径与 [`fill_text_meta`] 一致。
@@ -673,6 +677,7 @@ pub async fn save_comic_pages(
     meta.bump();
     comic::write_meta(&opened.dir, &meta).await?;
     comic::write_comic_info(&opened.dir, &meta).await?;
+    super::index::sync_book(store, &meta.book_url).await;
     Ok(true)
 }
 
