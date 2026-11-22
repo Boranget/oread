@@ -64,6 +64,25 @@ pub(super) async fn read(
                     Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
                 };
                 fetched.origin = source.book_source_url.clone();
+                // 目录优先：抓到正文后同步落盘，下次阅读（含离线）不再依赖缓存/回源。
+                let paragraphs = crate::library_store::write::markup_to_paragraphs(
+                    fetched.content.as_deref().unwrap_or(""),
+                );
+                if let Err(err) = crate::library_store::write::save_text_chapter(
+                    &s.store(),
+                    &q.book,
+                    &chapter.url,
+                    &paragraphs,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        book = %q.book,
+                        url = %chapter.url,
+                        error = %err,
+                        "write /k chapter to dir failed"
+                    );
+                }
                 let _ = save_content_cached(&s.library, &fetched).await;
                 fetched
             }
