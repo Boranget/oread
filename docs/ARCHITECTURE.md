@@ -148,7 +148,10 @@ Bearer 访问 `/opds*`，便于调试。
   - 漫画：解压后的 CBZ（扁平图片 + 标准 `ComicInfo.xml` + 目录边车 `oread.json`）。
     `oread.json` 只保存章节标题/章节 URL/卷标记/页范围与图片尺寸，不复制图片字节；
     缺失时按 `NNNN-MMM.ext` 文件名前缀反推章节，手工放入的 CBZ 也能直接读。
-- **`content.opf` 是元数据权威**；`index.db` 只存可重建的派生字段，靠 `oread:revision` 判脏自愈。
+- **`content.opf` 是元数据权威**；`index.db` 只存可重建的派生字段（书名/作者/系列/主题/
+  修订号/章页计数/封面 href），靠 `oread:revision` 判脏。`index.db` 放在
+  `data_dir/library/index.db`，删掉不会丢内容：进程启动时后台全量重建，
+  `boranlib doctor --rebuild-index` 可手动重建。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。
@@ -177,6 +180,9 @@ Bearer 访问 `/opds*`，便于调试。
   每本书一把写锁，正文/封面/页保存用 `oread:revision` 做乐观锁（冲突 409）。图片以文件内容
   识别格式并决定扩展名（只接受 JPEG/WebP），避免把非图片写进目录。本地图片 URL 带
   `?v=<revision>`：换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
+- 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
+  目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（仍靠回退）。
+  `--rebuild-index` 先重建索引再检查；有需要处理的问题时退出码 1，便于脚本/定时任务报警。
 
 ### 4.2 现状（迁移前）
 

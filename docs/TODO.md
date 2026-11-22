@@ -186,7 +186,7 @@
 ### 2.11 目录即书写路径（`进行中`）
 
 - 状态：`进行中`。读路径（文字书 / 漫画 / 导出 / 图片代理）与一次性迁移已完成；
-  写路径 v1 已接上，`index.db` 与旧表删除尚未开始。
+  写路径 v1 已接上，`index.db` 已建立（启动时重建 + `doctor` 检查），旧表删除尚未开始。
 - 已完成：
   - `library_store::write`：TOC 合并（按 URL 保留章节 id/href、新章追加、删除只移出 spine）、
     文字章节正文落盘、漫画整章页表与 `ComicInfo.xml` 落盘；
@@ -198,9 +198,11 @@
     `/api/library/book/meta`，同时写 OPF / `oread.json`）、改正文段落、换封面、换漫画单页；
     正文/封面/页保存带 `revision` 乐观锁，冲突返回 409；图片按内容识别格式，不信任客户端 MIME；
     写入顺序仍是正文/图片 → `nav.xhtml` → `content.opf`（漫画：图片 → `oread.json` → `ComicInfo.xml`）。
+  - `index.db` v1（`library_store::index`）：书目检索字段 + 修订号 + 章/页计数的派生索引；
+    进程启动时后台全量重建，`boranlib doctor [--rebuild-index]` 手动重建并检查
+    「目录 ↔ 索引 ↔ `library.db`」三方差异（解析失败、孤立目录、仅 DB 有书目）。
 - 还差：
-  - `index.db`：章节 href / `oread:revision` / 书目检索字段的派生索引，以及
-    `doctor --rebuild-index`；
+  - `index.db` 接入列表/搜索读路径（当前只服务诊断），并在写路径增量刷新；
   - 导出直接打包目录（不再逐章重新生成）；
   - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退；
   - 管理员编辑 v2：章节增删/拆分/合并、漫画页数量调整（v1 明确不做）。

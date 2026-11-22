@@ -49,16 +49,88 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    // 运维子命令：一次性把旧库正文导出成「目录即书」。服务本身不带业务参数。
+    // 运维子命令：一次性把旧库正文导出成「目录即书」；doctor 检查/重建派生索引。
+    // 服务本身不带业务参数。
     match std::env::args().nth(1).as_deref() {
         Some("migrate-store") => rt.block_on(run_migrate_store(cfg))?,
+        Some("doctor") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            rt.block_on(run_doctor(cfg, &args))?;
+        }
         Some(other) => {
-            eprintln!("未知子命令: {other}\n可用: migrate-store");
+            eprintln!("未知子命令: {other}\n可用: migrate-store, doctor");
             std::process::exit(2);
         }
         None => rt.block_on(run(cfg))?,
     }
     Ok(())
+}
+
+/// `boranlib doctor [--rebuild-index]`：检查目录、`index.db` 与 `library.db` 是否一致。
+///
+/// 目录是权威：`index.db` 随时可以重建，`library.db` 里没有的目录说明书在磁盘上、
+/// 但用户在馆藏列表里看不到（需要重新入馆或手工补书目）。
+async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
+    let mut rebuild = false;
+    for arg in args {
+        match arg.as_str() {
+            "--rebuild-index" => rebuild = true,
+            other => anyhow::bail!("未知参数: {other}\n用法: boranlib doctor [--rebuild-index]"),
+        }
+    }
+
+    let library = db::init_library(&cfg).await?;
+    let store = boranlib::library_store::Store::new(&cfg.data_dir);
+    store.create_layout()?;
+    let index = boranlib::library_store::index::Index::open(store.root()).await?;
+
+    if rebuild {
+        let r = index.rebuild(&store).await?;
+        println!(
+            "index.db 已重建：扫描 {} 个目录，写入 {} 行，删除 {} 行",
+            r.scanned, r.written, r.removed
+        );
+        print_list("解析失败", &r.failed);
+        print_list("跳过空骨架", &r.skipped);
+    }
+
+    let v = index.verify(&store, &library).await?;
+    println!(
+        "目录 {} 个，索引 {} 行；library.db 中尚无目录的书目 {} 个",
+        v.dirs,
+        v.indexed,
+        v.db_without_dir.len()
+    );
+    print_list("目录解析失败", &v.parse_failed);
+    print_list("索引缺少（重建即可）", &v.missing_in_index);
+    print_list("索引残留（重建即可）", &v.stale_in_index);
+    print_list("索引修订号滞后（重建即可）", &v.revision_drift);
+    print_list(
+        "目录存在但 library.db 没有（列表里看不到）",
+        &v.dir_without_db,
+    );
+    print_list("library.db 有但目录缺失（仍靠 DB 回退）", &v.db_without_dir);
+
+    if v.has_problems() {
+        eprintln!("doctor: 发现需要处理的问题");
+        std::process::exit(1);
+    }
+    println!("doctor: OK");
+    Ok(())
+}
+
+fn print_list(label: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    const LIMIT: usize = 20;
+    println!("{label}：{} 条", items.len());
+    for item in items.iter().take(LIMIT) {
+        println!("  - {item}");
+    }
+    if items.len() > LIMIT {
+        println!("  … 还有 {} 条", items.len() - LIMIT);
+    }
 }
 
 /// `boranlib migrate-store`：把 `library_content` / `library_images` 导出成书目录。
@@ -128,6 +200,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     // 馆藏采购单执行器：低优先级后台整本下载 + 定期回收临时缓存。
     boranlib::library_worker::spawn(state.clone());
+    // index.db：目录的派生索引，后台重建一次；失败不影响服务可用性。
+    boranlib::library_store::index::spawn_rebuild(state.store());
     let api = routes::build_router_with_state(state);
 
     // 前端静态资源（Svelte 构建产物 web/dist）；目录不存在时该路由返回 404，不影响 API。

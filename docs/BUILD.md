@@ -443,6 +443,20 @@ cd server
 （文字书 = 解压 EPUB 目录，漫画 = 解压 CBZ 目录）。**不删除任何数据库行**；已存在的书目录会跳过，
 因此可重复执行。结束后会打印书/章/图数量与失败清单；有失败时退出码非 0。
 
+### 5.2 一致性检查：`doctor`
+
+```powershell
+$env:BORANLIB_DATA_DIR='.\data'
+cd server
+& '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor
+& '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --rebuild-index
+```
+
+`doctor` 默认只读比对「书目录 ↔ `index.db` ↔ `library.db`」：目录解析失败、索引滞后/残留、
+目录存在但 `library.db` 没有书目（馆藏列表里看不到）、`library.db` 有但目录缺失（读路径仍回退 DB）。
+`--rebuild-index` 先从目录全量重建 `data\library\index.db`（删掉也无妨），再输出检查结果。
+索引滞后本身不算问题（重建即可）；解析失败或孤立目录存在时退出码为 1。
+
 部署到板子（绝不在板上 `cargo build`，链接期会 OOM）：
 
 ```powershell
