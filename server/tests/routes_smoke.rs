@@ -1390,6 +1390,117 @@ async fn comic_reads_from_local_dir_without_source() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `/k` 正文目录优先：书目录存在时不需要书源、也不查缓存，直接渲染章节文件。
+#[tokio::test]
+async fn kindle_reads_text_from_local_dir_without_source() {
+    use boranlib::library_store::{ChapterItem, OpfMeta, Store, Tier};
+
+    let dir = temp_dir("kindle-dir-read");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let username = "kindledir";
+    register(&app, username).await;
+
+    let book_url = "https://local.test/text";
+    let store = Store::new(&dir);
+    store.create_layout().unwrap();
+    let mut meta = OpfMeta::new(book_url, "本地文字书");
+    let item = ChapterItem {
+        id: "ch-0001".into(),
+        href: "chapters/ch-0001-a.xhtml".into(),
+        title: "本地章节标题".into(),
+        url: Some("https://local.test/text/1".into()),
+        is_volume: false,
+    };
+    meta.chapters.push(item.clone());
+    let book_dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+    store
+        .write_chapter(
+            &book_dir,
+            "zh",
+            &item,
+            &["目录里的正文段落".into(), "第二段".into()],
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/k/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "username={username}&password=secret123"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .expect("登录应写入 k_session")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let encoded = "https%3A%2F%2Flocal.test%2Ftext";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/k/toc?book={encoded}&source="))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("本地章节标题"), "目录应来自书目录: {html}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/k/read?book={encoded}&source=&ch=0"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("目录里的正文段落"),
+        "正文应来自书目录: {html}"
+    );
+    assert!(!html.contains("正文抓取失败"), "不应回源抓取: {html}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// EPUB 导出：info 报正文章节，epub 返回 ZIP；漫画书用 409 明确拒绝。
 #[tokio::test]
 async fn epub_export_info_and_download() {
