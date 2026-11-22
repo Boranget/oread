@@ -454,12 +454,15 @@ $env:BORANLIB_DATA_DIR='.\data'
 cd server
 & '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor
 & '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --rebuild-index
+& '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --sync-db
 ```
 
 `doctor` 默认只读比对「书目录 ↔ `index.db` ↔ `library.db`」：目录解析失败、索引滞后/残留、
 目录存在但 `library.db` 没有书目（馆藏列表里看不到）、`library.db` 有但目录缺失（读路径仍回退 DB）。
 `--rebuild-index` 先从目录全量重建 `data\library\index.db`（删掉也无妨），再输出检查结果。
-索引滞后本身不算问题（重建即可）；解析失败或孤立目录存在时退出码为 1。
+`--sync-db` 隐含重建索引，并把「目录有、`library.db` 没有」的书补登成书目（含书名/作者/标签/封面），
+适合手工把书目录放进 `collection/` 后让它在馆藏列表里出现；只插入缺失行，不覆盖已有书目。
+索引滞后本身不算问题（重建即可）；解析失败或补登后仍有孤立目录时退出码为 1。
 
 部署到板子（绝不在板上 `cargo build`，链接期会 OOM）：
 

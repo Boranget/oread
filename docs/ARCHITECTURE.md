@@ -191,7 +191,9 @@ Bearer 访问 `/opds*`，便于调试。
   `?v=<revision>`：换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（仍靠回退）。
-  `--rebuild-index` 先重建索引再检查；有需要处理的问题时退出码 1，便于脚本/定时任务报警。
+  `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目
+  （手工放进 `collection/` 的书目录因此能在列表里出现）。有需要处理的问题时退出码 1，
+  便于脚本/定时任务报警。
 - 导出（`library_store::pack`）：目录完整时直接按 store-only ZIP 原样打包——EPUB 把
   `mimetype` 放第一条、随后 `META-INF/container.xml`；CBZ 把 `ComicInfo.xml` 放第一条并排除
   内部边车 `oread.json`。目录缺失/不完整时才回退到逐章/逐页重新生成，因此导出的字节与

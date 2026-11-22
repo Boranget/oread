@@ -256,6 +256,75 @@ impl Index {
         Ok(report)
     }
 
+    /// 把目录里有、`library.db` 里没有的书补登成书目。
+    ///
+    /// 手工放进 `collection/` / `temp/` 的书目录、或迁移时漏登的书，执行后就会出现在馆藏列表。
+    /// 只插入缺失行，不覆盖已有书目；返回实际补登数量。
+    pub async fn adopt_orphans(&self, library: &SqlitePool) -> anyhow::Result<usize> {
+        let rows = self.rows().await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let existing: HashSet<String> = sqlx::query_scalar("SELECT book_url FROM library_books")
+            .fetch_all(library)
+            .await?
+            .into_iter()
+            .collect();
+        let now = now_ms();
+        let mut adopted = 0;
+        for row in rows {
+            let book_url = row.book_url.trim();
+            if book_url.is_empty() || existing.contains(book_url) {
+                continue;
+            }
+            // 封面 URL 与管理员换封面后的格式一致：文本书在 OEBPS 下，带修订号失效缓存。
+            let cover_url = row.cover_href.as_deref().map(|href| {
+                comic::local_image_url_v(&row.book_id, &format!("OEBPS/{href}"), row.revision)
+            });
+            let comic = row.kind == "comic";
+            let mut tx = library.begin().await?;
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO library_books (
+                    book_url, name, author, intro, language, publisher, pubdate,
+                    series_name, series_index, cover_url, book_source_type, total_chapter_num,
+                    tier, collected_at, last_accessed_at, origin_name
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            )
+            .bind(book_url)
+            .bind(&row.title)
+            .bind(&row.author)
+            .bind(&row.description)
+            .bind(&row.language)
+            .bind(&row.publisher)
+            .bind(&row.pubdate)
+            .bind(&row.series)
+            .bind(row.series_index)
+            .bind(&cover_url)
+            .bind(if comic { 2i64 } else { 1i64 })
+            .bind(row.chapter_count)
+            .bind(&row.tier)
+            .bind((row.tier == "collection").then_some(now))
+            .bind(now)
+            .bind("馆藏目录")
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            for tag in &row.subjects {
+                sqlx::query("INSERT OR IGNORE INTO library_tags (book_url, tag) VALUES (?1, ?2)")
+                    .bind(book_url)
+                    .bind(tag)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            if inserted > 0 {
+                adopted += 1;
+                tracing::info!(book = %book_url, tier = %row.tier, "adopted orphan dir into library.db");
+            }
+        }
+        Ok(adopted)
+    }
+
     /// 只读检查：目录 ↔ 索引 ↔ `library.db` 三方的差异。
     pub async fn verify(
         &self,
@@ -438,6 +507,14 @@ fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 馆藏时间戳（毫秒），与 `library_books.collected_at/last_accessed_at` 同口径。
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -745,6 +822,58 @@ mod tests {
         // 删除（移进 trash）后索引行应被清掉。
         store.move_to_trash(book_url).await.unwrap();
         assert!(index.get(book_url).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_orphans_inserts_missing_books_and_tags() {
+        let root = temp_root("adopt");
+        let store = Store::at(root.clone());
+        store.create_layout().unwrap();
+        text_book(&store, "https://example.com/adopt/1", "补登书").await;
+
+        let index = Index::open(&root).await.unwrap();
+        index.rebuild(&store).await.unwrap();
+
+        let library = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(root.join("library.db"))
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, name TEXT, author TEXT, \
+             intro TEXT, language TEXT, publisher TEXT, pubdate TEXT, series_name TEXT, \
+             series_index REAL, cover_url TEXT, book_source_type INTEGER NOT NULL DEFAULT 0, \
+             total_chapter_num INTEGER NOT NULL DEFAULT 0, tier TEXT NOT NULL DEFAULT 'temp', \
+             collected_at INTEGER, last_accessed_at INTEGER NOT NULL DEFAULT 0, origin_name TEXT)",
+            "CREATE TABLE library_tags (book_url TEXT NOT NULL, tag TEXT NOT NULL, \
+             PRIMARY KEY (book_url, tag))",
+        ] {
+            sqlx::query(sql).execute(&library).await.unwrap();
+        }
+
+        assert_eq!(index.adopt_orphans(&library).await.unwrap(), 1);
+        let (name, tier, source_type, chapters): (String, String, i64, i64) = sqlx::query_as(
+            "SELECT name, tier, book_source_type, total_chapter_num FROM library_books",
+        )
+        .fetch_one(&library)
+        .await
+        .unwrap();
+        assert_eq!(name, "补登书");
+        assert_eq!(tier, "collection");
+        assert_eq!(source_type, 1);
+        assert_eq!(chapters, 1);
+        let tag: String = sqlx::query_scalar("SELECT tag FROM library_tags")
+            .fetch_one(&library)
+            .await
+            .unwrap();
+        assert_eq!(tag, "科幻");
+
+        // 再跑一次不会重复插入。
+        assert_eq!(index.adopt_orphans(&library).await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -72,10 +72,14 @@ fn main() -> anyhow::Result<()> {
 /// 但用户在馆藏列表里看不到（需要重新入馆或手工补书目）。
 async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
     let mut rebuild = false;
+    let mut sync_db = false;
     for arg in args {
         match arg.as_str() {
             "--rebuild-index" => rebuild = true,
-            other => anyhow::bail!("未知参数: {other}\n用法: boranlib doctor [--rebuild-index]"),
+            "--sync-db" => sync_db = true,
+            other => anyhow::bail!(
+                "未知参数: {other}\n用法: boranlib doctor [--rebuild-index] [--sync-db]"
+            ),
         }
     }
 
@@ -84,7 +88,8 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
     store.create_layout()?;
     let index = boranlib::library_store::index::Index::open(store.root()).await?;
 
-    if rebuild {
+    // `--sync-db` 需要先看到最新目录，因此隐含一次索引重建。
+    if rebuild || sync_db {
         let r = index.rebuild(&store).await?;
         println!(
             "index.db 已重建：扫描 {} 个目录，写入 {} 行，删除 {} 行",
@@ -92,6 +97,11 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
         );
         print_list("解析失败", &r.failed);
         print_list("跳过空骨架", &r.skipped);
+    }
+
+    if sync_db {
+        let n = index.adopt_orphans(&library).await?;
+        println!("已补登 {n} 个目录书到 library.db");
     }
 
     let v = index.verify(&store, &library).await?;

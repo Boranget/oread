@@ -203,6 +203,8 @@
     「目录 ↔ 索引 ↔ `library.db`」三方差异（解析失败、孤立目录、仅 DB 有书目）。
     馆藏搜索（`GET /api/library/books?q=`）已接入索引（书名/作者/系列/主题/简介），
     写路径（TOC/正文/元数据/封面/漫画页/入馆/移出/删除/迁移）增量刷新。
+    `boranlib doctor --sync-db` 把「目录有、`library.db` 没有」的孤立目录补登成书目
+    （手工放进 `collection/` 的书目录因此能在列表里出现）。
   - 导出直接打包目录（`library_store::pack`）：EPUB / CBZ 在书目录完整时原样打包
     （CBZ 排除内部边车 `oread.json`），目录缺失/不完整才回退逐章生成。
   - `/k`（Kindle）目录与正文也目录优先：`/k/toc` 先读 OPF spine / `oread.json`，
