@@ -200,6 +200,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     // 馆藏采购单执行器：低优先级后台整本下载 + 定期回收临时缓存。
     boranlib::library_worker::spawn(state.clone());
+    // 旧库 → 目录：后台补齐仍只在旧表里的书，之后读写都走目录（失败只记日志）。
+    boranlib::library_store::migrate::spawn_bootstrap(state.library.clone(), state.store());
     // index.db：目录的派生索引，后台重建一次；失败不影响服务可用性。
     boranlib::library_store::index::spawn_rebuild(state.store());
     let api = routes::build_router_with_state(state);

@@ -31,24 +31,43 @@ pub(super) async fn read(
         return comic_read(&s, &db.0, &source, &chapters, ch, &q, fs, explicit, vp).await;
     }
 
-    let mut c: BookContent = match load_cached_content(
-        &s.library,
-        &chapter.url,
-        &source.book_source_url,
-        s.cfg.content_ttl_secs,
-    )
-    .await
-    {
-        Ok(Some(c)) => c,
-        _ => {
-            let mut fetched = match web_book::chapter_content(&source, chapter).await {
-                Ok(c) => c,
-                Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
-            };
-            fetched.origin = source.book_source_url.clone();
-            let _ = save_content_cached(&s.library, &fetched).await;
-            fetched
-        }
+    // 目录即书：书目录里已有这一章就直接读磁盘，管理员编辑与离线阅读都生效。
+    let dir_content =
+        match crate::ebook_source::load_dir_content(&s.store(), &s.library, &q.book, &chapter.url)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    book = %q.book,
+                    url = %chapter.url,
+                    error = %err,
+                    "read /k chapter from dir failed; falling back to db"
+                );
+                None
+            }
+        };
+    let mut c: BookContent = match dir_content {
+        Some(c) => c,
+        None => match load_cached_content(
+            &s.library,
+            &chapter.url,
+            &source.book_source_url,
+            s.cfg.content_ttl_secs,
+        )
+        .await
+        {
+            Ok(Some(c)) => c,
+            _ => {
+                let mut fetched = match web_book::chapter_content(&source, chapter).await {
+                    Ok(c) => c,
+                    Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
+                };
+                fetched.origin = source.book_source_url.clone();
+                let _ = save_content_cached(&s.library, &fetched).await;
+                fetched
+            }
+        },
     };
     if c.book_url.trim().is_empty() {
         c.book_url = q.book.clone();

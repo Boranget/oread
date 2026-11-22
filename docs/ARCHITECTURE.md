@@ -136,10 +136,11 @@ Bearer 访问 `/opds*`，便于调试。
 ## 4. 数据与缓存
 
 > **存储正在迁移中**：目标形态是「每本书一个解压目录 + 可重建索引」，见 §4.1。
-> `boranlib migrate-store` 把旧库导出成目录；**文字书与漫画的读路径都已优先走目录**
-> （阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 漫画页、图片代理），未迁移或目录缺失时
-> 回退 `library.db`。写路径也已切到目录：TOC/正文/漫画页抓取成功后直接落盘，
-> `library.db` 仍同步写一份作为回退；`index.db` 已建立（启动时后台重建 + `doctor` 检查）。
+> `boranlib migrate-store` 把旧库导出成目录；进程启动时还会在后台自动补齐尚未导出的书。
+> **文字书与漫画的读路径都已优先走目录**（阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 目录与正文、
+> `/k` 漫画页、图片代理），未迁移或目录缺失时回退 `library.db`。写路径也已切到目录：
+> TOC/正文/漫画页抓取成功后直接落盘，`library.db` 仍同步写一份作为回退；
+> `index.db` 已建立（启动时后台重建 + `doctor` 检查）。
 
 ### 4.1 目标存储：目录即书
 
@@ -162,6 +163,8 @@ Bearer 访问 `/opds*`，便于调试。
   后台每 60 s 重试；期间读路径优先选有内容的目录，不被空馆藏骨架挡住。`demote` / `move_to_trash`
   同理，删除与 TTL 清理都把目录移进 `trash/`。
 - 迁移命令：`boranlib migrate-store`（只读旧表、只写目录，已存在的书目录跳过）。
+  进程启动时也会在后台跑同一套迁移：只要旧内容表还有行，就补齐仍缺目录的书，
+  已有目录的书直接跳过；失败只记日志，读路径继续回退 `library.db`。
 - 写路径（`library_store::write`）：TOC 抓取成功后 `sync_toc` 按章节 URL 合并 spine——
   旧章保留 id/href 只更新标题，新章追加新序号，目录变短只移出 spine、不删文件也不复用序号；
   正文抓取成功后 `save_text_chapter` 写归一化段落（首段等于章节标题时去掉，避免重复）；
@@ -176,6 +179,9 @@ Bearer 访问 `/opds*`，便于调试。
   `/api/book/image` 在解析书源之前先识别该 scheme 并直读目录文件，因此**没有书源、源站
   下线也能读已入馆漫画**；`/api/book/images/meta`、`/k` 漫画页与 `/api/book/toc` 同样目录优先。
   图片代理的 WebP→灰度 JPEG、长条切片与 ETag 逻辑与数据库图片完全共用。
+- `/k`（Kindle/Silk）与 SPA 同源：`/k` 的目录（`ensure_chapters`）先读 OPF spine / `oread.json`，
+  `/k/read` 的正文先读章节文件；命中后管理员编辑与离线阅读立即生效，未命中才查缓存/回源。
+  书源已失效或不存在时合成一个「馆藏」书源，阅读路径按目录实际形态选择正文或漫画。
 - 管理员编辑（`library_store::edit` + `/api/library/book/edit*`）：只改已归一化的目录内容，
   v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用 `/api/library/book/meta`，DB 更新后
   同步写 `content.opf` / `oread.json`；正文与图片直接写文件，再按

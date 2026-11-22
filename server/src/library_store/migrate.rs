@@ -90,6 +90,53 @@ pub async fn migrate_from_db(pool: &SqlitePool, store: &Store) -> anyhow::Result
     Ok(report)
 }
 
+/// 启动时后台补齐：把仍只存在于旧表里的书导出成目录。
+///
+/// 这是「删旧表」的前置步骤：一本书一旦有目录，读写就都走目录。已存在目录的书
+/// 直接跳过，因此重复启动不会重复写盘；失败只记日志，读路径继续回退 `library.db`。
+pub fn spawn_bootstrap(pool: SqlitePool, store: Store) {
+    tokio::spawn(async move {
+        match legacy_content_present(&pool).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!("legacy content tables found; bootstrapping book dirs");
+                match migrate_from_db(&pool, &store).await {
+                    Ok(r) => tracing::info!(
+                        books = r.books,
+                        skipped = r.skipped,
+                        chapters = r.chapters,
+                        images = r.images,
+                        comics = r.comics,
+                        failures = r.failures.len(),
+                        "legacy db → book dirs finished"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "legacy db → book dirs failed"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "legacy content probe failed"),
+        }
+    });
+}
+
+/// 旧内容表是否还在且有行。未来删表后返回 `false`，启动不再扫描。
+async fn legacy_content_present(pool: &SqlitePool) -> anyhow::Result<bool> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('library_content', 'library_images')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if tables < 2 {
+        return Ok(false);
+    }
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM library_content) + (SELECT COUNT(*) FROM library_images)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(rows > 0)
+}
+
 async fn migrate_book(
     pool: &SqlitePool,
     store: &Store,
@@ -449,5 +496,32 @@ mod tests {
         assert_eq!(ext_for_mime("image/webp"), "webp");
         assert_eq!(ext_for_mime("image/jpeg"), "jpg");
         assert_eq!(ext_for_mime(""), "jpg");
+    }
+
+    #[tokio::test]
+    async fn legacy_content_probe_handles_missing_and_empty_tables() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // 未来删表后启动不应报错，也不应尝试迁移。
+        assert!(!legacy_content_present(&pool).await.unwrap());
+
+        sqlx::query("CREATE TABLE library_content (url TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE library_images (url TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!legacy_content_present(&pool).await.unwrap());
+
+        sqlx::query("INSERT INTO library_content (url) VALUES ('https://x/c1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(legacy_content_present(&pool).await.unwrap());
     }
 }

@@ -9,18 +9,21 @@ pub(super) async fn ensure_chapters(
     source_url: &str,
     book_url: &str,
 ) -> AppResult<(BookSource, Vec<BookChapter>)> {
-    // 目录即书的漫画：章节来自 oread.json，书源不存在也能读。
-    if let Ok(Some(opened)) = s.store().open_comic(book_url).await {
-        let chapters = crate::ebook_source::comic_book_chapters(book_url, &opened.meta);
+    // 目录即书：OPF spine / oread.json 是权威目录，命中后不再看缓存表、也不回源。
+    // 书源可能已失效或根本不存在（本地馆藏），这时合成一个「馆藏」书源。
+    if let Ok(Some(chapters)) = crate::ebook_source::load_dir_toc(&s.store(), book_url).await {
         if !chapters.is_empty() {
-            let source = load_source(&s.shared, source_url)
+            let comic = matches!(s.store().open_comic(book_url).await, Ok(Some(_)));
+            let mut source = load_source(&s.shared, source_url)
                 .await
                 .unwrap_or_else(|_| BookSource {
                     book_source_url: source_url.to_string(),
-                    book_source_name: "馆藏漫画".into(),
-                    book_source_type: 2,
+                    book_source_name: "馆藏".into(),
+                    book_source_type: if comic { 2 } else { 1 },
                     ..Default::default()
                 });
+            // 阅读页按书源类型选漫画/正文路径；以目录实际形态为准。
+            source.book_source_type = if comic { 2 } else { 1 };
             return Ok((source, chapters));
         }
     }

@@ -3673,6 +3673,9 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | `/k/read` | `book`、`source` | `ch`、`p`（章内页码，1 起）、`fs`、`vw`、`vh`、`vmh` |
 | `/k/search` | — | `key`、`fs`、`sp`、`scope`（显式 `all`/`expanded`/`enhanced` 走全量，其余 curated）、`include_cooled`、`vw`、`vh`、`vmh` |
 
+- 目录优先：`/k/toc` 的章节列表先读书目录（OPF spine / `oread.json`），`/k/read` 的正文先读章节文件；
+  命中后不再看 `library_chapters` / `library_content` 缓存，也不回源。书源失效或不存在时按「馆藏」书源渲染；
+  未命中才回退旧缓存并抓取。管理员在 SPA 里改过的正文/元数据会直接反映到 Kindle。
 - `/k/search` 与 `/api/search`、`/api/search/aggregate` 共用同一份 60s 聚合缓存与书名过滤；缓存未命中时同样写源健康/查询类产出证据，命中缓存不重复计数。`scope=all` 的冷启动仍按整批预算跑满（无 anytime 早停）。
 - `fs`：字号档位 1..4；缺参回落 Cookie `k_fs`，再缺省 2。
 - `vw` / `vh`：视口宽/高（CSS px）。服务端只认请求参数（`VP_MIN=240` – `VP_MAX=2400` 内才采用；宽度下限覆盖手机 360–430），缺参回落环境默认 `KINDLE_VW=1072` / `KINDLE_VH=1268`；显式 `vw` 时页面锁 `width={vw}`，缺参时 meta 为 `width=device-width`（让脚本量出真实 CSS 宽）。两个参数由 `<head>` 内联脚本实测后带回：高取 `min(outerHeight−1, innerHeight)`（`screen.availHeight` 上限保护），宽取 `documentElement.clientWidth`（取不到退 `innerWidth`）。**不读、不写 Cookie**。
