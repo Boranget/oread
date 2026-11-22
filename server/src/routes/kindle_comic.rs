@@ -172,7 +172,11 @@ pub(super) async fn load_comic_images(
                 .enumerate()
                 .map(|(i, page)| BookImage {
                     index: i as i64 + 1,
-                    url: crate::library_store::comic::local_image_url(&book_id, &page.href),
+                    url: crate::library_store::comic::local_image_url_v(
+                        &book_id,
+                        &page.href,
+                        opened.meta.revision,
+                    ),
                     width: page.width,
                     height: page.height,
                     bytes: page.bytes,

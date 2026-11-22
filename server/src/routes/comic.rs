@@ -425,7 +425,7 @@ async fn comic_chapter_from_dir(
         }
         images.push(BookImage {
             index: i as i64 + 1,
-            url: comic::local_image_url(&book_id, &page.href),
+            url: comic::local_image_url_v(&book_id, &page.href, opened.meta.revision),
             width,
             height,
             bytes: page.bytes,

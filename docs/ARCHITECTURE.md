@@ -170,6 +170,13 @@ Bearer 访问 `/opds*`，便于调试。
   `/api/book/image` 在解析书源之前先识别该 scheme 并直读目录文件，因此**没有书源、源站
   下线也能读已入馆漫画**；`/api/book/images/meta`、`/k` 漫画页与 `/api/book/toc` 同样目录优先。
   图片代理的 WebP→灰度 JPEG、长条切片与 ETag 逻辑与数据库图片完全共用。
+- 管理员编辑（`library_store::edit` + `/api/library/book/edit*`）：只改已归一化的目录内容，
+  v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用 `/api/library/book/meta`，DB 更新后
+  同步写 `content.opf` / `oread.json`；正文与图片直接写文件，再按
+  「正文/图片 → `nav.xhtml` → `content.opf`」或「图片 → `oread.json` → `ComicInfo.xml`」更新。
+  每本书一把写锁，正文/封面/页保存用 `oread:revision` 做乐观锁（冲突 409）。图片以文件内容
+  识别格式并决定扩展名（只接受 JPEG/WebP），避免把非图片写进目录。本地图片 URL 带
+  `?v=<revision>`：换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
 
 ### 4.2 现状（迁移前）
 

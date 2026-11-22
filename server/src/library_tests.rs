@@ -340,6 +340,7 @@ async fn metadata_patch_writes_clears_and_replaces() {
             "".into(),       // 跳过
             "经典".into(),
         ]),
+        ..Default::default()
     };
     assert!(!patch.is_empty());
     update_metadata(&p, "b1", &patch).await.unwrap();

@@ -2,6 +2,7 @@
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
   import { api, getRole } from '../lib/api.js';
   import { describeFailure } from '../lib/apiErrors.js';
+  import BookEditor from '../lib/BookEditor.svelte';
 
   const dispatch = createEventDispatcher();
   // 入馆 / 移出 / 删除 / 回收临时缓存都要管理员；浏览与占用所有登录账号可读。
@@ -37,6 +38,7 @@
   let error = '';
   let notice = '';
   let busyUrl = '';
+  let editingUrl = '';
   let estimatingUrl = '';
   let armedUrl = '';
   let armedTimer = null;
@@ -395,6 +397,7 @@
         </div>
         {#if isAdmin}
           <div class="lib-book-actions">
+            <button class="ghost" on:click={() => (editingUrl = b.book_url)} disabled={!!busyUrl}>编辑</button>
             {#if b.tier === 'collection'}
               <button class="ghost" on:click={() => release(b)} disabled={!!busyUrl}>移出馆藏</button>
             {:else}
@@ -415,6 +418,17 @@
       </button>
     </div>
   {/if}
+{/if}
+
+{#if editingUrl}
+  <BookEditor
+    bookUrl={editingUrl}
+    on:close={() => (editingUrl = '')}
+    on:saved={() => {
+      reload();
+      loadStats();
+    }}
+  />
 {/if}
 
 {#if isAdmin}

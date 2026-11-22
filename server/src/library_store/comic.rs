@@ -422,9 +422,17 @@ pub fn local_image_url(book_id: &str, href: &str) -> String {
     format!("{LOCAL_IMAGE_SCHEME}{book_id}/{href}")
 }
 
+/// 带修订号的本地图片 URL。修订号变化后 URL 变化，图片缓存与 ETag 自动失效，
+/// 换页/换封面后不会继续拿到旧字节。
+pub fn local_image_url_v(book_id: &str, href: &str, revision: u64) -> String {
+    format!("{LOCAL_IMAGE_SCHEME}{book_id}/{href}?v={revision}")
+}
+
 /// 解析本地图片 URL → `(book_id, href)`；不是本地 URL 返回 `None`。
+/// 忽略 `?v=` 之类的查询串，href 永远是目录内的相对路径。
 pub fn parse_local_image_url(url: &str) -> Option<(&str, &str)> {
     let rest = url.trim().strip_prefix(LOCAL_IMAGE_SCHEME)?;
+    let rest = rest.split(['?', '#']).next()?;
     let (id, href) = rest.split_once('/')?;
     if id.is_empty()
         || href.is_empty()
@@ -447,6 +455,12 @@ mod tests {
         assert_eq!(
             parse_local_image_url(&url),
             Some(("abc123", "0001-001.jpg"))
+        );
+        let versioned = local_image_url_v("abc123", "0001-001.jpg", 7);
+        assert_eq!(
+            parse_local_image_url(&versioned),
+            Some(("abc123", "0001-001.jpg")),
+            "查询串只用于缓存失效，不进入文件路径"
         );
         assert!(parse_local_image_url("https://x/a.jpg").is_none());
         assert!(parse_local_image_url("oread-img://abc/../x.jpg").is_none());

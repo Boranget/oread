@@ -1,9 +1,11 @@
 <script>
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-  import { api, describeFailure } from '../lib/api.js';
+  import { api, describeFailure, getRole } from '../lib/api.js';
+  import BookEditor from '../lib/BookEditor.svelte';
 
   export let book; // { bookUrl, sourceId, name, author, bookType }
   const dispatch = createEventDispatcher();
+  const isAdmin = getRole() === 'admin';
 
   const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
 
@@ -19,6 +21,8 @@
   let imageError = '';
   let currentImg = null;
   let showToc = false;
+  let showEditor = false;
+  let editorSaved = false;
   let toast = '';
   let toastTimer = null;
   let saveTimer = null;
@@ -50,6 +54,13 @@
     private_address: '图片地址指向内网，已拦截',
     invalid_url: '图片地址无效',
   };
+
+  // 当前页在书目录里的相对路径（`oread-img://<book_id>/<href>` 去掉前缀）。
+  function currentPageHref() {
+    const url = (images[imgIndex] && images[imgIndex].url) || '';
+    const m = /^oread-img:\/\/[^/]+\/(.+)$/.exec(url);
+    return m ? m[1] : '';
+  }
 
   function imageErrorText(e) {
     if (e && e.code && CODE_MSG[e.code]) return CODE_MSG[e.code];
@@ -391,6 +402,15 @@
     <button class="cm-btn" disabled={noPrevChapter} on:click={() => goChapter(-1, 'last')}>上一章</button>
     <button class="cm-btn" disabled={noNextChapter} on:click={() => goChapter(1, 'first')}>下一章</button>
     <button class="cm-btn" on:click={() => (showToc = !showToc)}>目录</button>
+    {#if isAdmin && currentChapter}
+      <button
+        class="cm-btn"
+        on:click={() => {
+          editorSaved = false;
+          showEditor = true;
+        }}>编辑</button
+      >
+    {/if}
     <button class="cm-btn" on:click={close}>退出</button>
   </div>
 
@@ -420,6 +440,24 @@
 
   {#if toast}
     <div class="cm-toast">{toast}</div>
+  {/if}
+
+  {#if showEditor && currentChapter}
+    <BookEditor
+      bookUrl={book.bookUrl}
+      initialTab="content"
+      initialChapter={currentChapter.url}
+      initialPage={currentPageHref()}
+      on:close={() => {
+        showEditor = false;
+        if (editorSaved && currentPos >= 0) {
+          // 保持当前阅读位置：按比例回到原页（换页后页数不变）。
+          const ratio = images.length > 1 ? imgIndex / (images.length - 1) : 0;
+          loadChapter(currentPos, { ratio });
+        }
+      }}
+      on:saved={() => (editorSaved = true)}
+    />
   {/if}
 </div>
 

@@ -19,6 +19,7 @@
 //! - 先写正文/图片，最后写 `content.opf`，任何时刻目录都是一本合法的书。
 
 pub mod comic;
+pub mod edit;
 pub mod migrate;
 pub mod opf;
 pub mod read;

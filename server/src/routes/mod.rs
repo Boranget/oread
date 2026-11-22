@@ -1,3 +1,4 @@
+pub mod book_edit;
 pub mod bookmarks;
 pub mod books;
 pub mod bookshelf;
@@ -118,6 +119,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .merge(replace::routes())
         .merge(stats::routes())
         .merge(library::routes())
+        .merge(book_edit::routes())
         .merge(opds::routes())
         // 响应编码层只挂在 `/k`：压缩 HTML 省 Kindle 流量，同时不碰 API 热路径
         //（全局挂载会让 /healthz、搜索结果等 JSON 都多一份 gzip CPU，实测 p95 +5ms）。

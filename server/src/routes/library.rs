@@ -159,6 +159,7 @@ fn book_item(b: &LibraryBook) -> serde_json::Value {
 
 /// 元数据的长度上限：只防滥用，不追求完整校验（语言/日期允许书写源原样值）。
 const META_MAX_TEXT: usize = 200;
+const META_MAX_INTRO: usize = 4000;
 const META_MAX_LANGUAGE: usize = 35; // BCP 47 上限
 const META_MAX_TAGS: usize = 64;
 const META_MAX_TAG_LEN: usize = 64;
@@ -183,6 +184,10 @@ pub struct IdentifierReq {
 pub struct MetaPatchReq {
     #[serde(alias = "book_id")]
     pub book_url: String,
+    /// 书名 / 作者 / 简介：管理员编辑馆藏内容时也要能改。
+    pub name: Option<String>,
+    pub author: Option<String>,
+    pub intro: Option<String>,
     pub language: Option<String>,
     pub publisher: Option<String>,
     pub pubdate: Option<String>,
@@ -204,6 +209,9 @@ fn check_meta_len(label: &str, value: &str, max: usize) -> AppResult<()> {
 /// 把请求体校验后转成领域补丁；非法值直接 400，不落库。
 fn to_metadata_patch(req: MetaPatchReq) -> AppResult<library::MetadataPatch> {
     for (label, value, max) in [
+        ("name", req.name.as_deref(), META_MAX_TEXT),
+        ("author", req.author.as_deref(), META_MAX_TEXT),
+        ("intro", req.intro.as_deref(), META_MAX_INTRO),
         ("language", req.language.as_deref(), META_MAX_LANGUAGE),
         ("publisher", req.publisher.as_deref(), META_MAX_TEXT),
         ("pubdate", req.pubdate.as_deref(), META_MAX_TEXT),
@@ -219,6 +227,10 @@ fn to_metadata_patch(req: MetaPatchReq) -> AppResult<library::MetadataPatch> {
                 "series_index 必须是 >= 0 的有限数".into(),
             ));
         }
+    }
+    // 书名是 OPF 的必填项：允许不改，但不允许清空。
+    if req.name.as_deref().is_some_and(|v| v.trim().is_empty()) {
+        return Err(AppError::BadRequest("书名不能为空".into()));
     }
 
     let identifiers = match req.identifiers {
@@ -268,6 +280,9 @@ fn to_metadata_patch(req: MetaPatchReq) -> AppResult<library::MetadataPatch> {
     };
 
     Ok(library::MetadataPatch {
+        name: req.name,
+        author: req.author,
+        intro: req.intro,
         language: req.language,
         publisher: req.publisher,
         pubdate: req.pubdate,
@@ -283,6 +298,7 @@ fn metadata_json(b: &LibraryBook, extras: &library::MetadataExtras) -> serde_jso
         "book_url": b.book_url,
         "name": b.name,
         "author": b.author,
+        "intro": b.intro,
         "tier": b.tier,
         "language": b.language,
         "publisher": b.publisher,
@@ -318,7 +334,33 @@ async fn book_meta(
     })))
 }
 
+fn patch_to_fields(patch: &library::MetadataPatch) -> crate::library_store::edit::MetaFields {
+    use crate::library_store::edit::MetaFields;
+    // identifiers 被整体替换时，没有 isbn 就等于清空；没带该字段时才保持原值。
+    let isbn = patch.identifiers.as_ref().map(|list| {
+        list.iter()
+            .find(|(scheme, _)| scheme.eq_ignore_ascii_case("isbn"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    });
+    MetaFields {
+        title: patch.name.clone(),
+        author: patch.author.clone(),
+        description: patch.intro.clone(),
+        language: patch.language.clone(),
+        publisher: patch.publisher.clone(),
+        pubdate: patch.pubdate.clone(),
+        subjects: patch.tags.clone(),
+        series: patch.series_name.clone(),
+        series_index: patch.series_index,
+        isbn,
+    }
+}
+
 /// 写一本书的元数据。仅管理员：馆藏是全局共享内容，普通账号只能改自己的书架字段。
+///
+/// 目录是权威：DB 更新后同步写 `content.opf` / `oread.json`；目录尚未建立时只写 DB，
+/// 等首次目录同步再建目录。
 async fn set_book_meta(
     State(s): State<AppState>,
     u: AuthUser,
@@ -334,6 +376,21 @@ async fn set_book_meta(
         return Err(AppError::BadRequest("没有可更新的字段".into()));
     }
     library::update_metadata(&s.library, &book_url, &patch).await?;
+    let fields = patch_to_fields(&patch);
+    let store = s.store();
+    if let Err(e) = crate::library_store::edit::save_text_meta(&store, &book_url, &fields).await {
+        match e {
+            crate::library_store::edit::EditError::NotFound(_) => {
+                match crate::library_store::edit::save_comic_meta(&store, &book_url, &fields).await
+                {
+                    Ok(_) => {}
+                    Err(crate::library_store::edit::EditError::NotFound(_)) => {}
+                    Err(e) => return Err(super::book_edit::edit_error(e)),
+                }
+            }
+            e => return Err(super::book_edit::edit_error(e)),
+        }
+    }
     let book = library::load_book(&s.library, &book_url)
         .await?
         .ok_or_else(|| AppError::NotFound("馆藏里没有这本书".into()))?;

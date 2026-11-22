@@ -2471,6 +2471,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `book_url` | string | 馆藏书目主键；不存在时自动建一行临时书目 |
+| `name` / `author` / `intro` | string | 书名 / 作者 / 简介；`name` 传空串会被拒绝 |
 | `language` | string | BCP 47，最长 35 |
 | `publisher` / `pubdate` / `series_name` | string | 最长 200；`pubdate` 原样保存（如 `2020-01-01`） |
 | `series_index` | number | `>= 0` 的有限数 |
@@ -2482,6 +2483,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 成功 `200`：返回写入后的 `meta`（结构同 `GET`）。
 - 错误：`400`（空补丁 / 数值非法 / 超长）；`403`（非管理员写入）；`404`（`GET` 时书不在馆藏）；`401`。
 - 行为：`GET` 只读书目与扩展表，不触发抓取；`POST` 不改变 `tier` / 入馆状态。
+- 目录同步：`POST` 在写 `library.db` 后，若书目录已存在，会把同一批字段写进 `content.opf`
+  （文字书）或 `oread.json` + `ComicInfo.xml`（漫画）；目录尚未建立时只写 DB，等首次
+  TOC 同步建目录时再补。目录写入失败会返回 500（DB 已更新，可重试）。
 
 ### 6.12.4 `POST /api/library/comic/estimate`（管理员）
 
@@ -2620,6 +2624,39 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 断点续跑：图片章节的 `images_ready=1` 才算已缓存（`content` 对漫画是空串，不能只看 `content IS NOT NULL`）；`upsert_content` 后清单保留，失败的图片下次续跑补齐。
 - 读取：图片代理优先读书目录（`oread-img://<sha256(book_url)>/<文件名>`），再读 `library_images`，命中都回填进程内 LRU；命中时不需要回源，源站 DNS 故障也能离线读已入馆漫画。墨水屏灰度 / WebP 转码变体仍运行时生成，不落盘。
 - 目录即书的漫画读路径：`GET /api/comic/source`、`GET /api/book/toc`、`GET /api/comic/chapter` 命中书目录后不再要求书源；章节图片返回 `oread-img://` 本地地址，响应带 `local=true`。`/api/book/image` 与 `POST /api/book/images/meta` 识别该 scheme 后直读文件，`source` 参数可省略。
+
+### 6.12.12 管理员编辑书目录（`/api/library/book/edit*`）
+
+- 鉴权：全部 **admin**。
+- 对象：入馆/同步目录时已归一化的书目录，管理员不接触原始网页 CSS/JS。元数据编辑复用 6.12.3
+  （同时写目录）；本节只放正文、封面与漫画单页。
+- 乐观锁：`GET /api/library/book/edit` 返回 `revision`；正文/封面/漫画页保存必须带同一修订号，
+  不匹配返回 `409`（`conflict`），调用方应刷新后重试。
+- 未缓存章节：`GET /api/library/book/edit/chapter` 对未下载章节返回 `404`，提示先打开一次或等整本下载完成。
+- 图片请求体：JSON + base64（可带 `data:image/...;base64,` 前缀）。单请求上限 16 MB、图片本体
+  上限 10 MB；服务端按文件内容识别格式，**只接受 JPEG / WebP**（本服务只编译这两种解码器，
+  墨水屏灰度与长条切片也依赖它们），不信任客户端声明的 MIME。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/library/book/edit?book_url=` | 编辑视图：`{ok, kind:"text"\|"comic", book_url, book_id, tier, revision, meta, cover, chapters}` |
+| `GET /api/library/book/edit/chapter?book_url=&chapter_url=` | `{ok, revision, title, paragraphs[]}`；卷标题/占位章返回 `400`/`404` |
+| `POST /api/library/book/edit/chapter` | body `{book_url, chapter_url, revision, paragraphs[]}` → `{ok, revision}` |
+| `POST /api/library/book/edit/cover` | body `{book_url, revision, mime, data}` → `{ok, revision, cover:{href, media_type, url}}` |
+| `POST /api/library/book/edit/page` | body `{book_url, chapter_url, href, revision, mime, data}` → `{ok, revision, page:{href, mime, width, height, bytes}}` |
+
+- 编辑视图字段：
+  - `meta`：与 `content.opf` / `oread.json` 一致（`title/author/language/publisher/pubdate/description/subjects/series/series_index/isbn`）。
+  - `cover`：文字书为 `{href, media_type, data_url}`（≤4 MB 才带 `data_url`），无封面为 `null`；漫画恒为 `null`。
+  - `chapters[]`：文字书 `{id, title, url, is_volume, cached}`；漫画 `{id, title, url, is_volume, pages, cached}`。
+- 正文限制：最多 5000 段、单段 20000 字、总计 200 万字；空正文返回 `400`。
+- 换封面：写 `OEBPS/images/cover.<ext>` 并更新 OPF；旧扩展名不同会删除旧文件，同时把
+  `library_books.cover_url` 指到 `oread-img://<book_id>/OEBPS/images/cover.<ext>?v=<revision>`。
+- 换漫画页：保持页序号与文件名前缀，扩展名随实际格式变化；页表更新 `mime/width/height/bytes`，
+  旧扩展名文件删除。
+- 落盘顺序：正文/图片 → `nav.xhtml` → `content.opf`；漫画为图片 → `oread.json` → `ComicInfo.xml`。
+  每一步都是同目录临时文件 + fsync + rename。
+- 范围（v1）：不增删/拆分/合并章节，不改漫画页数量。
 
 ### 6.13 OPDS 1.2 目录（`/opds*`）
 

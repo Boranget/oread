@@ -16,6 +16,7 @@
   export let brightness = 100;
   export let autoOn = false;
   export let autoSpeed = 3;
+  export let canEdit = false;
 
   const dispatch = createEventDispatcher();
 
@@ -157,6 +158,9 @@
           <button class="rd-btn" on:click={() => dispatch('bookmarks')}>书签</button>
           <button class="rd-btn" on:click={() => dispatch('search')}>书内搜索</button>
           <button class="rd-btn" on:click={() => dispatch('switch')}>换源</button>
+          {#if canEdit}
+            <button class="rd-btn" on:click={() => dispatch('edit')}>编辑本章</button>
+          {/if}
         </div>
       </div>
 

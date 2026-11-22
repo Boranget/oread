@@ -252,6 +252,9 @@ pub async fn adopt_source(
 /// `identifiers` / `tags` 传 `Some(vec![])` 表示清空，`Some(非空)` 表示整体替换。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetadataPatch {
+    pub name: Option<String>,
+    pub author: Option<String>,
+    pub intro: Option<String>,
     pub language: Option<String>,
     pub publisher: Option<String>,
     pub pubdate: Option<String>,
@@ -264,7 +267,10 @@ pub struct MetadataPatch {
 impl MetadataPatch {
     /// 一个字段都没带：路由层据此返回 400，避免空补丁静默成功。
     pub fn is_empty(&self) -> bool {
-        self.language.is_none()
+        self.name.is_none()
+            && self.author.is_none()
+            && self.intro.is_none()
+            && self.language.is_none()
             && self.publisher.is_none()
             && self.pubdate.is_none()
             && self.series_name.is_none()
@@ -303,6 +309,15 @@ pub async fn update_metadata(
     let mut tx = pool.begin().await?;
 
     let mut sets: Vec<&str> = Vec::new();
+    if patch.name.is_some() {
+        sets.push("name = ?");
+    }
+    if patch.author.is_some() {
+        sets.push("author = ?");
+    }
+    if patch.intro.is_some() {
+        sets.push("intro = ?");
+    }
     if patch.language.is_some() {
         sets.push("language = ?");
     }
@@ -324,6 +339,15 @@ pub async fn update_metadata(
             sets.join(", ")
         );
         let mut q = sqlx::query(&sql);
+        if let Some(v) = &patch.name {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = &patch.author {
+            q = q.bind(non_empty(v));
+        }
+        if let Some(v) = &patch.intro {
+            q = q.bind(non_empty(v));
+        }
         if let Some(v) = &patch.language {
             q = q.bind(non_empty(v));
         }

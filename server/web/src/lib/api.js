@@ -601,4 +601,24 @@ export const api = {
   libraryJobs: (opts = {}) =>
     request('GET', `/library/jobs?${buildQuery({ status: opts.status, limit: opts.limit })}`),
   libraryJobCancel: (id) => request('POST', '/library/jobs/cancel', { id }),
+  // ---- 管理员编辑（目录即书）----
+  // 编辑视图：目录里的权威元数据 + 章节目录（漫画带页表）
+  bookEdit: (bookUrl) =>
+    request('GET', `/library/book/edit?${buildQuery({ book_url: bookUrl })}`),
+  // 单章段落：未缓存时返回 404，前端提示先打开一次或整本下载
+  bookEditChapter: (bookUrl, chapterUrl) =>
+    request(
+      'GET',
+      `/library/book/edit/chapter?${buildQuery({ book_url: bookUrl, chapter_url: chapterUrl })}`
+    ),
+  // 元数据写库 + 写 content.opf / oread.json（与 /library/book/meta 同一契约）
+  saveLibraryBookMeta: (body) => request('POST', '/library/book/meta', body),
+  // 正文段落保存：带 revision，冲突时 409
+  saveBookChapter: (body) =>
+    request('POST', '/library/book/edit/chapter', body, { timeout: 60000 }),
+  // 换封面 / 换漫画单页：data 为 base64（可带 data URL 前缀）
+  saveBookCover: (body) =>
+    request('POST', '/library/book/edit/cover', body, { timeout: 60000 }),
+  replaceComicPage: (body) =>
+    request('POST', '/library/book/edit/page', body, { timeout: 60000 }),
 };

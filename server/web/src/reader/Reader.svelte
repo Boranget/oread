@@ -1,7 +1,8 @@
 <script>
   import { createEventDispatcher, onMount, onDestroy, tick } from 'svelte';
-  import { api, describeFailure } from '../lib/api.js';
+  import { api, describeFailure, getRole } from '../lib/api.js';
   import ExportDialog from '../lib/ExportDialog.svelte';
+  import BookEditor from '../lib/BookEditor.svelte';
   import ReaderBookmarks from './ReaderBookmarks.svelte';
   import ReaderContent from './ReaderContent.svelte';
   import ReaderJump from './ReaderJump.svelte';
@@ -33,6 +34,7 @@
 
   export let book; // { bookUrl, sourceId, name, author, coverUrl, intro }
   const dispatch = createEventDispatcher();
+  const isAdmin = getRole() === 'admin';
 
   const MODES = ['scroll', 'paged', 'fade'];
 
@@ -74,6 +76,8 @@
   let showPanel = false;
   let showSwitch = false;
   let showExport = false;
+  let showEditor = false;
+  let editorSaved = false;
   let controlsVisible = true;
   let toast = '';
   // 正文替换规则：账号设置 use_replace_rule 控制的显式开关
@@ -891,6 +895,7 @@
     brightness={brightness}
     autoOn={autoOn}
     autoSpeed={autoSpeed}
+    canEdit={isAdmin}
     on:mode={(e) => changeMode(e.detail)}
     on:font-step={(e) => stepFont(e.detail)}
     on:line-step={(e) => stepLine(e.detail)}
@@ -905,6 +910,11 @@
     on:speed={(e) => setAutoSpeed(e.detail)}
     on:bookmarks={toggleBookmarks}
     on:search={toggleBookSearch}
+    on:edit={() => {
+      showPanel = false;
+      editorSaved = false;
+      showEditor = true;
+    }}
     on:switch={() => {
       showPanel = false;
       toggleSwitch();
@@ -953,6 +963,20 @@
       bookUrl={book.bookUrl}
       name={info?.name || book.name || ''}
       on:close={() => (showExport = false)}
+    />
+  {/if}
+
+  {#if showEditor}
+    <BookEditor
+      bookUrl={book.bookUrl}
+      initialTab="content"
+      initialChapter={current?.url || ''}
+      on:close={() => {
+        showEditor = false;
+        // 保存过正文就重拉本章，避免继续显示旧段落。
+        if (editorSaved && currentPos >= 0) openChapter(currentPos);
+      }}
+      on:saved={() => (editorSaved = true)}
     />
   {/if}
 </div>

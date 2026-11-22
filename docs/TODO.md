@@ -194,12 +194,16 @@
   - 入馆 / 移出 / 删除 / TTL 清理 = 目录 `promote` / `demote` / `move_to_trash`；
     `promote` 失败留 `.oread-promote` 标记，后台 60 s 重试；
   - 元数据以 `content.opf` / `oread.json` 为权威，DB 只补空字段，不覆盖管理员编辑。
+  - 管理员编辑 v1（`library_store::edit` + `/api/library/book/edit*`）：改元数据（复用
+    `/api/library/book/meta`，同时写 OPF / `oread.json`）、改正文段落、换封面、换漫画单页；
+    正文/封面/页保存带 `revision` 乐观锁，冲突返回 409；图片按内容识别格式，不信任客户端 MIME；
+    写入顺序仍是正文/图片 → `nav.xhtml` → `content.opf`（漫画：图片 → `oread.json` → `ComicInfo.xml`）。
 - 还差：
   - `index.db`：章节 href / `oread:revision` / 书目检索字段的派生索引，以及
     `doctor --rebuild-index`；
   - 导出直接打包目录（不再逐章重新生成）；
   - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退；
-  - 管理员编辑：改正文段落、改元数据、换封面、换漫画单页（v1 不做增删/拆分/合并章节）。
+  - 管理员编辑 v2：章节增删/拆分/合并、漫画页数量调整（v1 明确不做）。
 - 纪律：章节文件名序号创建后永不复用/改名；顺序只存 spine；目录是唯一权威。
 
 ---
