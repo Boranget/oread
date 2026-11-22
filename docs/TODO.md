@@ -204,7 +204,8 @@
     馆藏搜索（`GET /api/library/books?q=`）已接入索引（书名/作者/系列/主题/简介），
     写路径（TOC/正文/元数据/封面/漫画页/入馆/移出/删除/迁移）增量刷新。
     `boranlib doctor --sync-db` 把「目录有、`library.db` 没有」的孤立目录补登成书目
-    （手工放进 `collection/` 的书目录因此能在列表里出现）。
+    （手工放进 `collection/` 的书目录因此能在列表里出现）；`doctor` 同时逐本比对旧缓存表
+    `library_content` / `library_images` 的目录覆盖情况，作为「何时可以删旧表」的判据。
   - 导出直接打包目录（`library_store::pack`）：EPUB / CBZ 在书目录完整时原样打包
     （CBZ 排除内部边车 `oread.json`），目录缺失/不完整才回退逐章生成。
   - `/k`（Kindle）目录与正文也目录优先：`/k/toc` 先读 OPF spine / `oread.json`，
@@ -213,7 +214,8 @@
     （已有目录跳过，失败只记日志），让读路径逐步收敛到「目录即书」。
 - 还差：
   - `index.db` 提供列表排序/分页（当前排序仍靠 `library.db` 的访问时间）；
-  - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退；
+  - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退：
+    `boranlib doctor` 已逐本报告旧缓存行的目录覆盖情况（「仅 DB」为 0 才可删表）；
   - 管理员编辑 v2：章节增删/拆分/合并、漫画页数量调整（v1 明确不做）。
 - 纪律：章节文件名序号创建后永不复用/改名；顺序只存 spine；目录是唯一权威。
 

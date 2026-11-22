@@ -121,6 +121,25 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
     );
     print_list("library.db 有但目录缺失（仍靠 DB 回退）", &v.db_without_dir);
 
+    // 旧缓存表能否删：目录已经是唯一副本时才会给出提示。
+    let legacy = boranlib::library_store::migrate::legacy_coverage(&library, &store).await?;
+    if legacy.content_rows + legacy.image_rows > 0 {
+        println!(
+            "旧缓存表：正文 {} 行（目录已覆盖 {}，仅 DB {}）；图片 {} 行（目录已覆盖 {}，仅 DB {}）",
+            legacy.content_rows,
+            legacy.content_covered,
+            legacy.content_only_db(),
+            legacy.image_rows,
+            legacy.image_covered,
+            legacy.image_only_db()
+        );
+        print_list("旧缓存仅 DB（没有书目录）", &legacy.books_without_dir);
+        print_list("旧缓存仅 DB（书目录不完整）", &legacy.books_partial);
+        if legacy.complete() {
+            println!("旧缓存已能全部由书目录重建，可以考虑删除 library_content / library_images");
+        }
+    }
+
     if v.has_problems() {
         eprintln!("doctor: 发现需要处理的问题");
         std::process::exit(1);

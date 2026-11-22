@@ -4,6 +4,7 @@
 //! 迁移只读旧表、只写目录，**不删除**任何数据库行；切换读写路径并验证无误后，
 //! 再由后续迁移删表。已存在的书目录默认跳过，避免覆盖管理员刚编辑过的内容。
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use sqlx::SqlitePool;
@@ -135,6 +136,136 @@ async fn legacy_content_present(pool: &SqlitePool) -> anyhow::Result<bool> {
     .fetch_one(pool)
     .await?;
     Ok(rows > 0)
+}
+
+/// 旧缓存表相对书目录的覆盖情况。用来判断「现在能不能删旧表」：
+/// 只有「仅 DB」的行数为 0，目录才是正文/图片的唯一副本。
+#[derive(Debug, Default, Clone)]
+pub struct LegacyCoverage {
+    pub content_rows: i64,
+    pub content_covered: i64,
+    pub image_rows: i64,
+    pub image_covered: i64,
+    /// 旧缓存行涉及的、完全没有书目录的书（去重排序）。
+    pub books_without_dir: Vec<String>,
+    /// 有目录、但仍有缓存行没被目录覆盖的书（去重排序）。
+    pub books_partial: Vec<String>,
+}
+
+impl LegacyCoverage {
+    pub fn content_only_db(&self) -> i64 {
+        (self.content_rows - self.content_covered).max(0)
+    }
+
+    pub fn image_only_db(&self) -> i64 {
+        (self.image_rows - self.image_covered).max(0)
+    }
+
+    /// 目录已经能重建全部旧缓存行，删表不会丢内容。
+    pub fn complete(&self) -> bool {
+        self.content_only_db() == 0 && self.image_only_db() == 0
+    }
+}
+
+/// 逐本比对旧缓存行与书目录：章节文件有正文才算覆盖，漫画页按原始图片 URL 比对。
+///
+/// 只读，不修改任何表。没有目录的书、目录不完整的书都会被列出来，方便先跑
+/// `migrate-store` 再删表。
+pub async fn legacy_coverage(pool: &SqlitePool, store: &Store) -> anyhow::Result<LegacyCoverage> {
+    let content: Vec<(String, String)> =
+        sqlx::query_as("SELECT url, book_url FROM library_content")
+            .fetch_all(pool)
+            .await?;
+    let images: Vec<(String, String)> = sqlx::query_as("SELECT url, book_url FROM library_images")
+        .fetch_all(pool)
+        .await?;
+
+    let mut coverage = LegacyCoverage {
+        content_rows: content.len() as i64,
+        image_rows: images.len() as i64,
+        ..Default::default()
+    };
+    let mut by_book: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    for (url, book_url) in content {
+        by_book.entry(book_url).or_default().0.push(url);
+    }
+    for (url, book_url) in images {
+        by_book.entry(book_url).or_default().1.push(url);
+    }
+
+    for (book_url, (content_urls, image_urls)) in by_book {
+        if book_url.trim().is_empty() {
+            coverage.books_without_dir.push("(book_url 为空)".into());
+            continue;
+        }
+        if store.find(&book_url).is_none() {
+            coverage.books_without_dir.push(book_url);
+            continue;
+        }
+        let (covered_content, covered_images) = dir_covered(store, &book_url, &content_urls).await;
+        let mut partial = false;
+        for url in content_urls {
+            if covered_content.contains(&url) {
+                coverage.content_covered += 1;
+            } else {
+                partial = true;
+            }
+        }
+        for url in image_urls {
+            if covered_images.contains(&url) {
+                coverage.image_covered += 1;
+            } else {
+                partial = true;
+            }
+        }
+        if partial {
+            coverage.books_partial.push(book_url);
+        }
+    }
+    Ok(coverage)
+}
+
+/// 目录里已经能读到的章节 URL / 原始图片 URL。解析失败按「没覆盖」处理，
+/// 宁可让 operator 再跑一次迁移，也不要误报可以删表。
+async fn dir_covered(
+    store: &Store,
+    book_url: &str,
+    content_urls: &[String],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut content = HashSet::new();
+    let mut images = HashSet::new();
+    if let Ok(Some(comic)) = store.open_comic(book_url).await {
+        for chapter in &comic.meta.chapters {
+            if chapter.pages.is_empty() {
+                continue;
+            }
+            if let Some(url) = chapter.url.as_deref() {
+                content.insert(url.trim().to_string());
+            }
+            for page in &chapter.pages {
+                if let Some(url) = page.source_url.as_deref() {
+                    images.insert(url.trim().to_string());
+                }
+            }
+        }
+        return (content, images);
+    }
+    if let Ok(Some(book)) = store.open_book(book_url).await {
+        for url in content_urls {
+            let Some(item) = book.meta.chapter_by_url(url) else {
+                continue;
+            };
+            if super::read::load_chapter(&book.dir, item)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                content.insert(url.trim().to_string());
+            }
+        }
+    }
+    (content, images)
 }
 
 async fn migrate_book(
@@ -523,5 +654,121 @@ mod tests {
             .await
             .unwrap();
         assert!(legacy_content_present(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_coverage_separates_covered_and_db_only_rows() {
+        use crate::entities::BookChapter;
+        use crate::library_store::comic;
+        use crate::library_store::write::{save_text_chapter, sync_text_toc, TocSeed};
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("oread-coverage-{}-{stamp}", std::process::id()));
+        let store = Store::at(root.join("library"));
+        store.create_layout().unwrap();
+
+        // 文字书：t1 已落盘，t2 只在 DB。
+        let text_url = "https://x/text";
+        let seed = TocSeed {
+            tier: Tier::Temp,
+            is_comic: false,
+            opf: OpfMeta::new(text_url, "文字书"),
+            comic: super::super::comic::ComicMeta::new(text_url, "文字书"),
+        };
+        let chapter = |url: &str| BookChapter {
+            url: url.into(),
+            title: Some("章".into()),
+            ..Default::default()
+        };
+        sync_text_toc(
+            &store,
+            &seed,
+            &[chapter("https://x/t1"), chapter("https://x/t2")],
+        )
+        .await
+        .unwrap();
+        assert!(
+            save_text_chapter(&store, text_url, "https://x/t1", &["正文".into()])
+                .await
+                .unwrap()
+        );
+
+        // 漫画书：i1 已落盘，i2 只在 DB。
+        let comic_url = "https://x/comic";
+        let mut meta = super::super::comic::ComicMeta::new(comic_url, "漫画书");
+        meta.chapters.push(super::super::comic::ComicChapter {
+            id: "ch-0001".into(),
+            title: "第一话".into(),
+            url: Some("https://x/c1".into()),
+            is_volume: false,
+            pages: vec![super::super::comic::ComicPage {
+                href: "0001-001.jpg".into(),
+                mime: "image/jpeg".into(),
+                width: Some(1),
+                height: Some(1),
+                bytes: Some(1),
+                source_url: Some("https://x/i1.jpg".into()),
+            }],
+        });
+        comic::write_meta(&store.dir_for(Tier::Temp, comic_url), &meta)
+            .await
+            .unwrap();
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE library_content (url TEXT, book_url TEXT)",
+            "CREATE TABLE library_images (url TEXT, book_url TEXT)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        for (url, book) in [
+            ("https://x/t1", text_url),
+            ("https://x/t2", text_url),
+            ("https://x/c1", comic_url),
+            ("https://x/z1", "https://x/none"),
+        ] {
+            sqlx::query("INSERT INTO library_content (url, book_url) VALUES (?1, ?2)")
+                .bind(url)
+                .bind(book)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (url, book) in [
+            ("https://x/i1.jpg", comic_url),
+            ("https://x/i2.jpg", comic_url),
+        ] {
+            sqlx::query("INSERT INTO library_images (url, book_url) VALUES (?1, ?2)")
+                .bind(url)
+                .bind(book)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let coverage = legacy_coverage(&pool, &store).await.unwrap();
+        assert_eq!(coverage.content_rows, 4);
+        assert_eq!(coverage.content_covered, 2);
+        assert_eq!(coverage.content_only_db(), 2);
+        assert_eq!(coverage.image_rows, 2);
+        assert_eq!(coverage.image_covered, 1);
+        assert_eq!(coverage.image_only_db(), 1);
+        assert_eq!(
+            coverage.books_without_dir,
+            vec!["https://x/none".to_string()]
+        );
+        assert!(coverage.books_partial.contains(&text_url.to_string()));
+        assert!(coverage.books_partial.contains(&comic_url.to_string()));
+        assert!(!coverage.complete());
+
+        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -165,6 +165,9 @@ Bearer 访问 `/opds*`，便于调试。
 - 迁移命令：`boranlib migrate-store`（只读旧表、只写目录，已存在的书目录跳过）。
   进程启动时也会在后台跑同一套迁移：只要旧内容表还有行，就补齐仍缺目录的书，
   已有目录的书直接跳过；失败只记日志，读路径继续回退 `library.db`。
+- 删旧表的前置判据：`boranlib doctor` 会逐本比对 `library_content` / `library_images`
+  与书目录（文字章节要求文件里有正文，漫画页按原始图片 URL），报告「仅 DB」行数与
+  没有目录/目录不完整的书；只有「仅 DB」为 0 时目录才是唯一副本，删表不会丢内容。
 - 写路径（`library_store::write`）：TOC 抓取成功后 `sync_toc` 按章节 URL 合并 spine——
   旧章保留 id/href 只更新标题，新章追加新序号，目录变短只移出 spine、不删文件也不复用序号；
   正文抓取成功后 `save_text_chapter` 写归一化段落（首段等于章节标题时去掉，避免重复）；
