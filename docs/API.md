@@ -2241,7 +2241,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `ComicInfo.xml`：最小元数据（`Title` / `Series` / `Number` / `Writer` / `Summary` / `LanguageISO` / `PageCount`），空字段省略；
   - 只做 store（不压缩）：漫画页本身已压缩，deflate 只会浪费 KPW3 的 CPU；同时让 EPUB 的 `mimetype` 规则可复用。
 - 语义：
-  - 只包含 `library_images` 里真正有字节的页；缺页计入 `x-missing-pages`，不伪造占位图。
+  - **目录优先**：书目录完整（`ComicInfo.xml` + 至少一张图片）时直接把目录原样打包，
+    内部边车 `oread.json` 不进入 CBZ；目录缺失或不完整时才回退到逐页生成。
+  - 回退路径只包含 `library_images` 里真正有字节的页；缺页计入 `x-missing-pages`，不伪造占位图。
   - 图片原样入包，不改宽度/质量；墨水屏转码仍由 `/api/book/image` 运行时完成。
 - 错误：
   - `400`（缺参 / 空参）；`409`（目录未缓存 / 没有图片章节 / 一页都没落盘）；`401`；`500`。
@@ -2289,6 +2291,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 - 鉴权：登录
 - 用途：把已缓存正文按章转成 XHTML，打包为 **EPUB 3**；不联网、不内联外部图片（漫画走 CBZ）。
+  **目录优先**：书目录完整（`mimetype` + `META-INF/container.xml` + `OEBPS/content.opf`）时
+  直接把目录原样打包，`x-written-chapters` 取已缓存章节数；目录缺失或不完整时才按章重新生成。
 - 查询参数：`book_url`（必填）
 - 成功 `200` 响应头：
 
@@ -2308,7 +2312,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `OEBPS/content.opf`：`version="3.0"` 的 package，含 metadata / manifest / spine；
   - `OEBPS/nav.xhtml`：EPUB 3 目录；
   - `OEBPS/style.css`：最小排版样式；
-  - `OEBPS/ch001.xhtml ...`：一章一文件。
+  - `OEBPS/ch001.xhtml ...`：一章一文件（目录直接打包时保留目录内实际文件名，
+    如 `OEBPS/chapters/ch-0001-*.xhtml`，不重命名）。
 - 正文归一化（`ebook::html`）：
   - `h1`–`h6` 保留标题层级；`p` / `div` / `li` / `blockquote` / 表格单元等块级元素各成段；
   - `<br>` 与文本换行断段；行内标签只取文字；

@@ -13,7 +13,7 @@ pub mod html;
 pub mod model;
 pub mod pipeline;
 pub mod xml;
-mod zip;
+pub mod zip;
 
 pub use model::{
     Artifact, BookInput, BookMeta, ChapterKind, ChapterRef, ComicInput, Format, PageData,

@@ -36,6 +36,7 @@ use crate::ebook::pipeline::FormatWriter;
 use crate::ebook::{BookInput, ComicInput, Format, WriteReport};
 use crate::ebook_source::{load_comic_input, LibraryReader};
 use crate::error::{AppError, AppResult};
+use crate::library_store::pack::PackKind;
 use crate::routes::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -202,13 +203,22 @@ async fn write_epub(
     ));
 
     let reader = export_reader(pool, &store, book_url).await;
-    let report = EpubWriter.write(&input, &reader, &path).await?;
+    // 目录优先：目录本身就是合法 EPUB，直接原样打包，不再逐章重新生成。
+    let (written_cached, size_bytes) =
+        match crate::library_store::pack::pack_book(&store, book_url, PackKind::Epub, &path).await?
+        {
+            Some(report) => (input.cached_chapters, report.bytes),
+            None => {
+                let report = EpubWriter.write(&input, &reader, &path).await?;
+                (report.written_chapters, report.size_bytes)
+            }
+        };
 
     Ok(ExportFile {
         path,
         input,
-        written_cached: report.written_chapters,
-        size_bytes: report.size_bytes,
+        written_cached,
+        size_bytes,
     })
 }
 
@@ -252,8 +262,27 @@ async fn write_cbz(
         seq
     ));
 
-    let reader = LibraryReader::new(pool, &input.book.meta.book_url);
-    let report = CbzWriter.write(&input.book, &reader, &path).await?;
+    let store = crate::library_store::Store::new(data_dir);
+    // 目录优先：完整漫画目录直接原样打包；`oread.json` 是内部边车，不进入 CBZ。
+    let report = match crate::library_store::pack::pack_book(
+        &store,
+        &input.book.meta.book_url,
+        PackKind::Cbz,
+        &path,
+    )
+    .await?
+    {
+        Some(packed) => WriteReport {
+            written_chapters: input.book.image_chapters().count() as i64,
+            written_pages: input.available_pages,
+            missing_pages: 0,
+            size_bytes: packed.bytes,
+        },
+        None => {
+            let reader = LibraryReader::new(pool, &input.book.meta.book_url);
+            CbzWriter.write(&input.book, &reader, &path).await?
+        }
+    };
     Ok(CbzExportFile {
         path,
         input,

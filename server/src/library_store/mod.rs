@@ -23,6 +23,7 @@ pub mod edit;
 pub mod index;
 pub mod migrate;
 pub mod opf;
+pub mod pack;
 pub mod read;
 pub mod write;
 

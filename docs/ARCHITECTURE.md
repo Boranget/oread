@@ -139,7 +139,7 @@ Bearer 访问 `/opds*`，便于调试。
 > `boranlib migrate-store` 把旧库导出成目录；**文字书与漫画的读路径都已优先走目录**
 > （阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 漫画页、图片代理），未迁移或目录缺失时
 > 回退 `library.db`。写路径也已切到目录：TOC/正文/漫画页抓取成功后直接落盘，
-> `library.db` 仍同步写一份作为回退；`index.db` 尚未建立。
+> `library.db` 仍同步写一份作为回退；`index.db` 已建立（启动时后台重建 + `doctor` 检查）。
 
 ### 4.1 目标存储：目录即书
 
@@ -183,6 +183,10 @@ Bearer 访问 `/opds*`，便于调试。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（仍靠回退）。
   `--rebuild-index` 先重建索引再检查；有需要处理的问题时退出码 1，便于脚本/定时任务报警。
+- 导出（`library_store::pack`）：目录完整时直接按 store-only ZIP 原样打包——EPUB 把
+  `mimetype` 放第一条、随后 `META-INF/container.xml`；CBZ 把 `ComicInfo.xml` 放第一条并排除
+  内部边车 `oread.json`。目录缺失/不完整时才回退到逐章/逐页重新生成，因此导出的字节与
+  磁盘上的书一致（包括管理员编辑结果）。
 
 ### 4.2 现状（迁移前）
 
