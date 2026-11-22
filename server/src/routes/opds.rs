@@ -252,11 +252,8 @@ async fn books(
         "SELECT b.book_url, b.name, b.author, b.intro, b.cover_url, b.origin, \
                 b.language, b.publisher, b.pubdate, \
                 b.series_name, b.series_index, b.last_accessed_at, b.collected_at, \
-                (SELECT COUNT(*) FROM library_content c \
-                   WHERE c.book_url = b.book_url AND c.content_type = 'text' \
-                     AND c.content IS NOT NULL AND length(trim(c.content)) > 0) AS text_cached, \
-                (SELECT COUNT(*) FROM library_images i \
-                   WHERE i.book_url = b.book_url) AS image_cached \
+                CASE WHEN b.book_source_type = 2 THEN 0 ELSE b.cached_chapters END AS text_cached, \
+                CASE WHEN b.book_source_type = 2 THEN b.cached_chapters ELSE 0 END AS image_cached \
          FROM library_books b \
          WHERE b.tier = 'collection' \
            AND (?1 = 'all' \

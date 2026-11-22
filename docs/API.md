@@ -2702,9 +2702,10 @@ acquisition feed，keyset 分页（`sort_ts DESC, book_url ASC`，不返回总�
 - 标签输出为 `<category term="标签">`，系列输出为 `<category term="series:系列" label="系列 #序号">`；
 - 有封面时输出 `http://opds-spec.org/image` 与 `image/thumbnail`，指向
   `/opds/cover?book_url=...`（无书源时直接给源站封面地址）；
-- **acquisition 只在内容已缓存时出现**：有非空文本章节 → EPUB
-  （`application/epub+zip`）；有已落盘漫画页 → CBZ（`application/vnd.comicbook+zip`）。
-  两者都没有的条目仍会列出，但不带下载链接。
+- **acquisition 只在内容已缓存时出现**：`library_books.cached_chapters > 0` 的文本书 → EPUB
+  （`application/epub+zip`），漫画书 → CBZ（`application/vnd.comicbook+zip`）。
+  该计数由目录写入、管理员编辑与 `boranlib doctor --sync-db` 从书目录刷新，
+  手工放进 `collection/` 的目录书也能正确出现下载链接；两者都没有的条目仍会列出，但不带下载链接。
 
 #### 6.13.3 `GET /opds/download/epub?book_url=...`
 

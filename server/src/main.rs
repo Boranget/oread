@@ -102,6 +102,8 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
     if sync_db {
         let n = index.adopt_orphans(&library).await?;
         println!("已补登 {n} 个目录书到 library.db");
+        let refreshed = boranlib::library_store::usage::refresh_all(&library, &store).await?;
+        println!("已按目录刷新 {refreshed} 本书的缓存统计");
     }
 
     let v = index.verify(&store, &library).await?;

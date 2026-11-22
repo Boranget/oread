@@ -25,6 +25,7 @@ pub mod migrate;
 pub mod opf;
 pub mod pack;
 pub mod read;
+pub mod usage;
 pub mod write;
 
 use std::collections::HashMap;

@@ -120,7 +120,8 @@ GET /opds/books?kind=text
       → users 实时校验收/禁用 → bcrypt（5 分钟进程内缓存）→ 注入 AuthUser/UserDb/LibraryDb
       失败 → 401 + WWW-Authenticate: Basic realm="oread OPDS"
  → routes/opds::books：只查 tier=collection，keyset 分页（sort_ts DESC, book_url ASC）
-      每行顺带统计已缓存文本章节数 / 已落盘漫画页数 → 决定是否输出 acquisition 链接
+      按 book_source_type 读 library_books.cached_chapters（目录写入/编辑/doctor --sync-db 维护）
+      → 决定是否输出 EPUB / CBZ acquisition 链接
       标签批量查 library_tags，元数据复用 language/publisher/pubdate/series_*
  → Atom acquisition feed（相对链接以 Host / X-Forwarded-Proto 补成绝对地址）
 
@@ -156,6 +157,10 @@ Bearer 访问 `/opds*`，便于调试。
 - 馆藏搜索（`GET /api/library/books?q=`）先查 `index.db`（书名/作者/系列/主题/简介），
   再与 `library.db` 的 `name`/`author` 取并集；写路径（TOC/正文/元数据/封面/漫画页/
   入馆/移出/删除/迁移）在落盘后增量刷新索引。排序与分页仍用 `library.db` 的访问时间。
+- 馆藏列表的「已缓存章节 / 正文 / 图片占用」仍读 `library_books` 的冗余列，但数值由目录计算
+  （`library_store::usage`）：文字书逐章读文件、占位章不算，漫画逐页 `stat`。管理员编辑后
+  立即重算，`doctor --sync-db` 全量重算；手工放进 `collection/` 的目录书因此也有正确进度，
+  OPDS 也按这个计数决定是否给 EPUB / CBZ 下载链接。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。

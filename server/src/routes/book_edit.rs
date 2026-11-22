@@ -273,7 +273,17 @@ async fn save_chapter(
     let meta = edit::save_chapter(&s.store(), book_url, chapter_url, q.revision, &q.paragraphs)
         .await
         .map_err(edit_error)?;
+    refresh_usage(&s, book_url).await;
     Ok(Json(json!({ "ok": true, "revision": meta.revision })))
+}
+
+/// 编辑改了章节/图片后，用目录重算馆藏列表的冗余统计（失败只记日志）。
+async fn refresh_usage(s: &AppState, book_url: &str) {
+    if let Err(e) =
+        crate::library_store::usage::refresh_rollup(&s.library, &s.store(), book_url).await
+    {
+        tracing::warn!(book = %book_url, error = %e, "refresh book usage rollup failed");
+    }
 }
 
 fn decode_image(data: &str) -> AppResult<Vec<u8>> {
@@ -378,6 +388,7 @@ async fn save_page(
     )
     .await
     .map_err(edit_error)?;
+    refresh_usage(&s, book_url).await;
     Ok(Json(json!({
         "ok": true,
         "revision": meta.revision,

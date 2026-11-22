@@ -1763,16 +1763,18 @@ async fn opds_requires_basic_and_exposes_collection() {
     // 两本馆藏 + 一本临时缓存；临时书不得出现在 OPDS 目录。
     sqlx::query(
         "INSERT INTO library_books (book_url, name, author, origin, tier, collected_at, \
-         last_accessed_at, language, publisher, pubdate, series_name, series_index) \
+         last_accessed_at, language, publisher, pubdate, series_name, series_index, \
+         cached_chapters) \
          VALUES ('https://o.test/text', '文字 & 书', '作者：张三', 'https://src.test', \
-         'collection', 10, 100, 'zh', '出版社', '2024-01-02', '系列', 2.0)",
+         'collection', 10, 100, 'zh', '出版社', '2024-01-02', '系列', 2.0, 1)",
     )
     .execute(&library)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO library_books (book_url, name, tier, collected_at, last_accessed_at) \
-         VALUES ('https://o.test/comic', '漫画书', 'collection', 20, 200)",
+        "INSERT INTO library_books (book_url, name, tier, collected_at, last_accessed_at, \
+         book_source_type, cached_chapters) \
+         VALUES ('https://o.test/comic', '漫画书', 'collection', 20, 200, 2, 1)",
     )
     .execute(&library)
     .await
