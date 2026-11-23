@@ -382,9 +382,46 @@ pub async fn load_dir_content(
 }
 
 /// 漫画导出视图：在 [`load_book_input`] 上补页数统计（声明页数 / 已落盘页数）。
-pub async fn load_comic_input(pool: &SqlitePool, book_url: &str) -> AppResult<ComicInput> {
+///
+/// 目录优先：书目录存在时按 `oread.json` 页表逐页 `stat`，不再看旧 BLOB 表；
+/// 没有目录的老书继续用 `library_content.images` + `library_images` 回退。
+pub async fn load_comic_input(
+    store: &crate::library_store::Store,
+    pool: &SqlitePool,
+    book_url: &str,
+) -> AppResult<ComicInput> {
     let book = load_book_input(pool, book_url).await?;
     let book_url = book.meta.book_url.as_str();
+
+    if let Some(comic) = store.open_comic(book_url).await? {
+        let mut total_pages = 0i64;
+        let mut available_pages = 0i64;
+        let mut available_bytes = 0i64;
+        for chapter in &comic.meta.chapters {
+            if chapter.is_volume {
+                continue;
+            }
+            total_pages += chapter.pages.len() as i64;
+            for page in &chapter.pages {
+                let Ok(path) = crate::library_store::safe_join(&comic.dir, &page.href) else {
+                    continue;
+                };
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    if meta.is_file() {
+                        available_pages += 1;
+                        available_bytes += meta.len() as i64;
+                    }
+                }
+            }
+        }
+        return Ok(ComicInput {
+            book,
+            total_pages,
+            available_pages,
+            available_bytes,
+        });
+    }
+
     let reader = LibraryReader::new(pool, book_url);
 
     let mut total_pages = 0i64;
@@ -787,7 +824,13 @@ mod tests {
     async fn comic_input_counts_declared_and_available_pages() {
         let p = pool().await;
         insert_comic(&p).await;
-        let input = load_comic_input(&p, "https://c/book").await.unwrap();
+        // 没有书目录：走旧 BLOB 回退。
+        let store = crate::library_store::Store::at(
+            std::env::temp_dir().join(format!("oread-comic-input-{}", std::process::id())),
+        );
+        let input = load_comic_input(&store, &p, "https://c/book")
+            .await
+            .unwrap();
         assert_eq!(input.book.image_chapters().count(), 2);
         assert_eq!(input.total_pages, 4);
         assert_eq!(input.available_pages, 3);

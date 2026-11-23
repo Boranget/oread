@@ -21,13 +21,18 @@ use crate::routes::AppState;
 
 /// 单章内图片下载并发。与章节并发相乘后仍远低于交互阅读的优先级。
 const IMAGE_PARALLEL: usize = 3;
-/// 落盘图片的单张上限：超过只保留清单，不进 `library_images`（与进程内 LRU 一致）。
+/// 落盘图片的单张上限：超过只保留清单，不写进书目录（与进程内 LRU 一致）。
 const IMAGE_KEEP_MAX: usize = 2 * 1024 * 1024;
-/// 单张图片的抓取结果：`(清单下标, Ok((字节数, 宽, 高)) | Err)`。
-type ImageOutcome = (
-    usize,
-    anyhow::Result<Option<(i64, Option<u32>, Option<u32>)>>,
-);
+/// 单章漫画下载到内存的上限；超过则整章失败，避免一次任务把内存吃光。
+const IMAGE_CHAPTER_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// 下载完成、尚未写进书目录的一张漫画图。
+struct FetchedImage {
+    data: Vec<u8>,
+    mime: String,
+    width: Option<u32>,
+    height: Option<u32>,
+}
 
 /// 空闲时的轮询间隔。
 const IDLE_POLL: Duration = Duration::from_secs(5);
@@ -476,10 +481,11 @@ async fn fetch_and_store(
     Ok(())
 }
 
-/// 漫画章节：抓图片清单 + 把图片原始字节落进 `library_images`。
+/// 漫画章节：抓图片清单 + 下载整章图片，直接写进书目录（`oread.json` 页表）。
 ///
-/// 续跑时优先复用库里已有的清单，不重新请求目录页；已落盘的图片按
-/// `(url, origin)` 跳过。单张超过 `IMAGE_KEEP_MAX` 的图只保留清单、不落盘。
+/// 续跑时优先复用 `library_content.images` 里的清单，不重新请求目录页；图片字节不再
+/// 落 `library_images` BLOB，下载完直接在内存里交给 `save_comic_pages`，目录是唯一副本。
+/// 单张超过 `IMAGE_KEEP_MAX` 的图只保留清单、不落盘（在线仍可经代理读到）。
 /// 任何一张图抓取失败都会让本章保持 `images_ready=0`，任务结束后可重试补齐。
 async fn fetch_comic(
     state: &AppState,
@@ -533,37 +539,23 @@ async fn fetch_comic(
 
     let max_body = state.cfg.image_max_body_bytes.max(1024);
     let referer = chapter.url.clone();
-    let outcomes: Vec<ImageOutcome> =
+    let outcomes: Vec<(usize, anyhow::Result<Option<FetchedImage>>)> =
         stream::iter(imgs.images.iter().cloned().enumerate().map(|(i, img)| {
             let referer = referer.clone();
-            let origin = origin.clone();
             async move {
                 if img.url.trim().is_empty() {
                     return (i, Ok(None));
                 }
-                if let Ok(Some(m)) =
-                    library_images::meta_of(&state.library, &img.url, &origin).await
-                {
-                    return (i, Ok(Some((m.size_bytes, m.width, m.height))));
-                }
                 match crate::image_fetch::fetch(source, &img.url, Some(&referer), max_body).await {
-                    Ok(f) if f.data.len() <= IMAGE_KEEP_MAX => {
-                        let saved = library_images::save(
-                            &state.library,
-                            book_url,
-                            &img.url,
-                            &origin,
-                            &f.mime,
-                            &f.data,
-                            f.width,
-                            f.height,
-                        )
-                        .await;
-                        match saved {
-                            Ok(n) => (i, Ok(Some((n, f.width, f.height)))),
-                            Err(e) => (i, Err(e)),
-                        }
-                    }
+                    Ok(f) if f.data.len() <= IMAGE_KEEP_MAX => (
+                        i,
+                        Ok(Some(FetchedImage {
+                            data: f.data,
+                            mime: f.mime,
+                            width: f.width,
+                            height: f.height,
+                        })),
+                    ),
                     // 超大图：跳过落盘，但清单里的 URL 仍保留（在线仍可经代理读到）。
                     Ok(_) => (i, Ok(None)),
                     Err(e) => (i, Err(e)),
@@ -574,19 +566,24 @@ async fn fetch_comic(
         .collect()
         .await;
 
+    // 按清单顺序回填，`buffer_unordered` 的完成顺序不可靠。
+    let mut fetched: Vec<Option<FetchedImage>> = (0..imgs.images.len()).map(|_| None).collect();
     let mut failed = 0usize;
     let mut missing = 0usize;
+    let mut total_bytes = 0usize;
     for (i, outcome) in outcomes {
         match outcome {
-            Ok(Some((size, w, h))) => {
+            Ok(Some(img)) => {
+                total_bytes = total_bytes.saturating_add(img.data.len());
                 let im = &mut imgs.images[i];
-                im.bytes = Some(size.max(0) as u64);
+                im.bytes = Some(img.data.len() as u64);
                 if im.width.is_none() {
-                    im.width = w;
+                    im.width = img.width;
                 }
                 if im.height.is_none() {
-                    im.height = h;
+                    im.height = img.height;
                 }
+                fetched[i] = Some(img);
             }
             Ok(None) => {
                 // 超大图只留清单；空 URL 是源页本身没有这一页。
@@ -612,66 +609,75 @@ async fn fetch_comic(
     if failed > 0 {
         anyhow::bail!("{failed} 张图片下载失败");
     }
-    library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
-    // 整章图片都落库后才写书目录：部分成功不写页表，读路径继续回退 DB。
-    if missing == 0 {
-        match write_comic_chapter_dir(state, book_url, chapter, &imgs, &origin).await {
-            Ok(true) => {
-                // 目录已持有原始图片：删掉这一章的 BLOB，避免同一章占两份磁盘。
-                let urls: Vec<String> = imgs.images.iter().map(|i| i.url.clone()).collect();
-                if let Err(e) =
-                    library_images::delete_urls(&state.library, book_url, &urls, &origin).await
-                {
-                    tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "drop comic blobs failed");
-                }
-                // 占用改由目录统计（图片字节在文件里，不再有 BLOB 行）。
-                if let Err(e) = crate::library_store::usage::refresh_rollup(
-                    &state.library,
-                    &state.store(),
-                    book_url,
-                )
-                .await
-                {
-                    tracing::warn!(book = %book_url, error = %e, "refresh comic usage failed");
-                }
-            }
-            // 书目录还没建（TOC 未同步）：保留 BLOB 给读路径回退。
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "write comic pages to dir failed")
-            }
-        }
+    if total_bytes > IMAGE_CHAPTER_MAX_BYTES {
+        anyhow::bail!(
+            "本章图片总大小超过 {} MiB，未写入书目录",
+            IMAGE_CHAPTER_MAX_BYTES / 1024 / 1024
+        );
     }
-    Ok(())
-}
+    // 缺页（超大图/空页）时只保留清单，不写不完整的页表，避免离线阅读缺页；
+    // 保持 images_ready=0，下次任务会再试（超大图由在线代理兜底）。
+    if missing > 0 {
+        return Ok(());
+    }
 
-/// 把刚下载完的一章漫画从 `library_images` 读回，写进书目录（`oread.json` 页表）。
-///
-/// 返回 `false` 表示书目录还没建（章节不在 spine 里），图片 BLOB 需要保留给读路径回退。
-async fn write_comic_chapter_dir(
-    state: &AppState,
-    book_url: &str,
-    chapter: &BookChapter,
-    imgs: &crate::web_book::ChapterImages,
-    origin: &str,
-) -> anyhow::Result<bool> {
     let mut pages = Vec::with_capacity(imgs.images.len());
-    for img in &imgs.images {
+    for (img, fetched) in imgs.images.iter().zip(fetched) {
         if img.url.trim().is_empty() {
             continue;
         }
-        let Some(stored) = library_images::load(&state.library, &img.url, origin).await? else {
-            anyhow::bail!("图片尚未落盘: {}", img.url);
+        let Some(fetched) = fetched else {
+            // `missing == 0` 时不该发生；防御性跳过，保持整章原子。
+            anyhow::bail!("图片尚未下载: {}", img.url);
         };
         pages.push(crate::library_store::write::ComicPageInput {
-            data: stored.data,
-            mime: stored.mime,
-            width: stored.width.or(img.width),
-            height: stored.height.or(img.height),
+            data: fetched.data,
+            mime: fetched.mime,
+            width: fetched.width.or(img.width),
+            height: fetched.height.or(img.height),
             source_url: Some(img.url.clone()),
         });
     }
-    crate::library_store::write::save_comic_pages(&state.store(), book_url, &chapter.url, &pages)
-        .await
-        .map_err(Into::into)
+    match crate::library_store::write::save_comic_pages(
+        &state.store(),
+        book_url,
+        &chapter.url,
+        &pages,
+    )
+    .await
+    {
+        Ok(true) => {
+            // 页表已完整落盘，才算这一章离线可读。
+            library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
+            // 清掉旧版本留下的 BLOB（本次已不再写），目录是唯一副本。
+            let urls: Vec<String> = imgs
+                .images
+                .iter()
+                .map(|i| i.url.clone())
+                .filter(|u| !u.trim().is_empty())
+                .collect();
+            if let Err(e) =
+                library_images::delete_urls(&state.library, book_url, &urls, &origin).await
+            {
+                tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "drop comic blobs failed");
+            }
+            if let Err(e) = crate::library_store::usage::refresh_rollup(
+                &state.library,
+                &state.store(),
+                book_url,
+            )
+            .await
+            {
+                tracing::warn!(book = %book_url, error = %e, "refresh comic usage failed");
+            }
+        }
+        // 书目录还没建（TOC 未同步）：图片只在内存里，下次任务重下。
+        Ok(false) => {
+            tracing::warn!(book = %book_url, chapter = %chapter.url, "book dir not ready; comic pages discarded")
+        }
+        Err(e) => {
+            tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "write comic pages to dir failed")
+        }
+    }
+    Ok(())
 }

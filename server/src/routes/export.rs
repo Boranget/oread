@@ -236,7 +236,8 @@ async fn write_cbz(
     uid: i64,
     book_url: &str,
 ) -> AppResult<CbzExportFile> {
-    let input = load_comic_input(pool, book_url).await?;
+    let store = crate::library_store::Store::new(data_dir);
+    let input = load_comic_input(&store, pool, book_url).await?;
     if input.total_pages == 0 {
         return Err(AppError::Conflict(
             "这本书没有图片章节，无法导出 CBZ".into(),
@@ -262,7 +263,6 @@ async fn write_cbz(
         seq
     ));
 
-    let store = crate::library_store::Store::new(data_dir);
     // 目录优先：完整漫画目录直接原样打包；`oread.json` 是内部边车，不进入 CBZ。
     let report = match crate::library_store::pack::pack_book(
         &store,
@@ -395,7 +395,7 @@ async fn export_cbz_info(
     _u: AuthUser,
     Query(q): Query<ExportQ>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let input = load_comic_input(&s.library, &q.book_url).await?;
+    let input = load_comic_input(&s.store(), &s.library, &q.book_url).await?;
     let export_url = format!(
         "/api/book/export/cbz?book_url={}",
         url::form_urlencoded::byte_serialize(q.book_url.trim().as_bytes()).collect::<String>()

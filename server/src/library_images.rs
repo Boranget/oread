@@ -1,11 +1,12 @@
-//! 馆藏漫画图片：把漫画章节的图片原始字节真正落盘。
+//! 馆藏漫画图片：旧库 BLOB 的只读回退。
 //!
-//! 只有 `tier=collection` 的漫画由后台 worker 下载并写入本表；临时层仍走进程内
-//! LRU，不占磁盘。图片按 `(url, origin)` 去重，和正文缓存键保持一致，避免镜像源
-//! 同 URL 串图。
+//! 新写入的漫画图片直接进书目录（`oread.json` 页表 + 扁平图片文件），不再落
+//! `library_images`。本模块只保留：
+//! - [`load`]：图片代理在目录缺失时读旧 BLOB；
+//! - [`delete_urls`]：目录接手原始字节后清掉旧行；
+//! - `mark_chapter_*`：维护 `library_content.images_ready` 标记。
 //!
-//! 这里只负责图片的读写；正文行的 `images_ready` 标记、书目占用统计仍由
-//! [`crate::library`] 与 worker 维护。
+//! 等 `doctor` 确认旧表覆盖完成、删表后本模块即可整体移除。
 
 use sqlx::SqlitePool;
 
@@ -18,21 +19,13 @@ pub struct StoredImage {
     pub height: Option<u32>,
 }
 
-/// 图片的轻量元数据（不读 BLOB）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImageMeta {
-    pub size_bytes: i64,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-}
-
 fn to_u32(v: Option<i64>) -> Option<u32> {
     v.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0)
 }
 
 type LoadRow = (String, String, Vec<u8>, Option<i64>, Option<i64>);
 
-/// 读取图片字节；命中时刷新访问时间，并顺带刷新所属书目的 `last_accessed_at`。
+/// 读取旧库图片字节；命中时刷新访问时间，并顺带刷新所属书目的 `last_accessed_at`。
 pub async fn load(
     pool: &SqlitePool,
     url: &str,
@@ -67,62 +60,7 @@ pub async fn load(
     }))
 }
 
-/// 只读元数据：用于 worker 断点续跑时判断「这张图是否已经下过」。
-pub async fn meta_of(
-    pool: &SqlitePool,
-    url: &str,
-    origin: &str,
-) -> anyhow::Result<Option<ImageMeta>> {
-    let row: Option<(i64, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT size_bytes, width, height FROM library_images WHERE url = ?1 AND origin = ?2",
-    )
-    .bind(url)
-    .bind(origin)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(size_bytes, width, height)| ImageMeta {
-        size_bytes,
-        width: to_u32(width),
-        height: to_u32(height),
-    }))
-}
-
-/// 写入/覆盖一张图片，返回实际字节数。
-#[allow(clippy::too_many_arguments)]
-pub async fn save(
-    pool: &SqlitePool,
-    book_url: &str,
-    url: &str,
-    origin: &str,
-    mime: &str,
-    data: &[u8],
-    width: Option<u32>,
-    height: Option<u32>,
-) -> anyhow::Result<i64> {
-    let size = data.len() as i64;
-    sqlx::query(
-        "INSERT INTO library_images \
-           (url, origin, book_url, mime, data, size_bytes, width, height, updated_at, accessed_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8, datetime('now'), datetime('now')) \
-         ON CONFLICT(url, origin) DO UPDATE SET \
-           book_url=excluded.book_url, mime=excluded.mime, data=excluded.data, \
-           size_bytes=excluded.size_bytes, width=excluded.width, height=excluded.height, \
-           updated_at=datetime('now'), accessed_at=datetime('now')",
-    )
-    .bind(url)
-    .bind(origin)
-    .bind(book_url)
-    .bind(mime)
-    .bind(data)
-    .bind(size)
-    .bind(width.map(i64::from))
-    .bind(height.map(i64::from))
-    .execute(pool)
-    .await?;
-    Ok(size)
-}
-
-/// 删除一批图片 BLOB。目录已经持有原始字节后调用，避免同一章占两份磁盘。
+/// 删除一批旧 BLOB。目录已经持有原始字节后调用，避免同一章占两份磁盘。
 ///
 /// 按 `(book_url, url, origin)` 删：表按 `(url, origin)` 去重，两本书可能共享同一张图，
 /// 这里只删当前书的行。返回实际删除的行数。
@@ -163,7 +101,7 @@ pub async fn mark_chapter_pending(
     Ok(())
 }
 
-/// 标记一章的图片已全部落盘（worker 在一章所有图片都成功后调用）。
+/// 标记一章的图片清单已抓取（worker 在清单落库后调用；页表是否完整由目录判断）。
 pub async fn mark_chapter_ready(
     pool: &SqlitePool,
     chapter_url: &str,

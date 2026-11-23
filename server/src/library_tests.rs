@@ -186,7 +186,7 @@ async fn clear_content_drops_images_and_keeps_book() {
 }
 
 #[tokio::test]
-async fn library_images_save_load_meta_and_ready_marker() {
+async fn library_images_load_and_ready_marker() {
     let p = pool().await;
     insert_book(&p, "b1", TIER_COLLECTION, Some(now_ms()), now_ms()).await;
     assert!(crate::library_images::load(&p, "i1", "src")
@@ -194,19 +194,14 @@ async fn library_images_save_load_meta_and_ready_marker() {
         .unwrap()
         .is_none());
 
-    let saved = crate::library_images::save(
-        &p,
-        "b1",
-        "i1",
-        "src",
-        "image/jpeg",
-        &[1, 2, 3, 4],
-        Some(120),
-        Some(80),
+    // 新写入不再落 BLOB；这里模拟旧库遗留行，验证只读回退与清理。
+    sqlx::query(
+        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes, width, height) \
+         VALUES ('i1', 'src', 'b1', 'image/jpeg', X'01020304', 4, 120, 80)",
     )
+    .execute(&p)
     .await
     .unwrap();
-    assert_eq!(saved, 4);
     let loaded = crate::library_images::load(&p, "i1", "src")
         .await
         .unwrap()
@@ -214,14 +209,6 @@ async fn library_images_save_load_meta_and_ready_marker() {
     assert_eq!(loaded.data, vec![1, 2, 3, 4]);
     assert_eq!(loaded.mime, "image/jpeg");
     assert_eq!((loaded.width, loaded.height), (Some(120), Some(80)));
-    let meta = crate::library_images::meta_of(&p, "i1", "src")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (meta.size_bytes, meta.width, meta.height),
-        (4, Some(120), Some(80))
-    );
 
     insert_image_chapter(&p, "b1", "c1", true).await;
     crate::library_images::mark_chapter_pending(&p, "c1", "src")
@@ -244,9 +231,13 @@ async fn library_images_save_load_meta_and_ready_marker() {
     assert!(urls.contains("text"));
 
     // 目录接手原始字节后可以删 BLOB；只删当前书、当前 origin。
-    crate::library_images::save(&p, "b1", "i1", "other", "image/jpeg", &[9], None, None)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
+         VALUES ('i1', 'other', 'b1', 'image/jpeg', X'09', 1)",
+    )
+    .execute(&p)
+    .await
+    .unwrap();
     let removed = crate::library_images::delete_urls(&p, "b1", &["i1".to_string()], "src")
         .await
         .unwrap();
