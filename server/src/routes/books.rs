@@ -208,7 +208,7 @@ pub(crate) use books_search_source::{
 pub(crate) use books_store::{
     book_name_of, book_store_for, content_cache_version, content_is_empty, load_book_meta,
     load_cached_chapters, load_cached_content, persist_book_changes, save_book_meta, save_chapters,
-    save_content_cached, sync_total_chapter_num, upsert_content,
+    save_content_cached, save_text_prefer_dir, sync_total_chapter_num, upsert_content,
 };
 
 /// 启动时把上次进程遗留的 running 搜索任务标为 interrupted。

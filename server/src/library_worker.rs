@@ -464,20 +464,8 @@ async fn fetch_and_store(
     if crate::routes::books::content_is_empty(&c) {
         anyhow::bail!("正文为空");
     }
-    crate::routes::books::upsert_content(&state.library, &c).await?;
-    // 目录优先：TOC 已经建过目录时，把归一化后的正文同步落盘。
-    let paragraphs =
-        crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
-    if let Err(e) = crate::library_store::write::save_text_chapter(
-        &state.store(),
-        book_url,
-        &chapter.url,
-        &paragraphs,
-    )
-    .await
-    {
-        tracing::warn!(book = %book_url, url = %chapter.url, error = %e, "write chapter to dir failed");
-    }
+    // 目录优先：正文写进书目录成功后不再往 `library_content` 写同一份。
+    crate::routes::books::save_text_prefer_dir(&state.store(), &state.library, &c).await?;
     Ok(())
 }
 

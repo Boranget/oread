@@ -95,38 +95,18 @@ pub(super) async fn content(
                     // 真正触发抓取时才记一次 miss；并发等待者只记 hit，命中率不被稀释。
                     crate::cache_metrics::record_miss();
                     match fetch_content(&s, &db, &q).await {
-                        Ok(c) => {
-                            // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
-                            save_content_cached(&s.library, &c).await?;
-                            // 目录优先：TOC 已建目录时把正文同步落盘；失败只记日志。
-                            let bu = {
-                                let b = c.book_url.trim();
-                                if b.is_empty() {
-                                    book_hint.clone().filter(|v| !v.trim().is_empty())
-                                } else {
-                                    Some(b.to_string())
-                                }
-                            };
-                            if let Some(bu) = bu {
-                                let paragraphs = crate::library_store::write::markup_to_paragraphs(
-                                    c.content.as_deref().unwrap_or(""),
-                                );
-                                if let Err(err) = crate::library_store::write::save_text_chapter(
-                                    &s.store(),
-                                    &bu,
-                                    &q.chapter_url,
-                                    &paragraphs,
-                                )
-                                .await
+                        Ok(mut c) => {
+                            // 目录优先：书目录写成功后不再往 `library_content` 写同一份正文。
+                            if c.book_url.trim().is_empty() {
+                                if let Some(bu) = book_hint.clone().filter(|v| !v.trim().is_empty())
                                 {
-                                    tracing::warn!(
-                                        book = %bu,
-                                        url = %q.chapter_url,
-                                        error = %err,
-                                        "write chapter to dir failed"
-                                    );
+                                    c.book_url = bu;
                                 }
                             }
+                            if c.url.trim().is_empty() {
+                                c.url = q.chapter_url.clone();
+                            }
+                            save_text_prefer_dir(&s.store(), &s.library, &c).await?;
                             c
                         }
                         // 回源失败：库里还有旧正文就先用着，别让已下载的书因源失效而打不开。
@@ -706,35 +686,13 @@ pub(super) async fn cache_all(
                             bytes: 0,
                         };
                     }
-                    match upsert_content(&pool, &c).await {
-                        Ok(()) => {
-                            // 目录优先：整批预取也把文本正文落进书目录，和单章读取一致。
-                            // 漫画这里只有图片清单，等 worker 下载完图片再写页表。
-                            if c.content_type.trim() != "image" {
-                                let paragraphs = crate::library_store::write::markup_to_paragraphs(
-                                    c.content.as_deref().unwrap_or(""),
-                                );
-                                if let Err(e) = crate::library_store::write::save_text_chapter(
-                                    &store,
-                                    &bu,
-                                    &url,
-                                    &paragraphs,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        book = %bu,
-                                        url = %url,
-                                        error = %e,
-                                        "cache-all write chapter to dir failed"
-                                    );
-                                }
-                            }
-                            CacheOutcome::Cached {
-                                index: idx,
-                                bytes: size,
-                            }
-                        }
+                    // 目录优先：文本正文写进书目录成功后不再写 `library_content`；
+                    // 漫画这里只落图片清单，等 worker 下载完图片再写页表。
+                    match save_text_prefer_dir(&store, &pool, &c).await {
+                        Ok(_) => CacheOutcome::Cached {
+                            index: idx,
+                            bytes: size,
+                        },
                         Err(e) => CacheOutcome::Failed {
                             index: idx,
                             url,

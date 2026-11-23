@@ -728,6 +728,64 @@ pub(crate) async fn upsert_content(lib: &SqlitePool, c: &BookContent) -> anyhow:
     Ok(())
 }
 
+/// 正文优先落书目录：目录写成功就不再往 `library_content` 写同一份正文。
+///
+/// 返回 `true` 表示书目录已经持有这一章；`false` 表示目录里还没有这本书/这一章
+/// （TOC 未同步或正文为空），已按旧路径写进 `library_content` 作为读回退。
+/// 目录写入失败只记日志并回退 DB，阅读请求本身不因落盘失败而失败。
+pub(crate) async fn save_text_prefer_dir(
+    store: &crate::library_store::Store,
+    lib: &SqlitePool,
+    c: &BookContent,
+) -> anyhow::Result<bool> {
+    if c.content_type.trim() == "image" {
+        save_content_cached(lib, c).await?;
+        return Ok(false);
+    }
+    let book_url = c.book_url.trim();
+    if !book_url.is_empty() && !c.url.trim().is_empty() {
+        let paragraphs =
+            crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
+        match crate::library_store::write::save_text_chapter_tracked(
+            store,
+            book_url,
+            &c.url,
+            &paragraphs,
+        )
+        .await
+        {
+            Ok(Some(write)) => {
+                if let Err(e) = crate::library_store::usage::note_text_chapter(
+                    lib,
+                    book_url,
+                    write.was_cached,
+                    write.size_delta,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        book = %book_url,
+                        url = %c.url,
+                        error = %e,
+                        "update cached chapter stats failed"
+                    );
+                }
+                crate::cache_metrics::record_save();
+                return Ok(true);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                book = %book_url,
+                url = %c.url,
+                error = %e,
+                "write chapter to dir failed; falling back to library_content"
+            ),
+        }
+    }
+    save_content_cached(lib, c).await?;
+    Ok(false)
+}
+
 /// 正文落库（馆藏不设容量上限，只做 TTL 回收，所以这里不做淘汰）。
 pub(crate) async fn save_content_cached(lib: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
     // 空正文不落库：源站临时占位/规则失效时抓到的空结果只影响本次请求，

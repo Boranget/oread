@@ -419,6 +419,15 @@ async fn retitle_chapter(
     }
 }
 
+/// 写一章正文的增量信息，供调用方维护 `library_books` 冗余统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChapterWrite {
+    /// 写入前这一章是否已经有可读正文（占位章/不存在都算未缓存）。
+    pub was_cached: bool,
+    /// 章节文件新旧字节差（新文件比旧文件大多少，负数表示变小）。
+    pub size_delta: i64,
+}
+
 /// 写一章正文。目录里没有这本书/这一章时返回 `Ok(false)`，调用方继续依赖 DB。
 pub async fn save_text_chapter(
     store: &Store,
@@ -426,19 +435,33 @@ pub async fn save_text_chapter(
     chapter_url: &str,
     paragraphs: &[String],
 ) -> io::Result<bool> {
+    Ok(
+        save_text_chapter_tracked(store, book_url, chapter_url, paragraphs)
+            .await?
+            .is_some(),
+    )
+}
+
+/// 同 [`save_text_chapter`]，但返回新旧文件差异，便于增量刷新缓存统计。
+pub async fn save_text_chapter_tracked(
+    store: &Store,
+    book_url: &str,
+    chapter_url: &str,
+    paragraphs: &[String],
+) -> io::Result<Option<ChapterWrite>> {
     if paragraphs.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let _guard = lock_book(book_url).await;
     let Some(opened) = store.open_book(book_url).await? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(idx) = opened.meta.chapter_index_by_ref(book_url, chapter_url) else {
-        return Ok(false);
+        return Ok(None);
     };
     let item = &opened.meta.chapters[idx];
     if item.is_volume {
-        return Ok(false);
+        return Ok(None);
     }
     // 抓取层常把章节标题也放在正文第一段；OPF 已单独保存标题，正文里去掉，
     // 避免阅读器重复显示。
@@ -451,12 +474,33 @@ pub async fn save_text_chapter(
         paragraphs.remove(0);
     }
     if paragraphs.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
+    let path = opened.dir.join("OEBPS").join(&item.href);
+    let old_len = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let was_cached = matches!(
+        crate::library_store::read::read_chapter_file(&opened.dir, &item.href).await,
+        Ok(Some(xhtml)) if crate::library_store::read::parse_chapter(&xhtml, &item.title).is_some()
+    );
     store
         .write_chapter(&opened.dir, &opened.meta.language, item, &paragraphs)
         .await?;
-    Ok(true)
+    let new_len = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    Ok(Some(ChapterWrite {
+        was_cached,
+        // 占位章的文件字节以前不计入 content_bytes，所以首次缓存按整份新文件计。
+        size_delta: if was_cached {
+            new_len - old_len
+        } else {
+            new_len
+        },
+    }))
 }
 
 // ---------------------------------------------------------------------------

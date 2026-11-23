@@ -45,7 +45,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::BookshelfItem;
 use crate::routes::books::{
     load_book_meta, load_cached_chapters, load_cached_content, save_book_meta, save_chapters,
-    save_content_cached,
+    save_content_cached, save_text_prefer_dir,
 };
 use crate::routes::bookshelf::{record_progress, SHELF_LIST_SQL};
 use crate::routes::image;

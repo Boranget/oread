@@ -128,6 +128,34 @@ pub async fn refresh_rollup(
     Ok(true)
 }
 
+/// 单章正文落盘后的增量统计：避免每次阅读都全量扫描整本书目录。
+///
+/// `was_cached` 表示写入前这一章是否已有可读正文；`size_delta` 是章节文件字节差。
+pub async fn note_text_chapter(
+    pool: &SqlitePool,
+    book_url: &str,
+    was_cached: bool,
+    size_delta: i64,
+) -> anyhow::Result<()> {
+    let add_chapters = i64::from(!was_cached);
+    sqlx::query(
+        "INSERT INTO library_books \
+           (book_url, last_accessed_at, cached_chapters, content_bytes, image_bytes) \
+         VALUES (?1, ?2, ?3, MAX(0, ?4), 0) \
+         ON CONFLICT(book_url) DO UPDATE SET \
+           cached_chapters = MAX(0, library_books.cached_chapters + ?3), \
+           content_bytes = MAX(0, library_books.content_bytes + ?4), \
+           last_accessed_at = ?2",
+    )
+    .bind(book_url.trim())
+    .bind(crate::library::now_ms())
+    .bind(add_chapters)
+    .bind(size_delta)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 逐本刷新所有有目录的书；返回实际刷新的本数。给 `doctor --sync-db` 用。
 pub async fn refresh_all(pool: &SqlitePool, store: &Store) -> anyhow::Result<usize> {
     let urls: Vec<String> = sqlx::query_scalar("SELECT book_url FROM library_books")
@@ -284,8 +312,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, cached_chapters INTEGER, \
-             content_bytes INTEGER, image_bytes INTEGER)",
+            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, last_accessed_at INTEGER NOT NULL DEFAULT 0, \
+             cached_chapters INTEGER, content_bytes INTEGER, image_bytes INTEGER)",
         )
         .execute(&pool)
         .await
@@ -315,5 +343,54 @@ mod tests {
             .await
             .unwrap());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn note_text_chapter_updates_stats_incrementally() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, last_accessed_at INTEGER NOT NULL DEFAULT 0, \
+             cached_chapters INTEGER NOT NULL DEFAULT 0, content_bytes INTEGER NOT NULL DEFAULT 0, \
+             image_bytes INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let book_url = "https://x/incremental";
+        sqlx::query("INSERT INTO library_books (book_url) VALUES (?1)")
+            .bind(book_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        note_text_chapter(&pool, book_url, false, 100)
+            .await
+            .unwrap();
+        note_text_chapter(&pool, book_url, true, -20).await.unwrap();
+        let (chapters, bytes): (i64, i64) = sqlx::query_as(
+            "SELECT cached_chapters, content_bytes FROM library_books WHERE book_url = ?1",
+        )
+        .bind(book_url)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((chapters, bytes), (1, 80));
+
+        // 书目行不存在时也能建立统计行（与旧 upsert_rollup 一致）。
+        note_text_chapter(&pool, "https://x/new", false, 50)
+            .await
+            .unwrap();
+        let (chapters, bytes): (i64, i64) = sqlx::query_as(
+            "SELECT cached_chapters, content_bytes FROM library_books WHERE book_url = ?1",
+        )
+        .bind("https://x/new")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((chapters, bytes), (1, 50));
     }
 }
