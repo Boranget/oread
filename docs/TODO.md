@@ -200,6 +200,8 @@
     写入顺序仍是正文/图片 → `nav.xhtml` → `content.opf`（漫画：图片 → `oread.json` → `ComicInfo.xml`）。
   - 整批预取（`/api/book/cache-all`）的文本正文也落书目录；预取与 worker 判断「已缓存章节」
     时先看目录（文字书非占位章、漫画页表非空），目录里已有的章节不再重复抓取。
+  - 老库的书只有 DB 目录时，首次读目录（`/api/book/toc`、`/k/toc`）会顺手把目录同步成
+    书目录（OPF / `oread.json`），后续正文与漫画页才有地方落盘。
   - `index.db` v1（`library_store::index`）：书目检索字段 + 修订号 + 章/页计数的派生索引；
     进程启动时后台全量重建，`boranlib doctor [--rebuild-index]` 手动重建并检查
     「目录 ↔ 索引 ↔ `library.db`」三方差异（解析失败、孤立目录、仅 DB 有书目）。

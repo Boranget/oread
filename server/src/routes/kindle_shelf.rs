@@ -29,6 +29,12 @@ pub(super) async fn ensure_chapters(
     }
     let source = load_source(&s.shared, source_url).await?;
     if let Some(chaps) = load_cached_chapters(&s.library, book_url, s.cfg.toc_ttl_secs).await? {
+        // 老库只有 DB 目录：顺手建出书目录，后续 /k 正文才能落盘。
+        if let Err(err) =
+            crate::library_store::write::sync_toc(&s.library, &s.store(), book_url, &chaps).await
+        {
+            tracing::warn!(book = %book_url, error = %err, "sync cached toc to book dir failed");
+        }
         return Ok((source, chaps));
     }
     let mut book = Book {
@@ -46,6 +52,11 @@ pub(super) async fn ensure_chapters(
     save_book_meta(&s.library, db, &book).await?;
     let chapters = web_book::chapter_list(&source, &book).await?;
     save_chapters(&s.library, book_url, &chapters).await?;
+    if let Err(err) =
+        crate::library_store::write::sync_toc(&s.library, &s.store(), book_url, &chapters).await
+    {
+        tracing::warn!(book = %book_url, error = %err, "sync toc to book dir failed");
+    }
     Ok((source, chapters))
 }
 

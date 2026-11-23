@@ -112,6 +112,21 @@ pub(super) async fn toc(
             if let Some(chaps) =
                 load_cached_chapters(&s.library, &q.book_url, s.cfg.toc_ttl_secs).await?
             {
+                // 老库的书只有 DB 目录：顺手建出书目录，后续正文才能落盘。
+                if let Err(err) = crate::library_store::write::sync_toc(
+                    &s.library,
+                    &s.store(),
+                    &q.book_url,
+                    &chaps,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        book = %q.book_url,
+                        error = %err,
+                        "sync cached toc to book dir failed"
+                    );
+                }
                 // 历史书目录已在缓存里但 total_chapter_num 仍为 0：一次目录访问就地补齐，
                 // 不必等缓存过期重抓。
                 let _ = sync_total_chapter_num(&s.library, &db.0, &q.book_url, chaps.len() as i64)
