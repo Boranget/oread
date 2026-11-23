@@ -336,9 +336,18 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
         .iter()
         .filter(|o| matches!(o, ChapterOutcome::Failed))
         .count();
-    library::refresh_rollup(&state.library, &job.book_url)
+    // 目录是权威：有目录时按目录重算占用；还没有目录的书回退旧表聚合。
+    match crate::library_store::usage::refresh_rollup(&state.library, &state.store(), &job.book_url)
         .await
-        .ok();
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            library::refresh_rollup(&state.library, &job.book_url)
+                .await
+                .ok();
+        }
+        Err(e) => tracing::warn!(book = %job.book_url, error = %e, "refresh usage failed"),
+    }
     Ok(if failed_n == 0 {
         library::JOB_DONE
     } else {

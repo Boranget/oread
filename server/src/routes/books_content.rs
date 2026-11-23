@@ -866,12 +866,31 @@ pub(super) async fn cache_clear(
     let (deleted, freed) = clear_content_cache(&s.library, scope)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    // 读路径目录优先：DB 行清掉后还得把书目录移进回收站，否则正文仍能离线读出。
+    let targets: Vec<String> = match scope {
+        Some(id) => vec![id.to_string()],
+        None => sqlx::query_scalar("SELECT book_url FROM library_books WHERE tier = 'temp'")
+            .fetch_all(&s.library)
+            .await
+            .map_err(AppError::from)?,
+    };
+    let mut trashed = 0u64;
+    for book_url in &targets {
+        match s.store().move_to_trash(book_url).await {
+            Ok(true) => trashed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(book = %book_url, error = %e, "move cleared book dir to trash failed")
+            }
+        }
+    }
     Ok(Json(json!({
         "ok": true,
         "scope": if scope.is_some() { "book" } else { "temp" },
         "book_id": scope,
         "deleted": deleted,
         "bytes_freed": freed,
+        "trashed": trashed,
     })))
 }
 

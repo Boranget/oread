@@ -2008,7 +2008,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 成功 `200`：
 
 ```json
-{ "ok": true, "scope": "book", "book_id": "https://example.com/book/123", "deleted": 120, "bytes_freed": 10485760 }
+{ "ok": true, "scope": "book", "book_id": "https://example.com/book/123", "deleted": 120, "bytes_freed": 10485760, "trashed": 1 }
 ```
 
 | 字段 | 类型 | 可空 | 说明 |
@@ -2018,10 +2018,11 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `book_id` | string | 是 | 按书清理时回显；全部清理为 `null` |
 | `deleted` | integer | 否 | 删除的 `library_content` 行数 |
 | `bytes_freed` | integer | 否 | 删除行的 `size_bytes` 合计（近似释放字节） |
+| `trashed` | integer | 否 | 移进回收站的临时书目录数（读路径目录优先，清缓存必须同时移走文件） |
 
 - 错误：JSON 非法 → 400/422 纯文本；`400 {"error":"该书已入馆，请先移出馆藏再清理正文"}`；`401`；`500`。
 - 行为：
-  - **只删 `library_content`**，不动 `library_chapters`、`library_books`、书架/进度/统计。
+  - **只删 `library_content` 与 `library_images`**，不动 `library_chapters`、`library_books`、书架/进度/统计；对应的临时书目录同时移进回收站（读路径目录优先，否则文件还在、清缓存看起来无效）。
   - 按书清理时若该书仍在馆藏，直接 `400`，避免任意账号删除全局共享内容。
   - 删除不存在的书返回 `deleted=0`，仍 `ok:true`。
   - 清理后服务端会尝试回收 SQLite 空闲页，文件大小不保证立即下降。
@@ -3772,7 +3773,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 47 | POST | `/api/book/toc/batch` | JWT | 否 | `book_urls`（别名 `book_ids`）`,source?` | `{ok,total,updated,failed,skipped,results[],elapsed_ms}` |
 | 48 | GET | `/api/book/search` | JWT | 否 | `book_id,q,limit?` | `{ok,book_id,query,limit,truncated,hits[],total_chapters,cached_chapters,uncached_chapters,complete,note,elapsed_ms}` |
 | 49 | POST | `/api/book/cache-all` | JWT | 否 | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/limited/...`） |
-| 50 | POST | `/api/book/cache/clear` | JWT | 否 | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed}`（只清临时层） |
+| 50 | POST | `/api/book/cache/clear` | JWT | 否 | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed,trashed}`（只清临时层，目录移回收站） |
 | 51 | GET | `/api/bookmarks` | JWT | 否 | `book_id?` | `Bookmark[]`（裸数组） |
 | 52 | POST | `/api/bookmarks` | JWT | 否 | `book_id,chapter_index?,position?,chapter_title?,note?` | `Bookmark` |
 | 53 | DELETE | `/api/bookmarks/delete` | JWT | 否 | `id` | `{ok,deleted}` |
@@ -4014,7 +4015,7 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 
 - 状态：**已实现（2026-11-19 切换为馆藏分层模型）**：
   - 内容层全局共享：书目 / 目录 / 正文存 `library.db`；账号只保留书架、进度、设置等私有状态。
-  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空**全部临时层**正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed}`；馆藏需先移出。
+  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空**全部临时层**正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed,trashed}`，并把对应书目录移进回收站；馆藏需先移出。
   - `POST /api/book/cache/trim`（6.9.1）：立即回收过期临时缓存。
   - `POST /api/book/cache-all`（6.8）：整本补缓存，不再有预算上限。
   - `GET /api/library/stats`、`GET /api/library/books`、`POST /api/library/{collect,release,delete,temp/clean}`、`GET /api/library/jobs`、`POST /api/library/jobs/cancel`（6.12）：馆藏浏览、入馆、移出、删除、后台整本下载与取消。
