@@ -242,6 +242,23 @@ async fn library_images_save_load_meta_and_ready_marker() {
     let urls = cached_chapter_urls(&p, "b1", "v1").await.unwrap();
     assert!(urls.contains("c1"));
     assert!(urls.contains("text"));
+
+    // 目录接手原始字节后可以删 BLOB；只删当前书、当前 origin。
+    crate::library_images::save(&p, "b1", "i1", "other", "image/jpeg", &[9], None, None)
+        .await
+        .unwrap();
+    let removed = crate::library_images::delete_urls(&p, "b1", &["i1".to_string()], "src")
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    assert!(crate::library_images::load(&p, "i1", "src")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(crate::library_images::load(&p, "i1", "other")
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]

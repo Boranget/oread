@@ -590,21 +590,46 @@ async fn fetch_comic(
     library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
     // 整章图片都落库后才写书目录：部分成功不写页表，读路径继续回退 DB。
     if missing == 0 {
-        if let Err(e) = write_comic_chapter_dir(state, book_url, chapter, &imgs, &origin).await {
-            tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "write comic pages to dir failed");
+        match write_comic_chapter_dir(state, book_url, chapter, &imgs, &origin).await {
+            Ok(true) => {
+                // 目录已持有原始图片：删掉这一章的 BLOB，避免同一章占两份磁盘。
+                let urls: Vec<String> = imgs.images.iter().map(|i| i.url.clone()).collect();
+                if let Err(e) =
+                    library_images::delete_urls(&state.library, book_url, &urls, &origin).await
+                {
+                    tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "drop comic blobs failed");
+                }
+                // 占用改由目录统计（图片字节在文件里，不再有 BLOB 行）。
+                if let Err(e) = crate::library_store::usage::refresh_rollup(
+                    &state.library,
+                    &state.store(),
+                    book_url,
+                )
+                .await
+                {
+                    tracing::warn!(book = %book_url, error = %e, "refresh comic usage failed");
+                }
+            }
+            // 书目录还没建（TOC 未同步）：保留 BLOB 给读路径回退。
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "write comic pages to dir failed")
+            }
         }
     }
     Ok(())
 }
 
 /// 把刚下载完的一章漫画从 `library_images` 读回，写进书目录（`oread.json` 页表）。
+///
+/// 返回 `false` 表示书目录还没建（章节不在 spine 里），图片 BLOB 需要保留给读路径回退。
 async fn write_comic_chapter_dir(
     state: &AppState,
     book_url: &str,
     chapter: &BookChapter,
     imgs: &crate::web_book::ChapterImages,
     origin: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut pages = Vec::with_capacity(imgs.images.len());
     for img in &imgs.images {
         if img.url.trim().is_empty() {
@@ -622,6 +647,6 @@ async fn write_comic_chapter_dir(
         });
     }
     crate::library_store::write::save_comic_pages(&state.store(), book_url, &chapter.url, &pages)
-        .await?;
-    Ok(())
+        .await
+        .map_err(Into::into)
 }

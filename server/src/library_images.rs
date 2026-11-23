@@ -122,6 +122,33 @@ pub async fn save(
     Ok(size)
 }
 
+/// 删除一批图片 BLOB。目录已经持有原始字节后调用，避免同一章占两份磁盘。
+///
+/// 按 `(book_url, url, origin)` 删：表按 `(url, origin)` 去重，两本书可能共享同一张图，
+/// 这里只删当前书的行。返回实际删除的行数。
+pub async fn delete_urls(
+    pool: &SqlitePool,
+    book_url: &str,
+    urls: &[String],
+    origin: &str,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let mut removed = 0u64;
+    for url in urls {
+        removed += sqlx::query(
+            "DELETE FROM library_images WHERE book_url = ?1 AND url = ?2 AND origin = ?3",
+        )
+        .bind(book_url)
+        .bind(url)
+        .bind(origin)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    tx.commit().await?;
+    Ok(removed)
+}
+
 /// 重置一章的图片完整性标记（重新抓取清单或补图前调用）。
 pub async fn mark_chapter_pending(
     pool: &SqlitePool,

@@ -177,7 +177,9 @@ Bearer 访问 `/opds*`，便于调试。
   旧章保留 id/href 只更新标题，新章追加新序号，目录变短只移出 spine、不删文件也不复用序号；
   正文抓取成功后 `save_text_chapter` 写归一化段落（首段等于章节标题时去掉，避免重复）；
   漫画整章所有页都拿到才 `save_comic_pages` 写页表与 `ComicInfo.xml`，部分成功不写，
-  读路径继续回退 DB；页数变少时删除旧的多余页文件。所有写入先章节/图片、再 `nav.xhtml`、
+  读路径继续回退 DB；页数变少时删除旧的多余页文件。写目录成功后 worker 删除该章的
+  `library_images` BLOB 并用目录重算占用，正常情况下同一章只有一份原始图片；
+  书目录还没建时保留 BLOB 供回退。所有写入先章节/图片、再 `nav.xhtml`、
   最后 `content.opf`，并受每本书一把写锁保护。
 - 读路径：`Store::open_book` 解析 OPF，按 `oread:chapter-url` 定位章节文件；`<body>` 还原成
   段落 HTML（去掉与 OPF 重复的首行标题）。未抓取的章节写成带 `oread-pending` 标记的占位文件，
@@ -222,7 +224,7 @@ Bearer 访问 `/opds*`，便于调试。
   - 回源失败时（正文/目录）回退到库中旧缓存，正文响应带 `stale=true`；完全无缓存才返回错误。
 - **采购单**：入馆时排队，`library_worker` 在服务端整本下载（默认 1 任务 × 3 章并发），进程重启后把 `running` 放回队列断点续跑；剩余磁盘低于 `LIBRARY_DISK_FLOOR_MB`（默认 1 GiB）时暂停，交互阅读不受影响。
 - **冷却与来源回填**：任务开始前查 `source_health.cooldown_until`，冷却中的书源把任务推迟到冷却结束（`library_jobs.updated_at` 即「下次可执行时间」），先跑别的书；worker 加载到真实书源后回填馆藏书目缺失的 `origin` / `origin_name` / `book_source_type`。
-- **漫画图片**：只有馆藏漫画由 worker 把解密后的原始字节写进 `library_images`（BLOB，单张 > 2 MiB 只留清单不落盘），按 `(url, origin)` 去重，随正文一起删除/TTL 回收；临时层仍走进程内 LRU。`/api/book/image` 命中本地 BLOB 后回填 LRU，不再回源；墨水屏灰度/WebP 转码变体仍运行时生成，不落盘。
+- **漫画图片**：馆藏漫画由 worker 把解密后的原始字节**暂存** `library_images`（BLOB，单张 > 2 MiB 只留清单不落盘），整章写进书目录成功后删除该章 BLOB——目录成为唯一副本；书目录未建（TOC 未同步）时保留 BLOB 供读路径回退。`/api/book/image` 优先读目录里的 `oread-img://` 文件，BLOB 只作回退；墨水屏灰度/WebP 转码变体仍运行时生成，不落盘。
 - **体积预估**：`POST /api/library/comic/estimate` 抽 3 章 × 2 图，只探测响应头（`Range: bytes=0-0` 优先），按 `book_url + source + uid` 缓存 30 分钟；估算只警告不硬拦，前端展示区间与「抽样估算，以实际下载为准」。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文分开预算。
 - **规则缓存**：`<data_dir>/cache/rule/`，仅 `cache.getFile/putFile` 可写。
