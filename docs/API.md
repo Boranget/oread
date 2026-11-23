@@ -1961,7 +1961,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `ok` | boolean | 否 | 恒 true |
 | `book_url` / `source` | string | 否 | 回显/解析后的书籍 URL 与书源 ID |
 | `total_chapters` | integer | 否 | 目录中的章节总数（**含分卷行**） |
-| `already_cached` | integer | 否 | `total_chapters - pending.len()`：已缓存正文的章节 + 被跳过的分卷行；**不是** `total_chapters - attempted`（`attempted` 已被 `limit` 截断） |
+| `already_cached` | integer | 否 | `total_chapters - pending.len()`：已缓存正文的章节（旧表或书目录）+ 被跳过的分卷行；**不是** `total_chapters - attempted`（`attempted` 已被 `limit` 截断） |
 | `attempted` | integer | 否 | 本次实际尝试抓取的章节数（≤ `limit`） |
 | `cached` | integer | 否 | 本次成功写入的章节数 |
 | `failed` | integer | 否 | 本次失败数，= `failures.length` |
@@ -1982,9 +1982,10 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `404 source not found`：`source` 不存在；`401`；`500`。
 - 行为：
   - 需要目录已缓存；否则先调 6.2。
-  - 跳过 `is_volume = true` 的分卷行；跳过馆藏正文中已有正文的章节。
+  - 跳过 `is_volume = true` 的分卷行；跳过旧表或书目录里已有正文的章节（文字书要求非占位章，漫画要求页表非空）。
   - **并发 3**；按 `index` 升序取前 `limit` 个待抓章节。
   - 馆藏不设容量上限，不再按预算跳过；写入使用与 6.4 相同的 upsert，并回填 `book_url`/`chapter_index`。
+  - 文本正文同时写进书目录（与 6.4 一致）；漫画这里只有图片清单，图片字节仍由 worker 下载。
   - **部分失败仍返回 `200`**，通过 `failed`/`failures` 表达；不会整批回滚已成功的章节。
 
 ### 6.9 `POST /api/book/cache/clear`

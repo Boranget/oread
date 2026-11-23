@@ -632,6 +632,20 @@ pub(super) async fn cache_all(
     };
     let source = load_source(&s.shared, &source_id).await?;
     // 只有当前解析管线指纹的记录才算已缓存；旧指纹/无指纹的行交给预取重建。
+    // 目录优先：已经落进书目录的章节同样算已缓存，不重复抓取。
+    let mut cached_set: HashSet<String> = match crate::library_store::usage::cached_chapter_urls(
+        &s.store(),
+        &book_url,
+    )
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => HashSet::new(),
+        Err(e) => {
+            tracing::warn!(book = %book_url, error = %e, "scan cached chapters from dir failed");
+            HashSet::new()
+        }
+    };
     let cached_urls: Vec<String> = sqlx::query_scalar(
         "SELECT url FROM library_content WHERE book_url = ?1 AND content IS NOT NULL \
          AND cache_version = ?2",
@@ -640,7 +654,7 @@ pub(super) async fn cache_all(
     .bind(content_cache_version())
     .fetch_all(&s.library)
     .await?;
-    let cached_set: HashSet<String> = cached_urls.into_iter().collect();
+    cached_set.extend(cached_urls);
     let total_chapters = chapters.len();
     let mut pending: Vec<BookChapter> = chapters
         .into_iter()
@@ -659,11 +673,13 @@ pub(super) async fn cache_all(
     let pool = s.library.clone();
     let src = source.clone();
     let bu = book_url.clone();
+    let store = s.store();
 
     let outcomes: Vec<CacheOutcome> = stream::iter(pending.into_iter().map(|ch| {
         let pool = pool.clone();
         let src = src.clone();
         let bu = bu.clone();
+        let store = store.clone();
         async move {
             let mut chapter = ch.clone();
             if chapter.book_url.as_deref().unwrap_or("").trim().is_empty() {
@@ -691,10 +707,34 @@ pub(super) async fn cache_all(
                         };
                     }
                     match upsert_content(&pool, &c).await {
-                        Ok(()) => CacheOutcome::Cached {
-                            index: idx,
-                            bytes: size,
-                        },
+                        Ok(()) => {
+                            // 目录优先：整批预取也把文本正文落进书目录，和单章读取一致。
+                            // 漫画这里只有图片清单，等 worker 下载完图片再写页表。
+                            if c.content_type.trim() != "image" {
+                                let paragraphs = crate::library_store::write::markup_to_paragraphs(
+                                    c.content.as_deref().unwrap_or(""),
+                                );
+                                if let Err(e) = crate::library_store::write::save_text_chapter(
+                                    &store,
+                                    &bu,
+                                    &url,
+                                    &paragraphs,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        book = %bu,
+                                        url = %url,
+                                        error = %e,
+                                        "cache-all write chapter to dir failed"
+                                    );
+                                }
+                            }
+                            CacheOutcome::Cached {
+                                index: idx,
+                                bytes: size,
+                            }
+                        }
                         Err(e) => CacheOutcome::Failed {
                             index: idx,
                             url,

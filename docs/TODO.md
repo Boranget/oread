@@ -198,6 +198,8 @@
     `/api/library/book/meta`，同时写 OPF / `oread.json`）、改正文段落、换封面、换漫画单页；
     正文/封面/页保存带 `revision` 乐观锁，冲突返回 409；图片按内容识别格式，不信任客户端 MIME；
     写入顺序仍是正文/图片 → `nav.xhtml` → `content.opf`（漫画：图片 → `oread.json` → `ComicInfo.xml`）。
+  - 整批预取（`/api/book/cache-all`）的文本正文也落书目录；预取与 worker 判断「已缓存章节」
+    时先看目录（文字书非占位章、漫画页表非空），目录里已有的章节不再重复抓取。
   - `index.db` v1（`library_store::index`）：书目检索字段 + 修订号 + 章/页计数的派生索引；
     进程启动时后台全量重建，`boranlib doctor [--rebuild-index]` 手动重建并检查
     「目录 ↔ 索引 ↔ `library.db`」三方差异（解析失败、孤立目录、仅 DB 有书目）。
