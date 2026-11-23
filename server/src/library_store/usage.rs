@@ -1,4 +1,4 @@
-﻿//! 从书目录统计「已缓存章节数 / 正文占用 / 图片占用」。
+//! 从书目录统计「已缓存章节数 / 正文占用 / 图片占用」。
 //!
 //! 这几个数字以前由 `library_content` / `library_images` 聚合（见
 //! [`crate::library::refresh_rollup`]）；目录成为权威后，管理员编辑、手工放入的
@@ -54,6 +54,52 @@ pub async fn book_usage(store: &Store, book_url: &str) -> std::io::Result<Option
             usage.content_bytes += xhtml.len() as i64;
         }
         return Ok(Some(usage));
+    }
+    Ok(None)
+}
+
+/// 目录里已缓存的章节 URL 集合；目录不存在或无法解析时返回 `None`（调用方回退 DB）。
+///
+/// 文字书要求章节文件不是占位章（`parse_chapter` 有正文），漫画要求页表非空。
+/// 卷标题不算章节。没有 `oread:chapter-url` 的老目录条目直接跳过。
+pub async fn cached_chapter_urls(
+    store: &Store,
+    book_url: &str,
+) -> std::io::Result<Option<std::collections::HashSet<String>>> {
+    if let Some(comic) = store.open_comic(book_url).await? {
+        let mut out = std::collections::HashSet::new();
+        for chapter in &comic.meta.chapters {
+            if chapter.is_volume || chapter.pages.is_empty() {
+                continue;
+            }
+            if let Some(url) = chapter
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                out.insert(url.to_string());
+            }
+        }
+        return Ok(Some(out));
+    }
+    if let Some(book) = store.open_book(book_url).await? {
+        let mut out = std::collections::HashSet::new();
+        for item in &book.meta.chapters {
+            if item.is_volume {
+                continue;
+            }
+            let Some(url) = item.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let Ok(Some(xhtml)) = read::read_chapter_file(&book.dir, &item.href).await else {
+                continue;
+            };
+            if read::parse_chapter(&xhtml, &item.title).is_some() {
+                out.insert(url.to_string());
+            }
+        }
+        return Ok(Some(out));
     }
     Ok(None)
 }
@@ -152,6 +198,13 @@ mod tests {
         assert_eq!(usage.cached_chapters, 1);
         assert!(usage.content_bytes > 0);
         assert_eq!(usage.image_bytes, 0);
+        // worker 用它跳过已落目录的章节：占位章不能算命中。
+        let cached = cached_chapter_urls(&store, book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cached.contains("https://x/c1"));
+        assert!(!cached.contains("https://x/c2"));
         std::fs::remove_dir_all(root).ok();
     }
 

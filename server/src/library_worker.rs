@@ -233,12 +233,28 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
 
     // 图片章节的 `content` 是空串，不能只看 content IS NOT NULL；
     // `cached_chapter_urls` 对漫画额外要求 images_ready=1（图片真的全部落盘）。
-    let cached = library::cached_chapter_urls(
-        &state.library,
+    // 目录优先：已落进书目录的章节也算已缓存；目录不存在时回退旧表。
+    let mut cached = match crate::library_store::usage::cached_chapter_urls(
+        &state.store(),
         &job.book_url,
-        crate::routes::books::content_cache_version(),
     )
-    .await?;
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => std::collections::HashSet::new(),
+        Err(e) => {
+            tracing::warn!(book = %job.book_url, error = %e, "scan cached chapters from dir failed");
+            std::collections::HashSet::new()
+        }
+    };
+    cached.extend(
+        library::cached_chapter_urls(
+            &state.library,
+            &job.book_url,
+            crate::routes::books::content_cache_version(),
+        )
+        .await?,
+    );
 
     let pending: Vec<BookChapter> = chapters
         .iter()
