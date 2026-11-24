@@ -192,37 +192,39 @@ fn no_page_exceeds_line_budget() {
 }
 
 #[test]
-fn chunk_ranges_split_at_200k_chars() {
-    let text = "字".repeat(300_000);
-    let chunks = chunk_ranges(&text, K_CHUNK_CHARS);
-    assert_eq!(chunks.len(), 2, "30 万字应切成 2 块");
-    assert_eq!(&text[chunks[0].0..chunks[0].1].chars().count(), &200_000);
-    assert_eq!(&text[chunks[1].0..chunks[1].1].chars().count(), &100_000);
+fn plan_doc_pages_keeps_image_order_and_truncates_text() {
+    use boranlib_ebook::html::Block;
 
-    let plan = plan_pages(&text, &FS_SPECS[1], budget(&FS_SPECS[1]), vp().page_w());
-    assert_eq!(plan.chunks.len(), 2);
-    assert!(plan.pages.len() > 2);
-    assert_eq!(plan.pages[0].0, 0);
-    assert_eq!(plan.pages.last().unwrap().0, 1, "末页应属于第 2 块");
-    assert!(plan
-        .pages
-        .iter()
-        .all(|&(ci, s, e)| ci < 2 && s <= e && e <= text.len()));
-}
-
-#[test]
-fn truncate_to_chars_is_in_place_and_char_safe() {
-    let mut text = "字".repeat(900_000);
-    assert!(
-        truncate_to_chars(&mut text, K_MAX_TEXT_CHARS),
-        "90 万字应触发截断"
+    let blocks = vec![
+        Block::Paragraph("第一段".into()),
+        Block::Image {
+            src: "oread-img://abc/OEBPS/images/a.jpg".into(),
+            alt: "图".into(),
+        },
+        Block::Paragraph("第二段".into()),
+    ];
+    let (pages, truncated) = plan_doc_pages(
+        &blocks,
+        &FS_SPECS[1],
+        budget(&FS_SPECS[1]),
+        vp().page_w(),
+        K_MAX_TEXT_CHARS,
     );
-    assert_eq!(text.chars().count(), K_MAX_TEXT_CHARS);
-    assert!(text.is_char_boundary(text.len()));
+    assert!(!truncated);
+    assert_eq!(pages.len(), 3, "文字/图片/文字各一页");
+    assert!(matches!(&pages[0], KPage::Text(t) if t.contains("第一段")));
+    assert!(matches!(&pages[1], KPage::Image { src, .. } if src.ends_with("a.jpg")));
+    assert!(matches!(&pages[2], KPage::Text(t) if t.contains("第二段")));
 
-    let mut short = "短".repeat(100);
-    assert!(!truncate_to_chars(&mut short, K_MAX_TEXT_CHARS));
-    assert_eq!(short.chars().count(), 100);
+    let (pages, truncated) = plan_doc_pages(
+        &blocks,
+        &FS_SPECS[1],
+        budget(&FS_SPECS[1]),
+        vp().page_w(),
+        2,
+    );
+    assert!(truncated, "超过字符上限应标记截断");
+    assert!(matches!(&pages[0], KPage::Text(t) if t == "第一"));
 }
 
 /// 目录含分卷行：总数只算非分卷章节，分页按过滤后的列表，链接 index 保持原始值。
@@ -284,16 +286,6 @@ fn volume_entry_detects_flag_and_synthetic_url() {
         url: "https://example.test/ch/3".into(),
         ..Default::default()
     }));
-}
-
-#[test]
-fn html_to_text_strips_tags() {
-    let html = "<p>第一段&nbsp;内容</p><p>第二段<br>换行</p><div class=\"x\">尾</div>";
-    let t = html_to_text(html);
-    assert!(t.contains("第一段 内容"));
-    assert!(t.contains("第二段\n换行"));
-    assert!(t.contains("尾"));
-    assert!(!t.contains('<'));
 }
 
 /// 阅读页版面高 = 运行时现算可用高（vp.h）；四档行预算按

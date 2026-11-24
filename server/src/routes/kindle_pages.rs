@@ -574,28 +574,7 @@ pub(super) fn volume_notice(q: &ReadQ, fs: usize, explicit: bool, vp: Vp) -> Res
     res
 }
 
-// ---------------- 正文纯文本化与分页 ----------------
-
-pub(super) static RE_BLOCK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)<\s*(br|/p|/div|/li|/h[1-6]|p|div|li|h[1-6])[^>]*>").unwrap());
-pub(super) static RE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
-pub(super) static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
-
-/// 把章节 HTML 转成纯文本：块级标签换行化 → 去标签 → 解码常用实体 → 合并空行
-pub(super) fn html_to_text(html: &str) -> String {
-    let s = RE_BLOCK.replace_all(html, "\n");
-    let s = RE_TAG.replace_all(&s, "");
-    let s = s
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'");
-    let s = RE_WS.replace_all(&s, "\n\n");
-    s.trim().to_string()
-}
+// ---------------- 正文分页 ----------------
 
 /// 单字宽度（em）：ASCII/数字/半角标点 0.5，其余（汉字、全角标点）1.0
 pub(super) fn char_em(c: char) -> f64 {
@@ -726,58 +705,84 @@ pub(super) fn paginate_lines(
     pages
 }
 
-/// 按字符数切块：返回每个块的字节区间，每块 ≤ per 个字符
-pub(super) fn chunk_ranges(text: &str, per: usize) -> Vec<(usize, usize)> {
-    if text.is_empty() || per == 0 {
-        return vec![(0, 0)];
-    }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut n = 0usize;
-    for (i, _) in text.char_indices() {
-        if n == per {
-            out.push((start, i));
-            start = i;
-            n = 0;
+/// `/k` 的一页：文字页或整页插图。
+pub(super) enum KPage {
+    Text(String),
+    Image { src: String, alt: String },
+}
+
+/// 正文块 → `/k` 页表。文字按行预算分页，插图单独成页（一张一页），
+/// 避免在老 Kindle 内核上做复杂的图文混排高度测量。
+pub(super) fn plan_doc_pages(
+    blocks: &[boranlib_ebook::html::Block],
+    spec: &FsSpec,
+    budget: usize,
+    text_w: usize,
+    max_chars: usize,
+) -> (Vec<KPage>, bool) {
+    use boranlib_ebook::html::Block;
+
+    fn flush(
+        text: &mut String,
+        pages: &mut Vec<KPage>,
+        spec: &FsSpec,
+        budget: usize,
+        text_w: usize,
+    ) {
+        if text.trim().is_empty() {
+            text.clear();
+            return;
         }
-        n += 1;
+        for (s, e) in paginate_lines(text, spec, budget, text_w) {
+            pages.push(KPage::Text(text[s..e].to_string()));
+        }
+        text.clear();
     }
-    out.push((start, text.len()));
-    out
-}
 
-/// 分页计划：正文按 20 万字符分块，逐块分页；不额外复制正文，页表只存字节区间。
-pub(super) struct PagePlan {
-    /// 每块的全局字节区间
-    pub(super) chunks: Vec<(usize, usize)>,
-    /// 每页 (块下标, 起, 止)，起止为全局字节偏移
-    pub(super) pages: Vec<(usize, usize, usize)>,
-}
-
-pub(super) fn plan_pages(text: &str, spec: &FsSpec, budget: usize, text_w: usize) -> PagePlan {
-    let chunks = chunk_ranges(text, K_CHUNK_CHARS);
     let mut pages = Vec::new();
-    for (ci, &(cs, ce)) in chunks.iter().enumerate() {
-        for (s, e) in paginate_lines(&text[cs..ce], spec, budget, text_w) {
-            pages.push((ci, cs + s, cs + e));
+    let mut text = String::new();
+    let mut remaining = max_chars;
+    let mut truncated = false;
+    for block in blocks {
+        match block {
+            Block::Heading(_, t) | Block::Paragraph(t) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if remaining == 0 {
+                    truncated = true;
+                    continue;
+                }
+                let count = t.chars().count();
+                if count > remaining {
+                    let cut = t
+                        .char_indices()
+                        .nth(remaining)
+                        .map(|(i, _)| i)
+                        .unwrap_or(t.len());
+                    text.push_str(&t[..cut]);
+                    text.push('\n');
+                    truncated = true;
+                    remaining = 0;
+                } else {
+                    text.push_str(t);
+                    text.push('\n');
+                    remaining -= count;
+                }
+            }
+            Block::Image { src, alt } => {
+                flush(&mut text, &mut pages, spec, budget, text_w);
+                pages.push(KPage::Image {
+                    src: src.clone(),
+                    alt: alt.clone(),
+                });
+            }
         }
     }
+    flush(&mut text, &mut pages, spec, budget, text_w);
     if pages.is_empty() {
-        pages.push((0, 0, 0));
+        pages.push(KPage::Text(String::new()));
     }
-    PagePlan { chunks, pages }
-}
-
-/// 超过 `max` 字符时按字符边界截断（不额外复制整段文本），返回是否发生截断
-pub(super) fn truncate_to_chars(text: &mut String, max: usize) -> bool {
-    if text.chars().count() <= max {
-        return false;
-    }
-    let cut = text
-        .char_indices()
-        .nth(max)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    text.truncate(cut);
-    true
+    (pages, truncated)
 }

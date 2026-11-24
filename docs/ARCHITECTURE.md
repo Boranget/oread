@@ -188,6 +188,7 @@ Bearer 访问 `/opds*`，便于调试。
   图片代理的 WebP→灰度 JPEG、长条切片与 ETag 逻辑与数据库图片完全共用。
 - `/k`（Kindle/Silk）与 SPA 同源：`/k` 的目录（`ensure_chapters`）先读 OPF spine / `oread.json`，
   `/k/read` 的正文先读章节文件；命中后管理员编辑与离线阅读立即生效，未命中才查缓存/回源。
+  正文按语义块服务端分页：文字按行预算切页，插图单独成页并走 `/api/book/image`（`eink=1`）。
   书源已失效或不存在时合成一个「馆藏」书源，阅读路径按目录实际形态选择正文或漫画。
 - 管理员编辑（`library_store::edit` + `/api/library/book/edit*`）：只改已归一化的目录内容，
   v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用 `/api/library/book/meta`，DB 更新后

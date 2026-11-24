@@ -96,17 +96,16 @@ pub(super) async fn read(
         c.content.clone(),
     )
     .await;
-    let mut text = html_to_text(body_html.as_deref().unwrap_or(""));
-    let truncated = truncate_to_chars(&mut text, K_MAX_TEXT_CHARS);
+    // 正文先归一化为语义块：文字按行预算分页，插图单独成页。
+    let blocks = boranlib_ebook::html::to_blocks(body_html.as_deref().unwrap_or(""));
     let spec = vp.fs(fs);
     // 每页行数由「正文可用高 ÷ 行高」动态算出；字号/行高已按视口比例缩放
     let budget = line_budget(vp, spec.line);
-    let plan = plan_pages(&text, &spec, budget, vp.content_w());
-    let n = plan.pages.len() as i64;
+    let (pages, truncated) =
+        plan_doc_pages(&blocks, &spec, budget, vp.content_w(), K_MAX_TEXT_CHARS);
+    let n = pages.len() as i64;
     let p = q.p.unwrap_or(1).clamp(1, n);
-    let (block_idx, cur_start, cur_end) = plan.pages[(p - 1) as usize];
-    let cur = &text[cur_start..cur_end];
-    let blocks = plan.chunks.len();
+    let page = &pages[(p - 1) as usize];
 
     let ch_title = title.clone().unwrap_or_else(|| format!("第 {} 章", ch + 1));
     // 打开阅读页即落库：进度在服务端渲染路径自动 upsert（幂等，重复渲染不写脏）
@@ -120,13 +119,7 @@ pub(super) async fn read(
     .await;
     let toc_url = toc_link(&q, fs, ch, p, vp);
     let (prev, next) = read_nav(&q, fs, ch, p, n, chapters.len() as i64, &toc_url, vp);
-    let mut meta = if blocks > 1 {
-        // 超长章节按 20 万字符分块：底栏“目录”格下方同时给出页内进度、页码与分块号
-        let pct = ((p as f64 * 100.0 / n as f64).round() as usize).clamp(1, 100);
-        format!("加载中{pct}%·{p}/{n}·{}/{}块", block_idx + 1, blocks)
-    } else {
-        format!("{p}/{n}")
-    };
+    let mut meta = format!("{p}/{n}");
     if truncated {
         meta.push_str("·已截断");
     }
@@ -136,21 +129,43 @@ pub(super) async fn read(
 
     let mut paras = String::new();
     let gap = para_gap_px(spec.line);
-    let mut first_para = true;
-    for para in cur.split('\n') {
-        let para = para.trim();
-        if para.is_empty() {
-            continue;
+    match page {
+        KPage::Text(cur) => {
+            let mut first_para = true;
+            for para in cur.split('\n') {
+                let para = para.trim();
+                if para.is_empty() {
+                    continue;
+                }
+                let mt = if first_para { 0 } else { gap };
+                first_para = false;
+                paras.push_str(&format!(
+                    "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em;margin-top:{mt}px;word-wrap:break-word\">{para}</p>",
+                    size = spec.size,
+                    line = spec.line,
+                    mt = mt,
+                    para = esc(para)
+                ));
+            }
         }
-        let mt = if first_para { 0 } else { gap };
-        first_para = false;
-        paras.push_str(&format!(
-            "<p style=\"font-size:{size}px;line-height:{line}px;text-indent:2em;margin-top:{mt}px;word-wrap:break-word\">{para}</p>",
-            size = spec.size,
-            line = spec.line,
-            mt = mt,
-            para = esc(para)
-        ));
+        KPage::Image { src, alt } => {
+            // 插图单独成页，走与漫画相同的图片代理（墨水屏灰度/限宽在服务端生成）。
+            let proxy = format!(
+                "/api/book/image?source={}&book_url={}&chapter_url={}&url={}&eink=1",
+                qenc(&q.source),
+                qenc(&q.book),
+                qenc(&chapter.url),
+                qenc(src)
+            );
+            let max_h = budget.saturating_sub(1).max(1) * spec.line;
+            paras.push_str(&format!(
+                "<div style=\"text-align:center;margin-top:{gap}px\"><img src=\"{proxy}\" alt=\"{alt}\" style=\"display:block;max-width:100%;max-height:{max_h}px;margin:0 auto\"></div>",
+                gap = gap,
+                proxy = proxy,
+                alt = esc(alt),
+                max_h = max_h
+            ));
+        }
     }
     // 阅读页正文区：高度 = 运行时可用高 − 顶栏 − 底栏（`read_only_css` 里写死），
     // 服务端按 `line_budget` 切好一屏文字，`data-lb` 供探针回报「本屏行数」。

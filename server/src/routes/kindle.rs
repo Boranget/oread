@@ -31,8 +31,6 @@ use axum::{
     Form, Router,
 };
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 

@@ -221,8 +221,6 @@ pub(super) const K_SHELF_PAGE: usize = 10;
 pub(super) const K_SEARCH_PAGE: usize = 9;
 /// /k 渲染前对正文纯文本的硬截断（防御超大章节把分页临时索引撑爆内存）
 pub(super) const K_MAX_TEXT_CHARS: usize = 800_000;
-/// 超长章节分块：每块最多 20 万字符，按块分页，避免一次性按 80 万字构建全量页表
-pub(super) const K_CHUNK_CHARS: usize = 200_000;
 /// 字号 Cookie（与 `?fs=` 二选一，显式参数优先）
 pub(super) const K_FS_COOKIE: &str = "k_fs";
 
