@@ -371,9 +371,7 @@ pub async fn adopt_metadata(
     tags: &[String],
 ) -> anyhow::Result<MetadataPatch> {
     let book_url = book_url.trim();
-    if book_url.is_empty()
-        || (series_name.is_none() && series_index.is_none() && tags.is_empty())
-    {
+    if book_url.is_empty() || (series_name.is_none() && series_index.is_none() && tags.is_empty()) {
         return Ok(MetadataPatch::default());
     }
     ensure_book(pool, book_url).await?;
@@ -393,11 +391,10 @@ pub async fn adopt_metadata(
             patch.series_index = Some(index);
         }
     }
-    let has_tags: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM library_tags WHERE book_url = ?1")
-            .bind(book_url)
-            .fetch_one(pool)
-            .await?;
+    let has_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_tags WHERE book_url = ?1")
+        .bind(book_url)
+        .fetch_one(pool)
+        .await?;
     if has_tags == 0 {
         let tags: Vec<String> = tags
             .iter()

@@ -302,7 +302,9 @@ async fn adopt_metadata_fills_blanks_and_never_overwrites() {
     )
     .await
     .unwrap();
-    let patch3 = adopt_metadata(&p, "b1", Some("新系列"), None, &[]).await.unwrap();
+    let patch3 = adopt_metadata(&p, "b1", Some("新系列"), None, &[])
+        .await
+        .unwrap();
     assert_eq!(patch3.series_name.as_deref(), Some("新系列"));
 }
 

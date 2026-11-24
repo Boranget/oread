@@ -416,15 +416,22 @@ async fn detail_save_keeps_personal_fields() {
     };
     save_book_meta(&pool, &pool, &detail).await.unwrap();
 
-    let row: (String, Option<i64>, Option<String>, Option<String>, Option<String>, bool, i64) =
-        sqlx::query_as(
-            "SELECT name, \"group\", custom_tag, custom_cover_url, custom_intro, \
+    let row: (
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT name, \"group\", custom_tag, custom_cover_url, custom_intro, \
                     can_update, \"order\" FROM book_meta WHERE book_url = ?1",
-        )
-        .bind(url)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    )
+    .bind(url)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(row.0, "新名");
     assert_eq!(row.1, Some(3), "分组不能丢");
     assert_eq!(row.2.as_deref(), Some("私人标签"));

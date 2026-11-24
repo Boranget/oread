@@ -230,11 +230,7 @@ fn parse_series_index(raw: &str) -> Option<f64> {
     let text = text
         .trim_end_matches(|c: char| matches!(c, '卷' | '部' | '册' | '集' | '季'))
         .trim();
-    let first = text
-        .split(['/', '／'])
-        .next()
-        .unwrap_or(text)
-        .trim();
+    let first = text.split(['/', '／']).next().unwrap_or(text).trim();
     if let Ok(v) = first.parse::<f64>() {
         return (v.is_finite() && v >= 0.0).then_some(v);
     }
@@ -320,17 +316,7 @@ fn split_tags(raw: &str) -> Vec<String> {
         raw.split(|c: char| {
             matches!(
                 c,
-                ',' | '，'
-                    | '、'
-                    | '/'
-                    | '／'
-                    | '|'
-                    | '｜'
-                    | ';'
-                    | '；'
-                    | '\n'
-                    | '\r'
-                    | '\t'
+                ',' | '，' | '、' | '/' | '／' | '|' | '｜' | ';' | '；' | '\n' | '\r' | '\t'
             )
         })
         .map(str::to_string)
