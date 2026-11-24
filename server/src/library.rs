@@ -371,7 +371,9 @@ pub async fn adopt_metadata(
     tags: &[String],
 ) -> anyhow::Result<MetadataPatch> {
     let book_url = book_url.trim();
-    if book_url.is_empty() {
+    if book_url.is_empty()
+        || (series_name.is_none() && series_index.is_none() && tags.is_empty())
+    {
         return Ok(MetadataPatch::default());
     }
     ensure_book(pool, book_url).await?;
