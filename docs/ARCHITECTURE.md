@@ -227,6 +227,8 @@ Bearer 访问 `/opds*`，便于调试。
 - Svelte 4 + Vite，产物 `server/web/dist`，由 `ServeDir` 托管；`src/App.svelte` 负责登录态与 tab 路由。
 - 首屏只静态引入 Login/Bookshelf/Discover；Reader、ComicReader 与统计/馆藏/书源/替换/设置页均 `import()` 懒加载，失败有可见错误与重试。
 - **阅读器独立目录 `src/reader/`**：`Reader.svelte`、`ComicReader.svelte`、`Reader*.svelte`、`reader*.js` 与其单测都在这里。硬规则：`reader/` 只能 import `./` 与 `../lib/`，**不许 import `pages/`**——管理端组件里的 `object-fit`/`transform`/`vw` 会让 KPW3 阅读页白屏，而故障现场在别处。门禁 `node scripts/check-reader-boundary.mjs`（CI 的 web job 已接入）。
+- **PC 与移动端共用同一阅读器**：不按 UA 分叉，只按视口/触控/键盘调整页宽、手势与控制栏；`/k` 是唯一的第二套前端（服务端渲染，无业务 JS）。
+- **正文长期模型是语义块**（标题/段落/图片）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。当前 Web 端暂由 `readerHtml.js` 解析 HTML，迁移计划见 [TODO.md](TODO.md) 第 1 项。
 - 馆藏页（`pages/Library.svelte`）所有登录账号可浏览占用与进度；入馆/移出/删除/回收临时缓存按 `getRole() === 'admin'` 收口。
 - 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`searchJobsModel`（任务状态/进度/时间纯函数）、`readingPrefs`、`theme` 等，均有 `node --test` 单测；阅读器相关的 `readerHtml/images/stats/auto/progress/gestures/math` 已随阅读器移入 `src/reader/`。
 - 搜索任务共享状态在 `lib/searchJobsStore.js`：App 登录后轮询 `/api/search/jobs`（有运行中任务 2.5s、空闲 15s），退出时停止并清空；Discover 的 `SearchJobsPanel` 只读取 store，支持取消、移除与「查看结果」重新挂载（运行中继续轮询，已结束直接读快照）。
