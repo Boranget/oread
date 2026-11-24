@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 
 use super::comic::{self, ComicChapter, ComicMeta, ComicPage};
 use super::read::{body_blocks, read_chapter_file};
-use super::{lock_book, text_blocks, ChapterItem, OpfMeta, Store, Tier};
+use super::{lock_book, text_blocks, ChapterItem, ImageItem, OpfMeta, Store, Tier};
 use crate::entities::BookChapter;
 use boranlib_ebook::html::{to_blocks, Block};
 
@@ -440,18 +440,21 @@ pub async fn save_text_chapter(
     blocks: &[Block],
 ) -> io::Result<bool> {
     Ok(
-        save_text_chapter_tracked(store, book_url, chapter_url, blocks)
+        save_text_chapter_tracked(store, book_url, chapter_url, blocks, &[])
             .await?
             .is_some(),
     )
 }
 
 /// 同 [`save_text_chapter`]，但返回新旧文件差异，便于增量刷新缓存统计。
+///
+/// `images` 是本次已写入 `OEBPS/images/` 的插图；新出现的会补进 OPF manifest。
 pub async fn save_text_chapter_tracked(
     store: &Store,
     book_url: &str,
     chapter_url: &str,
     blocks: &[Block],
+    images: &[ImageItem],
 ) -> io::Result<Option<ChapterWrite>> {
     if blocks.is_empty() {
         return Ok(None);
@@ -495,6 +498,27 @@ pub async fn save_text_chapter_tracked(
     store
         .write_chapter(&opened.dir, &opened.meta.language, item, &blocks)
         .await?;
+    // 新插图补进 manifest；已有条目（含封面同文件）不重复写。
+    if !images.is_empty() {
+        let mut meta = opened.meta;
+        let mut changed = false;
+        for img in images {
+            let exists = meta.images.iter().any(|x| x.href == img.href)
+                || meta
+                    .cover
+                    .as_ref()
+                    .map(|c| c.href == img.href)
+                    .unwrap_or(false);
+            if !exists {
+                meta.images.push(img.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            meta.bump();
+            store.write_opf(&opened.dir, &meta).await?;
+        }
+    }
     let new_len = tokio::fs::metadata(&path)
         .await
         .map(|m| m.len() as i64)

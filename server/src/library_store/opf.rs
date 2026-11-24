@@ -41,6 +41,16 @@ pub struct CoverItem {
     pub media_type: String,
 }
 
+/// 正文插图登记信息（`OEBPS/images/` 下的原图）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageItem {
+    /// manifest id，例如 `img-1a2b3c4d5e6f7788`。
+    pub id: String,
+    /// 相对 `OEBPS/` 的路径，例如 `images/<sha256>.jpg`。
+    pub href: String,
+    pub media_type: String,
+}
+
 /// 书的元数据（OPF 的内存投影）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpfMeta {
@@ -62,6 +72,8 @@ pub struct OpfMeta {
     pub modified: String,
     pub cover: Option<CoverItem>,
     pub chapters: Vec<ChapterItem>,
+    /// 正文插图；顺序即首次写入顺序，不参与 spine。
+    pub images: Vec<ImageItem>,
 }
 
 impl OpfMeta {
@@ -82,6 +94,7 @@ impl OpfMeta {
             modified: now_modified(),
             cover: None,
             chapters: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -239,6 +252,15 @@ pub fn to_opf_xml(meta: &OpfMeta) -> String {
             "    <item id=\"{}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
             escape_attr(&ch.id),
             escape_attr(&ch.href)
+        );
+    }
+    for img in &meta.images {
+        let _ = writeln!(
+            s,
+            "    <item id=\"{}\" href=\"{}\" media-type=\"{}\"/>",
+            escape_attr(&img.id),
+            escape_attr(&img.href),
+            escape_attr(&img.media_type)
         );
     }
     if meta.chapters.is_empty() {
@@ -495,6 +517,14 @@ fn read_manifest(el: Element<'_>, items: &mut Vec<(String, String)>, meta: &mut 
         if id == "nav" || id == "style" || id == "cover-image" {
             continue;
         }
+        if media_type.starts_with("image/") {
+            meta.images.push(ImageItem {
+                id,
+                href,
+                media_type: media_type.to_string(),
+            });
+            continue;
+        }
         items.push((id, href));
     }
 }
@@ -584,6 +614,11 @@ mod tests {
                 is_volume: true,
             },
         ];
+        meta.images = vec![ImageItem {
+            id: "img-0011223344556677".into(),
+            href: "images/0011223344556677.jpg".into(),
+            media_type: "image/jpeg".into(),
+        }];
         meta
     }
 
@@ -607,6 +642,7 @@ mod tests {
         assert_eq!(back.revision, meta.revision);
         assert_eq!(back.modified, meta.modified);
         assert_eq!(back.cover, meta.cover);
+        assert_eq!(back.images, meta.images);
         assert_eq!(back.chapters.len(), meta.chapters.len());
         for (a, b) in back.chapters.iter().zip(meta.chapters.iter()) {
             assert_eq!(a.id, b.id);

@@ -62,7 +62,9 @@ pub(super) async fn read(
                 fetched.url = chapter.url.clone();
             }
             // 书目录是正文唯一副本；目录里还没有这一章时只渲染本次结果。
-            if let Err(err) = save_text_prefer_dir(&s.store(), &s.library, &fetched).await {
+            if let Err(err) =
+                save_text_prefer_dir(&s.store(), &s.library, &fetched, Some(&source)).await
+            {
                 tracing::warn!(
                     book = %q.book,
                     url = %chapter.url,

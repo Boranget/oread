@@ -39,7 +39,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use boranlib_ebook::html::Block;
 
-pub use opf::{ChapterItem, CoverItem, OpfMeta};
+pub use opf::{ChapterItem, CoverItem, ImageItem, OpfMeta};
 
 pub const COLLECTION_DIR: &str = "collection";
 pub const TEMP_DIR: &str = "temp";

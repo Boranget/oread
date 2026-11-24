@@ -98,7 +98,8 @@ pub(super) async fn content(
                         c.url = q.chapter_url.clone();
                     }
                     // 书目录是正文唯一副本；目录里还没有这一章时只返回本次结果，不落盘。
-                    save_text_prefer_dir(&s.store(), &s.library, &c).await?;
+                    let img_source = load_source(&s.shared, &q.source).await.ok();
+                    save_text_prefer_dir(&s.store(), &s.library, &c, img_source.as_ref()).await?;
                     c
                 }
             }
@@ -600,7 +601,7 @@ pub(super) async fn cache_all(
                     }
                     // 目录是正文唯一副本：只有真正写进书目录的章节才算缓存。
                     // 漫画图片由整本下载 worker 下载后写页表，这里不落任何清单。
-                    match save_text_prefer_dir(&store, &pool, &c).await {
+                    match save_text_prefer_dir(&store, &pool, &c, Some(&src)).await {
                         Ok(true) => CacheOutcome::Cached {
                             index: idx,
                             bytes: size,

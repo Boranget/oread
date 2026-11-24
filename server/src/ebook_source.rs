@@ -217,19 +217,45 @@ pub async fn load_dir_content(
     if item.is_volume {
         return Ok(None);
     }
-    let Some(body) = store_read::load_chapter(&opened.dir, item).await? else {
+    let Some(mut body) = store_read::load_chapter(&opened.dir, item).await? else {
         return Ok(None);
     };
+    // 章内插图存的是 `images/<hash>.jpg` 这类相对路径（EPUB 需要相对地址）；
+    // 阅读端统一改成 `oread-img://` 本地 URL，走同一个图片代理（含墨水屏转码）。
+    let book_id = Store::book_id(book_url);
+    localize_images(&mut body.blocks, &book_id, opened.meta.revision);
+    let html = store_read::blocks_to_html(&body.blocks);
     let _ = crate::library::touch_book(pool, book_url).await;
     Ok(Some(BookContent {
         book_url: book_url.to_string(),
         url: chapter_url.to_string(),
         title: Some(item.title.clone()),
-        content: Some(body.html),
+        content: Some(html),
         chapter_index: pos as i64,
         content_type: "text".into(),
         ..Default::default()
     }))
+}
+
+/// 把章内相对图片路径改成带修订号的本地图片 URL；远程地址原样保留。
+///
+/// 章节文件在 `OEBPS/chapters/`，所以正文里的相对地址形如 `../images/<hash>.jpg`；
+/// 换算成相对 `OEBPS/` 的路径后再拼本地 URL。
+fn localize_images(blocks: &mut [boranlib_ebook::html::Block], book_id: &str, revision: u64) {
+    use boranlib_ebook::html::Block;
+    for block in blocks.iter_mut() {
+        let Block::Image { src, .. } = block else {
+            continue;
+        };
+        let raw = src.trim();
+        if raw.is_empty() || raw.contains("://") {
+            continue;
+        }
+        let mut rel = raw.strip_prefix("./").unwrap_or(raw);
+        rel = rel.strip_prefix("../").unwrap_or(rel);
+        let href = format!("OEBPS/{}", rel.trim_start_matches('/'));
+        *src = comic::local_image_url_v(book_id, &href, revision);
+    }
 }
 
 /// 漫画导出视图：书目录是唯一来源，按 `oread.json` 页表逐页 `stat`。
@@ -373,5 +399,41 @@ impl ChapterReader for LibraryReader {
 
     async fn page_data(&self, _url: &str) -> anyhow::Result<Option<PageData>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::localize_images;
+    use boranlib_ebook::html::Block;
+
+    #[test]
+    fn relative_images_become_versioned_local_urls() {
+        let mut blocks = vec![
+            Block::Paragraph("正文".into()),
+            Block::Image {
+                src: "../images/a.jpg".into(),
+                alt: String::new(),
+            },
+            Block::Image {
+                src: "https://remote.test/b.jpg".into(),
+                alt: String::new(),
+            },
+        ];
+        localize_images(&mut blocks, "abc123", 7);
+        assert_eq!(
+            blocks[1],
+            Block::Image {
+                src: "oread-img://abc123/OEBPS/images/a.jpg?v=7".into(),
+                alt: String::new(),
+            }
+        );
+        assert_eq!(
+            blocks[2],
+            Block::Image {
+                src: "https://remote.test/b.jpg".into(),
+                alt: String::new(),
+            }
+        );
     }
 }

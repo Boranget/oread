@@ -528,6 +528,7 @@ pub(crate) async fn save_text_prefer_dir(
     store: &crate::library_store::Store,
     lib: &SqlitePool,
     c: &BookContent,
+    source: Option<&crate::entities::BookSource>,
 ) -> anyhow::Result<bool> {
     if c.content_type.trim() == "image" {
         return Ok(false);
@@ -536,9 +537,17 @@ pub(crate) async fn save_text_prefer_dir(
     if book_url.is_empty() || c.url.trim().is_empty() {
         return Ok(false);
     }
-    let blocks = crate::library_store::write::markup_to_blocks(c.content.as_deref().unwrap_or(""));
-    match crate::library_store::write::save_text_chapter_tracked(store, book_url, &c.url, &blocks)
-        .await
+    let mut blocks =
+        crate::library_store::write::markup_to_blocks(c.content.as_deref().unwrap_or(""));
+    // 插图原图写入书目录，并把块里的远程地址改成本地相对路径。
+    let images = match (source, store.find(book_url)) {
+        (Some(src), Some((_, dir))) => ingest_images(src, &dir, &c.url, &mut blocks).await,
+        _ => Vec::new(),
+    };
+    match crate::library_store::write::save_text_chapter_tracked(
+        store, book_url, &c.url, &blocks, &images,
+    )
+    .await
     {
         Ok(Some(write)) => {
             if let Err(e) = crate::library_store::usage::note_text_chapter(
@@ -562,4 +571,155 @@ pub(crate) async fn save_text_prefer_dir(
         Ok(None) => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 单章最多落盘的插图数；超出部分仍保留远程地址，由图片代理按需读取。
+const MAX_CHAPTER_IMAGES: usize = 30;
+/// 单章插图原图总字节上限；超出部分不落盘。
+const MAX_CHAPTER_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// 单张插图原图上限，与图片代理的回源上限一致。
+const MAX_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 把相对图片地址按章节 URL 归并为 http(s) 绝对地址。
+fn abs_image_url(raw: &str, base: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let url = url::Url::parse(raw)
+        .or_else(|_| url::Url::parse(base)?.join(raw))
+        .ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+/// 下载正文插图原图到 `OEBPS/images/`，按内容哈希去重，并改写块里的地址。
+///
+/// 只收 JPEG / WebP；失败、超限或格式不支持的图保留远程地址，不阻塞正文落盘。
+async fn ingest_images(
+    source: &crate::entities::BookSource,
+    dir: &std::path::Path,
+    chapter_url: &str,
+    blocks: &mut [boranlib_ebook::html::Block],
+) -> Vec<crate::library_store::ImageItem> {
+    use boranlib_ebook::html::Block;
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let mut urls: Vec<String> = Vec::new();
+    for block in blocks.iter() {
+        if let Block::Image { src, .. } = block {
+            if let Some(url) = abs_image_url(src, chapter_url) {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+    }
+    urls.truncate(MAX_CHAPTER_IMAGES);
+    if urls.is_empty() {
+        return Vec::new();
+    }
+
+    let images_dir = dir.join("OEBPS").join("images");
+    if let Err(e) = tokio::fs::create_dir_all(&images_dir).await {
+        tracing::warn!(error = %e, "create inline image dir failed");
+        return Vec::new();
+    }
+
+    let fetched: Vec<(String, Vec<u8>, &'static str, &'static str, String)> =
+        futures::stream::iter(urls)
+            .map(|url| {
+                let source = source.clone();
+                let chapter_url = chapter_url.to_string();
+                async move {
+                    let img = match crate::image_fetch::fetch(
+                        &source,
+                        &url,
+                        Some(&chapter_url),
+                        MAX_INLINE_IMAGE_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(%url, error = %e, "download inline image failed");
+                            return None;
+                        }
+                    };
+                    let (ext, mime) = match image::guess_format(&img.data) {
+                        Ok(image::ImageFormat::Jpeg) => ("jpg", "image/jpeg"),
+                        Ok(image::ImageFormat::WebP) => ("webp", "image/webp"),
+                        _ => {
+                            tracing::warn!(%url, "skip inline image: only JPEG/WebP accepted");
+                            return None;
+                        }
+                    };
+                    let mut hasher = Sha256::new();
+                    hasher.update(&img.data);
+                    let hash = format!("{:x}", hasher.finalize());
+                    Some((url, img.data, ext, mime, hash))
+                }
+            })
+            // 保持章节里的图片顺序，预算裁剪才有确定结果。
+            .buffered(4)
+            .filter_map(|v| async move { v })
+            .collect()
+            .await;
+
+    // 先按预算筛，再写盘：被预算裁掉的图不会在目录里留下孤儿文件。
+    let mut total = 0u64;
+    let mut kept = Vec::new();
+    for entry in fetched {
+        let size = entry.1.len() as u64;
+        if total + size > MAX_CHAPTER_IMAGE_BYTES {
+            tracing::warn!(url = %entry.0, "skip inline image: chapter image budget exceeded");
+            continue;
+        }
+        total += size;
+        kept.push(entry);
+    }
+
+    let mut written: Vec<(String, crate::library_store::ImageItem)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (url, data, ext, mime, hash) in kept {
+        let path = images_dir.join(format!("{hash}.{ext}"));
+        if !path.is_file() {
+            if let Err(e) = crate::library_store::atomic_write(&path, &data).await {
+                tracing::warn!(%url, error = %e, "write inline image failed");
+                continue;
+            }
+        }
+        let item = crate::library_store::ImageItem {
+            id: format!("img-{}", &hash[..16]),
+            href: format!("images/{hash}.{ext}"),
+            media_type: mime.to_string(),
+        };
+        if seen.insert(item.href.clone()) {
+            written.push((url, item));
+        } else {
+            // 同一张图被多个地址引用：只登记一次 manifest，但每个地址都要改写。
+            if let Some((_, first)) = written.iter().find(|(_, x)| x.href == item.href) {
+                written.push((url, first.clone()));
+            }
+        }
+    }
+    if written.is_empty() {
+        return Vec::new();
+    }
+
+    let map: HashMap<String, String> = written
+        .iter()
+        .map(|(url, item)| (url.clone(), format!("../{}", item.href)))
+        .collect();
+    for block in blocks.iter_mut() {
+        if let Block::Image { src, .. } = block {
+            if let Some(url) = abs_image_url(src, chapter_url) {
+                if let Some(href) = map.get(&url) {
+                    *src = href.clone();
+                }
+            }
+        }
+    }
+    written.into_iter().map(|(_, item)| item).collect()
 }

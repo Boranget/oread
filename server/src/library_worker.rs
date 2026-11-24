@@ -449,7 +449,8 @@ async fn fetch_and_store(
         anyhow::bail!("正文为空");
     }
     // 目录优先：正文写进书目录成功后不再往 `library_content` 写同一份。
-    crate::routes::books::save_text_prefer_dir(&state.store(), &state.library, &c).await?;
+    crate::routes::books::save_text_prefer_dir(&state.store(), &state.library, &c, Some(source))
+        .await?;
     Ok(())
 }
 
