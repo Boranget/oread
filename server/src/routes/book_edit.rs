@@ -278,7 +278,7 @@ async fn save_chapter(
 }
 
 /// 编辑改了章节/图片后，用目录重算馆藏列表的冗余统计（失败只记日志）。
-async fn refresh_usage(s: &AppState, book_url: &str) {
+pub(super) async fn refresh_usage(s: &AppState, book_url: &str) {
     if let Err(e) =
         crate::library_store::usage::refresh_rollup(&s.library, &s.store(), book_url).await
     {

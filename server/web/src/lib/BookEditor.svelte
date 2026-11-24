@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher, onMount } from 'svelte';
   import { api, describeFailure } from './api.js';
+  import BookFileEditor from './BookFileEditor.svelte';
 
   export let bookUrl = '';
   export let initialTab = 'meta';
@@ -116,7 +117,7 @@
       // 首次载入时应用入口参数：从阅读器打开时直接定位到当前章节。
       if (!initialApplied) {
         initialApplied = true;
-        if (initialTab === 'content' || initialTab === 'cover') tab = initialTab;
+        if (initialTab === 'content' || initialTab === 'cover' || initialTab === 'files') tab = initialTab;
         if (initialChapter && chapters.some((c) => refOf(c) === initialChapter)) {
           chapterRef = initialChapter;
           await selectChapter();
@@ -344,6 +345,7 @@
         </button>
         {#if kind === 'text'}
           <button class:on={tab === 'cover'} on:click={() => (tab = 'cover')}>封面</button>
+          <button class:on={tab === 'files'} on:click={() => (tab = 'files')}>文件</button>
         {/if}
       </div>
 
@@ -469,6 +471,13 @@
           </button>
         </div>
         <p class="muted tiny-note">只接受 JPEG / WebP；替换后写入书目录的 content.opf，馆藏列表会立即使用新封面。</p>
+      {:else if tab === 'files'}
+        <BookFileEditor
+          bookUrl={bookUrl}
+          {revision}
+          on:revision={(e) => (revision = e.detail)}
+          on:saved={() => dispatch('saved')}
+        />
       {/if}
     {/if}
   </div>

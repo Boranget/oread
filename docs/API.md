@@ -2515,8 +2515,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ### 6.12.12 管理员编辑书目录（`/api/library/book/edit*`）
 
-> 现状：v1 端点保持可用，但暂停继续扩展。对齐 calibre 的结构化编辑
-> （章节源码/增删拆分/预览/校验）排在其它待办之后，见 [TODO.md](TODO.md)「最后做」。
+> 现状：v1 端点保持可用；calibre 式的文件树/源码编辑见 6.12.13。v1 只改段落，
+> 含图片的章节仍需用 6.12.13 直接改源码。
 
 - 鉴权：全部 **admin**。
 - 对象：入馆/同步目录时已归一化的书目录，管理员不接触原始网页 CSS/JS。元数据编辑复用 6.12.3
@@ -2548,6 +2548,40 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 落盘顺序：正文/图片 → `nav.xhtml` → `content.opf`；漫画为图片 → `oread.json` → `ComicInfo.xml`。
   每一步都是同目录临时文件 + fsync + rename。
 - 范围（v1）：不增删/拆分/合并章节，不改漫画页数量。
+
+### 6.12.13 calibre 式文件编辑（`/api/library/book/edit/file*`）
+
+> 只对文字书（合法 EPUB 3 目录）开放；漫画继续用 6.12.12 的单页替换。
+
+- 鉴权：全部 **admin**；所有写操作带 `revision`，不匹配返回 `409`。
+- 文件树：只列书目录内文件，跳过隐藏文件与临时文件；`kind` 为 `text|image|binary`，
+  `editable` 表示能否源码保存或换图。
+- 路径：一律书目录内相对路径（`OEBPS/chapters/...`），拒绝绝对路径、`..`、盘符；
+  越界按 `400` 返回。
+- 文本保存：上限 8 MB；`xhtml/html/xml/opf/ncx` 必须良构 XML；`content.opf` 还要通过
+  `parse_opf` 且 book-url 不变；`mimetype` 只读。
+- 修订号：保存任意文件后把 `content.opf` 的 `oread:revision` 加一、刷新
+  `dcterms:modified`；OPF 本身只改这两处，不重建 manifest，手工加的条目不会丢。
+- 图片替换：按内容识别格式，只接受 JPEG / WebP，扩展名必须一致，上限 10 MB；
+  返回新的 `oread-img://...?v=<revision>`。
+- 替换：默认按字面量、区分大小写，可选正则；默认搜索全部文本文件，可用 `paths` 限定；
+  先 `dry_run` 看命中，再应用。应用前逐文件校验 XML；命中超过 10000 或文件超过
+  5000 个直接拒绝。
+- Check book：校验 mimetype、`container.xml`、OPF manifest/spine、nav 链接、XHTML
+  良构与图片存在性；返回 `errors` / `warnings` / `issues[]`。
+- 预览：把 XHTML 解析成与阅读器相同的语义块（标题/段落/图片），图片地址改写为本地
+  代理 URL；只预览，不写盘。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/library/book/edit/files?book_url=` | `{ok, kind:"text", book_url, book_id, revision, meta, files[]}`；`files[] = {path, size, media_type, kind, editable}` |
+| `GET /api/library/book/edit/file?book_url=&path=` | `{ok, revision, path, size, media_type, kind:"text"\|"image", text?, image_url?}` |
+| `POST /api/library/book/edit/file` | body `{book_url, path, revision, content}` → `{ok, revision, size}` |
+| `POST /api/library/book/edit/file/image` | body `{book_url, path, revision, data}` → `{ok, revision, size, image_url}` |
+| `POST /api/library/book/edit/file/delete` | body `{book_url, path, revision}` → `{ok, revision}`；mimetype / container / OPF / nav 不能删 |
+| `POST /api/library/book/edit/replace` | body `{book_url, revision, query, replacement, regex?, case_sensitive?, paths?, dry_run?}` → `{ok, total, changed_files[], hits[], truncated, applied, revision}` |
+| `GET /api/library/book/edit/check?book_url=` | `{ok, revision, checked_files, errors, warnings, issues[]}` |
+| `POST /api/library/book/edit/preview` | body `{book_url, path, content?}` → `{ok, revision, blocks[], truncated}` |
 
 ### 6.13 OPDS 1.2 目录（`/opds*`）
 

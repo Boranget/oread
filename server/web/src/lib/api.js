@@ -621,4 +621,26 @@ export const api = {
     request('POST', '/library/book/edit/cover', body, { timeout: 60000 }),
   replaceComicPage: (body) =>
     request('POST', '/library/book/edit/page', body, { timeout: 60000 }),
+
+  // ---- calibre 式目录编辑：文件树 / 源码 / 替换 / 预览 / Check book ----
+  bookEditFiles: (bookUrl) =>
+    request('GET', `/library/book/edit/files?${buildQuery({ book_url: bookUrl })}`),
+  bookEditFile: (bookUrl, path) =>
+    request(
+      'GET',
+      `/library/book/edit/file?${buildQuery({ book_url: bookUrl, path })}`
+    ),
+  saveBookFile: (body) =>
+    request('POST', '/library/book/edit/file', body, { timeout: 60000 }),
+  saveBookFileImage: (body) =>
+    request('POST', '/library/book/edit/file/image', body, { timeout: 60000 }),
+  deleteBookFile: (body) => request('POST', '/library/book/edit/file/delete', body),
+  replaceBookFiles: (body) =>
+    request('POST', '/library/book/edit/replace', body, { timeout: 60000 }),
+  checkBook: (bookUrl) =>
+    request('GET', `/library/book/edit/check?${buildQuery({ book_url: bookUrl })}`, undefined, {
+      timeout: 60000,
+    }),
+  previewBookFile: (body) =>
+    request('POST', '/library/book/edit/preview', body, { timeout: 30000 }),
 };

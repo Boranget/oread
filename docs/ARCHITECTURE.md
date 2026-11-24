@@ -193,13 +193,18 @@ Bearer 访问 `/opds*`，便于调试。
   `/k/read` 的正文先读章节文件；命中后管理员编辑与离线阅读立即生效，未命中才查缓存/回源。
   正文按语义块服务端分页：文字按行预算切页，插图单独成页并走 `/api/book/image`（`eink=1`）。
   书源已失效或不存在时合成一个「馆藏」书源，阅读路径按目录实际形态选择正文或漫画。
-- 管理员编辑（`library_store::edit` + `/api/library/book/edit*`）：只改已归一化的目录内容，
-  v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用 `/api/library/book/meta`，DB 更新后
-  同步写 `content.opf` / `oread.json`；正文与图片直接写文件，再按
-  「正文/图片 → `nav.xhtml` → `content.opf`」或「图片 → `oread.json` → `ComicInfo.xml`」更新。
-  每本书一把写锁，正文/封面/页保存用 `oread:revision` 做乐观锁（冲突 409）。图片以文件内容
-  识别格式并决定扩展名（只接受 JPEG/WebP），避免把非图片写进目录。本地图片 URL 带
-  `?v=<revision>`：换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
+- 管理员编辑（`library_store::edit` / `library_store::files` + `/api/library/book/edit*`）：
+  只改已归一化的目录内容。v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用
+  `/api/library/book/meta`，DB 更新后同步写 `content.opf` / `oread.json`；正文与图片直接写文件，
+  再按「正文/图片 → `nav.xhtml` → `content.opf`」或「图片 → `oread.json` → `ComicInfo.xml`」更新。
+  每本书一把写锁，所有保存用 `oread:revision` 做乐观锁（冲突 409）。图片以文件内容识别格式并
+  决定扩展名（只接受 JPEG/WebP），避免把非图片写进目录。本地图片 URL 带 `?v=<revision>`：
+  换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
+  - calibre 式文件编辑（`library_store::files`）：对文字书枚举目录文件树，按书内相对路径读/写
+    任意文本或 JPEG/WebP，支持跨文件字面量/正则替换、语义块预览与 Check book。写入仍走同一把
+    书锁与原子写；保存非 OPF 文件时只把 OPF 的 `oread:revision` / `dcterms:modified` 文本节点
+    替换掉，不重建 manifest，手工加的字体/样式条目不会被覆盖。路径解析拒绝绝对路径与 `..`，
+    章节图片的 `../images/...` 由专用解析器在书目录内回退。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（该书当前不可读）。
   `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目

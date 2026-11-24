@@ -161,7 +161,7 @@ fn revision_conflict(current: u64) -> EditError {
     ))
 }
 
-fn require_revision(current: u64, expected: u64) -> Result<(), EditError> {
+pub(super) fn require_revision(current: u64, expected: u64) -> Result<(), EditError> {
     if current == expected {
         Ok(())
     } else {
@@ -311,7 +311,7 @@ pub async fn save_chapter(
 ///
 /// 只接受 JPEG/WebP：本仓库的 `image` 依赖只编译了这两种解码器，墨水屏灰度与
 /// 长条切片也只处理这两种；收下 PNG/GIF 会在真机上读不出来。
-fn detect_image(data: &[u8]) -> Result<(&'static str, &'static str), EditError> {
+pub(super) fn detect_image(data: &[u8]) -> Result<(&'static str, &'static str), EditError> {
     if data.is_empty() {
         return Err(EditError::BadRequest("图片内容为空".into()));
     }

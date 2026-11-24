@@ -1516,6 +1516,160 @@ async fn kindle_reads_text_from_local_dir_without_source() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// calibre 式编辑：文件树、源码保存、替换与 Check book 走通，修订号递增。
+#[tokio::test]
+async fn admin_book_file_editor_routes() {
+    use boranlib::library_store::{ChapterItem, OpfMeta, Store, Tier};
+
+    let dir = temp_dir("book-files");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let admin = register_admin(&app, &shared, "fileadmin").await;
+
+    let book_url = "https://local.test/files";
+    let encoded = "https%3A%2F%2Flocal.test%2Ffiles";
+    let store = Store::new(&dir);
+    store.create_layout().unwrap();
+    let mut meta = OpfMeta::new(book_url, "文件编辑书");
+    let item = ChapterItem {
+        id: "ch-0001".into(),
+        href: "chapters/ch-0001-a.xhtml".into(),
+        title: "第一章".into(),
+        url: Some("https://local.test/files/1".into()),
+        is_volume: false,
+    };
+    meta.chapters.push(item.clone());
+    let book_dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+    store
+        .write_chapter(
+            &book_dir,
+            "zh",
+            &item,
+            &text_blocks(&["原始正文段落".into()]),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/library/book/edit/files?book_url={encoded}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tree = body_json(resp).await;
+    let revision = tree["revision"].as_u64().expect("revision");
+    assert!(tree["files"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|f| f["path"] == "OEBPS/content.opf")));
+
+    let chapter = "OEBPS/chapters/ch-0001-a.xhtml";
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/library/book/edit/file?book_url={encoded}&path={chapter}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let read = body_json(resp).await;
+    assert!(read["text"].as_str().unwrap_or("").contains("原始正文段落"));
+
+    let edited = read["text"]
+        .as_str()
+        .unwrap()
+        .replace("原始正文段落", "改过的正文");
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/edit/file",
+            &serde_json::json!({
+                "book_url": book_url,
+                "path": chapter,
+                "revision": revision,
+                "content": edited,
+            })
+            .to_string(),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let saved = body_json(resp).await;
+    let revision = saved["revision"].as_u64().expect("revision");
+    assert_eq!(revision, tree["revision"].as_u64().unwrap() + 1);
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/library/book/edit/check?book_url={encoded}"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let report = body_json(resp).await;
+    assert_eq!(report["errors"], 0, "{report}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/edit/replace",
+            &serde_json::json!({
+                "book_url": book_url,
+                "revision": revision,
+                "query": "改过的正文",
+                "replacement": "替换后的正文",
+                "dry_run": true,
+            })
+            .to_string(),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let dry = body_json(resp).await;
+    assert_eq!(dry["applied"], false);
+    assert!(dry["total"].as_u64().unwrap_or(0) >= 1, "{dry}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/book/edit/replace",
+            &serde_json::json!({
+                "book_url": book_url,
+                "revision": revision,
+                "query": "改过的正文",
+                "replacement": "替换后的正文",
+            })
+            .to_string(),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let applied = body_json(resp).await;
+    assert_eq!(applied["applied"], true, "{applied}");
+
+    // 越界路径必须按参数错误拒绝，不能落到 500。
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/library/book/edit/file?book_url={encoded}&path=..%2Fsecret"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// EPUB 导出：info 报正文章节，epub 返回 ZIP；漫画书用 409 明确拒绝。
 #[tokio::test]
 async fn epub_export_info_and_download() {
