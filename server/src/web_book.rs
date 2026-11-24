@@ -249,7 +249,7 @@ use web_book_explore::*;
 pub use web_book_content::{chapter_content, chapter_content_book};
 pub use web_book_explore::{explore_all, explore_categories};
 pub use web_book_images::{chapter_images, chapter_images_book, ChapterImages, MAX_CHAPTER_IMAGES};
-pub use web_book_info::{book_info, book_info_book, parse_book_info_html};
+pub use web_book_info::{book_info, book_info_book, parse_book_info_html, BookInfoExtras};
 pub(crate) use web_book_rank::dedupe_key;
 pub use web_book_rank::{
     search_all, search_all_scoped_evidenced, search_all_with_errors,

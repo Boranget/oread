@@ -1044,3 +1044,52 @@ async fn content_fetch_uses_source_timeout() {
     };
     assert_source_timeout(chapter_content(&s, &chapter).await.unwrap_err());
 }
+
+#[test]
+fn detail_maps_series_and_tags_from_rules() {
+    let mut s = BookSource {
+        book_source_url: "https://x.example".into(),
+        ..Default::default()
+    };
+    s.rule_book_info = Some(BookInfoRule {
+        series_name: Some("class.series@text".into()),
+        series_index: Some("class.index@text".into()),
+        tags: Some("class.tag@text".into()),
+        ..Default::default()
+    });
+    let html = r#"<div class="series">银河系漫游指南</div>
+                  <span class="index">第三部</span>
+                  <span class="tag">科幻</span>
+                  <span class="tag">经典</span>"#;
+    let mut book = Book {
+        book_url: "https://x.example/book/1".into(),
+        ..Default::default()
+    };
+    let extras = parse_book_info_html(&s, &mut book, html, None).unwrap();
+    assert_eq!(extras.series_name.as_deref(), Some("银河系漫游指南"));
+    assert_eq!(extras.series_index, Some(3.0));
+    assert_eq!(extras.tags, vec!["科幻".to_string(), "经典".to_string()]);
+}
+
+#[test]
+fn detail_tags_fall_back_to_kind() {
+    let mut s = BookSource {
+        book_source_url: "https://x.example".into(),
+        ..Default::default()
+    };
+    s.rule_book_info = Some(BookInfoRule {
+        kind: Some("class.kind@text".into()),
+        ..Default::default()
+    });
+    let html = r#"<span class="kind">标签：玄幻、奇幻/修真</span>"#;
+    let mut book = Book {
+        book_url: "https://x.example/book/1".into(),
+        ..Default::default()
+    };
+    let extras = parse_book_info_html(&s, &mut book, html, None).unwrap();
+    assert_eq!(
+        extras.tags,
+        vec!["玄幻".to_string(), "奇幻".to_string(), "修真".to_string()]
+    );
+    assert!(extras.series_name.is_none(), "不猜书名/分类里的系列");
+}

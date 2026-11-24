@@ -359,6 +359,58 @@ pub async fn update_metadata(
     Ok(())
 }
 
+/// 详情页自动映射：把系列/标签写进馆藏元数据，**只填空缺**。
+///
+/// 管理员编辑过的值（系列、序号、标签）是权威，书源不能覆盖；
+/// 返回实际写入的补丁，调用方据此同步书目录里的 OPF/ComicInfo。
+pub async fn adopt_metadata(
+    pool: &SqlitePool,
+    book_url: &str,
+    series_name: Option<&str>,
+    series_index: Option<f64>,
+    tags: &[String],
+) -> anyhow::Result<MetadataPatch> {
+    let book_url = book_url.trim();
+    if book_url.is_empty() {
+        return Ok(MetadataPatch::default());
+    }
+    ensure_book(pool, book_url).await?;
+    let (current_series, current_index): (Option<String>, Option<f64>) =
+        sqlx::query_as("SELECT series_name, series_index FROM library_books WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(pool)
+            .await?;
+    let mut patch = MetadataPatch::default();
+    if non_empty(current_series.as_deref().unwrap_or("")).is_none() {
+        if let Some(name) = series_name.and_then(non_empty) {
+            patch.series_name = Some(name.to_string());
+        }
+    }
+    if current_index.is_none() {
+        if let Some(index) = series_index.filter(|v| v.is_finite() && *v >= 0.0) {
+            patch.series_index = Some(index);
+        }
+    }
+    let has_tags: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM library_tags WHERE book_url = ?1")
+            .bind(book_url)
+            .fetch_one(pool)
+            .await?;
+    if has_tags == 0 {
+        let tags: Vec<String> = tags
+            .iter()
+            .filter_map(|tag| non_empty(tag).map(str::to_string))
+            .collect();
+        if !tags.is_empty() {
+            patch.tags = Some(tags);
+        }
+    }
+    if !patch.is_empty() {
+        update_metadata(pool, book_url, &patch).await?;
+    }
+    Ok(patch)
+}
+
 /// 读取标签与标识（按 scheme/tag 排序，保证输出稳定）。
 pub async fn load_metadata_extras(
     pool: &SqlitePool,

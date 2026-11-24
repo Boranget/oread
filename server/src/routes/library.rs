@@ -461,7 +461,9 @@ async fn book_meta(
     })))
 }
 
-fn patch_to_fields(patch: &library::MetadataPatch) -> crate::library_store::edit::MetaFields {
+pub(super) fn patch_to_fields(
+    patch: &library::MetadataPatch,
+) -> crate::library_store::edit::MetaFields {
     use crate::library_store::edit::MetaFields;
     // identifiers 被整体替换时，没有 isbn 就等于清空；没带该字段时才保持原值。
     let isbn = patch.identifiers.as_ref().map(|list| {
@@ -526,6 +528,34 @@ async fn set_book_meta(
         "ok": true,
         "meta": metadata_json(&book, &extras),
     })))
+}
+
+/// 把元数据补丁写进书目录（文字书 OPF / 漫画 ComicInfo）。
+///
+/// 目录不存在时静默跳过：首次同步目录会用 DB 里的最新元数据初始化。
+pub(super) async fn sync_meta_to_store(
+    store: &crate::library_store::Store,
+    book_url: &str,
+    patch: &library::MetadataPatch,
+) {
+    if patch.is_empty() {
+        return;
+    }
+    let fields = patch_to_fields(patch);
+    if let Err(e) = crate::library_store::edit::save_text_meta(store, book_url, &fields).await {
+        match e {
+            crate::library_store::edit::EditError::NotFound(_) => {
+                match crate::library_store::edit::save_comic_meta(store, book_url, &fields).await {
+                    Ok(_) => {}
+                    Err(crate::library_store::edit::EditError::NotFound(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(book = %book_url, error = %e, "sync meta to book dir failed");
+                    }
+                }
+            }
+            e => tracing::warn!(book = %book_url, error = %e, "sync meta to book dir failed"),
+        }
+    }
 }
 
 /// 索引不可用或为空时的退路：直接按 `library.db` 的书名/作者 keyset 分页。

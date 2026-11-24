@@ -471,9 +471,13 @@ async fn import_book_from_html(
         ..Default::default()
     };
     // 规则出错不阻断导入：字段由下面 meta 兜底；整页解析失败也不该静默建空书
-    if let Err(e) = web_book::parse_book_info_html(source, &mut book, html, store) {
-        tracing::warn!(source = %source.book_source_url, error = %e, "import url: book info rule failed");
-    }
+    let extras = match web_book::parse_book_info_html(source, &mut book, html, store) {
+        Ok(extras) => extras,
+        Err(e) => {
+            tracing::warn!(source = %source.book_source_url, error = %e, "import url: book info rule failed");
+            web_book::BookInfoExtras::default()
+        }
+    };
     fill_fallback(&mut book, meta_from_html(html), book_url);
 
     if blank(&book.name) {
@@ -499,6 +503,15 @@ async fn import_book_from_html(
     .execute(pool)
     .await?;
     crate::routes::books::save_book_meta(lib, pool, &book).await?;
+    // 系列/标签只补馆藏层空缺；书目录尚未建立时等首次同步目录再写进 OPF。
+    crate::library::adopt_metadata(
+        lib,
+        &book.book_url,
+        extras.series_name.as_deref(),
+        extras.series_index,
+        &extras.tags,
+    )
+    .await?;
     if let Some(st) = store {
         crate::routes::books::persist_book_changes(pool, st.take_changes()).await;
     }

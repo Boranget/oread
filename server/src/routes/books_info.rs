@@ -77,9 +77,20 @@ pub(super) async fn book_info(
     }
     let key = web_book::book_key(&source, &book.book_url);
     let store = book_store_for(&db.0, &key).await;
-    web_book::book_info_book(s.fetcher.as_ref(), &source, &mut book, Some(&store)).await?;
+    let extras =
+        web_book::book_info_book(s.fetcher.as_ref(), &source, &mut book, Some(&store)).await?;
     persist_book_changes(&db.0, store.take_changes()).await;
     save_book_meta(&s.library, &db.0, &book).await?;
+    // 详情页的系列/标签只补馆藏层的空缺，管理员改过的值不会被覆盖。
+    let patch = crate::library::adopt_metadata(
+        &s.library,
+        &book.book_url,
+        extras.series_name.as_deref(),
+        extras.series_index,
+        &extras.tags,
+    )
+    .await?;
+    crate::routes::library::sync_meta_to_store(&s.store(), &book.book_url, &patch).await;
     // 详情页知道真实书源：顺手把封面补进书目录（后台执行，不阻塞返回）。
     // 已有封面时函数会直接跳过，管理员换过的封面不会被覆盖。
     {

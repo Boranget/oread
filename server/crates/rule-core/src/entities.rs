@@ -182,6 +182,15 @@ pub struct BookInfoRule {
     pub word_count: Option<String>,
     #[serde(default)]
     pub can_re_name: Option<String>,
+    /// 非 Legado 标准字段：详情页的系列名规则（可选，供自有书源扩展）。
+    #[serde(default)]
+    pub series_name: Option<String>,
+    /// 系列序号规则：数字，或带「第/卷/部」的文本，取其中的数值。
+    #[serde(default)]
+    pub series_index: Option<String>,
+    /// 标签规则：可返回多个值；缺省时把 `kind` 按分隔符拆成标签。
+    #[serde(default)]
+    pub tags: Option<String>,
     #[serde(default)]
     pub download_urls: Option<String>,
     #[serde(flatten, default)]

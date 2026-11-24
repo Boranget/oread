@@ -252,6 +252,60 @@ async fn metadata_patch_writes_clears_and_replaces() {
     assert_eq!(left, 0);
 }
 
+#[tokio::test]
+async fn adopt_metadata_fills_blanks_and_never_overwrites() {
+    let p = pool().await;
+    insert_book(&p, "b1", TIER_COLLECTION, Some(now_ms()), now_ms()).await;
+
+    let patch = adopt_metadata(
+        &p,
+        "b1",
+        Some("  银河系漫游指南 "),
+        Some(1.0),
+        &["科幻".to_string(), " 经典 ".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(patch.series_name.as_deref(), Some("银河系漫游指南"));
+    assert_eq!(patch.series_index, Some(1.0));
+    assert_eq!(
+        patch.tags,
+        Some(vec!["科幻".to_string(), "经典".to_string()])
+    );
+
+    // 第二次带不同值：已有值保持，补丁为空
+    let patch2 = adopt_metadata(
+        &p,
+        "b1",
+        Some("别的系列"),
+        Some(9.0),
+        &["别的标签".to_string()],
+    )
+    .await
+    .unwrap();
+    assert!(patch2.is_empty(), "已有元数据不应被书源覆盖");
+
+    let b = load_book(&p, "b1").await.unwrap().unwrap();
+    assert_eq!(b.series_name.as_deref(), Some("银河系漫游指南"));
+    assert_eq!(b.series_index, Some(1.0));
+    let extras = load_metadata_extras(&p, "b1").await.unwrap();
+    assert_eq!(extras.tags, vec!["科幻".to_string(), "经典".to_string()]);
+
+    // 管理员清空系列后，书源可以再次补上
+    update_metadata(
+        &p,
+        "b1",
+        &MetadataPatch {
+            series_name: Some(String::new()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let patch3 = adopt_metadata(&p, "b1", Some("新系列"), None, &[]).await.unwrap();
+    assert_eq!(patch3.series_name.as_deref(), Some("新系列"));
+}
+
 #[test]
 fn empty_metadata_patch_is_detected() {
     assert!(MetadataPatch::default().is_empty());

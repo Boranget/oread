@@ -218,6 +218,7 @@ Bearer 访问 `/opds*`，便于调试。
   - `tier=temp`：临时缓存，按 `last_accessed_at` 做 TTL 回收（默认 30 天），每小时后台清理。
   - **不设容量上限**，只做占用监控；`/api/healthz` 与 `/api/library/stats` 暴露分层占用。
   - **元数据分层**：系列、语言、出版社、出版日期、标识（ISBN 等）、标签属于「谁抓到都一样」的全局字段，写在 `library_books` / `library_identifiers` / `library_tags`；星级、分组、私人标签留在用户库。读写接口见 [API.md](API.md) 6.12.3。
+  - **详情页自动映射**：书源可选配 `seriesName` / `seriesIndex` / `tags` 详情规则（非 Legado 标准字段）；未配 `tags` 时把 `kind` 按 `,，、/;` 拆成标签。只填馆藏层空缺，管理员改过的值不会被书源覆盖；写入后同步书目录的 OPF/ComicInfo，导出直接带上。
 - **`users/<uid>.db`**：书架、阅读进度、设置、书签、替换规则、书源登录态（`book_vars`/`book_cache`）、个人覆盖字段。物理分桶，连接池有 LRU 上限。`book_meta.total_chapter_num` 保留为馆藏权威值的副本，书架进度口径不变。
 - **正文读取**：先按书目录读章节文件，命中直接返回；未命中才抓取，目录存在时写入章节文件，否则本次结果不落盘。
   - `tier=collection` 的书**不按 TTL 过期**：正文、目录、漫画图片都直接读书目录，书源失效后已入馆的书仍可打开。
