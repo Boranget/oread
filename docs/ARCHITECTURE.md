@@ -1,6 +1,6 @@
 # 架构速览
 
-本文只讲「代码放在哪、请求怎么走、数据存在哪」。接口字段见 [API.md](API.md)，构建与部署见 [BUILD.md](BUILD.md)，规则语义见 [ENGINE_REFERENCE_NOTES.md](ENGINE_REFERENCE_NOTES.md)。
+本文只讲「代码放在哪、请求怎么走、数据存在哪」。接口字段见 [API.md](API.md)，构建与部署见 [BUILD.md](BUILD.md) 与 [DEPLOY.md](DEPLOY.md)，墨水屏约束见 [EINK_STYLE.md](EINK_STYLE.md)。
 
 ## 1. 进程与分层
 

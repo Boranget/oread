@@ -3,7 +3,7 @@
 > 适用：Windows 本机 → OpenStick（Debian 11 / aarch64 / systemd）。
 > 脚本：`scripts\deploy.ps1`（PowerShell 5.1+）。仓库内不写入设备地址与任何凭据，
 > 地址用 `-Device` 或 `OREAD_DEVICE` 传入，认证走 ssh-agent / `~/.ssh/config` / `-SshKey`。
-> 正式发版仍以 `docs/RELEASE.md` 和 `RUNBOOK.md` 为准；本脚本是“构建 + 上传 + 安装 + 回滚”的自动化封装。
+> 正式发版流程见 `docs/RELEASE.md`；本脚本是“构建 + 上传 + 安装 + 回滚”的自动化封装。
 
 ## 0. 一条命令
 
@@ -83,7 +83,7 @@ $env:OREAD_DEVICE = '192.168.1.191'
 
 ## 3. 设备侧布局
 
-与 `RUNBOOK.md` 一致，脚本只动这三处：
+脚本只动这三处：
 
 ```
 /opt/boranlib/boranlib                       # 静态二进制（755 root:root）
@@ -92,6 +92,9 @@ $env:OREAD_DEVICE = '192.168.1.191'
 ```
 
 不改 `boranlib.env`、不重装系统、不动 nginx 配置、不改网络接口。
+
+> **不做旧数据迁移**：换设备或重建部署时，停服后直接删除 `/opt/boranlib/data/`，
+> 再启动即会重新初始化数据库；不需要导出、导入或迁移旧库。
 
 ### 3.1 反向代理 gzip（手动，部署脚本不覆盖）
 
@@ -148,7 +151,7 @@ journalctl -u boranlib -n 50 --no-pager
 
 ### 数据库不在自动回滚范围内
 
-脚本只回滚程序与前端。**跨迁移版本升级前**，按 `RUNBOOK.md` 第 3 步手工备份
+脚本只回滚程序与前端。**跨迁移版本升级前**，按 `docs/BUILD.md` §11.1 手工备份
 `/opt/boranlib/data/shared.db` 与 `users/*.db`；若新版本已执行迁移、必须回退数据库，
 用那份备份覆盖后再启动。
 
@@ -164,45 +167,7 @@ sha256sum /opt/boranlib/web/dist/index.html
 ```
 
 - 二进制 / `index.html` 的 SHA-256 应与脚本输出一致。
-- `healthz` 连续多次 200（RUNBOOK 第 6 步的 30 次脚本可直接复用）。
-
-### 本次升级（迁移 `0012`）的额外检查
-
-`0012_repair_budget_truncation_poison.sql` 会把“最后错误为全局搜索预算耗尽”的隔离源
-降回 `observing`。设备若装有 `sqlite3`：
-
-```bash
-sqlite3 /opt/boranlib/data/shared.db \
-  "select version, description from _sqlx_migrations order by version desc limit 3;"
-
-sqlite3 /opt/boranlib/data/shared.db \
-  "select count(*) from source_health where tier='quarantined' and last_error like '全局搜索预算耗尽%';"
-```
-
-- 第一句应能看到 `12|repair budget truncation poison`。
-- 第二句应为 `0`。
-
-然后做一次真实搜索（登录后，两段式接口）：
-
-```bash
-# 1) 建任务，记下返回的 job_id（需要登录 Cookie / Bearer token）
-curl -s 'http://127.0.0.1:3000/api/search/start?key=%E7%99%BE%E5%B9%B4%E5%AD%A4%E7%8B%AC'
-# 2) 取结果
-curl -s 'http://127.0.0.1:3000/api/search/result?job_id=<job_id>'
-```
-
-也可以直接用网页端搜索“百年孤独”。
-
-若旧健康数据仍在冷却（未重启过、或想立即重试），管理员可手动重新信任：
-
-```bash
-curl -s -X POST http://127.0.0.1:3000/api/sources/health/reset \
-  -H 'Content-Type: application/json' \
-  -H "Cookie: <管理员会话 Cookie>" \
-  -d '{"source_ids":["https://www.kxwx.org"]}'
-```
-
-`source_ids` 省略或传空数组表示重置全部。该接口需要管理员权限。
+- `healthz` 连续多次 200。
 
 ## 6. 常见问题
 
@@ -217,11 +182,11 @@ curl -s -X POST http://127.0.0.1:3000/api/sources/health/reset \
 | 上传很慢 | 静态二进制约 10 MB，属正常；避免在设备上编译 |
 | `上传文件缺失` / `校验失败` | 远端没收到 `/opt/boranlib/.upload-<stamp>.*` 或哈希不符；脚本会在改动任何文件前中止。检查设备磁盘空间、目录权限、网络后重跑 |
 | `Text file busy` | 旧版脚本直接覆盖运行中的二进制。新版先写 `boranlib.new.<stamp>` 再 rename，回滚也会先停服务；直接重跑即可 |
-| 迁移校验和失败 | 说明产物内嵌迁移换行或内容与库不一致。不要改库绕过，先按 `RUNBOOK.md` 第 2 步闸门核验 |
+| 迁移校验和失败 | 说明产物内嵌迁移换行或内容与库不一致。不要改库绕过，先按 `docs/BUILD.md` §11.2 闸门核验 |
 
 ### 关于“只装 Release 产物”
 
-`RUNBOOK.md` 的默认约束是优先装 GitHub Release 产物。需要严格遵循时，先下载并复算
+默认约束是优先装 GitHub Release 产物。需要严格遵循时，先下载并复算
 `SHA256SUMS.txt`，再用 `-SkipBuild -Binary <release>\boranlib-linux-aarch64` 部署。
 本脚本默认从当前仓库构建，适合“本地修复后尽快上机验证”；正式发版仍走 tag + CI。
 

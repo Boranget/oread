@@ -4,7 +4,7 @@
 
 它不是参数调优记录，而是一份约束模型。后续任何「某个源该不该排前面」的改动，都应该能落到本文的某个量上，而不是再加一条特判。
 
-相关实现：[`server/src/routes/books_search_job.rs`](../server/src/routes/books_search_job.rs)、[`server/src/source_health_scoring.rs`](../server/src/source_health_scoring.rs)、[`server/src/source_bench_run.rs`](../server/src/source_bench_run.rs)、[`server/src/title_filter.rs`](../server/src/title_filter.rs)。
+相关实现：[`server/src/routes/books_search_job.rs`](../server/src/routes/books_search_job.rs)、[`server/src/source_health_scoring.rs`](../server/src/source_health_scoring.rs)、[`server/src/source_bench_run.rs`](../server/src/source_bench_run.rs)、[`server/src/title_filter.rs`](../server/crates/rule-core/src/title_filter.rs)。
 
 ## 1. 改造前的三个隐含错误
 

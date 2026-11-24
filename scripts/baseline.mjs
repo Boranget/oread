@@ -4,7 +4,7 @@
 //
 // 用法：
 //   node scripts/baseline.mjs
-//   node scripts/baseline.mjs --frontend --json docs/baseline/2026-11-07.json
+//   node scripts/baseline.mjs --frontend --json baseline.json
 //   node scripts/baseline.mjs --build --build-release --test
 //   node scripts/baseline.mjs --url http://127.0.0.1:18080 --user admin --pass '<口令>'
 //

@@ -6,135 +6,9 @@
 
 - 产品/服务名：**Boranlib**；历史文档里的 `oread` 均指本项目，已统一改名。
 - 二进制：`boranlib`（Windows `boranlib.exe`）；部署目录 `/opt/boranlib`。
-- 环境变量：统一前缀 `BORANLIB_*`，并兼容旧 `LEGADO_*` 前缀（新名优先）。程序**只读取这两个前缀**，不读取未加前缀的旧名（例如只设 `WEB_DIR` 不生效，应设 `BORANLIB_WEB_DIR` 或 `LEGADO_WEB_DIR`）。程序内置端口缺省为 **8080**（`BORANLIB_PORT` / 旧 `LEGADO_PORT`）；但 **Windows 成品包**（v0.3.12 实测）的 `start.ps1` 在未显式配置时会注入 `BORANLIB_PORT=3000`，因此成品包默认实际监听 **`0.0.0.0:3000`**，只有直接运行二进制才落回 8080。15.4 表同时列出“新名 / 兼容旧名”。
+- 环境变量：统一前缀 `BORANLIB_*`，并兼容旧 `LEGADO_*` 前缀（新名优先）。程序**只读取这两个前缀**，不读取未加前缀的旧名（例如只设 `WEB_DIR` 不生效，应设 `BORANLIB_WEB_DIR` 或 `LEGADO_WEB_DIR`）。程序内置端口缺省为 **8080**（`BORANLIB_PORT` / 旧 `LEGADO_PORT`）；但 **Windows 成品包**（v0.3.12 实测）的 `start.ps1` 在未显式配置时会注入 `BORANLIB_PORT=3000`，因此成品包默认实际监听 **`0.0.0.0:3000`**，只有直接运行二进制才落回 8080。13.4 表同时列出“新名 / 兼容旧名”。
 - 书源 JSON 里的 `Legado` 指**上游兼容格式**，不是本项目品牌，保留不改。
 - 仓库路径 `<repo>` 与 `../...` 链接是磁盘既有路径，未随品牌改名，保持原样。
-
-## 生成时间与依据
-
-- 生成时间：2026-11-02 19:34（Asia/Shanghai，UTC+8）；最后对齐：2026-11-03 15:16（第四轮复核）
-- 仓库：`<repo>`
-- Git：`HEAD = 7dbe6f14`（2026-11-02 16:31:55 +0800），工作区存在大量未提交改动，因此**以磁盘上读取到的源码为准**
-- 读取范围与文件修改时间（第四轮复核后更新）：
-
-| 依据文件 | 文件修改时间 | 用途 |
-|---|---|---|
-| `server/src/routes/mod.rs` | 2026-11-03 14:09 | 路由注册、公开路径、全局中间件 |
-| `server/src/routes/sources.rs` | 2026-11-03 09:10 | 书源接口、书源更新检查 |
-| `server/src/routes/books.rs` | 2026-11-03 14:43 | 搜索/两段式搜索 job（`q`/`key` 别名、`source_ids` 过滤/淘汰修复）/发现/详情/目录/目录批量/正文/书内搜索/整本缓存/缓存清理/换源 |
-| `server/src/routes/export.rs` | 2026-11-03 14:08 | 导出信息与 TXT 流式导出 |
-| `server/src/main.rs`、`server/src/config.rs` | 2026-11-03 14:43 | `BORANLIB_WEB_DIR`（兼容 `LEGADO_WEB_DIR`）静态资源目录、环境变量默认值 |
-| `server/src/routes/bookshelf.rs` | 2026-11-03 10:48 | 书架/分组/批量操作/进度 |
-| `server/src/routes/bookmarks.rs` | 2026-11-03 09:35 | 书签 CRUD |
-| `server/src/routes/replace.rs` | 2026-11-03 11:00 | 替换规则 CRUD、导入/导出/预览、设置 |
-| `server/src/routes/stats.rs` | 2026-11-03 08:37 | 阅读统计 |
-| `server/src/routes/health.rs` | 2026-11-02 19:15 | 健康检查（未跟踪） |
-| `server/src/auth.rs` | 2026-11-03 10:49 | 注册/登录/改密/管理员用户管理/JWT/令牌版本 |
-| `server/src/entities.rs` | 2026-11-03 10:41 | 书源/书籍/章节（含 `update_time`/`word_count`/`volume_title`）/正文/替换规则结构 |
-| `server/src/models.rs` | 2026-11-02 19:24 | 书源列表项、书架项 |
-| `server/src/serde_util.rs` | 2026-11-02 18:42 | camelCase/snake_case 双向转换 |
-| `server/src/error.rs` | 2026-11-02 17:11 | 统一错误体与状态码（含 504 `Timeout`） |
-| `server/src/web_book.rs` | 2026-11-03 09:07 | 抓取/解析/去重/排序/聚合行为、模板变量、目录多页、分卷行 URL |
-| `server/src/rule_engine.rs` | 2026-11-03 13:19 | 规则引擎、`@js` 内置与 DOM 桥、`##` 替换 |
-| `server/src/config.rs`、`server/src/req.rs` | 2026-11-03 13:07 | 环境变量默认值、出站 HTTP 并发与搜索预算 |
-| `server/migrations/shared/*`、`migrations/user/*` | 2026-11-02 19:00 ~ 2026-11-03 09:25 | 两张库的表结构；`user/0004_bookmarks_settings.sql` 新增书签表与 `page_width`/`font_family` 默认值 |
-| `server/web/src/lib/api.js` | 工作区已改 | 前端现有调用方式（仅作交叉参考） |
-
-**重要提醒**：代码可能正在被其他 agent 修改。若接口与本文不一致，以重新读取源码后的结果为准，并及时更新本文。
-
-**20:05 复核记录（2026-11-02）**：`books.rs` 于 19:55 更新，`/api/search` 与 `/api/search/aggregate` 已共用 `aggregated()`（各源只抓第 1 页 + 本地切片 + 60s 缓存）。本文 2.3、5.1、14#8 已同步修订；原先的“双重分页不可靠”结论作废。
-
-**09:20 复核记录（2026-11-03）**：按最新磁盘源码补齐 4 个新接口，并更新 5 处既有行为（`@js` 抛错、模板与目录多页、`##` 捕获组、分组字段、统计 `days`），接口总数由 39 增至 **43**。
-
-| 变更 | 落点 | 验证状态 |
-|---|---|---|
-| 新增 `GET /api/replace-rules/export` | 8.3 | **已验证**（回归 B4：非空导出、camelCase、无本地 id、`?id` 单条/404） |
-| 新增 `POST /api/replace-rules/import` | 8.4 | **已验证**（回归 B4：非空导入 `inserted=1`、非法结构 400） |
-| 新增 `POST /api/replace-rules/preview` | 8.5 | **已验证**（回归 B4：替换/坏正则/私网拒绝）；5 MiB/15s 预算未验证 |
-| 新增 `POST /api/sources/check-updates` | 4.9 | **已验证**（回归 B5：四类差异各 1、只读、空数组） |
-| `@js` 未支持内置改为抛错 | 2.7、6.4 | 未验证（无单测） |
-| 搜索/目录模板支持 `${page}`/`${key}`；`nextTocUrl` 多页 | 2.7、5.1 | 仅单测（`${page}`、多页链接）；`${key}` 未验证 |
-| `##正则##` 支持 `$1` | 2.7、8.7 | 仅单测 |
-| 分组 `cover`/`show` 局部更新 | 7.7 | 仅单测（COALESCE） |
-| `GET /api/stats/overview` 的 `days` 语义 | 10.2 | 仅单测（两条 SQL） |
-
-> 09:20 表中 #40~#43（export/import/preview/check-updates）已在下方 **11:08 回归（`report-20261103-1108.md`）**中验证到 HTTP 层，状态以回归记录为准。
-
-**11:00 复核记录（2026-11-03，第二轮）**：补齐 11 个已注册但文档缺失的接口，并修订账号鉴权、目录字段、设置校验等既有条目。接口总数由 43 增至 **54**（不含 `/k/*` 的 8 个 HTML 路由）。
-
-| 变更 | 落点 | 验证状态 |
-|---|---|---|
-| 新增 `POST /api/auth/password` | 3.3 | **已验证**（回归 7/7：成功改密、`relogin_required=true`、旧 token 401、旧密码 401、新密码 200、错误旧密码/过短 400） |
-| 新增 `GET /api/admin/users` | 3.4 | **已验证**（回归 7/7：4 个账号、普通用户 403） |
-| 新增 `POST /api/admin/users/status` | 3.5 | **已验证**（回归 7/7：禁用后旧 JWT 401、启用后旧 JWT 仍 401、重新登录成功、禁自己 400）；最后管理员保护仅单测 |
-| JWT 增加 `ver`，禁用/改密后旧令牌立即失效 | 1.2、3.2 | **已验证**（回归 B8：禁用/启用/改密后旧 JWT 立即 401，旧密码失效、新密码可登录） |
-| 新增 `POST /api/book/toc/batch` | 6.3 | **已验证**（回归 3/3：成功抓取、混合批 `updated=2 skipped=2`、失败隔离、别名）；并发 3 未被直接观测 |
-| `GET /api/book/toc` 新增 `update_time`/`word_count`/`volume_title`，`is_volume`/`is_vip` 有真实值 | 6.2 | **已验证**（HTTP + 回归：200 响应含三字段）；分卷行真实数据渲染仅单测 |
-| 分卷行 URL `volume:<book_url>#<index>` 禁止抓正文 | 6.2、6.4 | 仅单测（URL 生成）；**无 HTTP 证据** |
-| 新增书签 `GET/POST /api/bookmarks`、`DELETE /api/bookmarks/delete` | 6.6 | **已验证**（回归 6/6：字段、`position` 0/1 放行与 1.5/-0.1 400、2001 字 400、按书 3 条、`deleted=1`、`id=0` 400） |
-| 新增 `GET /api/book/search` | 6.7 | **已验证**（回归 6/6：命中 2 章、`complete` 两种状态、参数校验、`limit` clamp）；**504 未触发** |
-| 新增 `POST /api/book/cache-all` | 6.8 | **已验证**（回归 4/4：逐章失败隔离、`limited` 截断、无目录/空 url 400） |
-| 新增 `POST /api/book/cache/clear` | 6.9 | **已验证**（回归 4/4：按书 `deleted>=3`、用户级 `scope=user` + `bytes_freed`） |
-| 新增 `POST /api/bookshelf/batch` | 7.11 | **已验证**（回归 4/4：`set_group updated=2 failed=1`、`remove_group`/`remove`、非法 action/空 ids 400） |
-| 设置新增 `page_width`/`font_family`，并改为全字段校验 | 9.1、9.2 | **已验证**（回归 4/4：默认值、`640/mono` 写入读回、300/2100/`comic` 400 不覆盖、320/2000 与枚举） |
-
-**11:08 冒烟 + 回归复核（2026-11-03）**：证据来源 **`<local-tools>\tests\report-20261103-1108.md`**，被测二进制与 `:3000` 一致（**9,224,704 B / mtime 2026-11-03 11:08:53 / sha256 `F24B000C…`**）。总结果：旧用例 **75/75**、新接口 **46/46**、`/k` **10/10**，零失败。
-
-| 接口 / 行为 | 回归证据 | 仍缺证据 |
-|---|---|---|
-| 书签 GET/POST/过滤/DELETE | 6/6：完整字段、`position=0/1` 放行、`1.5/-0.1` 400、2001 字/空 `book_id`/负章节 400、按书 3 条、`deleted=1`、`id=0` 400 | 同章多条（无唯一约束） |
-| `GET /api/book/search` | 6/6：4 章缓存 3 章、命中 2 章、`complete=false/true` 两态、空 `q`/201 字 400、`limit=999`→50 | **超时 504 未触发**（实测 200 / 1 ms） |
-| `POST /api/book/cache-all` | 4/4：`limited=true attempted=2 cached=2`、逐章失败隔离（`cached=3 failed=1`）、无目录/空 `book_url` 400 | — |
-| `POST /api/book/cache/clear` | 4/4：按书 `deleted>=3`、用户级 `scope=user` + `bytes_freed` | — |
-| 规则包 export/import/preview | 8/8：非空导出（camelCase、无本地 id）、`?id` 单条/404、`inserted=1` 可回读、坏正则 200+`invalid_regex`、私网 400、非法结构 400 | 5 MiB / 15 s 预算分支 |
-| `POST /api/sources/check-updates` | 4/4：四类差异各 1（`updated=1 local_newer=1 same=1 new=1`）、只读、空数组 | — |
-| `POST /api/bookshelf/batch` | 4/4：`set_group updated=2 failed=1`、`remove_group`/`remove`、非法 action/空 ids 400 | — |
-| `POST /api/book/toc/batch` | 3/3：混合批 `updated=2 skipped=2`（重复+缺源）、单本失败隔离、空列表 400、`book_ids` 别名 | **并发 3 未被直接观测** |
-| `GET /api/admin/users` / `POST .../status` | 7/7：4 账号、普通用户 403、禁用后旧 JWT 401、启用后旧 JWT 仍 401、重新登录成功、禁自己 400 | 最后管理员保护（未见单独用例） |
-| `POST /api/auth/password` | 7/7：成功改密 `relogin_required=true`、旧 token 401、旧密码 401、新密码 200、旧密码错/新密码过短 400 | — |
-| `GET /api/book/toc` | 200 响应含 `update_time`/`word_count`/`volume_title` | **分卷行真实数据渲染**、`volume:` URL 抓正文被拒 |
-| `/k/*` | 10/10：登录发 `k_session`、错误密码 303、未登录登录页、书架/目录页、正文 `?fs=1/2/3` → 28/32/38px | — |
-
-> 本文所有“仅单测”均指 `server/src/**` 内 `#[cfg(test)]` 已覆盖对应函数；除非条目明确写“已验证（HTTP 冒烟/回归…）”，否则**没有** HTTP 级联调证据。未列出的新行为一律按“未验证”对待。
-
-**14:16 复核记录（2026-11-03，第三轮）**：补齐两段式聚合搜索接口，并同步 `@js`/DOM 桥行为与环境变量默认值。接口总数由 54 增至 **56**（不含 `/k/*` 的 8 个 HTML 路由）。
-
-| 变更 | 落点 | 验证状态 |
-|---|---|---|
-| 新增 `GET /api/search/start` | 5.5 | **已验证**（HTTP 实测 `:3000`：200 字段齐全、空/缺 `key` 400） |
-| 新增 `GET /api/search/result` | 5.6 | **已验证**（HTTP 实测 `:3000`：中间态 `done=false`+`has_more=true`、终态 `done=true`、分页 clamp、`page=99` 空页、伪造/过期 job 404） |
-| job 60s TTL | 5.5、5.6 | **已验证**（HTTP：70s 后 404）。当时的“最多 8 个”与淘汰顺序 bug 均已被后来的 32/64 上限取代，见 5.5 正文 |
-| 单源 200 本、总结果 400 本上限 | 5.5 | 源码级，未直接触发截断 |
-| `@js:` 返回数组改为 JSON 字符串 | 2.7 | 仅单测（`rule_engine.rs` 用例） |
-| DOM 桥 `getElements/getString/getStringList` 仅字面量选择器；输入 1 MiB / 节点 2000 / 抽取 1 MiB；JS 3000ms 预算 | 2.7、6.4 | 字面量选择器与 DOM 桥**仅单测**；三个上限与 3000ms 超预算为**源码级，未验证** |
-| `HTTP_CONCURRENCY` 默认 16（1..16）、`SEARCH_TIMEOUT_SECS` 8（5..30）、`SEARCH_ALL_TIMEOUT_SECS` 8（5..30）、`SEARCH_CURATED_BUDGET_SECS` 6 / `SEARCH_ALL_BUDGET_SECS` 40（2..60） | 15.4 | `HTTP_CONCURRENCY` 源码级；预算经 `/healthz` 的 `search` 块与 `deadline_ms`/`total_budget_ms` **HTTP 实测**（2026-11-04 扫参） |
-
-> 本轮 HTTP 证据来自 `:3000` 上运行的工程侧旧构建名 `legado-server.exe`（对外发布名 `boranlib.exe`；**9,259,520 B / mtime 2026-11-03 13:32:29**），与上一轮 11:08 回归二进制不同。`books.rs` 磁盘 mtime 为 14:06（晚于被测二进制）；两段式搜索的字段与行为按磁盘源码核对，若后续源码改动与实测不一致，以重新构建后的结果为准。
-
-**15:01 复核记录（2026-11-03，第四轮）**：后端已上线新二进制 **9,315,840 B / mtime 2026-11-03 14:46:58 / sha256 `B498BB42…`**（`cargo test` **99 项通过**）。接口总数由 56 增至 **58**（不含 `/k/*` 的 8 个 HTML 路由）。
-
-| 变更 | 落点 | 验证状态 |
-|---|---|---|
-| 新增 `GET /api/book/export/info` | 6.10 | **已验证**（HTTP `:3000`：72 章样本 `total=72/cached=5/missing=67`；缺参/空参/无目录 400） |
-| 新增 `GET /api/book/export/txt` | 6.11 | **已验证**（HTTP `:3000`：`text/plain` 附件 + 5 个 `x-*` 头；头部/占位块/页脚齐全；72 章样本 78,718 B / 15 ms）。性能验收样本为 34,586 B / 17 ms；常驻内存 18.4→18.4 MB 见下 |
-| `search/start` 支持 `q`/`key` 别名与 `source_ids` 过滤，响应新增三字段 | 5.5、12.2#55 | **已验证**（HTTP：`q` 可用；`source_ids=1,999,abc` → `requested=[1,999,abc]`、`ignored=[999,abc]`、`warning` 非空、`source_total=1`；全无效 → `source_total=0` 且 `done=true`）；`key` 优先于 `q` 为**源码级** |
-| 修复 job 淘汰顺序：超过 8 个时淘汰 `elapsed` **最大**的最旧任务 | 5.5 | **已验证**（HTTP：连开 9 个 → 第 1 个 404，第 2~9 个 200；2026-11-03 15:00 上线）。**该结论已被当前 32/64 上限取代**，见 5.5 正文 |
-| `BORANLIB_WEB_DIR` / `LEGADO_WEB_DIR` 静态资源目录（默认 `web/dist`；`:3000` 设为 `<repo>/server/web/dist`） | 11.4、15.4 | **已验证**（HTTP：`/` 200、`/assets/*` 200、`/k/login` 200；`/k` 带会话 200、无会话 303 → `/k/login`） |
-| 单源 200 / 总 400 截断 | 5.5 | **未验证**：未真实触发截断 |
-| `is_pay=true` 章节 | 6.10、6.11 | **仅单测**：导出不做付费过滤，真实付费样本链路未验证 |
-| 超大书导出压力样本 | 6.11 | **未验证**：本轮仅 72 章；未做 10k+ 章/大文件压力 |
-
-> 本轮 `:3000` 证据与上面第三轮记录的 13:32 二进制不是同一构建；第四轮条目以 **14:46:58 新二进制** 为准。
-
-### 第五轮（全景校准，2026-11-04 20:10）
-
-- 本轮只在 **隔离数据目录 + 端口 `3061`** 上实测（复制 `server/data`，未触碰 `:3000/:3500` / OpenStick）；测试完成即关闭，`cargo test`（默认线程）**186 passed / 0 failed**。
-- 新增 **5 个接口**（健康巡检 3 个 + `prune` + `quarantine`），接口总数 **58 → 63**；书源类 **9 → 14**。
-- 关键口径：健康状态主键是 `bookSourceUrl`（不是域名）；只有“源站不可达”（连接失败/超时/4xx/5xx）计入连续失败，**规则引擎失败（`FAIL_ENGINE`）不冷却、不进隔离区**。
-- 已实测：3 个站点级死源连续 3 次失败后写 `cooldown_until`；默认搜索 `skipped_cooldown=2`、`source_total=2`、0 错误、1.24s；`include_cooled=1` 时 `source_total=4`、耗时 2.47s、多出 26 本书，证明冷却源确实被跳过/按需放行；`FAIL_ENGINE` 源连续 3 次 `partial` 后 `consecutive_failures` 仍为 0。
-- 导入账本：`boranlib-sources.json`（107 条）首次 `added=23 / unchanged=84 / distinct_hosts=74`；同合集二次导入 `collection_unchanged=true`、`probed=0`、`unchanged=107`；手工隔离后再导入 `resurrected=1`；三态实测 `update_rejected=1` / `conflict=1` 均保留本地版本。
-
----
 
 ## 目录
 
@@ -150,9 +24,7 @@
 10. [阅读统计](#10-阅读统计)
 11. [健康检查/其他](#11-健康检查其他)
 12. [接口总表与覆盖统计](#12-接口总表与覆盖统计)
-13. [待实现接口（草案；已落地条目标注“已实现”）](#13-待实现接口草案已落地条目标注已实现)
-14. [待确认清单](#14-待确认清单)
-15. [附录：错误状态码与前端处理建议](#15-附录错误状态码与前端处理建议)
+13. [附录：错误状态码与前端处理建议](#13-附录错误状态码与前端处理建议)
 
 ---
 
@@ -249,7 +121,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 前端必须遵守：
 
 - 用 `toc[index]` 定位章节；保存时传该数组下标。
-- 目录刷新后若章节顺序变化，`chapter_index` 可能指向不同章节（服务端没有按 URL 校正的逻辑）。前端宜同时保存章节 URL（目前契约未提供进度 URL 字段，见 13.1）。
+- 目录刷新后若章节顺序变化，`chapter_index` 可能指向不同章节（服务端没有按 URL 校正的逻辑）。前端宜同时保存章节 URL（目前契约未提供进度 URL 字段，已记入 TODO）。
 - `percent` / `reading_progress` = `(chapter_index + clamp(position, 0, 1)) / total_chapters * 100`，**包含章内比例**，钳制在 `0..100`。
 
 ### 2.3 分页语义
@@ -294,7 +166,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `reading_stats.day`、`reading_streak.last_day`、统计接口的 `day` | `"YYYY-MM-DD"` | **服务器本地日期**（`chrono::Local` / `date('now','localtime')`） | [stats.rs](../server/src/routes/stats.rs#L44-L50)，[bookshelf.rs](../server/src/routes/bookshelf.rs#L199-L210) |
 | `reading_streak` 对外字段 | 整数天数（`streak_days`/`longest_streak_days`） | — | 同上 |
 | JWT `exp` | Unix 秒 | UTC | [auth.rs](../server/src/auth.rs#L121-L134) |
-| `Book.latest_chapter_time`、`BookChapter.start/end` | `i64` | 语义未定义/当前恒 0 | [entities.rs](../server/src/entities.rs#L255-L273) |
+| `Book.latest_chapter_time`、`BookChapter.start/end` | `i64` | 语义未定义/当前恒 0 | [entities.rs](../server/crates/rule-core/src/entities.rs#L255-L273) |
 | `SearchBook.time` | `String?`（当前不填充，恒 `null`） | — | [web_book.rs](../server/src/web_book.rs#L117-L129) |
 
 前端必须遵守：
@@ -302,7 +174,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 形如 `2026-11-02 11:34:36` 的字符串是 **UTC**，解析时补 `Z`（或 `+00:00`）再转本地，否则会差 8 小时。
 - 形如 `2026-11-02` 的 `day` 是**服务器本地日期**，不应再做时区换算。
 - `updated_at` 等字段可能为 `null`（例如从未阅读）。
-- 服务器本地时区由部署环境决定（当前设备为 `Asia/Shanghai`）；跨时区部署时 `day` 与 UTC 时间戳会不一致，见 14 节“待确认”。
+- 服务器本地时区由部署环境决定（当前设备为 `Asia/Shanghai`）；跨时区部署时 `day` 与 UTC 时间戳会不一致，已记入 TODO。
 
 ### 2.6 `bookshelf` / `reading_progress` / `book_meta` 的一致性
 
@@ -324,7 +196,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `checkKeyWord` → `check_key_word`
   - 已经是 snake_case 的键保持不变。
 - 已知边界：连续大写缩写会被拆开（`URL` → `u_r_l`），因此**导入时请使用 Legado 的标准拼写**（`bookSourceUrl`，而不是 `bookSourceURL`）。
-- 数字字段允许字符串：`string_or_i64` 接受 `"30"`/`30`；布尔字段允许 `"true"`/`"false"`/`"1"`/`"0"`（[serde_util.rs](../server/src/serde_util.rs#L8-L35)）。
+- 数字字段允许字符串：`string_or_i64` 接受 `"30"`/`30`；布尔字段允许 `"true"`/`"false"`/`"1"`/`"0"`（[serde_util.rs](../server/crates/rule-core/src/serde_util.rs#L8-L35)）。
 
 **导出方向（snake_case → camelCase）**
 
@@ -356,15 +228,15 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 目录地址本身可以是模板：`.../toc_{{page}}.html` 或 `.../toc_${page}.html`，首屏固定代入 `page=1`；目录规则内也可用当前页号（[web_book.rs](../server/src/web_book.rs#L251-L279)）。**验证状态：仅单测（`${page}`）；`${key}` 未验证。**
 - 目录支持 `nextTocUrl` 翻页，**最多抓 10 页**，按 URL 去重防循环；`nextTocUrl` 为字面 URL/`{{page}}`/`${page}` 模板时按“下一页页码”代入；为 CSS/JSON 等规则时先按列表规则取**全部**匹配值（多页目录可一次给出），复合规则（`&&`/`||`/`##`/`@js:`）退回单值（[web_book.rs](../server/src/web_book.rs#L211-L248)、[web_book.rs](../server/src/web_book.rs#L259-L311)）。**验证状态：仅单测（多页链接与 10 页上限）。**
 - 正文支持 `nextContentUrl` 拼接，最多 10 页；`sourceRegex` 先于 `replaceRegex`，按 `正则##替换` 或 `/pat/repl/` 执行（[web_book.rs](../server/src/web_book.rs#L245-L292)、[web_book.rs](../server/src/web_book.rs#L473-L505)）。
-- `##正则##替换` 的替换串支持 Rust regex 风格的捕获组引用 `$1`、`$2`…（[rule_engine.rs](../server/src/rule_engine.rs#L521-L546)、[rule_engine.rs](../server/src/rule_engine.rs#L1447-L1458)）。**验证状态：仅单测。**
-- **`@js:` 的返回值**：表达式结果为数组时，统一用 `JSON.stringify` 序列化为 JSON 字符串（不再用逗号拼接）。当该规则被当作**列表规则**（`get_string_list`）消费时，会按书源章节语义展开：`string[]` → 逐项；`[{text/name/title,href/url}]` 对象数组 → 每项保留为紧凑 JSON（后续 `chapterName`/`chapterUrl` 等裸字段规则按键取值，别名 `text/name/title`、`href/url/src`）；`[[title,url]]` 二元数组（含嵌套层）→ 规范化为带别名对象；`[{header,list:[...]}]` 分卷结构 → 生成一条分卷头（`volume=true`）+ 递归子项；`null`/空串/缺字段项跳过并记一条 `tracing::warn`（含跳过计数）。漫画图片列表（`keep_objects=false`）取 `src/url/href`。单值规则拿到的仍是 JSON 字符串本身（例如 `["a","b"]`）（[rule_engine.rs](../server/src/rule_engine.rs)）。**验证状态：单测 5 例（对象/二元嵌套/分卷/空项/列表数组 result）+ 真实站点（中文万维目录 1→30、开心漫画 1→60、武道文学 0→1665，见 `docs/ENGINE_ALIGN_20261105.md`）。**
+- `##正则##替换` 的替换串支持 Rust regex 风格的捕获组引用 `$1`、`$2`…（[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs#L521-L546)、[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs#L1447-L1458)）。**验证状态：仅单测。**
+- **`@js:` 的返回值**：表达式结果为数组时，统一用 `JSON.stringify` 序列化为 JSON 字符串（不再用逗号拼接）。当该规则被当作**列表规则**（`get_string_list`）消费时，会按书源章节语义展开：`string[]` → 逐项；`[{text/name/title,href/url}]` 对象数组 → 每项保留为紧凑 JSON（后续 `chapterName`/`chapterUrl` 等裸字段规则按键取值，别名 `text/name/title`、`href/url/src`）；`[[title,url]]` 二元数组（含嵌套层）→ 规范化为带别名对象；`[{header,list:[...]}]` 分卷结构 → 生成一条分卷头（`volume=true`）+ 递归子项；`null`/空串/缺字段项跳过并记一条 `tracing::warn`（含跳过计数）。漫画图片列表（`keep_objects=false`）取 `src/url/href`。单值规则拿到的仍是 JSON 字符串本身（例如 `["a","b"]`）（[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs)）。**验证状态：单测 5 例（对象/二元嵌套/分卷/空项/列表数组 result）+ 真实站点（中文万维目录 1→30、开心漫画 1→60、武道文学 0→1665，见 `docs/ENGINE_ALIGN_20261105.md`）。**
 - **规则级变量链 `@put:{key:表达式}` / `@get:{key}`（书源规则语义约定）**：`@put` 在规则任意位置执行，写入**单次规则求值**的变量字典；`@get` 读出（支持 `@get:key` 与 `@get:{key}`），取不到返回**空串**；可链式（前一条写入的键被后续规则/后续片段读回）。作用域是**单次规则求值实例（一次抓取请求）**：详情/目录/正文各请求互不泄漏；`java.put`/`book.putVariable` 与 `@put` 共用同一变量表，并通过尾部 sentinel 回传 Rust（同书变量可落库）。无全局表，并发请求互不影响。**验证状态：单测 4 例（链式、取空、并发隔离、与 JSONPath/`@js` 组合）+ 真实站点（小说下载网/手机小说下载网目录 0→101/89）。**
 - **`@js:` / `<js>` 段内 `{{表达式}}` 先展开**：与书源规则约定一致，`{{ }}` 属规则级模板，**先于 JS 求值**展开；展开结果按上下文拼接进源码——位于字符串字面量内时转义引号/反斜杠/换行（模板串额外转义 `\${`），否则原样拼接；展开失败记 `tracing::warn` 并保留原文（不静默清空）。**验证状态：单测 3 例（展开后语法合法、引号转义、失败保留原文）；真实站点无可归因证据。**
-- **`cookie` JS 全局（书源规则最小面）**：`cookie.getCookie(url)` → `name=value; ...`（无值空串）；`cookie.setCookie(url, value)`（`value` 支持 `a=b; c=d` 多段）、`cookie.removeCookie(url|domain)`、`cookie.clear()` → 均返回空串，可直接拼进 `{{ }}` 模板 URL。底层复用 `req.rs` 的按源 Cookie 桶（`source:<bookSourceUrl>`，与抓取请求共享；无源键时退化为 host 桶），**仅进程内、不持久化到库**；不同源各自成桶，并发不串味。注意 `java.getCookie`/`java.setCookie` 仍是另一套 API，继续显式抛未实现（[req.rs](../server/src/req.rs)、[rule_engine.rs](../server/src/rule_engine.rs)）。**验证状态：单测 4 例（取无值、设置后取、删除后取、并发两源隔离）；真实站点无可归因证据。**
-- **DOM 桥（Phase 1）**：`java.getElements`、`java.getString`、`java.getStringList` 已支持，但**只接受字符串字面量选择器**（`"..."`/`'...'`），不能是变量或动态拼接；动态选择器仍抛 `UNSUPPORTED_JS_API:...（仅支持字面量选择器参数）`。桥在 Rust 侧对**当前页 HTML**（传入规则求值的 `input`）预抽取，JS 内只做查表；`getElements`/`getStringList` 返回匹配元素的 **HTML 字符串数组**，`getString` 返回首个匹配的抽取结果（[rule_engine.rs](../server/src/rule_engine.rs#L816-L865)）。上限：页面 HTML > **1 MiB** 不做预抽取（调用会抛错）；每个列表截断到 **2000** 个节点；所有选择器累计抽取文本 > **1 MiB** 时停止继续预抽取；选择器自身含 `@js:`/`<js>` 的跳过。**验证状态：字面量选择器与 DOM 桥仅单测；上述三个上限为源码级，未验证。**
+- **`cookie` JS 全局（书源规则最小面）**：`cookie.getCookie(url)` → `name=value; ...`（无值空串）；`cookie.setCookie(url, value)`（`value` 支持 `a=b; c=d` 多段）、`cookie.removeCookie(url|domain)`、`cookie.clear()` → 均返回空串，可直接拼进 `{{ }}` 模板 URL。底层复用 `req.rs` 的按源 Cookie 桶（`source:<bookSourceUrl>`，与抓取请求共享；无源键时退化为 host 桶），**仅进程内、不持久化到库**；不同源各自成桶，并发不串味。注意 `java.getCookie`/`java.setCookie` 仍是另一套 API，继续显式抛未实现（[req.rs](../server/crates/rule-core/src/req.rs)、[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs)）。**验证状态：单测 4 例（取无值、设置后取、删除后取、并发两源隔离）；真实站点无可归因证据。**
+- **DOM 桥（Phase 1）**：`java.getElements`、`java.getString`、`java.getStringList` 已支持，但**只接受字符串字面量选择器**（`"..."`/`'...'`），不能是变量或动态拼接；动态选择器仍抛 `UNSUPPORTED_JS_API:...（仅支持字面量选择器参数）`。桥在 Rust 侧对**当前页 HTML**（传入规则求值的 `input`）预抽取，JS 内只做查表；`getElements`/`getStringList` 返回匹配元素的 **HTML 字符串数组**，`getString` 返回首个匹配的抽取结果（[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs#L816-L865)）。上限：页面 HTML > **1 MiB** 不做预抽取（调用会抛错）；每个列表截断到 **2000** 个节点；所有选择器累计抽取文本 > **1 MiB** 时停止继续预抽取；选择器自身含 `@js:`/`<js>` 的跳过。**验证状态：字面量选择器与 DOM 桥仅单测；上述三个上限为源码级，未验证。**
 - **`org.jsoup` 桥（新增）**：JS 里可直接用 `org.jsoup.Jsoup.parse(html[, baseUri])` 得到文档对象，再 `select`/`selectFirst`/`get`/`eq`/`first`/`last`/`size`/`attr`/`hasAttr`/`text`/`html`/`outerHtml`/`is`/`parent`/`nextSiblingElements` 等；`Elements` 支持数字下标、`length` 与 `for…in`（只枚举下标）。`attr("abs:href")` 等 `abs:` 前缀按 `baseUri` 解析。选择器用 `scraper`（html5ever）后端，**jsoup 专有伪类**（`:contains`/`:containsOwn`/`:matches`/`:matchesOwn`/`:eq(`/`:lt(`/`:gt(`/`:nth(`）显式抛 `UNSUPPORTED_JS_API`，不静默返回空。147 源实际调用面只有 `parse`+`select`+索引/`attr`/`text`/`html`，覆盖面无缺口。**验证状态：仅单测（5 例）；未做真实站点逐源验证。**
 - **剩余 `java.*`（新增）**：`aesBase64DecodeToString`、`createSymmetricCrypto`（AES/CBC + PKCS5/7/NoPadding；key 支持字符串/字节数组；ECB 显式报错）、`bytesToStr`、`timeFormatUTC(t,format,offsetHours)`、`getElement(selector)`（基于当前页）、`refreshTocUrl()`（等价 `book.tocUrl` 变更标记，随后重取详情页更新目录）。**验证状态：全部仅单测；哔哩漫画 `image_decode` 链路（`base64Decode`+`createSymmetricCrypto`+`bytesToStr`+`Buffer.concat`）有单测，但真机仍被 jsLib/`Reload` 卡住。**
-- `@js:` 中依赖网络/Cookie/WebView 的 Legado 内置**仍抛错**：`java.ajax`、`java.post`、`java.connect`、`java.getCookie`、`java.setCookie`、`java.webView`、`java.webViewGetSource`、`java.webViewGetOverrideUrl`（[rule_engine.rs](../server/src/rule_engine.rs#L366-L397)）。**字段级容错**：书源解析中任一字段规则抛错 → 该字段按空值处理、记 `tracing::warn` 与规则异常台账，**不再整源失败**；`/api/search` 仍静默丢弃“最终解析为空”的源，`/api/search/aggregate`/`result` 仅在网络/空解析时放 `errors[]`。**验证状态：字段级容错有单测；HTTP 级行为经 147 源运行时探测（见 `docs/ENGINE_ALIGN_20261105.md`）。**
+- `@js:` 中依赖网络/Cookie/WebView 的 Legado 内置**仍抛错**：`java.ajax`、`java.post`、`java.connect`、`java.getCookie`、`java.setCookie`、`java.webView`、`java.webViewGetSource`、`java.webViewGetOverrideUrl`（[rule_engine.rs](../server/crates/rule-core/src/rule_engine.rs#L366-L397)）。**字段级容错**：书源解析中任一字段规则抛错 → 该字段按空值处理、记 `tracing::warn` 与规则异常台账，**不再整源失败**；`/api/search` 仍静默丢弃“最终解析为空”的源，`/api/search/aggregate`/`result` 仅在网络/空解析时放 `errors[]`。**验证状态：字段级容错有单测；HTTP 级行为经 147 源运行时探测（见 `docs/ENGINE_ALIGN_20261105.md`）。**
 - **JS 时间预算**：默认 **3000ms**（`JS_TIMEOUT_MS`，可配 20..5000）。预算是在脚本执行**结束后**按墙钟耗时判定，超过则规则失败并返回 `js eval exceeded Nms budget (took Xms)`；不是抢占式中断，脚本仍可能先跑完。默认值由 200ms 放宽到 3000ms：慢设备上腾讯漫画正文图片规则单次约 1.4s，200ms 会把整章图片判超时（0 张）；常见规则仍为毫秒级，不受影响。**验证状态：默认值与超时语义有单测；耗时分布见 v0.3.8 实测。**
 - `ruleBookInfo.init` 的结果现在参与编排：可改写 `book.bookUrl`（返回给 Rust 侧），目录更新时也用它作为 `preUpdateJs` 的输入（[web_book.rs](../server/src/web_book.rs#L175-L177)）。
 - `ruleContent.imageDecode` 与 `ruleToc.preUpdateJs`/`formatJs` 状态：`imageDecode` 已接入图片代理（有 `imageDecode` 的源先整图缓冲解密再直出，失败回退原图并记异常）；`preUpdateJs` 已在目录抓取前执行，`refreshTocUrl()`/bookUrl 变化会触发重取详情页刷新目录；`formatJs`、`imageStyle`、`payAction` 与登录相关规则仍未接入。
@@ -403,7 +275,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 行为：
   - 新用户 `role = "user"`；注册成功直接返回 token（不要求再登录）。
   - 首次访问任何需登录接口时，按 `sub` 自动创建 `users/{id}.db` 并跑用户库迁移（[auth.rs](../server/src/auth.rs#L56-L96)）。
-  - 不存在的 `/api/auth/me`、`logout`、`refresh` 仍未实现（见 13.11）；自助改密已实现，见 3.3。
+  - 不存在的 `/api/auth/me`、`logout`、`refresh` 仍未实现（已记入 TODO）；自助改密已实现，见 3.3。
 
 ### 3.2 `POST /api/auth/login`
 
@@ -522,7 +394,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - **禁用**：若目标原本 `disabled=0`，执行 `disabled=1` 且 `token_version = token_version + 1`；若已禁用则**幂等**，不再递增版本。
   - **启用**：只执行 `disabled=0`，**不**还原 `token_version`。因此被禁用前的旧 JWT 仍然 401，用户必须重新登录。
   - 禁用后目标用户的 Bearer 立即 401；`/k` Cookie 立即 303 回 `/k/login`。
-  - 不能通过本接口修改角色（没有 `role` 字段），也没有删除用户接口（见 13.11）。
+  - 不能通过本接口修改角色（没有 `role` 字段），也没有删除用户接口（已记入 TODO）。
 
 ---
 
@@ -1545,7 +1417,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：缺参 → 400 纯文本；`404 source not found`（在全部书源中找，含 disabled）；上游抓取/规则失败 → `400 internal: ...`；`401`。
 - 行为：
   - 书源没有 `ruleBookInfo` 时**不报错**，直接返回只填了 `book_url`/`origin`/`origin_name` 的对象（`web_book::book_info` 立即返回）。
-  - 成功后 upsert `book_meta`（`ON CONFLICT(book_url)` 更新解析字段），但 `can_update` 会被写成 `false`，`group` 会被写成 `null`——即**可能清空已有分组**（[books.rs](../server/src/routes/books.rs#L333-L383)、[entities.rs](../server/src/entities.rs#L221-L284)）。这是当前实际行为，见 TODO。
+  - 成功后 upsert `book_meta`（`ON CONFLICT(book_url)` 更新解析字段），但 `can_update` 会被写成 `false`，`group` 会被写成 `null`——即**可能清空已有分组**（[books.rs](../server/src/routes/books.rs#L333-L383)、[entities.rs](../server/crates/rule-core/src/entities.rs#L221-L284)）。这是当前实际行为，见 TODO。
   - `POST /api/bookshelf` 之后调本接口可覆盖书架展示数据；前端若先加书架再取详情，注意分组可能丢失。
 
 ### 6.2 `GET /api/book/toc`
@@ -1625,7 +1497,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 - 错误：缺参 → 400 纯文本；`404 source not found`（仅缓存未命中时才会加载书源）；`400 internal: ...`（目录抓取/解析失败）；`401`。
 - 行为：
   - **缓存优先**：只要该 `book_url` 在 `library_chapters` 中有任意一行 `updated_at >= now - TOC_TTL_SECS`，**或该书 `tier=collection`（馆藏目录不按 TTL 过期）**，就直接返回全部缓存行，**不再访问网络，也忽略 `source` 参数**（[books_info.rs](../server/src/routes/books_info.rs)）。
-  - TTL 来自 `BORANLIB_TOC_TTL_SECS`（兼容旧前缀 `LEGADO_TOC_TTL_SECS`），默认 21600 秒（6 小时），启动时钳制到 60..604800（[config.rs](../server/src/config.rs#L40-L62)）。
+  - TTL 来自 `BORANLIB_TOC_TTL_SECS`（兼容旧前缀 `LEGADO_TOC_TTL_SECS`），默认 21600 秒（6 小时），启动时钳制到 60..604800（[config.rs](../server/crates/rule-core/src/config.rs#L40-L62)）。
   - 未命中：读取 `library_books.toc_url`（若有）作为目录页，解析 `ruleToc`；支持 `nextTocUrl`，最多 10 页。
   - **回源失败兜底**：抓取失败但库中仍有旧目录时，直接返回旧目录并记 warning；完全无缓存才把原错误返回前端。
   - 落库策略：在单事务内先 `DELETE FROM library_chapters WHERE book_url=?` 再逐条插入（整本替换），失败不会留下半份目录。若解析结果为 0 章，会保存 0 行，下次仍会重新抓取。
@@ -2785,7 +2657,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
   - 排序：`COALESCE(reading_progress.updated_at, bookshelf.added_at) DESC`（最近读/最近加在前），**没有置顶、没有自定义排序**（[bookshelf.rs](../server/src/routes/bookshelf.rs#L76-L103)）。
   - 分组筛选用 `COALESCE(bs.group, bm.group) = ?`，因此只在 `book_meta` 上设置了分组的书也能按该分组命中。
   - `total_chapter_num` 只有调用过 `/api/book/info` 或进度上报后才会被写入，刚加架的书通常为 0。
-  - 不返回 `can_update`、最新章节、自定义封面/简介等字段（见 13.2 提案）。
+  - 不返回 `can_update`、最新章节、自定义封面/简介等字段（已记入 TODO）。
 
 ### 7.2 `POST /api/bookshelf`
 
@@ -3713,14 +3585,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
   - K 埋点 2 个（`/api/k/metrics`、`/api/k/metrics/export`，仅管理员）
 - **另有 OPDS 1.2 路由 5 个**（`/opds`、`/opds/books`、`/opds/download/epub`、`/opds/download/cbz`、`/opds/cover`），响应为 Atom XML / 文件流，不计入上面的 JSON 接口数；鉴权为 HTTP Basic（也接受 Bearer）。
 - 计数口径：按“方法 + 路径”计；`/api/bookshelf` 的 GET/POST/DELETE 算 3 个，`/api/bookmarks` 的 GET/POST 算 2 个。
-- **确认口径**：
-  - 已在 `:3000` 上对**回归所用二进制（9,224,704 B / mtime 2026-11-03 11:08:53 / sha256 `F24B000C…`）**完成 HTTP 冒烟与回归；证据来源 `report-20261103-1108.md`：旧用例 75/75、新接口 46/46、`/k` 10/10，零失败。
-  - 当前 `:3000` 实例运行的是工程侧旧构建名的 `legado-server.exe`（对外发布名 `boranlib.exe`）：**9,315,840 B / mtime 2026-11-03 14:46:58 / sha256 `B498BB42…`**（99 项单测通过）；#55~#56 的复测与 #57~#58 的实测均基于该实例。
-  - #40~#43（export/import/preview/check-updates）与 #44~#54 的主要成功/错误路径均已验证；#55~#56（两段式搜索）已于 2026-11-03 14:0x / 15:0x 在 `:3000` 上 HTTP 实测（字段、中间态、分页 clamp、404、`source_ids`、淘汰顺序）；#57~#58（导出）已实测 `info` 与 `txt`（含文件头/占位/x-* 头）。覆盖明细见开头复核表。
-  - **#59~#63（健康巡检 / 汇总 / 重置 / prune / quarantine）已在 2026-11-04 于隔离端口 `:3061` 完成 HTTP 实测**（隔离数据目录复制自 `server/data`，未触碰 `:3000/:3500`）；覆盖连续 3 次失败进入冷却、默认搜索跳过与 `include_cooled=1` 放行、`FAIL_ENGINE` 不冷却、导入体检三态、`prune` 预览/确认、`quarantine` 与复用复活、导出排除隔离区。`cargo test` 默认线程 **186 passed / 0 failed**。
-  - **#75~#78（CBZ / EPUB 导出）为 2026-11-20 新增**：`cargo test` 与路由冒烟通过；CBZ/EPUB 的 ZIP 结构、`mimetype` 首条 store、XML 可解析性已用 Python `zipfile` + `ElementTree` 本地校验。**尚未做 HTTP 实例实测与 KPW3 真机阅读验证。**
-  - 仍无 HTTP 证据的关键项：`book/search` 超时 504（实测 200 / 1 ms 未触发）、`toc` 分卷行真实数据渲染、用 `volume:` URL 请求正文、`toc/batch` 并发 3、`admin/status` 最后管理员保护、`preview` 5 MiB / 15 s 预算、`@js` 200ms 超预算、DOM 桥上限、`search` 单源 200 / 总 400 截断、`export` 的 `is_pay=true` 真实样本与 10k+ 章压力。
-- **待确认**：`latest_chapter_time`/`start`/`end` 的数值语义、部署时区对 `day` 的影响、SQLite `disk I/O error` 根因、`Book.can_update` 默认 false 是否预期（见 14 节）。
+- 验证口径：接口是否可用以源码、`cargo test` 与路由冒烟为准；本文不记录历史回归报告。
 
 ### 12.2 全量清单
 
@@ -3812,262 +3677,9 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 
 ---
 
-## 13. 待实现接口（草案；已落地条目标注“已实现”）
+## 13. 附录：错误状态码与前端处理建议
 
-> **本节保留的接口均“尚未实现，仅提案”**，前端不可按此直接联调。少数条目已在 2026-11-03 落地（各小节单独标注“已实现”并指向正文），其余仍是提案。
-> 说明：用户举例中的“批量启停书源”“书籍分组”“阅读统计”在本次生成时**已经存在**：
-> - 批量启停：`POST /api/sources/enabled`（4.4）
-> - 分组：`GET/POST /api/bookshelf/groups`、`POST /api/bookshelf/group`（7.4/7.6/7.7）
-> - 阅读统计：`POST /api/stats/reading`、`GET /api/stats/overview`（10.1/10.2）
->
-> 因此本节只列“确实没有”的接口，并把已有能力的字段缺口写成“扩展现有接口”。每条都给出建议落库与后端改动点，方便直接拆任务。
-> 2026-11-03 更新：原 13.12“替换规则导入/导出/试跑预览”已实现并转入正文 8.3~8.5，故从本节删除。
-
-### 13.1 书架：扩展列表字段（扩展现有 `GET /api/bookshelf`，非新路由）
-
-- 状态：**尚未实现，仅提案**
-- 现状：`BookshelfItem` 只有 12 个字段（见 7.1），前端无法在书架直接显示最新章节、更新标记、自定义封面/简介、置顶顺序。
-- 建议在 `models.rs::BookshelfItem` 与 SQL 中追加（均为 `book_meta` 已有列，除 `sort_order`）：
-
-| 新字段 | 类型 | 可空 | 来源 |
-|---|---|---|---|
-| `latest_chapter_title` | string | 是 | `book_meta.latest_chapter_title` |
-| `latest_chapter_time` | integer | 否 | `book_meta.latest_chapter_time` |
-| `can_update` | boolean | 否 | `book_meta.can_update` |
-| `custom_cover_url` | string | 是 | `book_meta.custom_cover_url` |
-| `custom_intro` | string | 是 | `book_meta.custom_intro` |
-| `book_source_type` | integer | 否 | `book_meta.book_source_type` |
-| `sort_order` | integer | 否 | 需新增 `bookshelf.sort_order`（新增迁移，当前最新为 user/0004，默认 0） |
-| `is_pinned` | boolean | 否 | 可由 `sort_order < 0` 推导，或新增列 |
-
-- SQL 改动：`LEFT JOIN book_meta` 已存在，直接补 `SELECT` 列；排序改为 `is_pinned DESC, sort_order ASC, COALESCE(rp.updated_at, bs.added_at) DESC`。
-- 风险：`GET /api/book/info` 会覆盖 `book_meta` 的 `group`/`can_update`，需先修 13.2/14 中的缺陷，否则扩展字段不稳定。
-
-### 13.2 书架：自定义封面 / 标签 / 简介
-
-- 状态：**尚未实现，仅提案**
-- 建议路由：`POST /api/bookshelf/book-meta`
-- 鉴权：登录
-- 请求体：
-
-```json
-{
-  "book_id": "https://example.com/book/123",
-  "custom_cover_url": "https://cdn.example/custom.jpg",
-  "custom_tag": "在追",
-  "custom_intro": "自己写的简介",
-  "group": "默认"
-}
-```
-
-- 所有字段可选，只更新提供的项（真正 PATCH 语义）。
-- 成功：`{"ok": true}`
-- 落库：`book_meta.custom_cover_url/custom_tag/custom_intro/group`；`book_id` 必须已存在于 `book_meta` 或 `bookshelf`。
-- 前端展示优先级建议：`custom_cover_url || cover_url`、`custom_intro || intro`。
-- 后端改动点：`routes/bookshelf.rs` 新增 handler；`models::BookshelfItem.cover` 改为 `COALESCE(custom_cover_url, cover_url, bs.cover)`。
-
-### 13.3 书架：置顶 / 拖动排序
-
-- 状态：**尚未实现，仅提案**
-- 建议路由：`PUT /api/bookshelf/order`
-- 鉴权：登录
-- 请求体：
-
-```json
-{
-  "mode": "manual",
-  "items": [
-    { "book_id": "https://example.com/book/1", "sort_order": 0, "is_pinned": true },
-    { "book_id": "https://example.com/book/2", "sort_order": 1, "is_pinned": false }
-  ]
-}
-```
-
-- `mode` 枚举：`manual`（按 `items` 顺序）/ `recent`（恢复默认最近阅读排序，清空 `sort_order`）。
-- 成功：`{"ok": true, "updated": 2}`
-- 落库：新增 `bookshelf.sort_order INTEGER NOT NULL DEFAULT 0`、`is_pinned INTEGER NOT NULL DEFAULT 0`（新增迁移，当前最新为 user/0004）。
-- 后端改动点：事务内逐条 `UPDATE`；`GET /api/bookshelf` 排序接入。
-- 前端注意：批量拖动只需提交变化项；服务端需保证同一用户内 `sort_order` 唯一或至少稳定。
-
-### 13.4 书架：批量删除
-
-- 状态：**部分已实现（2026-11-03）**：批量删除可直接用 `POST /api/bookshelf/batch` 的 `action="remove"`（见 7.11），逐项返回 `ok/error`，没有独立的 `deleted/missing` 汇总。独立路由 `POST /api/bookshelf/batch-delete` 仍是提案。
-- 鉴权：登录
-- 请求体：`{ "book_ids": ["https://a", "https://b"] }`（1..200 条）
-- 成功：
-
-```json
-{ "ok": true, "deleted": 2, "missing": [] }
-```
-
-- 行为：事务内删除 `bookshelf` 行；是否级联删 `reading_progress`/`book_stats` 需产品决策（建议 `keep_progress=true` 可选，默认保留，与单删 7.3 一致）。
-- 后端改动点：`routes/bookshelf.rs` 新增 handler；`DELETE /api/bookshelf` 可内部复用。
-
-### 13.5 书架：批量更新目录 / 检查更新
-
-- 状态（2026-11-03 更新）：**部分已实现**。批量刷新目录改用 `POST /api/book/toc/batch`（6.3），逐本返回 `updated/failed/skipped`、并发 3、上限 100；但它不回写 `latest_chapter_title`/`can_update` 等书架字段。独立 `POST /api/bookshelf/refresh` 与“比较章节数”的增强仍是提案。
-- 建议路由：`POST /api/bookshelf/refresh`（未实现）
-- 鉴权：登录
-- 请求体：
-
-```json
-{ "book_ids": ["https://a", "https://b"], "force": false }
-```
-
-- 成功：
-
-```json
-{
-  "ok": true,
-  "results": [
-    { "book_id": "https://a", "updated": true, "total_chapters": 310, "latest_chapter_title": "第 310 章", "error": null },
-    { "book_id": "https://b", "updated": false, "total_chapters": 0, "latest_chapter_title": null, "error": "timeout" }
-  ]
-}
-```
-
-- 行为：逐本调用现有 `chapter_list`，比较章节数/末章标题写回 `book_meta`；`force=true` 忽略 TOC TTL。
-- 约束：小机内存有限，建议服务端限制批量 ≤20 本、串行或并发 ≤3，并返回部分失败。
-- 后端改动点：复用 `books.rs::save_chapters` 与 `web_book::chapter_list`；需要按 `bookshelf.book_id` 找到 `source_id`（`bookshelf.source_id` 可能为空，需回退 `book_meta.origin`）。
-- 风险：当前 `bookshelf.source_id` 可为空；需先补数据或从 `book_meta.origin` 推断，否则无法抓取（标“待确认”）。
-
-### 13.6 书签 CRUD
-
-- 状态：**已实现（2026-11-03）**：`GET/POST /api/bookmarks`、`DELETE /api/bookmarks/delete?id=`，契约见 6.6。实际实现与提案的差异：
-  - 表字段为 `id/book_id/chapter_index/position/chapter_title/note/created_at`，**没有 `chapter_url`**，标题列名为 `chapter_title`。
-  - `GET` 返回裸数组，按 `created_at DESC, id DESC`（不是 `chapter_index` 升序）。
-  - `POST` 只新增（没有 `id` 更新语义），同书同章**不会 upsert**；返回单个 `Bookmark` 对象，不是 `{ok,id}`。
-  - 删除路径是 `/api/bookmarks/delete?id=`，不是 `/api/bookmarks?id=`。
-- 仍未实现：`GET /api/bookmarks/export`（Legado 书签 JSON 兼容导出）仍是提案。
-
-### 13.7 书内搜索
-
-- 状态：**已实现（2026-11-03），仅 cached 模式**：`GET /api/book/search?book_id=&q=&limit=`，契约见 6.7。实际参数没有 `source`/`key`/`scope`/`page`；响应是 `hits/complete/note`，不是 `matches/page`；每章只返回首个命中；总查询超 5s 返回 504。
-- 仍未实现：`all` 模式（按目录逐章抓取后搜索）。下面是原提案，仅作后续扩展参考：
-
-- 查询参数：`source`、`book_url`、`key`（均必填）、`scope=cached|all`（默认 `cached`）、`limit`（默认 20，最大 50）、`page`（默认 1）
-- 响应：
-
-```json
-{
-  "matches": [
-    {
-      "chapter_index": 12,
-      "chapter_url": "https://example.com/ch/12",
-      "chapter_title": "第十二章",
-      "snippet": "……包含关键字的片段……",
-      "offset": 128
-    }
-  ],
-  "total": 4,
-  "scanned_chapters": 30,
-  "page": 1,
-  "page_size": 20,
-  "has_more": false
-}
-```
-
-- 行为：
-  - `cached`：只扫该书目录里已落盘的章节，零网络请求，快。
-  - `all`：按目录逐章抓取（受 `HTTP_CONCURRENCY` 与超时约束），建议服务端限流并设置总预算。
-  - 大小写不敏感；`snippet` 由服务端截取（如前后 30 字符）。
-- 风险：`all` 在几百章书上可能超过请求超时，建议改为“创建任务 + 轮询”，但当前项目没有任务表，**待产品决策**。
-- 后端改动点：`routes/books.rs` 新增；复用 `library_store::read` 的目录章节读取或 `web_book::chapter_content`。
-
-### 13.8 阅读统计：按书时长 / 开关
-
-- 状态：**尚未实现，仅提案**
-- 现状：`book_stats` 没有 `seconds`，只能看完成度；`GET /api/stats/overview` 的 `books` 不含时长。
-- 建议：
-  1. 新增列（新增迁移，当前最新为 user/0004）：
-
-```sql
-ALTER TABLE book_stats ADD COLUMN seconds INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
-```
-
-  2. `POST /api/stats/reading` 在累加 `reading_stats` 的同时累加 `book_stats.seconds/chars`（现有 handler 小改）。
-  3. 新路由 `GET /api/stats/books?days=30&sort=seconds|last_read`：
-
-```json
-{
-  "days": 30,
-  "total_seconds": 7200,
-  "books": [
-    { "book_id": "https://a", "name": "示例", "seconds": 3600, "chars": 80000, "last_read_at": "2026-11-02 11:30:00", "completion": 4.33 }
-  ]
-}
-```
-
-  4. 记录开关：复用 `user_settings` 新增键 `enable_reading_stats`（`"1"`/`"0"`），通过现有 `GET/POST /api/settings` 扩展字段 `enable_reading_stats: boolean`；`record` 入口先判断开关。
-- 兼容：现有 `book_stats` 行 `seconds/chars` 默认 0，不影响旧统计。
-
-### 13.9 搜索历史（表已存在但无接口）
-
-- 状态：**尚未实现，仅提案**
-- 现状：`search_history` 表在 user/0001 已建（`id, query, searched_at`），无任何路由/写入（确认未使用）。
-- 建议：
-  - `GET /api/search/history?limit=20` → `{items:[{id, query, searched_at}], total}`
-  - `POST /api/search/history` → `{query}`；同 query 去重（更新 `searched_at`）或保留最近 N 条。
-  - `DELETE /api/search/history?id=...` 与 `DELETE /api/search/history`（清空）。
-- 写入时机建议：由前端在发起 `/api/search` 时显式调用，避免服务端搜索接口产生副作用（当前搜索是无状态只读）。
-- 后端改动点：`routes/books.rs` 或新 `routes/history.rs`。
-
-### 13.10 缓存管理
-
-- 状态：**已实现（2026-11-19 切换为馆藏分层模型）**：
-  - 内容层全局共享：书目 / 目录 / 正文存 `library.db`；账号只保留书架、进度、设置等私有状态。
-  - `POST /api/book/cache/clear`（6.9）：按 `book_id` 或清空**全部临时层**正文缓存，返回 `{ok,scope,book_id,deleted,bytes_freed,trashed}`，并把对应书目录移进回收站；馆藏需先移出。
-  - `POST /api/book/cache/trim`（6.9.1）：立即回收过期临时缓存。
-  - `POST /api/book/cache-all`（6.8）：整本补缓存，不再有预算上限。
-  - `GET /api/library/stats`、`GET /api/library/books`、`POST /api/library/{collect,release,delete,temp/clean}`、`GET /api/library/jobs`、`POST /api/library/jobs/cancel`（6.12）：馆藏浏览、入馆、移出、删除、后台整本下载与取消。
-  - 设置页「缓存与刷新」卡片：展示馆藏/临时分层占用、TTL 与过期提示，提供「回收过期临时缓存」「清理本书」「清理全部临时缓存」。
-  - 新增「馆藏」页：统计卡片、keyset 分页列表、入馆/移出/删除、采购单进度与取消。
-  - 仍未实现：独立 `GET /api/cache/stats`（现由 `/api/healthz` 承担）、删目录缓存（强制重抓，解决 6.2 换源串目录）、二次确认参数（前端两步点击代替）。
-- 现状（已更新）：缓存用量从 `/api/healthz` 的 `cache.{bytes,rows,collection,temp,books}` 查看；清理走 6.9 / 6.9.1，馆藏写操作走 6.12。
-- 后端改动点：`routes/books_store.rs`（馆藏读写）、`library.rs`（分层与采购单）、`library_worker.rs`（后台执行器）、`routes/library.rs`（管理接口）。
-
-### 13.11 账号与用户管理
-
-- 状态：**部分已实现（2026-11-03）**：
-  - 已落地 `POST /api/auth/password`（3.3）：6–128 字符、校验旧密码；成功后 `token_version+1`，**旧 JWT 立即 401**，不是“旧 token 仍有效”。
-  - 已落地 `GET /api/admin/users`（3.4）、`POST /api/admin/users/status`（3.5）：启用/禁用，禁用会递增 `token_version`；不能禁自己或最后一个启用管理员。
-  - 仍未实现：
-    - `GET /api/auth/me`（登录）→ `{id, username, role}`；token 里已有，但前端每次都解码不便。
-    - `POST /api/admin/users/{id}/role`（admin）→ `{role:"user"|"admin"}`；禁止把最后一个 admin 降级。
-    - `DELETE /api/admin/users/{id}`（admin）→ 删除账户；是否删 `users/{id}.db` 需产品决策（建议保留备份）。
-- 注意：这些接口涉及 `shared.db.users` 与用户库文件，需事务/文件操作顺序；当前没有审计日志。
-- 相关缺陷：`ensure_admin` 已在源码中启用（书源写接口），FEATURE_MATRIX 的旧描述“全仓无调用”已过时。
-
----
-
-## 14. 待确认清单
-
-以下条目源码无法给出确定答案，或依赖部署/产品决策，前端实现前应先确认。
-
-| # | 待确认项 | 现状/依据 | 建议 |
-|---|---|---|---|
-| 1 | `Book.latest_chapter_time` 的单位 | 字段为 `i64`，解析管线从不填充，恒 0（[entities.rs](../server/src/entities.rs#L255-L258)） | 若后续接入，明确用 Unix 毫秒（Legado 习惯）还是秒；前端暂按 0 处理 |
-| 2 | `BookChapter.start/end` 语义 | 建表默认 0，解析不填（[user/0002_extend.sql](../server/migrations/user/0002_extend.sql#L43-L57)） | 确认是否用于本地书字符偏移；Web 书源暂恒 0 |
-| 3 | `day` 与 UTC 时间戳的时区一致性 | `reading_stats.day` 用服务器本地日期，`updated_at` 用 UTC（[stats.rs](../server/src/routes/stats.rs#L44-L50)） | 跨时区部署时明确“统计日”以服务器时区为准；或统一改 UTC |
-| 4 | ~~`position > 1` 的归一化~~ **已修复（2026-11-03 复核）** | `POST /api/bookshelf/progress` 只接受 0..=1 的有限值，越界直接 400（[bookshelf.rs](../server/src/routes/bookshelf.rs#L375-L384)）；读取时 `progress_percent` 再 clamp | 前端无需再做 `/100` 归一化；历史数据越界时读取仍会 clamp |
-| 5 | `Book.can_update` 被写为 false 是否符合预期 | `save_book_meta` 每次写 `b.can_update`（默认 false），会覆盖建表默认 1（[books.rs](../server/src/routes/books.rs#L333-L383)） | 确认更新检查逻辑；否则书架“可更新”字段永远 false |
-| 6 | `GET /api/sources/detail` 返回 snake_case 是否有意 | export/import 是 camelCase，detail 是 snake_case（[sources.rs](../server/src/routes/sources.rs#L237-L243)） | 若前端表单复用它，建议统一为 camelCase 或同时提供 `format=camel` |
-| 7 | `GET /api/sources/export` 顺序是否需稳定 | 无 `ORDER BY`（[sources.rs](../server/src/routes/sources.rs#L48-L57)） | 若需可复现导出，补 `ORDER BY weight DESC, custom_order ASC, name` |
-| 8 | ~~`GET /api/search` 双重分页~~ **已修复（2026-11-02 20:0x 复核）** | 已改为与 aggregate 共用 `aggregated()`：各源只取第 1 页 + 本地切片（2.3） | 保留两个入口；若要全量翻页需另加分页抓取 |
-| 9 | `GET /api/explore` 的 A/B 两种模式是否应拆分 | 传分类 URL 会跨源查询，而非只查该源（5.3） | 建议新增 `source` 参数，避免前端误以为只查单源 |
-| 10 | 正文缓存按 `chapter_url`、目录缓存按 `book_url` 是否够用 | 换源/同 URL 会串数据（6.2/6.4） | 缓存键加 `origin`，或换源时清理旧缓存 |
-| 11 | 首次启动 SQLite `disk I/O error (4618)` | 环境曾有报告，源码无对应处理；清理 WAL/SHM 后恢复，根因未定位（见 TODO） | 复现时保留 `shared.db-wal/-shm` 与启动日志；确认文件锁/磁盘写满/杀软扫描 |
-| 12 | `GET /api/bookshelf` 的 `book_id` 参数是否为遗留 | handler 显式忽略（[bookshelf.rs](../server/src/routes/bookshelf.rs#L82-L83)） | 若要单书查询，改为 `WHERE book_id=?`；否则从契约移除 |
-| 13 | `timeout_millisecond` 是否应生效 | 字段存了但 `apply_rules` 不用；Rust regex 无内置超时（[replace.rs](../server/src/routes/replace.rs#L294-L333)） | 确认改为模式长度限制 + 线程超时，或从契约移除 |
-| 14 | 静态资源 fallback 对所有 GET 生效 | `ServeDir(BORANLIB_WEB_DIR)` 未限制路径（默认 `web/dist`，`:3000` 为 `<repo>/server/web/dist`；[main.rs](../server/src/main.rs#L52-L55)） | 生产建议只对非 `/api` 路径启用，并加 SPA fallback；部署时确保 `BORANLIB_WEB_DIR` 指向实际 `dist` |
-| 15 | `BookSource` 未知字段的 `extra` 是否会污染导出 | `#[serde(flatten)] extra` 原样保存并转 camel（[entities.rs](../server/src/entities.rs#L70-L72)） | 验证一轮 Legado 导入→导出无字段丢失/重复 |
-
----
-
-## 15. 附录：错误状态码与前端处理建议
-
-### 15.1 两类错误体
+### 13.1 两类错误体
 
 1. **业务错误（统一 JSON）**：`{"error":"..."}`，由 `AppError` 产生（400/401/403/404/500/504）。`504` 目前只在 `GET /api/book/search` 超过 5 秒预算时出现。
 2. **框架提取错误（纯文本）**：Axum 的 `Query`/`Json` 提取失败，响应不是 `{"error":...}`：
@@ -4079,19 +3691,19 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
    - `401`：清除 token 并跳登录；`403`：提示“需要管理员”；`404`：提示“书源不存在/资源不存在”；`400` 且文案以 `internal:` 开头：提示“书源站点抓取失败”，可换源重试。
    - 不要假设错误总是 JSON。
 
-### 15.2 成功状态码
+### 13.2 成功状态码
 
 - 全部成功响应均为 `200`；源码中没有 `201 Created`/`204 No Content`。
 - `GET /api/health` 成功是 `text/plain`，其余成功均为 JSON。
 
-### 15.3 超时与重试建议（前端侧）
+### 13.3 超时与重试建议（前端侧）
 
 - 搜索/发现（多源并发）可能耗时较长；需要“先到先渲染”时用两段式 `GET /api/search/start` + `GET /api/search/result`（5.5/5.6），单次 result 请求很短，轮询即可；需要一次性完整结果时可用 `/api/search/aggregate`（60s 缓存可降低重试成本）。
 - 详情/目录/正文抓取受服务端 `BORANLIB_HTTP_TIMEOUT_SECS`（当前实际读取 `HTTP_TIMEOUT_SECS`，默认 15s）限制；失败返回 400，不建议自动无限重试。
 - 进度上报/统计上报是轻量写库，可失败后下次心跳重试；`position` 与 `chapter_index` 幂等（upsert）。
 - `GET /api/book/search` 有 5s 总预算，超时返回 `504`；不要对同一关键词自动重试，应收窄关键词，或先 `POST /api/book/cache-all` 减少未缓存章节。
 
-### 15.4 环境变量索引（影响接口行为）
+### 13.4 环境变量索引（影响接口行为）
 
 > 命名口径：统一使用 `BORANLIB_*`，兼容旧 `LEGADO_*` 前缀（新名优先；空串按未设置处理）。程序**不读取未加前缀的旧名**（`HOST`、`PORT`、`WEB_DIR` 等单独设置均无效）。下表“兼容旧名”为可用的旧前缀写法。
 
@@ -4120,9 +3732,9 @@ ALTER TABLE book_stats ADD COLUMN chars INTEGER NOT NULL DEFAULT 0;
 | `BORANLIB_ADMIN_USER` / `BORANLIB_ADMIN_PASS` | `LEGADO_ADMIN_USER` / `LEGADO_ADMIN_PASS` | `admin` / `<寮€鍙戦粯璁ゅ彛浠?`（仅开发） | 首次启动管理员；**生产环境必须显式设置 `ADMIN_PASS`（≥8 字节且非 <寮€鍙戦粯璁ゅ彛浠?），否则拒绝启动** |
 | `BORANLIB_RUST_LOG` | `LEGADO_RUST_LOG` | `info` | 日志级别 |
 
-依据：[config.rs](../server/src/config.rs#L60-L75)、[main.rs](../server/src/main.rs#L52-L55)、[req.rs](../server/src/req.rs#L64-L67)、[auth.rs](../server/src/auth.rs#L225-L243)。
+依据：[config.rs](../server/crates/rule-core/src/config.rs#L60-L75)、[main.rs](../server/src/main.rs#L52-L55)、[req.rs](../server/crates/rule-core/src/req.rs#L64-L67)、[auth.rs](../server/src/auth.rs#L225-L243)。
 
 ---
 
-*文档结束。任何接口变更请同步更新本文件；未实现内容统一放在第 13 节，禁止在正文中混入“计划中的字段”。*
+*文档结束。本文只记录当前契约；未实现内容与排期统一记入 `TODO.md`，不要在正文混入“计划中的字段”。*
 
