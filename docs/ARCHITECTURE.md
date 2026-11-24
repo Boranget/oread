@@ -151,9 +151,9 @@ Bearer 访问 `/opds*`，便于调试。
   修订号/章页计数/封面 href），靠 `oread:revision` 判脏。`index.db` 放在
   `data_dir/library/index.db`，删掉不会丢内容：进程启动时后台全量重建，
   `boranlib doctor --rebuild-index` 可手动重建。
-- 馆藏搜索（`GET /api/library/books?q=`）先查 `index.db`（书名/作者/系列/主题/简介），
-  再与 `library.db` 的 `name`/`author` 取并集；写路径（TOC/正文/元数据/封面/漫画页/
-  入馆/移出/删除）在落盘后增量刷新索引。排序与分页仍用 `library.db` 的访问时间。
+- 馆藏列表与搜索都走 `index.db`：列表按书名/作者 keyset 分页（不依赖访问时间），搜索匹配
+  书名/作者/系列/主题/简介；`library.db` 只补充来源、占用与访问时间。写路径（TOC/正文/元数据/
+  封面/漫画页/入馆/移出/删除）在落盘后增量刷新索引；索引为空或打不开时列表退回 `library.db`。
 - 馆藏列表的「已缓存章节 / 正文 / 图片占用」仍读 `library_books` 的冗余列，但数值由目录计算
   （`library_store::usage`）：文字书逐章读文件、占位章不算，漫画逐页 `stat`。管理员编辑后
   立即重算，`doctor --sync-db` 全量重算；手工放进 `collection/` 的目录书因此也有正确进度，

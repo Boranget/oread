@@ -14,8 +14,8 @@
     { id: 'all', label: '全部' },
   ];
   const SORTS = [
-    { id: 'accessed', label: '最近访问' },
-    { id: 'collected', label: '入馆时间' },
+    { id: 'title', label: '书名' },
+    { id: 'author', label: '作者' },
   ];
   const STATUS_LABEL = {
     queued: '排队中',
@@ -27,7 +27,7 @@
   };
 
   let tier = 'collection';
-  let sort = 'accessed';
+  let sort = 'title';
   let q = '';
   let stats = null;
   let statsErr = '';
@@ -348,7 +348,7 @@
 </div>
 
 <div class="toolbar">
-  <input class="grow" placeholder="搜索书名或作者" bind:value={q} on:keydown={(e) => e.key === 'Enter' && search()} />
+  <input class="grow" placeholder="搜索书名、作者、系列、标签" bind:value={q} on:keydown={(e) => e.key === 'Enter' && search()} />
   <select value={sort} on:change={(e) => setSort(e.currentTarget.value)} aria-label="排序">
     {#each SORTS as s}
       <option value={s.id}>{s.label}</option>

@@ -89,6 +89,50 @@ impl VerifyReport {
     }
 }
 
+/// 馆藏列表排序：只用索引里稳定、与访问行为无关的字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    Title,
+    Author,
+}
+
+impl Sort {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "title" => Some(Self::Title),
+            "author" => Some(Self::Author),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Author => "author",
+        }
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Author => "COALESCE(author, '')",
+        }
+    }
+
+    /// 行里参与游标的排序值，必须与 SQL 的 `column()` 一致。
+    pub fn key(self, row: &IndexRow) -> &str {
+        match self {
+            Self::Title => &row.title,
+            Self::Author => row.author.as_deref().unwrap_or(""),
+        }
+    }
+}
+
+const ROW_COLUMNS: &str =
+    "book_id, book_url, tier, kind, title, author, language, publisher, pubdate, \
+     series, series_index, subjects, description, revision, chapter_count, page_count, \
+     cover_href, updated_at";
+
 /// `index.db` 的句柄。克隆便宜（SQLite 连接池）。
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -132,6 +176,7 @@ impl Index {
             )",
             "CREATE UNIQUE INDEX IF NOT EXISTS book_index_url ON book_index(book_url)",
             "CREATE INDEX IF NOT EXISTS book_index_updated ON book_index(updated_at)",
+            "CREATE INDEX IF NOT EXISTS book_index_title ON book_index(title, book_url)",
         ] {
             sqlx::query(sql).execute(&pool).await?;
         }
@@ -189,6 +234,48 @@ impl Index {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// 馆藏列表：按书名或作者 keyset 分页，可选关键词过滤（与搜索同口径）。
+    ///
+    /// 游标是 `(排序值, book_url)`；调用方负责把 `next_cursor` 原样传回。
+    /// `tier` 为 `all` 时不限层级。
+    pub async fn page(
+        &self,
+        tier: &str,
+        term: Option<&str>,
+        sort: Sort,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<IndexRow>> {
+        let pattern = term.map(|term| {
+            format!(
+                "%{}%",
+                term.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
+        let sql = format!(
+            "SELECT {ROW_COLUMNS} FROM book_index \
+             WHERE (?1 = 'all' OR tier = ?1) \
+               AND (?2 = '' OR title LIKE ?2 ESCAPE '\\' OR author LIKE ?2 ESCAPE '\\' \
+                 OR series LIKE ?2 ESCAPE '\\' OR subjects LIKE ?2 ESCAPE '\\' \
+                 OR description LIKE ?2 ESCAPE '\\') \
+               AND (({col} > ?3) OR ({col} = ?3 AND book_url > ?4)) \
+             ORDER BY {col} ASC, book_url ASC LIMIT ?5",
+            col = sort.column()
+        );
+        let (key, url) = after.unwrap_or(("", ""));
+        let rows = sqlx::query(&sql)
+            .bind(tier)
+            .bind(pattern.unwrap_or_default())
+            .bind(key)
+            .bind(url)
+            .bind(limit.max(1))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_from_sql).collect())
     }
 
     /// 刷新一本书；目录不存在时返回 `None` 并删除旧行。
@@ -735,6 +822,63 @@ mod tests {
         assert_eq!(comic.revision, 3);
         assert_eq!(comic.chapter_count, 1);
         assert_eq!(comic.page_count, 2);
+    }
+
+    #[tokio::test]
+    async fn page_sorts_by_title_and_cursor_resumes() {
+        let root = temp_root("page");
+        let store = Store::at(root.clone());
+        store.create_layout().unwrap();
+        text_book(&store, "https://example.com/p/c", "C 书").await;
+        text_book(&store, "https://example.com/p/a", "A 书").await;
+        text_book(&store, "https://example.com/p/b", "B 书").await;
+
+        let index = Index::open(&root).await.unwrap();
+        index.rebuild(&store).await.unwrap();
+
+        let first = index
+            .page("collection", None, Sort::Title, None, 2)
+            .await
+            .unwrap();
+        let titles: Vec<&str> = first.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["A 书", "B 书"]);
+
+        let last = first.last().unwrap();
+        let key = Sort::Title.key(last);
+        let rest = index
+            .page(
+                "collection",
+                None,
+                Sort::Title,
+                Some((key, last.book_url.as_str())),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].title, "C 书");
+
+        let hit = index
+            .page("collection", Some("B"), Sort::Title, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hit.len(), 1, "关键词过滤走索引字段");
+        assert_eq!(hit[0].title, "B 书");
+
+        // 作者相同：按 book_url 升序稳定续页。
+        let by_author = index
+            .page("collection", None, Sort::Author, None, 10)
+            .await
+            .unwrap();
+        let urls: Vec<&str> = by_author.iter().map(|r| r.book_url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/p/a",
+                "https://example.com/p/b",
+                "https://example.com/p/c"
+            ]
+        );
     }
 
     #[tokio::test]

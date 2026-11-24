@@ -1014,8 +1014,7 @@ async fn admin_can_list_users() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// 馆藏浏览/管理：普通账号只读、管理员可入馆/移出/删除；`sort=collected` 的
-/// keyset 分页不能漏掉没有入馆时间的临时书。
+/// 馆藏浏览/管理：普通账号只读、管理员可入馆/移出/删除；列表按书名 keyset 分页。
 #[tokio::test]
 async fn library_browse_and_admin_actions() {
     let dir = temp_dir("library");
@@ -1074,17 +1073,18 @@ async fn library_browse_and_admin_actions() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "普通账号不能看采购单");
 
-    // sort=collected 分页：第一页取 2 本，第二页必须包含 collected_at 为 NULL 的临时书。
+    // 书名分页：第一页取 2 本，第二页继续；本用例没有目录，走 library.db 回退。
     let resp = app
         .clone()
         .oneshot(authed_get(
-            "/api/library/books?tier=all&sort=collected&limit=2",
+            "/api/library/books?tier=all&sort=title&limit=2",
             &user,
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let page1 = body_json(resp).await;
+    assert_eq!(page1["sort"], "title", "{page1}");
     let urls1: Vec<&str> = page1["items"]
         .as_array()
         .unwrap()
@@ -1100,7 +1100,7 @@ async fn library_browse_and_admin_actions() {
     let resp = app
         .clone()
         .oneshot(authed_get(
-            &format!("/api/library/books?tier=all&sort=collected&limit=2&cursor={cursor}"),
+            &format!("/api/library/books?tier=all&sort=title&limit=2&cursor={cursor}"),
             &user,
         ))
         .await
@@ -1113,7 +1113,7 @@ async fn library_browse_and_admin_actions() {
         .iter()
         .filter_map(|v| v["book_url"].as_str())
         .collect();
-    assert_eq!(urls2, vec!["https://lib.test/c"], "NULL 入馆时间不能漏行");
+    assert_eq!(urls2, vec!["https://lib.test/c"], "临时书不能漏行");
     assert!(page2["next_cursor"].is_null(), "{page2}");
 
     // 管理员入馆：无书源时只标记馆藏，不排队下载。

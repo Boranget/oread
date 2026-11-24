@@ -2258,9 +2258,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `tier` | string | `collection` | `collection` / `temp` / `all` |
-| `sort` | string | `accessed` | `accessed`（最近访问） / `collected`（入馆时间） |
-| `q` | string | — | 模糊匹配：`library.db` 的书名/作者 + `index.db` 的书名/作者/系列/主题/简介（`%`/`_` 已转义为字面量） |
-| `cursor` | string | — | keyset 游标，原样回传上一页的 `next_cursor`；首页不传 |
+| `sort` | string | `title` | `title`（书名） / `author`（作者）；排序与分页走 `index.db` |
+| `q` | string | — | 模糊匹配 `index.db` 的书名/作者/系列/主题/简介（`%`/`_` 已转义为字面量）；索引不可用时退回 `library.db` 的书名/作者 |
+| `cursor` | string | — | 不透明 keyset 游标，原样回传上一页的 `next_cursor`；首页不传 |
 | `limit` | integer | 50 | clamp 1..200 |
 
 - 成功 `200`：
@@ -2269,7 +2269,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 {
   "ok": true,
   "tier": "collection",
-  "sort": "accessed",
+  "sort": "title",
   "limit": 50,
   "items": [
     {
@@ -2299,29 +2299,29 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
       "download_percent": 100
     }
   ],
-  "next_cursor": "1763500000000:https://example.com/book/123"
+  "next_cursor": "W1wiQSDkuaYiLCAiaHR0cHM6Ly9leGFtcGxlLmNvbS9ib29rLzEyMyJd"
 }
 ```
 
 | 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
 | `items[].tier` | string | 否 | `collection` / `temp` |
-| `items[].collected_at` | integer | 是 | 入馆时间（epoch ms），临时层为 `null` |
-| `items[].last_accessed_at` / `checked_at` | integer | 否 | 最近访问 / 最近检查时间（epoch ms） |
+| `items[].collected_at` | integer | 是 | 入馆时间（epoch ms）；临时层或索引里尚未补登的书目为 `null` |
+| `items[].last_accessed_at` / `checked_at` | integer | 是 | 最近访问 / 最近检查时间（epoch ms）；索引独有（`library.db` 无行）时为 `null` |
 | `items[].cached_chapters` | integer | 否 | 馆藏正文中已缓存章节数；漫画还要求图片全部落盘才算已缓存 |
 | `items[].series_name` / `series_index` | string/number | 是 | 系列名与卷序号（OPF `belongs-to-collection` 口径），未填写为 `null` |
 | `items[].language` / `publisher` / `pubdate` | string | 是 | 语言 / 出版社 / 出版日期；未填写为 `null`；标签与标识用 6.12.3 单独读取 |
 | `items[].content_bytes` / `image_bytes` | integer | 否 | 正文（含图片清单 JSON）/ 漫画图片原始字节占用 |
 | `items[].book_source_type` | integer | 否 | `2` 为漫画；前端据此在入馆前做体积预估 |
 | `items[].download_percent` | integer/null | 是 | `cached_chapters / total_chapter_num`；目录未知时为 `null` |
-| `next_cursor` | string/null | 是 | keyset 游标 `<sort_ts>:<book_url>`；没有下一页为 `null` |
+| `next_cursor` | string/null | 是 | 不透明 keyset 游标；没有下一页为 `null` |
 
-- 错误：`400`（`tier`/`sort` 非法）；`401`；`500`。
-- 行为：`ORDER BY <sort_expr> DESC, book_url ASC`，用游标续页，**不使用 OFFSET**；不返回总数。
-  - `sort=accessed` 用 `last_accessed_at`；`sort=collected` 用 `COALESCE(collected_at, 0)`（临时层没有入馆时间，按 0 排序，分页不会漏行）。
-  - 搜索先查 `index.db`（书名/作者/系列/主题/简介，最多 2000 条命中），再与 `library.db`
-    的 `name`/`author` 匹配取并集：尚未建目录的旧书仍能被搜到；索引不可用时自动只走 DB。
-    索引在启动时重建，正文/元数据/封面/漫画页保存后增量刷新，因此搜索结果与目录一致。
+- 错误：`400`（`tier`/`sort` 非法、游标损坏）；`401`；`500`。
+- 行为：按 `index.db` 的 `(title, book_url)` 或 `(author, book_url)` 升序 keyset 分页，**不使用 OFFSET**；不返回总数。
+  - 列表不再依赖“最近访问时间”，阅读一本书不会让馆藏顺序跳动。
+  - 书名/作者/系列/语言/出版信息以目录（`index.db`）为准；来源、占用、缓存进度与时间从 `library.db` 补充，索引里还没有对应书目的行这些字段为 0/null。
+  - 搜索在 `index.db` 内完成（书名/作者/系列/主题/简介）；索引为空或打不开时整页退回 `library.db`（书名/作者），避免刚部署/重建期间列表空白。
+  - `index.db` 是派生缓存：启动时后台重建，写路径增量刷新；删掉只会短暂退回数据库结果。
 
 ### 6.12.3 单书元数据：`GET` / `POST /api/library/book/meta`
 

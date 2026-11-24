@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use futures::stream::StreamExt;
 
 use axum::{
@@ -23,6 +24,7 @@ use crate::entities::Book;
 use crate::error::{AppError, AppResult};
 use crate::image_fetch;
 use crate::library::{self, LibraryBook};
+use crate::library_store::index::{self, IndexRow, Sort};
 use crate::routes::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -94,63 +96,188 @@ async fn stats(State(s): State<AppState>, _u: AuthUser) -> AppResult<Json<serde_
 pub struct BooksQ {
     /// `collection`（默认）| `temp` | `all`
     pub tier: Option<String>,
-    /// 书名/作者模糊过滤
+    /// 关键词过滤（书名/作者/系列/主题/简介）
     pub q: Option<String>,
-    /// keyset 游标：`<sort_ts>:<book_url>`，首页不传
+    /// keyset 游标：`base64("排序值","book_url")`，首页不传
     pub cursor: Option<String>,
     pub limit: Option<i64>,
-    /// `accessed`（默认）| `collected`
+    /// `title`（默认）| `author`
     pub sort: Option<String>,
 }
 
-fn parse_cursor(raw: Option<&str>) -> AppResult<(i64, String)> {
+/// 解码 keyset 游标；排序值与 `book_url` 都由服务端生成，客户端只需原样回传。
+fn parse_cursor(raw: Option<&str>) -> AppResult<Option<(String, String)>> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok((i64::MAX, String::new()));
+        return Ok(None);
     };
-    let (ts, url) = raw
-        .split_once(':')
-        .ok_or_else(|| AppError::BadRequest("cursor 格式应为 <sort_ts>:<book_url>".into()))?;
-    let ts = ts
-        .parse::<i64>()
-        .map_err(|_| AppError::BadRequest("cursor 的时间戳不是整数".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| AppError::BadRequest("cursor 无效".into()))?;
+    let (key, url): (String, String) =
+        serde_json::from_slice(&bytes).map_err(|_| AppError::BadRequest("cursor 无效".into()))?;
     if url.is_empty() {
         return Err(AppError::BadRequest("cursor 缺少 book_url".into()));
     }
-    Ok((ts, url.to_string()))
+    Ok(Some((key, url)))
 }
 
-fn book_item(b: &LibraryBook) -> serde_json::Value {
-    json!({
-        "book_url": b.book_url,
-        "name": b.name,
-        "author": b.author,
-        "kind": b.kind,
-        "book_source_type": b.book_source_type,
-        "origin": b.origin,
-        "origin_name": b.origin_name,
-        "cover_url": b.cover_url,
-        "language": b.language,
-        "publisher": b.publisher,
-        "pubdate": b.pubdate,
-        "series_name": b.series_name,
-        "series_index": b.series_index,
-        "tier": b.tier,
-        "collected_at": b.collected_at,
-        "last_accessed_at": b.last_accessed_at,
-        "checked_at": b.checked_at,
-        "total_chapter_num": b.total_chapter_num,
-        "cached_chapters": b.cached_chapters,
-        "content_bytes": b.content_bytes,
-        "content_mb": mb(b.content_bytes),
-        "image_bytes": b.image_bytes,
-        "image_mb": mb(b.image_bytes),
-        // 下载进度用百分比表示，目录未知时为 null（前端显示「未知」）
-        "download_percent": if b.total_chapter_num > 0 {
-            Some((b.cached_chapters * 100 / b.total_chapter_num).min(100))
+fn make_cursor(key: &str, url: &str) -> String {
+    let raw = serde_json::to_vec(&(key, url)).unwrap_or_default();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// 列表行：`index.db` 提供排序与内容字段，`library.db` 只补充来源、占用与访问信息。
+struct ListItem {
+    book_url: String,
+    /// 当前排序键（书名或作者），用于生成下一页游标。
+    cursor_key: String,
+    name: String,
+    author: Option<String>,
+    kind: Option<String>,
+    book_source_type: i64,
+    origin: Option<String>,
+    origin_name: Option<String>,
+    cover_url: Option<String>,
+    language: Option<String>,
+    publisher: Option<String>,
+    pubdate: Option<String>,
+    series_name: Option<String>,
+    series_index: Option<f64>,
+    tier: String,
+    collected_at: Option<i64>,
+    last_accessed_at: Option<i64>,
+    checked_at: Option<i64>,
+    total_chapter_num: i64,
+    cached_chapters: i64,
+    content_bytes: i64,
+    image_bytes: i64,
+}
+
+impl ListItem {
+    fn from_index(row: &IndexRow, db: Option<&LibraryBook>, sort: Sort) -> Self {
+        let name = if row.title.trim().is_empty() {
+            db.and_then(|b| b.name.clone()).unwrap_or_default()
         } else {
-            None
-        },
-    })
+            row.title.clone()
+        };
+        let kind = if row.kind.trim().is_empty() {
+            db.and_then(|b| b.kind.clone())
+        } else {
+            Some(row.kind.clone())
+        };
+        Self {
+            book_url: row.book_url.clone(),
+            cursor_key: sort.key(row).to_string(),
+            name,
+            author: row
+                .author
+                .clone()
+                .or_else(|| db.and_then(|b| b.author.clone())),
+            book_source_type: db.map(|b| b.book_source_type).unwrap_or_else(|| {
+                if kind.as_deref() == Some("comic") {
+                    2
+                } else {
+                    0
+                }
+            }),
+            kind,
+            origin: db.and_then(|b| b.origin.clone()),
+            origin_name: db.and_then(|b| b.origin_name.clone()),
+            cover_url: db.and_then(|b| b.cover_url.clone()),
+            language: row
+                .language
+                .clone()
+                .or_else(|| db.and_then(|b| b.language.clone())),
+            publisher: row
+                .publisher
+                .clone()
+                .or_else(|| db.and_then(|b| b.publisher.clone())),
+            pubdate: row
+                .pubdate
+                .clone()
+                .or_else(|| db.and_then(|b| b.pubdate.clone())),
+            series_name: row
+                .series
+                .clone()
+                .or_else(|| db.and_then(|b| b.series_name.clone())),
+            series_index: row.series_index.or_else(|| db.and_then(|b| b.series_index)),
+            tier: row.tier.clone(),
+            collected_at: db.and_then(|b| b.collected_at),
+            last_accessed_at: db.map(|b| b.last_accessed_at),
+            checked_at: db.map(|b| b.checked_at),
+            total_chapter_num: db.map(|b| b.total_chapter_num).unwrap_or(0),
+            cached_chapters: db.map(|b| b.cached_chapters).unwrap_or(0),
+            content_bytes: db.map(|b| b.content_bytes).unwrap_or(0),
+            image_bytes: db.map(|b| b.image_bytes).unwrap_or(0),
+        }
+    }
+
+    fn from_db(b: &LibraryBook, sort: Sort) -> Self {
+        let name = b.name.clone().unwrap_or_default();
+        let author = b.author.clone().unwrap_or_default();
+        let cursor_key = match sort {
+            Sort::Title => name.clone(),
+            Sort::Author => author,
+        };
+        Self {
+            book_url: b.book_url.clone(),
+            cursor_key,
+            name,
+            author: b.author.clone(),
+            kind: b.kind.clone(),
+            book_source_type: b.book_source_type,
+            origin: b.origin.clone(),
+            origin_name: b.origin_name.clone(),
+            cover_url: b.cover_url.clone(),
+            language: b.language.clone(),
+            publisher: b.publisher.clone(),
+            pubdate: b.pubdate.clone(),
+            series_name: b.series_name.clone(),
+            series_index: b.series_index,
+            tier: b.tier.clone(),
+            collected_at: b.collected_at,
+            last_accessed_at: Some(b.last_accessed_at),
+            checked_at: Some(b.checked_at),
+            total_chapter_num: b.total_chapter_num,
+            cached_chapters: b.cached_chapters,
+            content_bytes: b.content_bytes,
+            image_bytes: b.image_bytes,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "book_url": self.book_url,
+            "name": self.name,
+            "author": self.author,
+            "kind": self.kind,
+            "book_source_type": self.book_source_type,
+            "origin": self.origin,
+            "origin_name": self.origin_name,
+            "cover_url": self.cover_url,
+            "language": self.language,
+            "publisher": self.publisher,
+            "pubdate": self.pubdate,
+            "series_name": self.series_name,
+            "series_index": self.series_index,
+            "tier": self.tier,
+            "collected_at": self.collected_at,
+            "last_accessed_at": self.last_accessed_at,
+            "checked_at": self.checked_at,
+            "total_chapter_num": self.total_chapter_num,
+            "cached_chapters": self.cached_chapters,
+            "content_bytes": self.content_bytes,
+            "content_mb": mb(self.content_bytes),
+            "image_bytes": self.image_bytes,
+            "image_mb": mb(self.image_bytes),
+            // 下载进度用百分比表示，目录未知时为 null（前端显示「未知」）
+            "download_percent": if self.total_chapter_num > 0 {
+                Some((self.cached_chapters * 100 / self.total_chapter_num).min(100))
+            } else {
+                None
+            },
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +528,70 @@ async fn set_book_meta(
     })))
 }
 
-/// 馆藏浏览：keyset 分页（`sort_ts DESC, book_url ASC`），不返回总数、不做 OFFSET。
+/// 索引不可用或为空时的退路：直接按 `library.db` 的书名/作者 keyset 分页。
+async fn db_page(
+    pool: &sqlx::SqlitePool,
+    tier: &str,
+    term: Option<&str>,
+    sort: Sort,
+    after: Option<(&str, &str)>,
+    limit: i64,
+) -> AppResult<Vec<LibraryBook>> {
+    let col = match sort {
+        Sort::Title => "COALESCE(name, '')",
+        Sort::Author => "COALESCE(author, '')",
+    };
+    let pattern = term.map(|term| {
+        format!(
+            "%{}%",
+            term.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )
+    });
+    let sql = format!(
+        "SELECT * FROM library_books \
+         WHERE (?1 = 'all' OR tier = ?1) \
+           AND (?2 = '' OR COALESCE(name, '') LIKE ?2 ESCAPE '\\' \
+             OR COALESCE(author, '') LIKE ?2 ESCAPE '\\') \
+           AND (({col} > ?3) OR ({col} = ?3 AND book_url > ?4)) \
+         ORDER BY {col} ASC, book_url ASC LIMIT ?5"
+    );
+    let (key, url) = after.unwrap_or(("", ""));
+    let rows = sqlx::query_as::<_, LibraryBook>(&sql)
+        .bind(tier)
+        .bind(pattern.unwrap_or_default())
+        .bind(key)
+        .bind(url)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// 一次取回当前页所有书目的数据库扩展字段（来源、占用、时间）。
+async fn load_books_by_urls(
+    pool: &sqlx::SqlitePool,
+    urls: &[String],
+) -> AppResult<HashMap<String, LibraryBook>> {
+    if urls.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (1..=urls.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT * FROM library_books WHERE book_url IN ({placeholders})");
+    let mut query = sqlx::query_as::<_, LibraryBook>(&sql);
+    for url in urls {
+        query = query.bind(url);
+    }
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|b| (b.book_url.clone(), b)).collect())
+}
+
+/// 馆藏浏览：排序与分页走 `index.db`（书名/作者，稳定且与访问行为无关），
+/// `library.db` 只补充来源、占用与访问时间。keyset 游标不返回总数、不做 OFFSET。
 async fn books(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -417,82 +607,94 @@ async fn books(
             ))
         }
     };
-    let sort = q.sort.as_deref().unwrap_or("accessed");
-    let sort_expr = match sort {
-        "accessed" => "last_accessed_at",
-        // 临时书没有入馆时间，统一按 0 排序，避免 NULL 在 keyset 比较里被漏掉。
-        "collected" => "COALESCE(collected_at, 0)",
-        _ => {
-            return Err(AppError::BadRequest(
-                "sort 只能是 accessed/collected".into(),
-            ))
-        }
-    };
-    let (ts, after_url) = parse_cursor(q.cursor.as_deref())?;
+    let sort = Sort::parse(q.sort.as_deref().unwrap_or("title"))
+        .ok_or_else(|| AppError::BadRequest("sort 只能是 title/author".into()))?;
+    let after = parse_cursor(q.cursor.as_deref())?;
+    let after_ref = after
+        .as_ref()
+        .map(|(key, url)| (key.as_str(), url.as_str()));
     let term = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let like = term.map(|s| format!("%{}%", s.replace('%', "\\%").replace('_', "\\_")));
 
-    // index.db 扩展搜索：除书名/作者外还匹配系列、主题与简介；索引不可用时
-    // 只退回 library.db 的 name/author，不影响旧书（尚未建目录）被搜到。
-    let mut index_urls: Vec<String> = Vec::new();
-    if let Some(term) = term {
-        let store = s.store();
-        match crate::library_store::index::shared(store.root()).await {
-            Ok(index) => match index.search(term, 2000).await {
-                Ok(urls) => index_urls = urls,
-                Err(e) => tracing::warn!(error = %e, "index.db search failed"),
-            },
-            Err(e) => tracing::warn!(error = %e, "index.db open failed; search falls back to db"),
+    // 索引是目录的派生缓存：为空/打不开时退回 library.db，避免刚部署或
+    // 重建期间列表整页空白。搜索命中为空则按“确实没有”处理，不再回退。
+    let indexed = match index::shared(s.store().root()).await {
+        Ok(index) => match index
+            .page(tier_filter, term, sort, after_ref, limit + 1)
+            .await
+        {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                tracing::warn!(error = %e, "index.db page failed; falling back to db");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "index.db open failed; falling back to db");
+            None
         }
-    }
-    let index_filter = if index_urls.is_empty() {
-        String::new()
-    } else {
-        let placeholders = (6..6 + index_urls.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(" OR book_url IN ({placeholders})")
     };
 
-    let sql = format!(
-        "SELECT * FROM library_books \
-         WHERE (?1 = 'all' OR tier = ?1) \
-           AND (?2 = '' OR name LIKE ?2 ESCAPE '\\' OR author LIKE ?2 ESCAPE '\\'{index_filter}) \
-           AND ({col} < ?3 OR ({col} = ?3 AND book_url > ?4)) \
-         ORDER BY {col} DESC, book_url ASC LIMIT ?5",
-        col = sort_expr
-    );
-    let mut query = sqlx::query_as(&sql)
-        .bind(tier_filter)
-        .bind(like.clone().unwrap_or_default())
-        .bind(ts)
-        .bind(&after_url)
-        .bind(limit + 1);
-    for url in &index_urls {
-        query = query.bind(url);
-    }
-    let rows: Vec<LibraryBook> = query.fetch_all(&s.library).await?;
-    let has_more = rows.len() as i64 > limit;
-    let page: Vec<&LibraryBook> = rows.iter().take(limit as usize).collect();
-    let next_cursor = if has_more {
-        page.last().map(|b| {
-            let key = if sort == "collected" {
-                b.collected_at.unwrap_or(0)
+    let (items, has_more) = match indexed {
+        Some(mut rows) => {
+            let mut has_more = rows.len() as i64 > limit;
+            if has_more {
+                rows.truncate(limit as usize);
+            }
+            if rows.is_empty() && term.is_none() {
+                let mut db_rows =
+                    db_page(&s.library, tier_filter, term, sort, after_ref, limit + 1).await?;
+                has_more = db_rows.len() as i64 > limit;
+                if has_more {
+                    db_rows.truncate(limit as usize);
+                }
+                (
+                    db_rows
+                        .iter()
+                        .map(|b| ListItem::from_db(b, sort))
+                        .collect::<Vec<_>>(),
+                    has_more,
+                )
             } else {
-                b.last_accessed_at
-            };
-            format!("{key}:{}", b.book_url)
-        })
+                let urls = rows.iter().map(|r| r.book_url.clone()).collect::<Vec<_>>();
+                let dbs = load_books_by_urls(&s.library, &urls).await?;
+                (
+                    rows.iter()
+                        .map(|r| ListItem::from_index(r, dbs.get(&r.book_url), sort))
+                        .collect(),
+                    has_more,
+                )
+            }
+        }
+        None => {
+            let mut db_rows =
+                db_page(&s.library, tier_filter, term, sort, after_ref, limit + 1).await?;
+            let has_more = db_rows.len() as i64 > limit;
+            if has_more {
+                db_rows.truncate(limit as usize);
+            }
+            (
+                db_rows
+                    .iter()
+                    .map(|b| ListItem::from_db(b, sort))
+                    .collect::<Vec<_>>(),
+                has_more,
+            )
+        }
+    };
+
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|b| make_cursor(&b.cursor_key, &b.book_url))
     } else {
         None
     };
     Ok(Json(json!({
         "ok": true,
         "tier": tier_filter,
-        "sort": sort,
+        "sort": sort.as_str(),
         "limit": limit,
-        "items": page.iter().map(|b| book_item(b)).collect::<Vec<_>>(),
+        "items": items.iter().map(ListItem::json).collect::<Vec<_>>(),
         "next_cursor": next_cursor,
     })))
 }
