@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use super::comic::{self, ComicChapter, ComicMeta, ComicPage};
 use super::read::{body_blocks, read_chapter_file};
 use super::{lock_book, text_blocks, ChapterItem, ImageItem, OpfMeta, Store, Tier};
-use crate::entities::BookChapter;
+use crate::entities::{BookChapter, BookSource};
 use boranlib_ebook::html::{to_blocks, Block};
 
 /// 旧正文 HTML → 语义块。标题保留层级，图片保留图片块；空文本块丢弃。
@@ -166,6 +166,46 @@ pub async fn sync_toc(
         sync_text_toc(store, &seed, chapters).await?;
     }
     Ok(())
+}
+
+/// 封面原图上限：与正文插图一致，避免把超大图塞进 EPUB。
+const MAX_COVER_BYTES: usize = 8 * 1024 * 1024;
+
+/// 把书源封面抓进目录，供 EPUB 导出与离线阅读使用。
+///
+/// 只在 OPF 还没有封面时执行：管理员换过的封面是权威，不能被书源覆盖。
+/// 只收 JPEG / WebP；失败只返回错误，由调用方记日志，不影响目录同步。
+pub async fn ingest_cover(
+    store: &Store,
+    book_url: &str,
+    cover_url: Option<&str>,
+    source: &BookSource,
+) -> anyhow::Result<bool> {
+    let Some(url) = cover_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let parsed = url::Url::parse(url)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Ok(false);
+    }
+    let Some(opened) = store.open_book(book_url).await? else {
+        return Ok(false);
+    };
+    if opened.meta.cover.is_some() {
+        return Ok(false);
+    }
+    let img = crate::image_fetch::fetch(source, url, Some(book_url), MAX_COVER_BYTES).await?;
+    let ok = matches!(
+        image::guess_format(&img.data),
+        Ok(image::ImageFormat::Jpeg) | Ok(image::ImageFormat::WebP)
+    );
+    if !ok {
+        anyhow::bail!("封面不是 JPEG/WebP，跳过入目录");
+    }
+    super::edit::replace_cover(store, book_url, opened.meta.revision, &img.mime, &img.data)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(true)
 }
 
 fn chapter_id(is_volume: bool, seq: u32) -> String {

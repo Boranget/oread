@@ -413,6 +413,18 @@ async fn ensure_chapters(
     {
         tracing::warn!(book = %job.book_url, error = %e, "sync toc to book dir failed");
     }
+    // 封面是可选增强：失败/非 JPEG/WebP 不影响正文与目录。
+    let cover_url = meta.as_ref().and_then(|m| m.cover_url.clone());
+    if let Err(e) = crate::library_store::write::ingest_cover(
+        &state.store(),
+        &job.book_url,
+        cover_url.as_deref(),
+        source,
+    )
+    .await
+    {
+        tracing::warn!(book = %job.book_url, error = %e, "ingest cover failed");
+    }
     let _ = crate::routes::books::sync_total_chapter_num(
         &state.library,
         user_pool,

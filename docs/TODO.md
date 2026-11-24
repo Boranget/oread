@@ -45,7 +45,7 @@
 5. 设计并移除 `library_chapters`：先解决非馆藏书的 TOC 落点、`is_vip`/`is_pay` 承载、
    `chapter_url → book_url` 反查三个问题。
 6. 从书源详情页自动映射系列名、系列序号、标签。
-7. EPUB 补封面、脚注（正文图片已支持）。
+7. EPUB 脚注（正文图片与书源封面已入目录）。
 8. 可选：导出产物缓存、AZW3 生成/推送。
 9. 补 README / CHANGELOG，把“目录即书”和旧缓存表已删写清楚。
 

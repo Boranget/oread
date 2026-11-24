@@ -166,6 +166,9 @@ Bearer 访问 `/opds*`，便于调试。
   `../images/<hash>.jpg`，OPF manifest 登记 `images/<hash>.jpg`。下载失败或超限的图保留远程地址。
   库内只存原图，墨水屏灰度/限宽在 `/k` 读图时代码生成。读路径把相对地址改写成带修订号的
   `oread-img://` 本地 URL，Web 与 `/k` 共用同一个图片代理。
+- 文字书封面：拿到书源（详情页或整本下载）时把 `cover_url` 下载为 `OEBPS/images/cover.<jpg|webp>`，
+  OPF 登记 `cover-image`，导出 EPUB 直接带封面；已有封面（含管理员换过的）不再被书源覆盖。
+  非 JPEG/WebP、超限或下载失败只记日志，不影响目录与正文。
 - `promote`（临时→馆藏）= 目录 `rename`；失败写 `.oread-promote` 标记（内容是 `book_url`），
   后台每 60 s 重试；期间读路径优先选有内容的目录，不被空馆藏骨架挡住。`demote` / `move_to_trash`
   同理，删除与 TTL 清理都把目录移进 `trash/`。

@@ -80,6 +80,26 @@ pub(super) async fn book_info(
     web_book::book_info_book(s.fetcher.as_ref(), &source, &mut book, Some(&store)).await?;
     persist_book_changes(&db.0, store.take_changes()).await;
     save_book_meta(&s.library, &db.0, &book).await?;
+    // 详情页知道真实书源：顺手把封面补进书目录（后台执行，不阻塞返回）。
+    // 已有封面时函数会直接跳过，管理员换过的封面不会被覆盖。
+    {
+        let store = s.store();
+        let source = source.clone();
+        let book_url = book.book_url.clone();
+        let cover_url = book.cover_url.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::library_store::write::ingest_cover(
+                &store,
+                &book_url,
+                cover_url.as_deref(),
+                &source,
+            )
+            .await
+            {
+                tracing::warn!(book = %book_url, error = %e, "ingest cover failed");
+            }
+        });
+    }
     Ok(Json(book))
 }
 
