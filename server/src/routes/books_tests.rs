@@ -393,6 +393,47 @@ async fn meta_pool() -> SqlitePool {
     pool
 }
 
+// 详情保存只写书源字段：分组/自定义标签/封面/简介/can_update/排序是个人字段，不得被覆盖
+#[tokio::test]
+async fn detail_save_keeps_personal_fields() {
+    let pool = meta_pool().await;
+    let url = "https://x/book";
+    sqlx::query(
+        "INSERT INTO book_meta \
+         (book_url, name, \"group\", custom_tag, custom_cover_url, custom_intro, can_update, \"order\") \
+         VALUES (?1, '旧名', 3, '私人标签', 'c.jpg', '私人简介', 1, 7)",
+    )
+    .bind(url)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 详情路由只带书源字段，个人字段保持默认（None/false/0）
+    let detail = Book {
+        book_url: url.into(),
+        name: Some("新名".into()),
+        ..Default::default()
+    };
+    save_book_meta(&pool, &pool, &detail).await.unwrap();
+
+    let row: (String, Option<i64>, Option<String>, Option<String>, Option<String>, bool, i64) =
+        sqlx::query_as(
+            "SELECT name, \"group\", custom_tag, custom_cover_url, custom_intro, \
+                    can_update, \"order\" FROM book_meta WHERE book_url = ?1",
+        )
+        .bind(url)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "新名");
+    assert_eq!(row.1, Some(3), "分组不能丢");
+    assert_eq!(row.2.as_deref(), Some("私人标签"));
+    assert_eq!(row.3.as_deref(), Some("c.jpg"));
+    assert_eq!(row.4.as_deref(), Some("私人简介"));
+    assert!(row.5, "can_update 不能被详情保存清零");
+    assert_eq!(row.6, 7, "排序不能被详情保存清零");
+}
+
 // total_chapter_num：目录回写后，详情保存（Book 默认 0）不得把它清零；空目录也不得清零
 #[tokio::test]
 async fn total_chapter_num_survives_detail_save_and_empty_refresh() {

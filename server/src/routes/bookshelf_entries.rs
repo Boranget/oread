@@ -9,11 +9,21 @@ pub async fn list(
     Query(q): Query<ShelfQ>,
 ) -> AppResult<Json<Vec<BookshelfItem>>> {
     let group = q.group.clone().filter(|g| !g.trim().is_empty());
-    let _ = q.book_id;
+    let book_id = q
+        .book_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
     let mut rows = sqlx::query_as::<_, BookshelfItem>(SHELF_LIST_SQL)
         .bind(group)
         .fetch_all(&db.0)
         .await?;
+    // `book_id` 是精确查询：单本书架项直接复用同一条列表 SQL 再过滤，
+    // 保持排序/进度/角标口径与全量列表一致。
+    if let Some(id) = book_id {
+        rows.retain(|row| row.book_id == id);
+    }
     // 更新开关与角标单独回填：列表 SQL 保持稳定，旧库迁移后也能工作
     let flags: Vec<(String, i64)> = sqlx::query_as("SELECT book_id, enable_update FROM bookshelf")
         .fetch_all(&db.0)
