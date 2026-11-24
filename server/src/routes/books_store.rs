@@ -494,7 +494,12 @@ pub(crate) fn content_is_empty(c: &BookContent) -> bool {
             .0
             .is_empty()
     } else {
-        text_is_blank(c.content.as_deref().unwrap_or(""))
+        let html = c.content.as_deref().unwrap_or("");
+        // 只有插图的章节也是有效内容：`text_is_blank` 只数可见字符，会把 <img> 当成空。
+        text_is_blank(html)
+            && !crate::library_store::write::markup_to_blocks(html)
+                .iter()
+                .any(boranlib_ebook::html::Block::is_image)
     }
 }
 
@@ -531,15 +536,9 @@ pub(crate) async fn save_text_prefer_dir(
     if book_url.is_empty() || c.url.trim().is_empty() {
         return Ok(false);
     }
-    let paragraphs =
-        crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
-    match crate::library_store::write::save_text_chapter_tracked(
-        store,
-        book_url,
-        &c.url,
-        &paragraphs,
-    )
-    .await
+    let blocks = crate::library_store::write::markup_to_blocks(c.content.as_deref().unwrap_or(""));
+    match crate::library_store::write::save_text_chapter_tracked(store, book_url, &c.url, &blocks)
+        .await
     {
         Ok(Some(write)) => {
             if let Err(e) = crate::library_store::usage::note_text_chapter(

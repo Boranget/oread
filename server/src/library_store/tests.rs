@@ -72,7 +72,7 @@ fn chapter_xhtml_escapes_and_keeps_order() {
     let html = chapter_xhtml(
         "zh",
         "标题 & <标签>",
-        &["甲 < 乙".into(), "  ".into(), "丙".into()],
+        &text_blocks(&["甲 < 乙".into(), "  ".into(), "丙".into()]),
     );
     assert!(html.contains("<title>标题 &amp; &lt;标签&gt;</title>"));
     assert!(html.contains("<p>甲 &lt; 乙</p>"));
@@ -80,6 +80,21 @@ fn chapter_xhtml_escapes_and_keeps_order() {
     let first = html.find("甲 &lt; 乙").unwrap();
     let second = html.find("<p>丙</p>").unwrap();
     assert!(first < second);
+}
+
+#[test]
+fn chapter_xhtml_keeps_image_blocks() {
+    let blocks = vec![
+        Block::Paragraph("前".into()),
+        Block::Image {
+            src: "https://a.test/x.jpg?a=1&b=2".into(),
+            alt: "\"图\"".into(),
+        },
+    ];
+    let html = chapter_xhtml("zh", "标题", &blocks);
+    assert!(html.contains("<img src=\"https://a.test/x.jpg?a=1&amp;b=2\""));
+    let back = super::read::body_blocks(&html, "标题");
+    assert_eq!(back, blocks);
 }
 
 #[tokio::test]
@@ -129,7 +144,12 @@ async fn chapter_round_trip_and_opf_order() {
     meta.chapters.push(item.clone());
     let dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
     store
-        .write_chapter(&dir, "zh", &item, &["第一段".into(), "第二段".into()])
+        .write_chapter(
+            &dir,
+            "zh",
+            &item,
+            &text_blocks(&["第一段".into(), "第二段".into()]),
+        )
         .await
         .unwrap();
     meta.bump();

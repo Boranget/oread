@@ -532,7 +532,7 @@ pub(crate) async fn epub_download(s: &AppState, uid: i64, book_url: &str) -> App
 mod tests {
     use super::*;
     use crate::entities::BookChapter;
-    use crate::library_store::{write as store_write, Store};
+    use crate::library_store::{text_blocks, write as store_write, Store};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn export_pool() -> SqlitePool {
@@ -617,13 +617,18 @@ mod tests {
             &store,
             book,
             "https://x/c1",
-            &["第一章正文".into(), "第二段".into()],
+            &text_blocks(&["第一章正文".into(), "第二段".into()]),
         )
         .await
         .unwrap();
-        store_write::save_text_chapter(&store, book, "https://x/c3", &["第三章正文内容".into()])
-            .await
-            .unwrap();
+        store_write::save_text_chapter(
+            &store,
+            book,
+            "https://x/c3",
+            &text_blocks(&["第三章正文内容".into()]),
+        )
+        .await
+        .unwrap();
         store
     }
 

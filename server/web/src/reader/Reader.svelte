@@ -13,7 +13,7 @@
   import ReaderToolbar from './ReaderToolbar.svelte';
   import { convertZh } from '../lib/zhconvert.js';
   import { isEmptyChapter, isVolumeTitle } from './readerContent.js';
-  import { htmlToParas, plainChars } from './readerHtml.js';
+  import { blocksToParas, htmlToParas, plainChars } from './readerHtml.js';
   import { createImageLoader } from './readerImages.js';
   import { createReadingStats } from './readerStats.js';
   import { createAutoScroll } from './readerAuto.js';
@@ -363,12 +363,19 @@
 
   $: prevPos = sibling(currentPos, -1, chapters);
   $: nextPos = sibling(currentPos, 1, chapters);
-  // 后端 content 可能是 HTML 片段（含 <p>/<br>/<img>）：保留图片，文本按段落切开
-  $: paras = current && current.content
-    ? htmlToParas(
-        current.content,
-        current.url || (chapters[currentPos] && chapters[currentPos].url) || ''
-      )
+  // 后端优先返回语义块；旧服务端/缓存没有 blocks 时退回 HTML 解析。
+  $: paras = current
+    ? Array.isArray(current.blocks)
+      ? blocksToParas(
+          current.blocks,
+          current.url || (chapters[currentPos] && chapters[currentPos].url) || ''
+        )
+      : current.content
+        ? htmlToParas(
+            current.content,
+            current.url || (chapters[currentPos] && chapters[currentPos].url) || ''
+          )
+        : []
     : [];
   $: imageParas = paras.filter((p) => p.type === 'image');
   $: if (current && imageParas.length) imageLoader.queue(imageParas);
@@ -378,7 +385,9 @@
   $: effFont = font;
   $: effLine = lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
-  $: displayParas = paras.map((p) => (p.type === 'text' ? { ...p, text: convertZh(p.text, zhMode) } : p));
+  $: displayParas = paras.map((p) =>
+    p.type === 'text' || p.type === 'heading' ? { ...p, text: convertZh(p.text, zhMode) } : p
+  );
   // 空正文不再渲染成“只有标题的空白页”：给出明确原因与可操作入口（重试/换源/下一章/目录）。
   $: chapterEmpty = !!current && !contentError && !contentLoading && displayParas.length === 0 && isEmptyChapter(current);
   $: emptyIsVolume = chapterEmpty && isVolumeTitle(displayTitle);

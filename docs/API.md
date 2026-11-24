@@ -1588,7 +1588,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `book_url` | string | 否 | 所属书籍 URL；**必定非空**（回填失败时整个请求返回 400） |
 | `url` | string | 否 | 章节 URL |
 | `title` | string | 是 | 章节标题；优先缓存值，其次请求参数 `title`，再按 `chapter_url` 反查 `library_chapters.title`；都拿不到才为 `null` |
-| `content` | string | 是 | 正文（经用户替换规则 + 图片样式处理） |
+| `content` | string | 是 | 正文 HTML（经用户替换规则 + 图片样式处理），保留给 `/k` 与旧客户端 |
+| `blocks` | array | 否 | 语义块：`{type:"heading",level,text}` / `{type:"paragraph",text}` / `{type:"image",src,alt}`；Web 阅读器优先用它渲染 |
 | `chapter_index` | integer | 否 | 章节下标；新抓取时恒 0（前端用目录数据补全） |
 | `resource_url` | string | 是 | 当前 null |
 | `is_local` | boolean | 否 | 当前 false |
@@ -1602,6 +1603,10 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   "url": "https://example.com/book/123/1.html",
   "title": "第一章 开端",
   "content": "<p>正文第一段</p><p>正文第二段</p>",
+  "blocks": [
+    { "type": "paragraph", "text": "正文第一段" },
+    { "type": "paragraph", "text": "正文第二段" }
+  ],
   "chapter_index": 0,
   "resource_url": null,
   "is_local": false

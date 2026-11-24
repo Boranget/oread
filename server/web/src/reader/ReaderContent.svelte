@@ -169,6 +169,8 @@
                     <div class="rd-img-ph">插图加载中…</div>
                   {/if}
                 </div>
+              {:else if p.type === 'heading'}
+                <p class="rd-p rd-h" data-para={i}>{p.text}</p>
               {:else}
                 <p class="rd-p" data-para={i}>{p.text}</p>
               {/if}
@@ -292,6 +294,11 @@
     margin: 0 0 0.85em;
     text-indent: 2em;
     word-break: break-word;
+  }
+  .rd-h {
+    margin: 1.2em 0 0.6em;
+    text-indent: 0;
+    font-weight: 600;
   }
   /* 内嵌图片：桌面居中 + max-width；手机满宽（颜色交给服务端灰度转码） */
   .rd-img {

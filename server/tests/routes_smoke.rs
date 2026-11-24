@@ -11,7 +11,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use boranlib::config::Config;
 use boranlib::entities::BookChapter;
-use boranlib::library_store::{write as store_write, Store};
+use boranlib::library_store::{text_blocks, write as store_write, Store};
 use boranlib::{db, routes};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -1436,7 +1436,7 @@ async fn kindle_reads_text_from_local_dir_without_source() {
             &book_dir,
             "zh",
             &item,
-            &["目录里的正文段落".into(), "第二段".into()],
+            &text_blocks(&["目录里的正文段落".into(), "第二段".into()]),
         )
         .await
         .unwrap();
@@ -1557,7 +1557,7 @@ async fn epub_export_info_and_download() {
         &store,
         "https://e.test/book",
         "https://e.test/c1",
-        &["第一章正文".into()],
+        &text_blocks(&["第一章正文".into()]),
     )
     .await
     .unwrap();
@@ -1827,7 +1827,7 @@ async fn opds_requires_basic_and_exposes_collection() {
         &store,
         "https://o.test/text",
         "https://o.test/text/1",
-        &["正文".into()],
+        &text_blocks(&["正文".into()]),
     )
     .await
     .unwrap();

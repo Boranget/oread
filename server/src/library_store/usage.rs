@@ -175,7 +175,7 @@ mod tests {
     use crate::entities::BookChapter;
     use crate::library_store::comic;
     use crate::library_store::write::{save_text_chapter, sync_text_toc, TocSeed};
-    use crate::library_store::{OpfMeta, Tier};
+    use crate::library_store::{text_blocks, OpfMeta, Tier};
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -216,7 +216,7 @@ mod tests {
             &store,
             book_url,
             "https://x/c1",
-            &["正文一".into(), "正文二".into()],
+            &text_blocks(&["正文一".into(), "正文二".into()]),
         )
         .await
         .unwrap();
@@ -301,9 +301,14 @@ mod tests {
         )
         .await
         .unwrap();
-        save_text_chapter(&store, book_url, "https://x/c1", &["正文".into()])
-            .await
-            .unwrap();
+        save_text_chapter(
+            &store,
+            book_url,
+            "https://x/c1",
+            &text_blocks(&["正文".into()]),
+        )
+        .await
+        .unwrap();
 
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)

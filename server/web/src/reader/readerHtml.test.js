@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { absImg, htmlToParas, imgAttr, pickImgSrc, plainChars, textToParas } from './readerHtml.js';
+import { absImg, blocksToParas, htmlToParas, imgAttr, pickImgSrc, plainChars, textToParas } from './readerHtml.js';
 
 test('plainChars 去掉标签与空白后计数', () => {
   assert.equal(plainChars(''), 0);
@@ -51,4 +51,19 @@ test('htmlToParas 忽略无法归一的图片地址', () => {
   assert.deepEqual(htmlToParas('<img src="data:x"><p>正文</p>', 'https://a.test/'), [
     { type: 'text', text: '正文' },
   ]);
+});
+
+test('blocksToParas 按语义块渲染标题、段落与图片', () => {
+  const blocks = [
+    { type: 'heading', level: 2, text: '小标题' },
+    { type: 'paragraph', text: '正文' },
+    { type: 'image', src: 'pic.jpg', alt: '图' },
+    { type: 'image', src: 'data:x', alt: '' },
+  ];
+  assert.deepEqual(blocksToParas(blocks, 'https://a.test/ch/1.html'), [
+    { type: 'heading', level: 2, text: '小标题' },
+    { type: 'text', text: '正文' },
+    { type: 'image', src: 'https://a.test/ch/pic.jpg', alt: '图' },
+  ]);
+  assert.deepEqual(blocksToParas(null, 'https://a.test/'), []);
 });

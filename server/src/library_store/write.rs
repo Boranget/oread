@@ -16,32 +16,40 @@ use sqlx::SqlitePool;
 
 use super::comic::{self, ComicChapter, ComicMeta, ComicPage};
 use super::read::{body_blocks, read_chapter_file};
-use super::{lock_book, ChapterItem, OpfMeta, Store, Tier};
+use super::{lock_book, text_blocks, ChapterItem, OpfMeta, Store, Tier};
 use crate::entities::BookChapter;
 use boranlib_ebook::html::{to_blocks, Block};
 
-/// 旧正文 HTML → 段落。标题块也并入段落（章节标题由 OPF 单独保存，避免重复）。
-pub fn markup_to_paragraphs(html: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for block in to_blocks(html) {
-        match block {
-            Block::Paragraph(text) | Block::Heading(_, text) => {
-                if !text.trim().is_empty() {
-                    out.push(text);
-                }
-            }
-        }
-    }
-    out
+/// 旧正文 HTML → 语义块。标题保留层级，图片保留图片块；空文本块丢弃。
+pub fn markup_to_blocks(html: &str) -> Vec<Block> {
+    to_blocks(html)
+        .into_iter()
+        .filter(|block| match block {
+            Block::Heading(_, text) | Block::Paragraph(text) => !text.trim().is_empty(),
+            Block::Image { .. } => true,
+        })
+        .collect()
 }
 
-fn paragraphs_of(xhtml: &str, title: &str) -> Vec<String> {
+/// 旧正文 HTML → 段落。标题块也并入段落（章节标题由 OPF 单独保存，避免重复）。
+/// 会丢弃图片块；写盘路径应改用 [`markup_to_blocks`]。
+pub fn markup_to_paragraphs(html: &str) -> Vec<String> {
+    markup_to_blocks(html)
+        .into_iter()
+        .filter_map(|block| match block {
+            Block::Paragraph(text) | Block::Heading(_, text) => Some(text),
+            Block::Image { .. } => None,
+        })
+        .collect()
+}
+
+fn blocks_of(xhtml: &str, title: &str) -> Vec<Block> {
     body_blocks(xhtml, title)
         .into_iter()
-        .map(|b| match b {
-            Block::Heading(_, text) | Block::Paragraph(text) => text,
+        .filter(|block| match block {
+            Block::Heading(_, text) | Block::Paragraph(text) => !text.trim().is_empty(),
+            Block::Image { .. } => true,
         })
-        .filter(|text| !text.trim().is_empty())
         .collect()
 }
 
@@ -372,7 +380,12 @@ async fn write_new_chapter(
         store.write_chapter(dir, language, item, &[]).await
     } else {
         store
-            .write_pending_chapter(dir, language, item, &["本章内容尚未缓存".to_string()])
+            .write_pending_chapter(
+                dir,
+                language,
+                item,
+                &text_blocks(&["本章内容尚未缓存".to_string()]),
+            )
             .await
     }
 }
@@ -394,21 +407,19 @@ async fn retitle_chapter(
         return write_new_chapter(store, dir, language, &updated).await;
     };
     let pending = super::is_pending_html(&xhtml);
-    let mut paragraphs = paragraphs_of(&xhtml, &item.title);
+    let mut blocks = blocks_of(&xhtml, &item.title);
     if item.is_volume {
         return store.write_chapter(dir, language, &updated, &[]).await;
     }
     if pending {
-        if paragraphs.is_empty() {
-            paragraphs.push("本章内容尚未缓存".to_string());
+        if blocks.is_empty() {
+            blocks.push(Block::Paragraph("本章内容尚未缓存".to_string()));
         }
         store
-            .write_pending_chapter(dir, language, &updated, &paragraphs)
+            .write_pending_chapter(dir, language, &updated, &blocks)
             .await
     } else {
-        store
-            .write_chapter(dir, language, &updated, &paragraphs)
-            .await
+        store.write_chapter(dir, language, &updated, &blocks).await
     }
 }
 
@@ -426,10 +437,10 @@ pub async fn save_text_chapter(
     store: &Store,
     book_url: &str,
     chapter_url: &str,
-    paragraphs: &[String],
+    blocks: &[Block],
 ) -> io::Result<bool> {
     Ok(
-        save_text_chapter_tracked(store, book_url, chapter_url, paragraphs)
+        save_text_chapter_tracked(store, book_url, chapter_url, blocks)
             .await?
             .is_some(),
     )
@@ -440,9 +451,9 @@ pub async fn save_text_chapter_tracked(
     store: &Store,
     book_url: &str,
     chapter_url: &str,
-    paragraphs: &[String],
+    blocks: &[Block],
 ) -> io::Result<Option<ChapterWrite>> {
-    if paragraphs.is_empty() {
+    if blocks.is_empty() {
         return Ok(None);
     }
     let _guard = lock_book(book_url).await;
@@ -458,15 +469,18 @@ pub async fn save_text_chapter_tracked(
     }
     // 抓取层常把章节标题也放在正文第一段；OPF 已单独保存标题，正文里去掉，
     // 避免阅读器重复显示。
-    let mut paragraphs = paragraphs.to_vec();
-    if paragraphs
+    let mut blocks = blocks.to_vec();
+    let first_is_title = blocks
         .first()
-        .map(|p| p.trim() == item.title.trim())
-        .unwrap_or(false)
-    {
-        paragraphs.remove(0);
+        .map(|b| match b {
+            Block::Heading(_, text) | Block::Paragraph(text) => text.trim() == item.title.trim(),
+            Block::Image { .. } => false,
+        })
+        .unwrap_or(false);
+    if first_is_title {
+        blocks.remove(0);
     }
-    if paragraphs.is_empty() {
+    if blocks.is_empty() {
         return Ok(None);
     }
     let path = opened.dir.join("OEBPS").join(&item.href);
@@ -479,7 +493,7 @@ pub async fn save_text_chapter_tracked(
         Ok(Some(xhtml)) if crate::library_store::read::parse_chapter(&xhtml, &item.title).is_some()
     );
     store
-        .write_chapter(&opened.dir, &opened.meta.language, item, &paragraphs)
+        .write_chapter(&opened.dir, &opened.meta.language, item, &blocks)
         .await?;
     let new_len = tokio::fs::metadata(&path)
         .await
@@ -825,7 +839,7 @@ mod tests {
             &store,
             book_url,
             "https://x/c1",
-            &["正文一".into(), "正文二".into()],
+            &text_blocks(&["正文一".into(), "正文二".into()]),
         )
         .await
         .unwrap();
@@ -838,18 +852,21 @@ mod tests {
         assert_eq!(body.text, "正文一\n正文二");
 
         // 未登记章节不落盘。
-        assert!(
-            !save_text_chapter(&store, book_url, "https://x/missing", &["x".into()])
-                .await
-                .unwrap()
-        );
+        assert!(!save_text_chapter(
+            &store,
+            book_url,
+            "https://x/missing",
+            &text_blocks(&["x".into()])
+        )
+        .await
+        .unwrap());
 
         // 正文首段与章节标题相同：OPF 已有标题，落盘时去掉，避免重复显示。
         assert!(save_text_chapter(
             &store,
             book_url,
             "https://x/c1",
-            &["第一章".into(), "正文三".into()]
+            &text_blocks(&["第一章".into(), "正文三".into()])
         )
         .await
         .unwrap());

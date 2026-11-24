@@ -240,8 +240,9 @@ pub async fn chapter_paragraphs(
     }
     let paragraphs = body_blocks(&xhtml, &item.title)
         .into_iter()
-        .map(|b| match b {
-            Block::Heading(_, text) | Block::Paragraph(text) => text,
+        .filter_map(|b| match b {
+            Block::Heading(_, text) | Block::Paragraph(text) => Some(text),
+            Block::Image { .. } => None,
         })
         .filter(|text| !text.trim().is_empty())
         .collect();
@@ -273,6 +274,14 @@ pub async fn save_chapter(
     if item.is_volume {
         return Err(EditError::BadRequest("卷标题没有正文".into()));
     }
+    // v1 的编辑接口只提交纯文本段落，整章保存会丢图片块：含插图的章节先只读。
+    if let Some(xhtml) = store.read_chapter(&opened.dir, &item.href).await? {
+        if body_blocks(&xhtml, &item.title).iter().any(Block::is_image) {
+            return Err(EditError::BadRequest(
+                "本章含插图，v1 暂不支持整章编辑；插图会在后续版本随段落一起保留".into(),
+            ));
+        }
+    }
     let clean: Vec<String> = paragraphs
         .iter()
         .map(|p| p.trim().to_string())
@@ -282,7 +291,12 @@ pub async fn save_chapter(
         return Err(EditError::BadRequest("正文不能为空".into()));
     }
     store
-        .write_chapter(&opened.dir, &opened.meta.language, &item, &clean)
+        .write_chapter(
+            &opened.dir,
+            &opened.meta.language,
+            &item,
+            &super::text_blocks(&clean),
+        )
         .await?;
     let mut meta = opened.meta;
     meta.bump();
@@ -490,7 +504,12 @@ mod tests {
         meta.chapters.push(item.clone());
         let dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
         store
-            .write_chapter(&dir, "zh", &item, &["第一段".into(), "第二段".into()])
+            .write_chapter(
+                &dir,
+                "zh",
+                &item,
+                &crate::library_store::text_blocks(&["第一段".into(), "第二段".into()]),
+            )
             .await
             .unwrap();
         meta.bump();

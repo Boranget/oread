@@ -196,11 +196,17 @@ pub(super) async fn content(
     if let Some(b) = c.content.take() {
         c.content = Some(replace::apply_image_style(&b, style));
     }
+    let blocks = c
+        .content
+        .as_deref()
+        .map(blocks_json)
+        .unwrap_or_else(|| json!([]));
     Ok(Json(json!({
         "book_url": c.book_url,
         "url": c.url,
         "title": c.title,
         "content": c.content,
+        "blocks": blocks,
         "chapter_index": c.chapter_index,
         "content_type": "text",
         "images": [],
@@ -210,6 +216,22 @@ pub(super) async fn content(
         // 书目录是唯一正文来源，不再有「回源失败读旧缓存」的状态。
         "stale": false,
     })))
+}
+
+/// 归一化正文 HTML → 前端语义块。`content` 继续保留给 `/k` 与旧客户端。
+fn blocks_json(html: &str) -> serde_json::Value {
+    use boranlib_ebook::html::{to_blocks, Block};
+    let items: Vec<serde_json::Value> = to_blocks(html)
+        .into_iter()
+        .map(|block| match block {
+            Block::Heading(level, text) => {
+                json!({"type": "heading", "level": level, "text": text})
+            }
+            Block::Paragraph(text) => json!({"type": "paragraph", "text": text}),
+            Block::Image { src, alt } => json!({"type": "image", "src": src, "alt": alt}),
+        })
+        .collect();
+    json!(items)
 }
 
 /// 回源抓取一章正文（文本或图片列表），不负责落库。
@@ -792,4 +814,25 @@ pub(super) async fn switch_source(
         None => candidates.collect(),
     };
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::blocks_json;
+
+    #[test]
+    fn blocks_json_maps_heading_paragraph_and_image() {
+        let v = blocks_json(
+            "<h2>标题</h2><p>正文</p>\
+             <div class=\"oread-img\"><img src=\"https://a.test/x.jpg\" alt=\"图\"/></div>",
+        );
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"type": "heading", "level": 2, "text": "标题"},
+                {"type": "paragraph", "text": "正文"},
+                {"type": "image", "src": "https://a.test/x.jpg", "alt": "图"}
+            ])
+        );
+    }
 }

@@ -94,11 +94,12 @@ impl OpfMeta {
     }
 }
 
-/// 一章正文的两种视图：给网页端/导出 writer 的 HTML，以及给搜索的纯文本。
+/// 一章正文的三种视图：给网页端/导出 writer 的 HTML、给搜索的纯文本，以及结构化块。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChapterBody {
     pub html: String,
     pub text: String,
+    pub blocks: Vec<Block>,
 }
 
 /// 读章节文件；不存在返回 `Ok(None)`。
@@ -134,7 +135,7 @@ pub fn body_blocks(xhtml: &str, title: &str) -> Vec<Block> {
     blocks
 }
 
-fn blocks_to_html(blocks: &[Block]) -> String {
+pub fn blocks_to_html(blocks: &[Block]) -> String {
     let mut out = String::with_capacity(blocks.len() * 96);
     for block in blocks {
         match block {
@@ -145,16 +146,24 @@ fn blocks_to_html(blocks: &[Block]) -> String {
             Block::Paragraph(text) => {
                 out.push_str(&format!("<p>{}</p>", xml_escape(text)));
             }
+            Block::Image { src, alt } => {
+                out.push_str(&format!(
+                    "<div class=\"oread-img\"><img src=\"{}\" alt=\"{}\"/></div>",
+                    xml_escape(src),
+                    xml_escape(alt)
+                ));
+            }
         }
     }
     out
 }
 
-fn blocks_to_text(blocks: &[Block]) -> String {
+pub fn blocks_to_text(blocks: &[Block]) -> String {
     let mut out = String::new();
     for block in blocks {
         let text = match block {
             Block::Heading(_, text) | Block::Paragraph(text) => text,
+            Block::Image { .. } => continue,
         };
         if text.trim().is_empty() {
             continue;
@@ -177,12 +186,14 @@ pub fn parse_chapter(xhtml: &str, title: &str) -> Option<ChapterBody> {
         return None;
     }
     let text = blocks_to_text(&blocks);
-    if text.trim().is_empty() {
+    // 纯图片章节也可以有内容；只有既没有文字也没有图片时才视为空章。
+    if text.trim().is_empty() && !blocks.iter().any(Block::is_image) {
         return None;
     }
     Some(ChapterBody {
         html: blocks_to_html(&blocks),
         text,
+        blocks,
     })
 }
 

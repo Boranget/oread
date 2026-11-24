@@ -7,9 +7,11 @@
 //! - 块级元素（`p`/`div`/`li`/`blockquote`/表格单元）各自成段；
 //! - `<br>` 与文本里的换行断段；
 //! - 行内标签只取文字（不强求保留粗体/颜色，阅读器可自行排版）；
-//! - `script`/`style`/`img`/`svg`/视频等直接丢弃，避免 EPUB 里出现外链资源。
+//! - `<img>` 成为独立图片块（兼容懒加载属性，过滤非法地址与跟踪像素）；
+//! - `script`/`style`/`svg`/视频等直接丢弃，避免 EPUB 里出现脚本与外链资源。
 
 use ego_tree::NodeRef;
+use scraper::node::Element;
 use scraper::{Html, Node};
 
 /// 归一化后的正文块。
@@ -17,6 +19,17 @@ use scraper::{Html, Node};
 pub enum Block {
     Heading(u8, String),
     Paragraph(String),
+    /// `src` 原样保留（相对地址由调用方按章节 URL 归一化），`alt` 可为空。
+    Image {
+        src: String,
+        alt: String,
+    },
+}
+
+impl Block {
+    pub fn is_image(&self) -> bool {
+        matches!(self, Block::Image { .. })
+    }
 }
 
 /// 把一章正文转成块序列。纯文本输入同样适用（按换行断段）。
@@ -66,6 +79,13 @@ fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
         Node::Element(el) => {
             let name = el.name();
             if is_skip(name) {
+                return;
+            }
+            if name == "img" {
+                b.flush();
+                if let Some((src, alt)) = image_of(el) {
+                    b.blocks.push(Block::Image { src, alt });
+                }
                 return;
             }
             if let Some(level) = heading_level(name) {
@@ -127,8 +147,78 @@ fn inline_text<'a>(node: &NodeRef<'a, Node>) -> String {
 fn is_skip(name: &str) -> bool {
     matches!(
         name,
-        "script" | "style" | "noscript" | "iframe" | "video" | "audio" | "source" | "svg" | "img"
+        "script" | "style" | "noscript" | "iframe" | "video" | "audio" | "source" | "svg"
     )
+}
+
+/// 图片地址候选：懒加载属性优先于 `src`（`src` 常是 1px 占位图），
+/// 最后才看 `srcset` 的第一项。顺序与前端旧解析保持一致。
+const IMG_ATTRS: &[&str] = &[
+    "data-src",
+    "data-original",
+    "data-lazy-src",
+    "data-original-src",
+    "data-echo",
+    "data-url",
+];
+
+fn attr(el: &Element, name: &str) -> Option<String> {
+    el.attr(name)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn image_src(el: &Element) -> Option<String> {
+    IMG_ATTRS
+        .iter()
+        .find_map(|name| attr(el, name))
+        .or_else(|| attr(el, "src"))
+        .or_else(|| {
+            let set = attr(el, "srcset").or_else(|| attr(el, "data-srcset"))?;
+            let first = set.split(',').next()?.split_whitespace().next()?;
+            Some(first.to_string())
+        })
+        .filter(|src| valid_img_src(src))
+}
+
+/// 只保留能安全交给前端的地址：拒绝 `javascript:`/`data:` 等伪协议。
+fn valid_img_src(src: &str) -> bool {
+    let lower = src.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    ![
+        "data:",
+        "javascript:",
+        "vbscript:",
+        "blob:",
+        "file:",
+        "about:",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+}
+
+fn dim_attr(el: &Element, name: &str) -> Option<u32> {
+    el.attr(name)?
+        .trim()
+        .trim_end_matches("px")
+        .parse::<u32>()
+        .ok()
+}
+
+/// 提取图片块；`width`/`height` 都很小（≤2px）时视为跟踪像素丢弃。
+fn image_of(el: &Element) -> Option<(String, String)> {
+    if let (Some(w), Some(h)) = (dim_attr(el, "width"), dim_attr(el, "height")) {
+        if w <= 2 && h <= 2 {
+            return None;
+        }
+    }
+    let src = image_src(el)?;
+    let alt = attr(el, "alt").unwrap_or_default();
+    let alt = alt.chars().take(200).collect();
+    Some((src, alt))
 }
 
 fn heading_level(name: &str) -> Option<u8> {
@@ -221,9 +311,49 @@ mod tests {
     }
 
     #[test]
-    fn skips_scripts_images_and_collapses_spaces() {
-        let blocks = to_blocks("<p>甲&nbsp;&nbsp;乙<script>alert(1)</script><img src=\"x\">丙</p>");
+    fn skips_scripts_and_collapses_spaces() {
+        let blocks = to_blocks("<p>甲&nbsp;&nbsp;乙<script>alert(1)</script>丙</p>");
         assert_eq!(blocks, vec![Block::Paragraph("甲 乙丙".into())]);
+    }
+
+    #[test]
+    fn images_become_blocks_with_lazy_src() {
+        let blocks = to_blocks(
+            "<p>前<img src=\"placeholder.gif\" data-src=\"real.jpg\" alt=\"图\">后</p>\
+             <img src=\"https://a.test/b.jpg\">",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("前".into()),
+                Block::Image {
+                    src: "real.jpg".into(),
+                    alt: "图".into()
+                },
+                Block::Paragraph("后".into()),
+                Block::Image {
+                    src: "https://a.test/b.jpg".into(),
+                    alt: "".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn images_filter_bad_sources_and_tracking_pixels() {
+        let blocks = to_blocks(
+            "<img src=\"javascript:alert(1)\">\
+             <img src=\"data:image/gif;base64,AAA\">\
+             <img src=\"https://a.test/p.gif\" width=\"1\" height=\"1\">\
+             <img srcset=\"https://a.test/x.jpg 1x, https://a.test/y.jpg 2x\">",
+        );
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                src: "https://a.test/x.jpg".into(),
+                alt: "".into()
+            }]
+        );
     }
 
     #[test]

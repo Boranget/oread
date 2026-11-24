@@ -159,7 +159,7 @@ fn collect_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use crate::library_store::opf::OpfMeta;
-    use crate::library_store::{ChapterItem, Tier};
+    use crate::library_store::{text_blocks, ChapterItem, Tier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -192,7 +192,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .write_chapter(&dir, "zh", &item, &["正文".into()])
+            .write_chapter(&dir, "zh", &item, &text_blocks(&["正文".into()]))
             .await
             .unwrap();
 

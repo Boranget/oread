@@ -37,6 +37,8 @@ use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+use boranlib_ebook::html::Block;
+
 pub use opf::{ChapterItem, CoverItem, OpfMeta};
 
 pub const COLLECTION_DIR: &str = "collection";
@@ -166,8 +168,12 @@ impl Store {
         if !pending.exists() && meta.chapters.is_empty() {
             atomic_write(
                 &pending,
-                pending_chapter_xhtml(&meta.language, "待缓存", &["本书内容尚未缓存".into()])
-                    .as_bytes(),
+                pending_chapter_xhtml(
+                    &meta.language,
+                    "待缓存",
+                    &text_blocks(&["本书内容尚未缓存".into()]),
+                )
+                .as_bytes(),
             )
             .await?;
         }
@@ -193,15 +199,15 @@ impl Store {
         atomic_write(&path, opf::to_nav_xhtml(meta).as_bytes()).await
     }
 
-    /// 写一章正文（归一化后的段落）。`id`/`href` 来自 [`ChapterItem`]。
+    /// 写一章正文（归一化后的语义块）。`id`/`href` 来自 [`ChapterItem`]。
     pub async fn write_chapter(
         &self,
         dir: &Path,
         language: &str,
         item: &ChapterItem,
-        paragraphs: &[String],
+        blocks: &[Block],
     ) -> io::Result<()> {
-        self.write_chapter_marked(dir, language, item, paragraphs, false)
+        self.write_chapter_marked(dir, language, item, blocks, false)
             .await
     }
 
@@ -212,9 +218,9 @@ impl Store {
         dir: &Path,
         language: &str,
         item: &ChapterItem,
-        paragraphs: &[String],
+        blocks: &[Block],
     ) -> io::Result<()> {
-        self.write_chapter_marked(dir, language, item, paragraphs, true)
+        self.write_chapter_marked(dir, language, item, blocks, true)
             .await
     }
 
@@ -223,18 +229,14 @@ impl Store {
         dir: &Path,
         language: &str,
         item: &ChapterItem,
-        paragraphs: &[String],
+        blocks: &[Block],
         pending: bool,
     ) -> io::Result<()> {
         let path = dir.join("OEBPS").join(&item.href);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let html = if pending {
-            pending_chapter_xhtml(language, &item.title, paragraphs)
-        } else {
-            chapter_xhtml(language, &item.title, paragraphs)
-        };
+        let html = chapter_xhtml_marked(language, &item.title, blocks, pending);
         atomic_write(&path, html.as_bytes()).await
     }
 
@@ -525,30 +527,34 @@ pub fn is_pending_html(html: &str) -> bool {
     html.contains(PENDING_CLASS)
 }
 
-/// 生成一章规范 XHTML。段落一律是纯文本，序列化时统一转义，
-/// 因此段落编辑「想写出非法文件」在结构上就不可能。
-pub fn chapter_xhtml(language: &str, title: &str, paragraphs: &[String]) -> String {
-    chapter_xhtml_marked(language, title, paragraphs, false)
+/// 纯文本段落 → 段落块（供旧调用方与占位章使用）。
+pub fn text_blocks(paragraphs: &[String]) -> Vec<Block> {
+    paragraphs
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| Block::Paragraph(p.trim().to_string()))
+        .collect()
+}
+
+/// 生成一章规范 XHTML。文本一律转义、图片地址过属性转义，
+/// 因此编辑「想写出非法文件」在结构上就不可能。
+pub fn chapter_xhtml(language: &str, title: &str, blocks: &[Block]) -> String {
+    chapter_xhtml_marked(language, title, blocks, false)
 }
 
 /// 占位章：结构与正文一致，只是段落带 [`PENDING_CLASS`]。
-pub fn pending_chapter_xhtml(language: &str, title: &str, paragraphs: &[String]) -> String {
-    chapter_xhtml_marked(language, title, paragraphs, true)
+pub fn pending_chapter_xhtml(language: &str, title: &str, blocks: &[Block]) -> String {
+    chapter_xhtml_marked(language, title, blocks, true)
 }
 
-fn chapter_xhtml_marked(
-    language: &str,
-    title: &str,
-    paragraphs: &[String],
-    pending: bool,
-) -> String {
+fn chapter_xhtml_marked(language: &str, title: &str, blocks: &[Block], pending: bool) -> String {
     use std::fmt::Write as _;
     let lang = if language.trim().is_empty() {
         opf::DEFAULT_LANGUAGE
     } else {
         language.trim()
     };
-    let mut s = String::with_capacity(256 + paragraphs.len() * 128);
+    let mut s = String::with_capacity(256 + blocks.len() * 128);
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     let _ = writeln!(
         s,
@@ -570,19 +576,43 @@ fn chapter_xhtml_marked(
             boranlib_ebook::xml::xml_escape(title.trim())
         );
     }
-    for p in paragraphs {
-        let text = p.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if pending {
-            let _ = writeln!(
-                s,
-                "<p class=\"{PENDING_CLASS}\">{}</p>",
-                boranlib_ebook::xml::xml_escape(text)
-            );
-        } else {
-            let _ = writeln!(s, "<p>{}</p>", boranlib_ebook::xml::xml_escape(text));
+    for block in blocks {
+        match block {
+            Block::Heading(level, text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let level = (*level).clamp(1, 6);
+                let _ = writeln!(
+                    s,
+                    "<h{level}>{}</h{level}>",
+                    boranlib_ebook::xml::xml_escape(text)
+                );
+            }
+            Block::Paragraph(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if pending {
+                    let _ = writeln!(
+                        s,
+                        "<p class=\"{PENDING_CLASS}\">{}</p>",
+                        boranlib_ebook::xml::xml_escape(text)
+                    );
+                } else {
+                    let _ = writeln!(s, "<p>{}</p>", boranlib_ebook::xml::xml_escape(text));
+                }
+            }
+            Block::Image { src, alt } => {
+                let _ = writeln!(
+                    s,
+                    "<div class=\"oread-img\"><img src=\"{}\" alt=\"{}\"/></div>",
+                    boranlib_ebook::xml::xml_escape(src),
+                    boranlib_ebook::xml::xml_escape(alt)
+                );
+            }
         }
     }
     s.push_str("</body>\n</html>\n");

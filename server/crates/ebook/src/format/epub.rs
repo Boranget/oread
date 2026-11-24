@@ -12,7 +12,7 @@
 //!
 //! 正文先经 [`crate::html::to_blocks`] 归一化为语义段落，再生成良构 XHTML；
 //! 未缓存章节写占位段落，与 TXT 导出口径一致，不静默丢章。
-//! 图片暂不内联（漫画走 CBZ；文字书图片后续单独做）。
+//! 图片块会原样输出 `<img>`；把图片文件打进 OPF manifest 的步骤后续补上。
 
 use std::path::Path;
 
@@ -130,6 +130,13 @@ fn chapter_xhtml(meta: &BookMeta, ch: &ChapterRef, blocks: &[Block]) -> String {
             }
             Block::Paragraph(text) => {
                 body.push_str(&format!("<p>{}</p>\n", xml_escape(text)));
+            }
+            Block::Image { src, alt } => {
+                body.push_str(&format!(
+                    "<div class=\"figure\"><img src=\"{}\" alt=\"{}\"/></div>\n",
+                    xml_escape(src),
+                    xml_escape(alt)
+                ));
             }
         }
     }

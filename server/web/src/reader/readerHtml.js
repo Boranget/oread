@@ -59,6 +59,26 @@ export function textToParas(html) {
     .filter(Boolean);
 }
 
+// 后端语义块（blocks）→ 阅读器段落。图片地址仍按章节 URL 归一化，
+// 与旧的 HTML 解析路径共用同一套图片加载逻辑。
+export function blocksToParas(blocks, base) {
+  const out = [];
+  for (const b of Array.isArray(blocks) ? blocks : []) {
+    const type = String((b && b.type) || '');
+    if (type === 'image') {
+      const src = absImg(b.src, base);
+      if (src) out.push({ type: 'image', src, alt: String(b.alt || '') });
+    } else if (type === 'heading') {
+      const text = String(b.text || '').trim();
+      if (text) out.push({ type: 'heading', level: Number(b.level) || 2, text });
+    } else if (type === 'paragraph') {
+      const text = String(b.text || '').trim();
+      if (text) out.push({ type: 'text', text });
+    }
+  }
+  return out;
+}
+
 // 正文解析：保留 <img>，按页面顺序切成文本段 / 图片段，图片随后走代理加载
 export function htmlToParas(html, base) {
   const src = String(html || '');
