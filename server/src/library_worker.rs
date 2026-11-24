@@ -14,9 +14,8 @@ use std::time::Duration;
 use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
 
-use crate::entities::{Book, BookChapter, BookContent};
+use crate::entities::{Book, BookChapter};
 use crate::library::{self, JobRow};
-use crate::library_images;
 use crate::routes::AppState;
 
 /// 单章内图片下载并发。与章节并发相乘后仍远低于交互阅读的优先级。
@@ -236,10 +235,8 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
         anyhow::bail!("目录为空，无法整本下载");
     }
 
-    // 图片章节的 `content` 是空串，不能只看 content IS NOT NULL；
-    // `cached_chapter_urls` 对漫画额外要求 images_ready=1（图片真的全部落盘）。
-    // 目录优先：已落进书目录的章节也算已缓存；目录不存在时回退旧表。
-    let mut cached = match crate::library_store::usage::cached_chapter_urls(
+    // 目录即书：只有真正落进书目录的章节才算已缓存。
+    let cached = match crate::library_store::usage::cached_chapter_urls(
         &state.store(),
         &job.book_url,
     )
@@ -252,14 +249,6 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
             std::collections::HashSet::new()
         }
     };
-    cached.extend(
-        library::cached_chapter_urls(
-            &state.library,
-            &job.book_url,
-            crate::routes::books::content_cache_version(),
-        )
-        .await?,
-    );
 
     let pending: Vec<BookChapter> = chapters
         .iter()
@@ -357,17 +346,12 @@ async fn run_job(state: &AppState, job: &JobRow) -> anyhow::Result<&'static str>
         .iter()
         .filter(|o| matches!(o, ChapterOutcome::Failed))
         .count();
-    // 目录是权威：有目录时按目录重算占用；还没有目录的书回退旧表聚合。
-    match crate::library_store::usage::refresh_rollup(&state.library, &state.store(), &job.book_url)
-        .await
+    // 目录是权威：按书目录重算占用。
+    if let Err(e) =
+        crate::library_store::usage::refresh_rollup(&state.library, &state.store(), &job.book_url)
+            .await
     {
-        Ok(true) => {}
-        Ok(false) => {
-            library::refresh_rollup(&state.library, &job.book_url)
-                .await
-                .ok();
-        }
-        Err(e) => tracing::warn!(book = %job.book_url, error = %e, "refresh usage failed"),
+        tracing::warn!(book = %job.book_url, error = %e, "refresh usage failed");
     }
     Ok(if failed_n == 0 {
         library::JOB_DONE
@@ -471,10 +455,9 @@ async fn fetch_and_store(
 
 /// 漫画章节：抓图片清单 + 下载整章图片，直接写进书目录（`oread.json` 页表）。
 ///
-/// 续跑时优先复用 `library_content.images` 里的清单，不重新请求目录页；图片字节不再
-/// 落 `library_images` BLOB，下载完直接在内存里交给 `save_comic_pages`，目录是唯一副本。
+/// 书目录是唯一副本：图片下载完整后交给 `save_comic_pages`，不写任何旧缓存表。
 /// 单张超过 `IMAGE_KEEP_MAX` 的图只保留清单、不落盘（在线仍可经代理读到）。
-/// 任何一张图抓取失败都会让本章保持 `images_ready=0`，任务结束后可重试补齐。
+/// 任何一张图抓取失败/缺页时不写页表，下次任务会再试。
 async fn fetch_comic(
     state: &AppState,
     source: &crate::entities::BookSource,
@@ -482,48 +465,12 @@ async fn fetch_comic(
     book_url: &str,
     chapter: &BookChapter,
 ) -> anyhow::Result<()> {
-    let origin = source.book_source_url.clone();
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT images FROM library_content \
-         WHERE url = ?1 AND origin = ?2 AND content_type = 'image'",
-    )
-    .bind(&chapter.url)
-    .bind(&origin)
-    .fetch_optional(&state.library)
-    .await?;
-    let mut imgs: crate::web_book::ChapterImages = match existing
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<crate::web_book::ChapterImages>(s).ok())
-    {
-        Some(v) if !v.images.is_empty() => v,
-        _ => {
-            crate::web_book::chapter_images_book(
-                state.fetcher.as_ref(),
-                source,
-                chapter,
-                Some(store),
-            )
-            .await?
-        }
-    };
+    let mut imgs: crate::web_book::ChapterImages =
+        crate::web_book::chapter_images_book(state.fetcher.as_ref(), source, chapter, Some(store))
+            .await?;
     if imgs.images.is_empty() {
         anyhow::bail!("图片列表为空");
     }
-
-    let mut c = BookContent {
-        url: chapter.url.clone(),
-        origin: origin.clone(),
-        book_url: book_url.to_string(),
-        title: chapter.title.clone(),
-        content: Some(String::new()),
-        chapter_index: chapter.index,
-        content_type: "image".into(),
-        images_json: Some(serde_json::to_string(&imgs)?),
-        ..Default::default()
-    };
-    // 先落清单（并把完整性标记清零）：中途取消/重启后仍能从清单继续补图。
-    crate::routes::books::upsert_content(&state.library, &c).await?;
-    library_images::mark_chapter_pending(&state.library, &chapter.url, &origin).await?;
 
     let max_body = state.cfg.image_max_body_bytes.max(1024);
     let referer = chapter.url.clone();
@@ -592,8 +539,6 @@ async fn fetch_comic(
         }
     }
 
-    c.images_json = Some(serde_json::to_string(&imgs)?);
-    crate::routes::books::upsert_content(&state.library, &c).await?;
     if failed > 0 {
         anyhow::bail!("{failed} 张图片下载失败");
     }
@@ -603,8 +548,8 @@ async fn fetch_comic(
             IMAGE_CHAPTER_MAX_BYTES / 1024 / 1024
         );
     }
-    // 缺页（超大图/空页）时只保留清单，不写不完整的页表，避免离线阅读缺页；
-    // 保持 images_ready=0，下次任务会再试（超大图由在线代理兜底）。
+    // 缺页（超大图/空页）时不写不完整的页表，避免离线阅读缺页；下次任务会再试
+    // （超大图由在线代理兜底）。
     if missing > 0 {
         return Ok(());
     }
@@ -635,20 +580,7 @@ async fn fetch_comic(
     .await
     {
         Ok(true) => {
-            // 页表已完整落盘，才算这一章离线可读。
-            library_images::mark_chapter_ready(&state.library, &chapter.url, &origin).await?;
-            // 清掉旧版本留下的 BLOB（本次已不再写），目录是唯一副本。
-            let urls: Vec<String> = imgs
-                .images
-                .iter()
-                .map(|i| i.url.clone())
-                .filter(|u| !u.trim().is_empty())
-                .collect();
-            if let Err(e) =
-                library_images::delete_urls(&state.library, book_url, &urls, &origin).await
-            {
-                tracing::warn!(book = %book_url, chapter = %chapter.url, error = %e, "drop comic blobs failed");
-            }
+            // 页表已完整落盘，这一章离线可读；统计按目录重算。
             if let Err(e) = crate::library_store::usage::refresh_rollup(
                 &state.library,
                 &state.store(),

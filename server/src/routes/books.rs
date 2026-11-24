@@ -194,7 +194,6 @@ mod books_content;
 use books_content::*;
 #[path = "books_store.rs"]
 mod books_store;
-use books_store::*;
 
 pub(crate) use books_search_api::{
     filtered_books, load_job_lookup, start_kindle_search_job, JobLookup,
@@ -206,9 +205,9 @@ pub(crate) use books_search_source::{
     is_searchable_source, order_by_health, resolve_search_sources, CuratedMissingFallback,
 };
 pub(crate) use books_store::{
-    book_name_of, book_store_for, content_cache_version, content_is_empty, load_book_meta,
-    load_cached_chapters, load_cached_content, persist_book_changes, save_book_meta, save_chapters,
-    save_content_cached, save_text_prefer_dir, sync_total_chapter_num, upsert_content,
+    book_name_of, book_store_for, content_is_empty, load_book_meta, load_cached_chapters,
+    persist_book_changes, save_book_meta, save_chapters, save_text_prefer_dir,
+    sync_total_chapter_num,
 };
 
 /// 启动时把上次进程遗留的 running 搜索任务标为 interrupted。

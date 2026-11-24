@@ -2,24 +2,13 @@
 
 use super::*;
 
+use crate::routes::books::books_store::load_any_chapters;
+
 use sqlx::sqlite::SqlitePoolOptions;
 
 /// 单测用的空查询先验：等价于「只看全局健康证据」，不依赖数据库。
 fn test_prior() -> crate::search_priority::SearchPrior {
     crate::search_priority::SearchPrior::empty(crate::query_class::QueryClass::Normal)
-}
-
-fn mk_content(url: &str, book: &str, idx: i64, body: &str) -> BookContent {
-    BookContent {
-        book_url: book.into(),
-        url: url.into(),
-        title: Some(format!("第{idx}章")),
-        content: Some(body.into()),
-        chapter_index: idx,
-        resource_url: None,
-        is_local: false,
-        ..Default::default()
-    }
 }
 
 async fn mem_pool() -> SqlitePool {
@@ -28,195 +17,12 @@ async fn mem_pool() -> SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    // 馆藏库真实 schema：正文 / 书目 / 目录 / 采购单
+    // 馆藏库真实 schema：书目 / 目录 / 采购单
     sqlx::migrate!("./migrations/library")
         .run(&pool)
         .await
         .expect("run library migrations");
     pool
-}
-
-// 空正文/零图章节不落缓存；修复前残留的空缓存按未命中处理。
-#[tokio::test]
-async fn empty_chapter_is_not_cached_and_old_empty_cache_is_miss() {
-    let pool = mem_pool().await;
-    let empty = mk_content("u1", "b1", 1, "   ");
-    save_content_cached(&pool, &empty).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u1'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(n, 0, "空文本不应写入缓存");
-
-    // 模拟修复前已经落库的空缓存：读取时应当作未命中并重新抓取。
-    sqlx::query(
-            "INSERT INTO library_content (url, book_url, title, content, chapter_index, content_type, \
-             updated_at, accessed_at) VALUES ('u1','b1','t','   ',1,'text',datetime('now'),datetime('now'))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .is_none());
-
-    // 图片章节零图同样不落缓存。
-    let img_empty = BookContent {
-        url: "u3".into(),
-        book_url: "b1".into(),
-        content_type: "image".into(),
-        content: Some(String::new()),
-        images_json: Some("[]".into()),
-        ..Default::default()
-    };
-    save_content_cached(&pool, &img_empty).await.unwrap();
-    let n3: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u3'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(n3, 0);
-
-    // 只有标签没有可见文字（@textNodes 空结果回退 @html 的产物）同样不落库。
-    let markup = mk_content("u4", "b1", 4, "<div class=\"text\">   </div>");
-    save_content_cached(&pool, &markup).await.unwrap();
-    let n4: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url='u4'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(n4, 0, "标签包裹的空白不应写入缓存");
-
-    // 带可见文字的 HTML 片段仍然落库并命中。
-    let html = mk_content("u5", "b1", 5, "<p>有正文的段落</p>");
-    save_content_cached(&pool, &html).await.unwrap();
-    assert!(load_cached_content(&pool, "u5", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .is_some());
-
-    // 正常正文仍然命中。
-    let ok = mk_content("u2", "b1", 2, "正文内容");
-    save_content_cached(&pool, &ok).await.unwrap();
-    assert!(load_cached_content(&pool, "u2", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .is_some());
-}
-
-// 解析管线指纹不符 → 旧缓存按未命中处理，重建后按当前指纹回写并正常命中。
-#[tokio::test]
-async fn content_cache_version_mismatch_is_miss_and_rebuilds() {
-    let pool = mem_pool().await;
-    let body = "当前管线抓到的完整正文";
-    let c = mk_content("u1", "b1", 1, body);
-    save_content_cached(&pool, &c).await.unwrap();
-    let hit = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("新写入的缓存应命中");
-    assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
-
-    // 模拟旧解析管线写下的残缺正文（短但非空，之前只能等 TTL）。
-    sqlx::query("UPDATE library_content SET cache_version = 'p1-0000000000000000', content = '半截正文' WHERE url = 'u1'")
-            .execute(&pool)
-            .await
-            .unwrap();
-    assert!(
-        load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
-            .await
-            .unwrap()
-            .is_none(),
-        "指纹不符必须视为未命中"
-    );
-
-    // 重建（重新抓取后写入）应回到命中，且指纹为当前版本。
-    save_content_cached(&pool, &c).await.unwrap();
-    let rebuilt = load_cached_content(&pool, "u1", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("重建后应命中");
-    assert_eq!(rebuilt.content.as_deref(), Some(body));
-    assert_eq!(
-        rebuilt.cache_version.as_deref(),
-        Some(content_cache_version())
-    );
-}
-
-// 旧记录没有 cache_version（迁移前写入）→ 未命中，首次读取重建后回写指纹。
-#[tokio::test]
-async fn legacy_content_without_version_is_miss_and_rewritten() {
-    let pool = mem_pool().await;
-    sqlx::query(
-        "INSERT INTO library_content (url, book_url, title, content, chapter_index, content_type, \
-             updated_at, accessed_at) VALUES ('legacy','b1','t','迁移前的正文',1,'text',\
-             datetime('now'),datetime('now'))",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(
-        load_cached_content(&pool, "legacy", "", 7 * 24 * 3600)
-            .await
-            .unwrap()
-            .is_none(),
-        "无指纹的旧记录必须视为未命中"
-    );
-
-    let rebuilt = mk_content("legacy", "b1", 1, "迁移前的正文");
-    save_content_cached(&pool, &rebuilt).await.unwrap();
-    let hit = load_cached_content(&pool, "legacy", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("回写后应命中");
-    assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
-}
-
-// 短但完整（<100 字符）的正文必须正常落库并命中，不能按长度误判为空。
-#[tokio::test]
-async fn short_complete_content_is_cached_and_hit() {
-    let pool = mem_pool().await;
-    let short = "短章也有完整正文：这一段不足一百字符，但内容完整，缓存必须正常命中。";
-    assert!(short.chars().count() < 100);
-    assert!(short.chars().count() > 20);
-    let c = mk_content("short", "b1", 1, short);
-    save_content_cached(&pool, &c).await.unwrap();
-    let hit = load_cached_content(&pool, "short", "", 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("短且非空的正文应命中");
-    assert_eq!(hit.content.as_deref(), Some(short));
-    assert_eq!(hit.cache_version.as_deref(), Some(content_cache_version()));
-}
-
-// 同一章节 URL 在不同来源下必须分区缓存，不能互相串正文。
-#[tokio::test]
-async fn content_cache_is_partitioned_by_origin() {
-    let pool = mem_pool().await;
-    let url = "https://mirror.example/chapter/1";
-    let mut a = mk_content(url, "book-a", 1, "来源 A 的正文");
-    a.origin = "https://source-a.example".into();
-    let mut b = mk_content(url, "book-b", 1, "来源 B 的正文");
-    b.origin = "https://source-b.example".into();
-    save_content_cached(&pool, &a).await.unwrap();
-    save_content_cached(&pool, &b).await.unwrap();
-
-    let hit_a = load_cached_content(&pool, url, &a.origin, 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("来源 A 应命中");
-    assert_eq!(hit_a.content.as_deref(), Some("来源 A 的正文"));
-    let hit_b = load_cached_content(&pool, url, &b.origin, 7 * 24 * 3600)
-        .await
-        .unwrap()
-        .expect("来源 B 应命中");
-    assert_eq!(hit_b.content.as_deref(), Some("来源 B 的正文"));
-
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content WHERE url = ?1")
-        .bind(url)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(rows, 2, "不同来源各自保留一行缓存");
 }
 
 // 搜索调度：两批共用一个总预算，不再给 preferred 单独切分时段
@@ -532,15 +338,6 @@ fn disabled_and_quarantined_sources_never_enter_search_pool() {
     assert_eq!(names, vec!["enabled"], "停用/隔离源不得进入搜索池");
 }
 
-// LIKE 通配符必须按字面量匹配，避免用户输入 `%`/`_` 把全库搜出来
-#[test]
-fn like_wildcards_are_escaped() {
-    assert_eq!(escape_like("100%"), "100\\%");
-    assert_eq!(escape_like("a_b"), "a\\_b");
-    assert_eq!(escape_like("c:\\x"), "c:\\\\x");
-    assert_eq!(escape_like("普通文本"), "普通文本");
-}
-
 // 片段：命中位置按字符计、前后 40 字上下文、命中次数正确（含 ASCII 大小写回退）
 #[test]
 fn snippet_has_context_offset_and_count() {
@@ -576,29 +373,6 @@ fn parse_use_replace_accepts_explicit_switch_only() {
     assert_eq!(parse_use_replace(None), None);
     assert_eq!(parse_use_replace(Some("")), None);
     assert_eq!(parse_use_replace(Some("yes")), None);
-}
-
-// 整本缓存写入路径：同一 URL 二次写入只保留一行，size_bytes 随正文更新
-#[tokio::test]
-async fn upsert_content_keeps_single_row_and_updates_size() {
-    let pool = mem_pool().await;
-    let c = mk_content("https://x/1", "https://x/book", 1, "短正文");
-    upsert_content(&pool, &c).await.unwrap();
-    let c2 = mk_content("https://x/1", "https://x/book", 1, "更长的正文内容");
-    upsert_content(&pool, &c2).await.unwrap();
-    let (rows, size): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM library_content")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(rows, 1);
-    assert_eq!(size, "更长的正文内容".len() as i64);
-    let title: String =
-        sqlx::query_scalar("SELECT title FROM library_content WHERE url = 'https://x/1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(title, "第1章");
 }
 
 async fn meta_pool() -> SqlitePool {
@@ -790,62 +564,6 @@ async fn chapter_meta_roundtrip_and_volume_grouping() {
     assert_eq!(loaded[0].volume_title.as_deref(), Some("第一卷 风起"));
     assert_eq!(loaded[1].volume_title.as_deref(), Some("第一卷 风起"));
     assert_eq!(loaded[2].volume_title.as_deref(), Some("第一卷 风起"));
-
-    // 正文落库回填字数；第 2 章在下一个分卷下
-    upsert_content(
-        &pool,
-        &mk_content("https://x/c1", book, 1, "第一章正文内容"),
-    )
-    .await
-    .unwrap();
-    let reloaded = load_cached_chapters(&pool, book, 0).await.unwrap().unwrap();
-    assert_eq!(
-        reloaded[1].word_count,
-        "第一章正文内容".chars().count() as i64
-    );
-}
-
-// 清理：按书只删该书；不传 book_id 清空全部；bytes_freed 为被删行的 size_bytes 之和
-#[tokio::test]
-async fn clear_cache_by_book_and_by_user() {
-    let pool = mem_pool().await;
-    let a = mk_content("https://x/a1", "https://x/a", 1, "aaa");
-    let b = mk_content("https://x/a2", "https://x/a", 2, "bbbb");
-    let other = mk_content("https://x/b1", "https://x/b", 1, "ccccc");
-    for c in [&a, &b, &other] {
-        upsert_content(&pool, c).await.unwrap();
-    }
-    sqlx::query(
-        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-         VALUES ('https://x/a/i1', '', 'https://x/a', 'image/jpeg', X'00', 100)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    let (deleted, freed) = clear_content_cache(&pool, Some("https://x/a"))
-        .await
-        .unwrap();
-    assert_eq!(deleted, 2);
-    assert_eq!(freed, 107, "图片字节也应计入释放量");
-    let images_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_images")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(images_left, 0);
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 1, "另一本书的缓存不应被清掉");
-
-    let (deleted_all, freed_all) = clear_content_cache(&pool, None).await.unwrap();
-    assert_eq!(deleted_all, 1);
-    assert_eq!(freed_all, 5);
-    let left2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_content")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left2, 0);
 }
 
 // 行表去重：同书多源只合并来源，分数与序号保持首次入库时的值。
@@ -1960,82 +1678,6 @@ fn result_response_exposes_status_and_cancel_counts() {
     assert_eq!(v["pending_sources"], 0, "任务结束后不再提示未排上的源");
     assert_eq!(v["total"], 1);
     assert_eq!(v["finished_at"], 42);
-}
-
-// 馆藏层不按 TTL 过期：已入馆的书，源失效后仍能读旧正文/旧目录。
-#[tokio::test]
-async fn collection_content_and_toc_ignore_ttl() {
-    let pool = mem_pool().await;
-    let book = "https://x/collected";
-    upsert_content(&pool, &mk_content("https://x/c1", book, 1, "正文"))
-        .await
-        .unwrap();
-    save_chapters(
-        &pool,
-        book,
-        &[BookChapter {
-            url: "https://x/c1".into(),
-            title: Some("第一章".into()),
-            book_url: Some(book.into()),
-            index: 1,
-            ..Default::default()
-        }],
-    )
-    .await
-    .unwrap();
-    assert!(crate::library::collect(&pool, book).await.unwrap());
-
-    // 正文与目录都改成 30 天前，模拟「很久没读 + 书源已失效」。
-    sqlx::query("UPDATE library_content SET updated_at = datetime('now','-30 days')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE library_chapters SET updated_at = datetime('now','-30 days')")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    assert!(
-        load_cached_content(&pool, "https://x/c1", "", 60)
-            .await
-            .unwrap()
-            .is_some(),
-        "馆藏正文不应因 TTL 过期"
-    );
-    assert!(
-        load_cached_chapters(&pool, book, 60)
-            .await
-            .unwrap()
-            .is_some(),
-        "馆藏目录不应因 TTL 过期"
-    );
-}
-
-// 临时层仍按 TTL 过期；回源失败时可读旧缓存兜底。
-#[tokio::test]
-async fn temp_content_expires_but_stale_fallback_reads_it() {
-    let pool = mem_pool().await;
-    let book = "https://x/temp";
-    upsert_content(&pool, &mk_content("https://x/t1", book, 1, "旧正文"))
-        .await
-        .unwrap();
-    sqlx::query("UPDATE library_content SET updated_at = datetime('now','-30 days')")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    assert!(
-        load_cached_content(&pool, "https://x/t1", "", 60)
-            .await
-            .unwrap()
-            .is_none(),
-        "临时层过期后正常读取应未命中"
-    );
-    let stale = load_stale_content(&pool, "https://x/t1", "")
-        .await
-        .unwrap()
-        .expect("兜底应拿到旧正文");
-    assert_eq!(stale.content.as_deref(), Some("旧正文"));
 }
 
 // 目录兜底：过期后 load_any_chapters 仍能拿到。

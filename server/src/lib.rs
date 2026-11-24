@@ -15,7 +15,6 @@ pub mod image_cache;
 pub mod image_fetch;
 pub mod k_metrics;
 pub mod library;
-pub mod library_images;
 pub mod library_store;
 pub mod library_worker;
 pub mod models;

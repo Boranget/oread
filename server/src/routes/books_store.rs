@@ -474,22 +474,6 @@ pub(crate) async fn sync_total_chapter_num(
     Ok(())
 }
 
-/// 目录写入后，用已缓存正文的长度回填章节字数（SQLite `length()` 对 TEXT 按字符计数）。
-pub(crate) async fn backfill_word_counts(lib: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE library_chapters SET word_count = COALESCE((\
-           SELECT length(trim(content)) FROM library_content \
-           WHERE library_content.url = library_chapters.url \
-             AND library_content.book_url = library_chapters.book_url \
-             AND content IS NOT NULL\
-         ), 0) WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .execute(lib)
-    .await?;
-    Ok(())
-}
-
 /// 取书籍名称（用于替换规则的 scope 匹配）。
 pub(crate) async fn book_name_of(lib: &SqlitePool, book_url: &str) -> anyhow::Result<String> {
     let name: Option<String> =
@@ -502,162 +486,20 @@ pub(crate) async fn book_name_of(lib: &SqlitePool, book_url: &str) -> anyhow::Re
 
 // ---------------- 正文（馆藏） ----------------
 
-/// 正文解析管线各步骤的版本号。抽取策略、清洗步骤、替换规则等任一变更时，
-/// 递增对应数字即可让全量旧缓存失效，无需人工清库，也不按时间粗暴失效。
-pub(super) const CONTENT_PIPELINE_STEPS: &[(&str, u32)] = &[
-    ("extract", 1), // 规则抽取：@textNodes 空结果回退 @html
-    ("clean", 2),   // 空白/换行清洗与字符计数
-    ("replace", 1), // 书源替换规则
-];
-
-/// 当前解析管线指纹（`p1-<fnv64>`）。存进 `library_content.cache_version`；
-/// 读取时指纹不符或缺失（旧记录）都按未命中处理并重建。
-pub(crate) fn content_cache_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        let joined = CONTENT_PIPELINE_STEPS
-            .iter()
-            .map(|(name, v)| format!("{name}:{v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in joined.as_bytes() {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        format!("p1-{hash:016x}")
-    })
-}
-
-/// 正文缓存读取：TTL 内命中原管线指纹则更新 accessed_at。
-/// `origin` 是书源 URL，与章节 `url` 共同构成缓存键，避免镜像源同 URL 串正文。
-pub(crate) async fn load_cached_content(
-    lib: &SqlitePool,
-    url: &str,
-    origin: &str,
-    ttl_secs: i64,
-) -> anyhow::Result<Option<BookContent>> {
-    load_cached_content_inner(lib, url, origin, ttl_secs, true).await
-}
-
-/// single-flight 闸门后的复查：命中照常计数，未命中不计数。
-/// 否则 N 个并发请求会各记一次 miss，把命中率算低。
-pub(crate) async fn peek_cached_content(
-    lib: &SqlitePool,
-    url: &str,
-    origin: &str,
-    ttl_secs: i64,
-) -> anyhow::Result<Option<BookContent>> {
-    load_cached_content_inner(lib, url, origin, ttl_secs, false).await
-}
-
-async fn load_cached_content_inner(
-    lib: &SqlitePool,
-    url: &str,
-    origin: &str,
-    ttl_secs: i64,
-    count_miss: bool,
-) -> anyhow::Result<Option<BookContent>> {
-    let row: Option<BookContent> = sqlx::query_as(
-        "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
-         content_type, images, cache_version \
-         FROM library_content WHERE url = ?1 AND origin = ?2 \
-           AND (updated_at >= datetime('now', ?3) \
-                OR book_url IN (SELECT book_url FROM library_books WHERE tier = 'collection'))",
-    )
-    .bind(url)
-    .bind(origin)
-    .bind(format!("-{ttl_secs} seconds"))
-    .fetch_optional(lib)
-    .await?;
-    if let Some(row) = row {
-        // 空正文（文本为空 / 图片章节零图）视为缓存未命中：旧版本的空白缓存不再命中，
-        // 每次读取都会重新抓取，避免整个 TTL 周期内一直白屏。
-        if content_is_empty(&row) {
-            if count_miss {
-                crate::cache_metrics::record_miss();
-            }
-            return Ok(None);
-        }
-        // 解析管线变了（或旧记录没有指纹）：旧结果可能残缺，按未命中重建。
-        if row.cache_version.as_deref() != Some(content_cache_version()) {
-            tracing::debug!(
-                url,
-                cached = row.cache_version.as_deref().unwrap_or("<none>"),
-                current = content_cache_version(),
-                "content cache version mismatch, refetch"
-            );
-            if count_miss {
-                crate::cache_metrics::record_miss();
-            }
-            return Ok(None);
-        }
-        let _ = sqlx::query(
-            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
-        )
-        .bind(url)
-        .bind(origin)
-        .execute(lib)
-        .await;
-        if !row.book_url.trim().is_empty() {
-            library::touch_book(lib, &row.book_url).await;
-        }
-        crate::cache_metrics::record_hit();
-        return Ok(Some(row));
-    }
-    if count_miss {
-        crate::cache_metrics::record_miss();
-    }
-    Ok(None)
-}
-
-/// 回源失败时的兜底：忽略 TTL 读取最后一次成功缓存的正文。
-///
-/// 只用于「抓取失败」分支，不参与正常命中；调用方应在响应里标记 `stale`，
-/// 让前端提示「书源暂不可用，显示已缓存内容」。
-pub(crate) async fn load_stale_content(
-    lib: &SqlitePool,
-    url: &str,
-    origin: &str,
-) -> anyhow::Result<Option<BookContent>> {
-    let row: Option<BookContent> = sqlx::query_as(
-        "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
-         content_type, images, cache_version \
-         FROM library_content WHERE url = ?1 AND origin = ?2",
-    )
-    .bind(url)
-    .bind(origin)
-    .fetch_optional(lib)
-    .await?;
-    if let Some(row) = row.filter(|r| !content_is_empty(r)) {
-        // 这次读取是真实发生的：刷新访问时间，避免临时层把它当成「很久没读」清掉。
-        let _ = sqlx::query(
-            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
-        )
-        .bind(url)
-        .bind(origin)
-        .execute(lib)
-        .await;
-        if !row.book_url.trim().is_empty() {
-            library::touch_book(lib, &row.book_url).await;
-        }
-        return Ok(Some(row));
-    }
-    Ok(None)
-}
-
-/// 判定缓存正文是否为空：文本章节按渲染结果判断（去掉标签/`&nbsp;` 后无可见字符）；
-/// 图片章节 images 列表为空。
+/// 判定抓取结果是否为空：文本章节按渲染结果判断（去掉标签/`&nbsp;` 后无可见字符）；
+/// 图片章节 images 列表为空。空结果不缓存，避免把源站临时占位固化下来。
 pub(crate) fn content_is_empty(c: &BookContent) -> bool {
     if c.content_type.trim() == "image" {
-        decode_cached_images(c.images_json.as_deref()).0.is_empty()
+        super::books_content::decode_cached_images(c.images_json.as_deref())
+            .0
+            .is_empty()
     } else {
         text_is_blank(c.content.as_deref().unwrap_or(""))
     }
 }
 
 /// 文本正文是否没有可见字符：`<p>正文</p>` 不算空，`<div class="text">   </div>`
-/// （`@textNodes` 为空时回退 `@html` 的产物）算空，避免把渲染后空白的正文写进缓存。
+/// （`@textNodes` 为空时回退 `@html` 的产物）算空。
 pub(super) fn text_is_blank(s: &str) -> bool {
     let mut visible = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -672,129 +514,53 @@ pub(super) fn text_is_blank(s: &str) -> bool {
     visible.replace("&nbsp;", " ").trim().is_empty()
 }
 
-/// 单条正文 upsert（不做淘汰），供 `/api/book/content` 与整本缓存共用。
-/// 缓存键为 `(url, origin)`；调用方必须先把 `c.origin` 填成书源 URL。
-pub(crate) async fn upsert_content(lib: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
-    let content_type = if c.content_type.trim().is_empty() {
-        "text"
-    } else {
-        c.content_type.as_str()
-    };
-    let size = (c.content.as_deref().map(|s| s.len()).unwrap_or(0)
-        + c.images_json.as_deref().map(|s| s.len()).unwrap_or(0)) as i64;
-    sqlx::query(
-        "INSERT INTO library_content \
-         (url, origin, book_url, title, content, chapter_index, resource_url, is_local, \
-          content_type, images, size_bytes, cache_version, updated_at, accessed_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12, datetime('now'), datetime('now')) \
-         ON CONFLICT(url, origin) DO UPDATE SET \
-          book_url=CASE WHEN excluded.book_url <> '' THEN excluded.book_url \
-                        ELSE library_content.book_url END, \
-          title=excluded.title, content=excluded.content, \
-          chapter_index=excluded.chapter_index, resource_url=excluded.resource_url, \
-          is_local=excluded.is_local, content_type=excluded.content_type, \
-          images=excluded.images, size_bytes=excluded.size_bytes, \
-          cache_version=excluded.cache_version, \
-          updated_at=datetime('now'), accessed_at=datetime('now')",
-    )
-    .bind(&c.url)
-    .bind(&c.origin)
-    .bind(&c.book_url)
-    .bind(&c.title)
-    .bind(&c.content)
-    .bind(c.chapter_index)
-    .bind(&c.resource_url)
-    .bind(c.is_local)
-    .bind(content_type)
-    .bind(&c.images_json)
-    .bind(size)
-    .bind(content_cache_version())
-    .execute(lib)
-    .await?;
-    // 正文字数回填到目录行（未知时保持 0）；SQLite TEXT 的 length() 按字符计数。
-    let chars = c.content.as_deref().unwrap_or("").trim().chars().count() as i64;
-    let _ = sqlx::query(
-        "UPDATE library_chapters SET word_count = ?2 \
-         WHERE url = ?1 AND (?3 = '' OR book_url = ?3)",
-    )
-    .bind(&c.url)
-    .bind(chars)
-    .bind(&c.book_url)
-    .execute(lib)
-    .await;
-    if !c.book_url.trim().is_empty() {
-        library::upsert_rollup(lib, &c.book_url).await?;
-    }
-    Ok(())
-}
-
-/// 正文优先落书目录：目录写成功就不再往 `library_content` 写同一份正文。
+/// 把抓到的文本正文写进书目录，并增量维护缓存统计。
 ///
-/// 返回 `true` 表示书目录已经持有这一章；`false` 表示目录里还没有这本书/这一章
-/// （TOC 未同步或正文为空），已按旧路径写进 `library_content` 作为读回退。
-/// 目录写入失败只记日志并回退 DB，阅读请求本身不因落盘失败而失败。
+/// 书目录是正文的唯一副本：返回 `true` 表示目录已持有这一章；`false` 表示
+/// 目录里还没有这本书/这一章（TOC 未同步或正文为空），本次只返回抓取结果、
+/// 不落盘也不写数据库。
 pub(crate) async fn save_text_prefer_dir(
     store: &crate::library_store::Store,
     lib: &SqlitePool,
     c: &BookContent,
 ) -> anyhow::Result<bool> {
     if c.content_type.trim() == "image" {
-        save_content_cached(lib, c).await?;
         return Ok(false);
     }
     let book_url = c.book_url.trim();
-    if !book_url.is_empty() && !c.url.trim().is_empty() {
-        let paragraphs =
-            crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
-        match crate::library_store::write::save_text_chapter_tracked(
-            store,
-            book_url,
-            &c.url,
-            &paragraphs,
-        )
-        .await
-        {
-            Ok(Some(write)) => {
-                if let Err(e) = crate::library_store::usage::note_text_chapter(
-                    lib,
-                    book_url,
-                    write.was_cached,
-                    write.size_delta,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        book = %book_url,
-                        url = %c.url,
-                        error = %e,
-                        "update cached chapter stats failed"
-                    );
-                }
-                crate::cache_metrics::record_save();
-                return Ok(true);
+    if book_url.is_empty() || c.url.trim().is_empty() {
+        return Ok(false);
+    }
+    let paragraphs =
+        crate::library_store::write::markup_to_paragraphs(c.content.as_deref().unwrap_or(""));
+    match crate::library_store::write::save_text_chapter_tracked(
+        store,
+        book_url,
+        &c.url,
+        &paragraphs,
+    )
+    .await
+    {
+        Ok(Some(write)) => {
+            if let Err(e) = crate::library_store::usage::note_text_chapter(
+                lib,
+                book_url,
+                write.was_cached,
+                write.size_delta,
+            )
+            .await
+            {
+                tracing::warn!(
+                    book = %book_url,
+                    url = %c.url,
+                    error = %e,
+                    "update cached chapter stats failed"
+                );
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                book = %book_url,
-                url = %c.url,
-                error = %e,
-                "write chapter to dir failed; falling back to library_content"
-            ),
+            crate::cache_metrics::record_save();
+            Ok(true)
         }
+        Ok(None) => Ok(false),
+        Err(e) => Err(e.into()),
     }
-    save_content_cached(lib, c).await?;
-    Ok(false)
-}
-
-/// 正文落库（馆藏不设容量上限，只做 TTL 回收，所以这里不做淘汰）。
-pub(crate) async fn save_content_cached(lib: &SqlitePool, c: &BookContent) -> anyhow::Result<()> {
-    // 空正文不落库：源站临时占位/规则失效时抓到的空结果只影响本次请求，
-    // 后续重试与换源不会被这份空缓存挡住。
-    if content_is_empty(c) {
-        tracing::debug!(url = c.url.as_str(), "skip caching empty chapter content");
-        return Ok(());
-    }
-    upsert_content(lib, c).await?;
-    crate::cache_metrics::record_save();
-    Ok(())
 }

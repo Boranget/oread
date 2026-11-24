@@ -154,7 +154,7 @@ pub(super) fn comic_stage(
     )
 }
 
-/// 取本章图片：先读 `library_content.images` 缓存，未命中回源并按 `/api/comic/chapter` 同规则回写。
+/// 取本章图片：目录页表优先；未命中按书源规则回源，不再写任何缓存表。
 pub(super) async fn load_comic_images(
     s: &AppState,
     _pool: &SqlitePool,
@@ -165,66 +165,30 @@ pub(super) async fn load_comic_images(
     // 目录即书：漫画目录命中后，图片地址全部指向本地文件。
     if let Ok(Some(opened)) = s.store().open_comic(book_url).await {
         if let Some(ch) = opened.chapter_by_ref(book_url, &chapter.url) {
-            let book_id = crate::library_store::Store::book_id(book_url);
-            return Ok(ch
-                .pages
-                .iter()
-                .enumerate()
-                .map(|(i, page)| BookImage {
-                    index: i as i64 + 1,
-                    url: crate::library_store::comic::local_image_url_v(
-                        &book_id,
-                        &page.href,
-                        opened.meta.revision,
-                    ),
-                    width: page.width,
-                    height: page.height,
-                    bytes: page.bytes,
-                    priority: Some(if i < 3 { "high" } else { "normal" }.into()),
-                })
-                .collect());
-        }
-    }
-    if let Ok(Some(c)) = crate::routes::comic::load_cached_images(
-        &s.library,
-        &chapter.url,
-        &source.book_source_url,
-        s.cfg.content_ttl_secs,
-    )
-    .await
-    {
-        if c.content_type == "image" {
-            let (v, _) = crate::routes::comic::decode_images(c.images_json.as_deref());
-            if !v.is_empty() {
-                return Ok(v);
+            if !ch.pages.is_empty() {
+                let book_id = crate::library_store::Store::book_id(book_url);
+                return Ok(ch
+                    .pages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, page)| BookImage {
+                        index: i as i64 + 1,
+                        url: crate::library_store::comic::local_image_url_v(
+                            &book_id,
+                            &page.href,
+                            opened.meta.revision,
+                        ),
+                        width: page.width,
+                        height: page.height,
+                        bytes: page.bytes,
+                        priority: Some(if i < 3 { "high" } else { "normal" }.into()),
+                    })
+                    .collect());
             }
         }
     }
     let parsed = web_book::chapter_images(source, chapter)
         .await
         .map_err(|e| format!("本章图片抓取失败: {e}"))?;
-    let images = parsed.images;
-    if images.is_empty() {
-        return Ok(images);
-    }
-    let payload = serde_json::to_string(&web_book::ChapterImages {
-        images: images.clone(),
-        truncated: parsed.truncated,
-    })
-    .unwrap_or_default();
-    let c = BookContent {
-        url: chapter.url.clone(),
-        origin: source.book_source_url.clone(),
-        book_url: book_url.to_string(),
-        title: chapter.title.clone(),
-        content: Some(String::new()),
-        chapter_index: chapter.index,
-        content_type: "image".into(),
-        images_json: Some(payload),
-        ..Default::default()
-    };
-    if let Err(e) = save_content_cached(&s.library, &c).await {
-        tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
-    }
-    Ok(images)
+    Ok(parsed.images)
 }

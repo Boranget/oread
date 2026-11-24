@@ -1,9 +1,8 @@
 //! 漫画阅读接口：`GET /api/comic/source` 与 `GET /api/comic/chapter`
 //!
-//! 章节图片列表复用 `library_chapters`（与小说目录同一张表、同一顺序），
-//! 图片缓存复用 `library_content`（`content_type=image`、`images` 列存 JSON），
-//! 单张图片继续走既有 `/api/book/image` 代理（内存 LRU + 5 MiB/15s HTTP 预算），
-//! 不另造一套缓存或抓取层。
+//! 章节图片列表优先读「目录即书」的 `oread.json` 页表；目录缺失或本章尚未缓存时
+//! 按书源规则回源，单张图片走既有 `/api/book/image` 代理（内存 LRU + 5 MiB/15s
+//! HTTP 预算）。不再写任何旧 `library_content` / `library_images` 缓存。
 
 use axum::{
     extract::{Query, State},
@@ -15,10 +14,10 @@ use serde_json::json;
 use sqlx::SqlitePool;
 
 use crate::auth::{AuthUser, UserDb};
-use crate::entities::{BookChapter, BookContent, BookImage, BookSource};
+use crate::entities::{BookChapter, BookImage, BookSource};
 use crate::error::{AppError, AppResult};
 use crate::library_store::{comic, Store};
-use crate::routes::books::{load_book_meta, save_content_cached};
+use crate::routes::books::load_book_meta;
 use crate::routes::image;
 use crate::routes::sources::load_source;
 use crate::routes::AppState;
@@ -140,55 +139,6 @@ async fn chapter_position(lib: &SqlitePool, book_url: &str, chapter: &BookChapte
     (ordinal, total)
 }
 
-/// 读取章节图片缓存。
-///
-/// 不复用 `books::load_cached_content`：它的 SELECT 选的是列名 `images`，
-/// 而 `BookContent.images_json` 带 `#[sqlx(default)]`，列名对不上时会静默取 `None`，
-/// 导致图片章节缓存命中后拿到空列表。这里显式起别名 `images AS images_json`。
-pub(crate) async fn load_cached_images(
-    lib: &SqlitePool,
-    url: &str,
-    origin: &str,
-    ttl_secs: i64,
-) -> anyhow::Result<Option<BookContent>> {
-    let row: Option<BookContent> = sqlx::query_as(
-        "SELECT url, book_url, title, content, chapter_index, resource_url, is_local, \
-         content_type, images AS images_json \
-         FROM library_content WHERE url = ?1 AND origin = ?2 \
-           AND (updated_at >= datetime('now', ?3) \
-                OR book_url IN (SELECT book_url FROM library_books WHERE tier = 'collection'))",
-    )
-    .bind(url)
-    .bind(origin)
-    .bind(format!("-{ttl_secs} seconds"))
-    .fetch_optional(lib)
-    .await?;
-    if row.is_some() {
-        let _ = sqlx::query(
-            "UPDATE library_content SET accessed_at = datetime('now') WHERE url = ?1 AND origin = ?2",
-        )
-        .bind(url)
-        .bind(origin)
-        .execute(lib)
-        .await;
-    }
-    Ok(row)
-}
-
-/// 解析缓存里的图片 JSON：兼容 `{images,truncated}` 与旧裸数组两种形态。
-pub(crate) fn decode_images(raw: Option<&str>) -> (Vec<BookImage>, bool) {
-    let Some(raw) = raw else {
-        return (Vec::new(), false);
-    };
-    if let Ok(v) = serde_json::from_str::<web_book::ChapterImages>(raw) {
-        return (v.images, v.truncated);
-    }
-    if let Ok(list) = serde_json::from_str::<Vec<BookImage>>(raw) {
-        return (list, false);
-    }
-    (Vec::new(), false)
-}
-
 fn source_json(src: &BookSource) -> serde_json::Value {
     json!({
         "source": src.book_source_url,
@@ -237,7 +187,7 @@ async fn source_type(
 
 /// `GET /api/comic/chapter?source=&book_url=&chapter_url=&index=`
 ///
-/// 返回该章的有序图片 URL 列表；`cached=true` 表示命中 `library_content` 缓存（未回源）。
+/// 返回该章的有序图片 URL 列表；目录命中时 `cached=true`（本地文件，离线可读）。
 async fn chapter_images(
     State(s): State<AppState>,
     _u: AuthUser,
@@ -247,7 +197,7 @@ async fn chapter_images(
     let book_url = clean(q.book_url.as_deref())
         .ok_or_else(|| AppError::BadRequest("缺少 book_url".into()))?
         .to_string();
-    // 目录即书：漫画目录命中时直接返回本地图片 URL，不查缓存表、不回源。
+    // 目录即书：漫画目录命中时直接返回本地图片 URL，不回源。
     if let Some(value) =
         comic_chapter_from_dir(&s, &book_url, q.chapter_url.as_deref(), q.index).await?
     {
@@ -269,52 +219,12 @@ async fn chapter_images(
     }
     let chapter = resolve_chapter(&s.library, &book_url, q.chapter_url.as_deref(), q.index).await?;
 
-    // 1) 命中章节缓存：直接返回图片列表，不再回源
-    let cached = load_cached_images(
-        &s.library,
-        &chapter.url,
-        &source.book_source_url,
-        s.cfg.content_ttl_secs,
-    )
-    .await?;
-    let (images, truncated, from_cache) = match cached {
-        Some(c) if c.content_type == "image" => {
-            let (v, t) = decode_images(c.images_json.as_deref());
-            (v, t, true)
-        }
-        _ => {
-            let parsed = web_book::chapter_images(&source, &chapter)
-                .await
-                .map_err(fetch_error)?;
-            let images = parsed.images;
-            let truncated = parsed.truncated;
-            // 空图片列表不回写缓存：腾讯等源的章节数据带随机 nonce，偶发的解析失败会得到 0 张图，
-            // 一旦缓存就会在 TTL 内「永久」返回空列表，用户需清缓存才能恢复。空结果按失败处理即可。
-            if !images.is_empty() {
-                let payload = serde_json::to_string(&web_book::ChapterImages {
-                    images: images.clone(),
-                    truncated,
-                })
-                .unwrap_or_default();
-                let c = BookContent {
-                    url: chapter.url.clone(),
-                    origin: source.book_source_url.clone(),
-                    book_url: book_url.clone(),
-                    title: chapter.title.clone(),
-                    content: Some(String::new()),
-                    chapter_index: chapter.index,
-                    content_type: "image".into(),
-                    images_json: Some(payload),
-                    ..Default::default()
-                };
-                // 馆藏不设容量上限：抓到就落库，只由 TTL 回收临时缓存。
-                if let Err(e) = save_content_cached(&s.library, &c).await {
-                    tracing::warn!(url = %chapter.url, error = %e, "comic content cache write failed");
-                }
-            }
-            (images, truncated, false)
-        }
-    };
+    // 目录没有这一章的页表：按书源规则回源，不写任何缓存表。
+    let parsed = web_book::chapter_images(&source, &chapter)
+        .await
+        .map_err(fetch_error)?;
+    let images = parsed.images;
+    let truncated = parsed.truncated;
 
     let (ordinal, total) = chapter_position(&s.library, &book_url, &chapter).await;
     let placeholder_suspected = !images.is_empty() && (chapter.is_pay || chapter.is_vip);
@@ -349,7 +259,7 @@ async fn chapter_images(
         "images": images_out,
         "count": images.len(),
         "truncated": truncated,
-        "cached": from_cache,
+        "cached": false,
         "placeholder_suspected": placeholder_suspected,
         // 单图代理路径：前端按此拼 `?source=&url=&chapter_url=`
         "image_proxy": "/api/book/image",
@@ -357,7 +267,7 @@ async fn chapter_images(
 }
 
 /// 目录即书的漫画章节：从 `oread.json` 取页表，返回 `oread-img://` 本地 URL。
-/// 目录不存在/章节不在目录里返回 `None`，调用方继续走旧缓存与回源。
+/// 目录不存在/章节不在目录里返回 `None`，调用方继续按书源回源。
 async fn comic_chapter_from_dir(
     s: &AppState,
     book_url: &str,
@@ -406,7 +316,7 @@ async fn comic_chapter_from_dir(
             "该序号是分卷标题，请从目录选择章节".into(),
         ));
     }
-    // 本地页表为空 = 这一章还没缓存到目录：回退 DB / 回源，而不是返回空图片列表。
+    // 本地页表为空 = 这一章还没缓存到目录：回源，而不是返回空图片列表。
     if chapter.pages.is_empty() {
         return Ok(None);
     }
@@ -486,24 +396,6 @@ fn fetch_error(e: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decode_images_accepts_wrapped_and_legacy_shapes() {
-        let wrapped = r#"{"images":[{"index":1,"url":"https://cdn/a.jpg"}],"truncated":true}"#;
-        let (imgs, truncated) = decode_images(Some(wrapped));
-        assert_eq!(imgs.len(), 1);
-        assert_eq!(imgs[0].url, "https://cdn/a.jpg");
-        assert!(truncated);
-
-        let legacy =
-            r#"[{"index":1,"url":"https://cdn/b.jpg"},{"index":2,"url":"https://cdn/c.jpg"}]"#;
-        let (imgs, truncated) = decode_images(Some(legacy));
-        assert_eq!(imgs.len(), 2);
-        assert!(!truncated);
-
-        assert_eq!(decode_images(None).0.len(), 0);
-        assert_eq!(decode_images(Some("not json")).0.len(), 0);
-    }
 
     #[test]
     fn source_json_marks_comic() {

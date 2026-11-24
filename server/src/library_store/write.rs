@@ -94,15 +94,8 @@ pub async fn seed_from_db(pool: &SqlitePool, book_url: &str) -> anyhow::Result<O
     .bind(book_url)
     .fetch_optional(pool)
     .await?;
-    // 类型字段缺失的老库：只要有过图片章节就按漫画处理（与迁移判定一致）。
-    let has_image: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM library_content \
-         WHERE book_url = ?1 AND content_type = 'image' LIMIT 1",
-    )
-    .bind(book_url)
-    .fetch_optional(pool)
-    .await?;
-    let is_comic = row.book_source_type == 2 || has_image.is_some();
+    // 漫画只由书源类型判定；书目录一旦建立就以目录本身为准。
+    let is_comic = row.book_source_type == 2;
 
     let title = row
         .name

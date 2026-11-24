@@ -67,19 +67,25 @@ pub(super) async fn proxy_decoded(
     serve_bytes(decoded, &ct, &etag, false, headers)
 }
 
-/// 馆藏漫画：图片字节已经在 `library_images` 里，命中后完全不走网络。
+/// 内存里的本地图片：字节来自书目录文件。
+pub(crate) struct StoredImage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) mime: String,
+}
+
+/// 馆藏漫画：图片字节直接来自书目录，完全不走网络。
 ///
-/// 输出路径与回源一致（同一套变体 key / ETag），只是字节来源换成本地 BLOB：
+/// 输出路径与回源一致（同一套变体 key / ETag）：
 /// 解密源直出、切片、WebP→灰度 JPEG、JPEG→灰度、原图直出。
 async fn proxy_stored(
     s: &AppState,
     source: &BookSource,
     q: &ImageQ,
     headers: &HeaderMap,
-    stored: crate::library_images::StoredImage,
+    stored: StoredImage,
     max_bytes: usize,
 ) -> Response {
-    let crate::library_images::StoredImage { data, mime, .. } = stored;
+    let StoredImage { data, mime } = stored;
     let ct_base = if mime.trim().is_empty() {
         sniff_image_mime(&data).to_string()
     } else {
@@ -244,7 +250,7 @@ async fn proxy_stored(
 /// 本地漫画页：`oread-img://<书目录名>/<文件>`。
 ///
 /// 完全不走网络，也不需要书源；后面复用 [`proxy_stored`] 的缓存/切片/灰度逻辑，
-/// 因此 KPW3 的 WebP 转码、长条切片与 ETag 行为和数据库图片一致。
+/// 因此 KPW3 的 WebP 转码、长条切片与 ETag 行为与回源图片一致。
 async fn proxy_local(
     s: &AppState,
     q: &ImageQ,
@@ -285,12 +291,7 @@ async fn proxy_local(
     };
     // 本地目录没有书源规则，用空 BookSource 走同一套直出/转码路径。
     let source = BookSource::default();
-    let stored = crate::library_images::StoredImage {
-        data,
-        mime,
-        width: None,
-        height: None,
-    };
+    let stored = StoredImage { data, mime };
     proxy_stored(s, &source, q, headers, stored, max_bytes).await
 }
 
@@ -328,15 +329,6 @@ pub(crate) async fn proxy(
             )
         }
     };
-    // 馆藏漫画：图片字节已落盘，命中后直接本地出图。
-    // 放在 SSRF 预检之前：命中不需要出站，源站 DNS 挂了也能读。
-    let stored = crate::library_images::load(&s.library, &q.url, &source.book_source_url)
-        .await
-        .ok()
-        .flatten();
-    if let Some(stored) = stored {
-        return proxy_stored(&s, &source, &q, &headers, stored, max_bytes).await;
-    }
     // 先做 SSRF 预检，私网地址在回源前就拒绝（避免把内网请求发出去）
     match url::Url::parse(&q.url) {
         Ok(u) => {

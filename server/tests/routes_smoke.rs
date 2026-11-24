@@ -10,6 +10,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
 use boranlib::config::Config;
+use boranlib::entities::BookChapter;
+use boranlib::library_store::{write as store_write, Store};
 use boranlib::{db, routes};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -896,7 +898,7 @@ async fn concurrent_content_requests_share_one_fetch() {
     let library = db::init_library(&cfg).await.expect("初始化馆藏库");
     let app = routes::build_router_with_fetcher(
         shared.clone(),
-        library,
+        library.clone(),
         cfg,
         std::sync::Arc::new(MockFetcher {
             content_calls: calls.clone(),
@@ -915,6 +917,27 @@ async fn concurrent_content_requests_share_one_fetch() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "导入书源");
+
+    // 目录是正文唯一副本：先有书目录，首次抓取的正文才落得下来，
+    // 后续并发请求才能在闸门后重查目录命中。
+    sqlx::query(
+        "INSERT INTO library_books (book_url, name, origin, tier, last_accessed_at) \
+         VALUES ('https://mock.example/book/1', '并发书', 'https://mock.example', 'temp', 1)",
+    )
+    .execute(&library)
+    .await
+    .unwrap();
+    let chapters = vec![BookChapter {
+        url: "https://mock.example/c1".into(),
+        title: Some("第一章".into()),
+        book_url: Some("https://mock.example/book/1".into()),
+        index: 0,
+        ..Default::default()
+    }];
+    let store = Store::new(&dir);
+    store_write::sync_toc(&library, &store, "https://mock.example/book/1", &chapters)
+        .await
+        .unwrap();
 
     let uri = "/api/book/content?source=https%3A%2F%2Fmock.example\
         &chapter_url=https%3A%2F%2Fmock.example%2Fc1\
@@ -1165,58 +1188,50 @@ async fn comic_cbz_export_info_and_download() {
     let user = register(&app, "cbzuser").await;
 
     sqlx::query(
-        "INSERT INTO library_books (book_url, name, author, tier, collected_at, last_accessed_at) \
-         VALUES ('https://c.test/book', '漫画书', '作者：画师', 'collection', 1, 1)",
+        "INSERT INTO library_books (book_url, name, author, tier, book_source_type, \
+         collected_at, last_accessed_at) \
+         VALUES ('https://c.test/book', '漫画书', '画师', 'collection', 2, 1, 1)",
     )
     .execute(&library)
     .await
     .unwrap();
-    for (url, idx) in [("https://c.test/ch1", 0), ("https://c.test/ch2", 1)] {
-        sqlx::query(
-            "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
-             VALUES ('https://c.test/book', ?1, ?1, 0, ?2)",
-        )
-        .bind(url)
-        .bind(idx)
-        .execute(&library)
+    let chapters = vec![
+        BookChapter {
+            url: "https://c.test/ch1".into(),
+            title: Some("第一话".into()),
+            book_url: Some("https://c.test/book".into()),
+            index: 0,
+            ..Default::default()
+        },
+        BookChapter {
+            url: "https://c.test/ch2".into(),
+            title: Some("第二话".into()),
+            book_url: Some("https://c.test/book".into()),
+            index: 1,
+            ..Default::default()
+        },
+    ];
+    let store = Store::new(&dir);
+    store_write::sync_toc(&library, &store, "https://c.test/book", &chapters)
         .await
         .unwrap();
-    }
-    for (ch, images) in [
-        (
-            "https://c.test/ch1",
-            r#"{"images":[{"url":"https://c.test/p1"},{"url":"https://c.test/p2"}]}"#,
-        ),
-        (
-            "https://c.test/ch2",
-            r#"{"images":[{"url":"https://c.test/p3"}]}"#,
-        ),
+    for (url, pages) in [
+        ("https://c.test/ch1", vec![b"one".to_vec(), b"two".to_vec()]),
+        ("https://c.test/ch2", vec![b"three".to_vec()]),
     ] {
-        sqlx::query(
-            "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
-             VALUES (?1, 'src', 'https://c.test/book', 'image', ?2, 1)",
-        )
-        .bind(ch)
-        .bind(images)
-        .execute(&library)
-        .await
-        .unwrap();
-    }
-    for (url, data) in [
-        ("https://c.test/p1", b"one".as_slice()),
-        ("https://c.test/p2", b"two".as_slice()),
-        ("https://c.test/p3", b"three".as_slice()),
-    ] {
-        sqlx::query(
-            "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-             VALUES (?1, 'src', 'https://c.test/book', 'image/jpeg', ?2, ?3)",
-        )
-        .bind(url)
-        .bind(data)
-        .bind(data.len() as i64)
-        .execute(&library)
-        .await
-        .unwrap();
+        let pages: Vec<store_write::ComicPageInput> = pages
+            .into_iter()
+            .map(|data| store_write::ComicPageInput {
+                data,
+                mime: "image/jpeg".into(),
+                width: None,
+                height: None,
+                source_url: None,
+            })
+            .collect();
+        store_write::save_comic_pages(&store, "https://c.test/book", url, &pages)
+            .await
+            .unwrap();
     }
 
     let resp = app
@@ -1518,26 +1533,32 @@ async fn epub_export_info_and_download() {
     .execute(&library)
     .await
     .unwrap();
-    for (url, title, idx) in [
-        ("https://e.test/c1", "第一章", 0),
-        ("https://e.test/c2", "第二章", 1),
-    ] {
-        sqlx::query(
-            "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
-             VALUES ('https://e.test/book', ?1, ?2, 0, ?3)",
-        )
-        .bind(url)
-        .bind(title)
-        .bind(idx)
-        .execute(&library)
+    let chapters = vec![
+        BookChapter {
+            url: "https://e.test/c1".into(),
+            title: Some("第一章".into()),
+            book_url: Some("https://e.test/book".into()),
+            index: 0,
+            ..Default::default()
+        },
+        BookChapter {
+            url: "https://e.test/c2".into(),
+            title: Some("第二章".into()),
+            book_url: Some("https://e.test/book".into()),
+            index: 1,
+            ..Default::default()
+        },
+    ];
+    let store = Store::new(&dir);
+    store_write::sync_toc(&library, &store, "https://e.test/book", &chapters)
         .await
         .unwrap();
-    }
-    sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content, size_bytes) \
-         VALUES ('https://e.test/c1', 'src', 'https://e.test/book', '第一章正文', 15)",
+    store_write::save_text_chapter(
+        &store,
+        "https://e.test/book",
+        "https://e.test/c1",
+        &["第一章正文".into()],
     )
-    .execute(&library)
     .await
     .unwrap();
 
@@ -1572,25 +1593,10 @@ async fn epub_export_info_and_download() {
         .unwrap();
     assert!(bytes.starts_with(b"PK\x03\x04"), "EPUB 必须是 ZIP");
 
-    // 只有漫画章节的书没有正文，明确 409。
+    // 只有漫画章节的书没有正文目录，明确 409。
     sqlx::query(
-        "INSERT INTO library_books (book_url, name, tier, last_accessed_at) \
-         VALUES ('https://e.test/comic', '漫画书', 'collection', 1)",
-    )
-    .execute(&library)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
-         VALUES ('https://e.test/comic', 'https://e.test/comic/1', '第一话', 0, 0)",
-    )
-    .execute(&library)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
-         VALUES ('https://e.test/comic/1', 'src', 'https://e.test/comic', 'image', \
-         '{\"images\":[{\"url\":\"https://e.test/p1\"}]}', 1)",
+        "INSERT INTO library_books (book_url, name, tier, book_source_type, last_accessed_at) \
+         VALUES ('https://e.test/comic', '漫画书', 'collection', 2, 1)",
     )
     .execute(&library)
     .await
@@ -1794,30 +1800,8 @@ async fn opds_requires_basic_and_exposes_collection() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content, size_bytes) \
-         VALUES ('https://o.test/text/1', 'src', 'https://o.test/text', '正文', 6)",
-    )
-    .execute(&library)
-    .await
-    .unwrap();
-    sqlx::query(
         "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
          VALUES ('https://o.test/comic', 'https://o.test/comic/1', '第一话', 0, 0)",
-    )
-    .execute(&library)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content_type, images, images_ready) \
-         VALUES ('https://o.test/comic/1', 'src', 'https://o.test/comic', 'image', \
-         '{\"images\":[{\"url\":\"https://o.test/p1\"}]}', 1)",
-    )
-    .execute(&library)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-         VALUES ('https://o.test/p1', 'src', 'https://o.test/comic', 'image/jpeg', X'FFD8FF', 3)",
     )
     .execute(&library)
     .await
@@ -1826,6 +1810,27 @@ async fn opds_requires_basic_and_exposes_collection() {
         .execute(&library)
         .await
         .unwrap();
+
+    // 下载复用导出管线：文字书必须有完整书目录才能导出 EPUB。
+    let store = Store::new(&dir);
+    let chapters = vec![BookChapter {
+        url: "https://o.test/text/1".into(),
+        title: Some("第一章".into()),
+        book_url: Some("https://o.test/text".into()),
+        index: 0,
+        ..Default::default()
+    }];
+    store_write::sync_toc(&library, &store, "https://o.test/text", &chapters)
+        .await
+        .unwrap();
+    store_write::save_text_chapter(
+        &store,
+        "https://o.test/text",
+        "https://o.test/text/1",
+        &["正文".into()],
+    )
+    .await
+    .unwrap();
 
     // 第一页 limit=1：最近阅读的漫画在前，且给出 next 游标。
     let resp = app

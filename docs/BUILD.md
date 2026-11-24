@@ -431,21 +431,13 @@ cd server; & '<local-tools>\cache\target-dev\debug\boranlib.exe'
 
 `/k` 埋点写在 `DATA_DIR/logs/k-metrics-YYYYMMDD.jsonl`（`DATA_DIR` 即 `BORANLIB_DATA_DIR`，默认 `data`）；管理员可用 `GET /api/k/metrics?date=YYYY-MM-DD` 看聚合、`GET /api/k/metrics/export?date=YYYY-MM-DD` 导出原始 JSONL（接口细节见 `docs/API.md` §11.5）。
 
-### 5.1 一次性迁移：旧库 → 目录即书
+### 5.1 存储形态：目录即书
 
-```powershell
-$env:BORANLIB_DATA_DIR='.\data'
-cd server
-& '<local-tools>\cache\target-dev\debug\boranlib.exe' migrate-store
-```
-
-只读 `library.db` 的正文/图片表，把每本书导出成 `data\library\{collection,temp}\<sha256(book_url)>/`
-（文字书 = 解压 EPUB 目录，漫画 = 解压 CBZ 目录）。**不删除任何数据库行**；已存在的书目录会跳过，
-因此可重复执行。结束后会打印书/章/图数量与失败清单；有失败时退出码非 0。
-
-正常启动时也会在后台跑同一套迁移：旧内容表还有行就补齐缺目录的书（已有目录跳过），
-日志里出现 `legacy db → book dirs finished` 即完成。命令行的 `migrate-store` 仍可用于
-手动触发并查看完整统计。
+正文、目录与漫画图片的唯一副本都在书目录：`data\library\{collection,temp}\<sha256(book_url)>/`
+（文字书 = 解压 EPUB 目录，漫画 = 解压 CBZ 目录 + `oread.json` 页表）。
+`library_content` / `library_images` 已在迁移 `0004_drop_legacy_cache.sql` 中删除，
+不再提供 `migrate-store` 命令，也不再在启动时后台补齐旧库；旧设备缓存按「全新开始」直接丢弃，
+书重新打开时按目录按需重新抓取。
 
 ### 5.2 一致性检查：`doctor`
 
@@ -458,16 +450,13 @@ cd server
 ```
 
 `doctor` 默认只读比对「书目录 ↔ `index.db` ↔ `library.db`」：目录解析失败、索引滞后/残留、
-目录存在但 `library.db` 没有书目（馆藏列表里看不到）、`library.db` 有但目录缺失（读路径仍回退 DB）。
+目录存在但 `library.db` 没有书目（馆藏列表里看不到）、`library.db` 有但目录缺失（该书当前不可读）。
 `--rebuild-index` 先从目录全量重建 `data\library\index.db`（删掉也无妨），再输出检查结果。
 `--sync-db` 隐含重建索引，并把「目录有、`library.db` 没有」的书补登成书目（含书名/作者/标签/封面），
 适合手工把书目录放进 `collection/` 后让它在馆藏列表里出现；只插入缺失行，不覆盖已有书目。
 它还会用书目录重算每本书的「已缓存章节 / 正文 / 图片占用」，手工放入的目录也能显示正确进度
 （占位章不计入已缓存章节）。
 索引滞后本身不算问题（重建即可）；解析失败或补登后仍有孤立目录时退出码为 1。
-另外会统计旧缓存表 `library_content` / `library_images` 里还有多少行没被书目录覆盖
-（文字章节要求章节文件有正文，漫画页按原始图片 URL 比对），并列出没有目录或目录不完整的书；
-「仅 DB」为 0 时目录已是唯一副本，可以考虑删旧表，否则先跑 `boranlib migrate-store`。
 
 部署到板子（绝不在板上 `cargo build`，链接期会 OOM）：
 

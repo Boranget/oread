@@ -29,8 +29,6 @@ use tokio::fs::{self, File};
 use tokio::io::AsyncReadExt;
 
 use crate::auth::AuthUser;
-use crate::ebook::format::cbz::CbzWriter;
-use crate::ebook::format::epub::EpubWriter;
 use crate::ebook::format::txt::{normalize_author, TxtWriter};
 use crate::ebook::pipeline::FormatWriter;
 use crate::ebook::{BookInput, ComicInput, Format, WriteReport};
@@ -72,20 +70,16 @@ async fn build_plan(
     crate::ebook_source::load_book_input_with_store(store, pool, book_url).await
 }
 
-/// 有书目录时让 writer 直接读磁盘；否则保持旧 `library_content` 读取。
-async fn export_reader<'a>(
-    pool: &'a SqlitePool,
+/// 让 writer 直接读已打开的书目录；目录不存在时不允许导出。
+async fn export_reader(
     store: &crate::library_store::Store,
-    book_url: &'a str,
-) -> LibraryReader<'a> {
-    let reader = LibraryReader::new(pool, book_url);
-    match store.open_book(book_url).await {
-        Ok(Some(book)) => reader.with_dir(book),
-        Ok(None) => reader,
-        Err(err) => {
-            tracing::warn!(book_url, error = %err, "open book dir failed; export falls back to db");
-            reader
-        }
+    book_url: &str,
+) -> AppResult<LibraryReader> {
+    match store.open_book(book_url).await? {
+        Some(book) => Ok(LibraryReader::new(book)),
+        None => Err(AppError::Conflict(
+            "这本书还没有完整的本地目录，无法导出".into(),
+        )),
     }
 }
 
@@ -162,7 +156,7 @@ async fn write_export(
         seq
     ));
 
-    let reader = export_reader(pool, &store, book_url).await;
+    let reader = export_reader(&store, book_url).await?;
     let report = TxtWriter.write(&input, &reader, &path).await?;
 
     Ok(ExportFile {
@@ -202,15 +196,15 @@ async fn write_epub(
         seq
     ));
 
-    let reader = export_reader(pool, &store, book_url).await;
-    // 目录优先：目录本身就是合法 EPUB，直接原样打包，不再逐章重新生成。
+    // 目录本身就是合法 EPUB，原样打包；不完整直接 409，不再逐章重新生成。
     let (written_cached, size_bytes) =
         match crate::library_store::pack::pack_book(&store, book_url, PackKind::Epub, &path).await?
         {
             Some(report) => (input.cached_chapters, report.bytes),
             None => {
-                let report = EpubWriter.write(&input, &reader, &path).await?;
-                (report.written_chapters, report.size_bytes)
+                return Err(AppError::Conflict(
+                    "这本书的本地目录不完整，无法导出 EPUB".into(),
+                ))
             }
         };
 
@@ -263,7 +257,8 @@ async fn write_cbz(
         seq
     ));
 
-    // 目录优先：完整漫画目录直接原样打包；`oread.json` 是内部边车，不进入 CBZ。
+    // 目录即书：完整漫画目录直接原样打包；`oread.json` 是内部边车，不进入 CBZ。
+    // 目录不完整直接 409，不再逐页回退生成。
     let report = match crate::library_store::pack::pack_book(
         &store,
         &input.book.meta.book_url,
@@ -279,8 +274,9 @@ async fn write_cbz(
             size_bytes: packed.bytes,
         },
         None => {
-            let reader = LibraryReader::new(pool, &input.book.meta.book_url);
-            CbzWriter.write(&input.book, &reader, &path).await?
+            return Err(AppError::Conflict(
+                "这本书的本地目录不完整，无法导出 CBZ".into(),
+            ))
         }
     };
     Ok(CbzExportFile {
@@ -535,14 +531,9 @@ pub(crate) async fn epub_download(s: &AppState, uid: i64, book_url: &str) -> App
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::BookChapter;
+    use crate::library_store::{write as store_write, Store};
     use sqlx::sqlite::SqlitePoolOptions;
-
-    /// 只用来证明「目录不存在时回退数据库」；不创建任何书目录。
-    fn empty_store() -> crate::library_store::Store {
-        crate::library_store::Store::new(
-            std::env::temp_dir().join(format!("oread-export-empty-{}", std::process::id())),
-        )
-    }
 
     async fn export_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -550,104 +541,27 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_books (book_url TEXT PRIMARY KEY, name TEXT, author TEXT, \
-             origin TEXT, origin_name TEXT, intro TEXT, language TEXT, publisher TEXT, \
-             pubdate TEXT, series_name TEXT, series_index REAL)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_chapters (book_url TEXT NOT NULL, url TEXT NOT NULL, \
-             title TEXT, is_volume INTEGER NOT NULL DEFAULT 0, \"index\" INTEGER NOT NULL DEFAULT 0, \
-             PRIMARY KEY (book_url, url))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_content (url TEXT NOT NULL, origin TEXT NOT NULL DEFAULT '', \
-             book_url TEXT NOT NULL, title TEXT, content TEXT, \
-             content_type TEXT NOT NULL DEFAULT 'text', images TEXT, \
-             size_bytes INTEGER NOT NULL DEFAULT 0, \
-             images_ready INTEGER NOT NULL DEFAULT 0, \
-             updated_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00', \
-             PRIMARY KEY (url, origin))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_images (url TEXT NOT NULL, origin TEXT NOT NULL, \
-             book_url TEXT NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL, \
-             size_bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (url, origin))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_identifiers (book_url TEXT NOT NULL, scheme TEXT NOT NULL, \
-             value TEXT NOT NULL, PRIMARY KEY (book_url, scheme, value))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE TABLE library_tags (book_url TEXT NOT NULL, tag TEXT NOT NULL, \
-             PRIMARY KEY (book_url, tag))",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::migrate!("./migrations/library")
+            .run(&pool)
+            .await
+            .expect("library migrations");
         pool
     }
 
-    async fn insert_book(pool: &SqlitePool, book: &str) {
+    async fn insert_book(pool: &SqlitePool, book: &str, name: &str, author: &str, kind: i64) {
         sqlx::query(
-            "INSERT INTO library_books (book_url, name, author, origin, origin_name) \
-             VALUES (?1, '测试书', '测试作者', 'https://src', '测试源')",
+            "INSERT INTO library_books \
+             (book_url, name, author, origin, origin_name, tier, book_source_type, \
+              collected_at, last_accessed_at) \
+             VALUES (?1, ?2, ?3, 'https://src', '测试源', 'collection', ?4, 1, 1)",
         )
         .bind(book)
+        .bind(name)
+        .bind(author)
+        .bind(kind)
         .execute(pool)
         .await
         .unwrap();
-        let rows = [
-            ("volume:book#0", "第一卷 风起", 1, 0),
-            ("https://x/c1", "第一章", 0, 1),
-            ("https://x/c2", "第二章", 0, 2),
-            ("https://x/c3", "第三章", 0, 3),
-        ];
-        for (url, title, is_volume, idx) in rows {
-            sqlx::query(
-                "INSERT INTO library_chapters (url, book_url, title, is_volume, \"index\") \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(url)
-            .bind(book)
-            .bind(title)
-            .bind(is_volume)
-            .bind(idx)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
-        for (url, body) in [
-            ("https://x/c1", "第一章正文\n第二段"),
-            ("https://x/c3", "第三章正文内容"),
-        ] {
-            sqlx::query(
-                "INSERT INTO library_content (url, book_url, content, size_bytes) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(url)
-            .bind(book)
-            .bind(body)
-            .bind(body.len() as i64)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -658,13 +572,111 @@ mod tests {
         std::env::temp_dir().join(format!("oread-export-{tag}-{}-{stamp}", std::process::id()))
     }
 
+    fn text_chapters(book: &str) -> Vec<BookChapter> {
+        vec![
+            BookChapter {
+                url: "volume:https://x/book#0".into(),
+                title: Some("第一卷 风起".into()),
+                book_url: Some(book.into()),
+                is_volume: true,
+                index: 0,
+                ..Default::default()
+            },
+            BookChapter {
+                url: "https://x/c1".into(),
+                title: Some("第一章".into()),
+                book_url: Some(book.into()),
+                index: 1,
+                ..Default::default()
+            },
+            BookChapter {
+                url: "https://x/c2".into(),
+                title: Some("第二章".into()),
+                book_url: Some(book.into()),
+                index: 2,
+                ..Default::default()
+            },
+            BookChapter {
+                url: "https://x/c3".into(),
+                title: Some("第三章".into()),
+                book_url: Some(book.into()),
+                index: 3,
+                ..Default::default()
+            },
+        ]
+    }
+
+    async fn build_text_book(pool: &SqlitePool, data_dir: &Path, book: &str) -> Store {
+        insert_book(pool, book, "测试书", "测试作者", 0).await;
+        let store = Store::new(data_dir);
+        let chapters = text_chapters(book);
+        store_write::sync_toc(pool, &store, book, &chapters)
+            .await
+            .unwrap();
+        store_write::save_text_chapter(
+            &store,
+            book,
+            "https://x/c1",
+            &["第一章正文".into(), "第二段".into()],
+        )
+        .await
+        .unwrap();
+        store_write::save_text_chapter(&store, book, "https://x/c3", &["第三章正文内容".into()])
+            .await
+            .unwrap();
+        store
+    }
+
+    async fn build_comic_book(pool: &SqlitePool, data_dir: &Path, book: &str) -> Store {
+        insert_book(pool, book, "漫画书", "画师", 2).await;
+        let store = Store::new(data_dir);
+        let chapters = vec![
+            BookChapter {
+                url: "https://c/ch1".into(),
+                title: Some("第一话".into()),
+                book_url: Some(book.into()),
+                index: 0,
+                ..Default::default()
+            },
+            BookChapter {
+                url: "https://c/ch2".into(),
+                title: Some("第二话".into()),
+                book_url: Some(book.into()),
+                index: 1,
+                ..Default::default()
+            },
+        ];
+        store_write::sync_toc(pool, &store, book, &chapters)
+            .await
+            .unwrap();
+        for (url, pages) in [
+            ("https://c/ch1", vec![b"one".to_vec(), b"two".to_vec()]),
+            ("https://c/ch2", vec![b"three".to_vec()]),
+        ] {
+            let pages: Vec<store_write::ComicPageInput> = pages
+                .into_iter()
+                .map(|data| store_write::ComicPageInput {
+                    data,
+                    mime: "image/jpeg".into(),
+                    width: None,
+                    height: None,
+                    source_url: None,
+                })
+                .collect();
+            store_write::save_comic_pages(&store, book, url, &pages)
+                .await
+                .unwrap();
+        }
+        store
+    }
+
     #[tokio::test]
     async fn export_streams_cached_chapters_in_order_with_placeholder() {
         let pool = export_pool().await;
         let book = "https://x/book";
-        insert_book(&pool, book).await;
         let dir = temp_dir("order");
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        build_text_book(&pool, &dir, book).await;
 
         let out = write_export(&pool, dir.to_str().unwrap(), 42, book)
             .await
@@ -676,14 +688,12 @@ mod tests {
         assert!(text.contains("书源：测试源"));
         assert!(text.contains("已缓存 2/3 章"), "头部应说明缓存进度: {text}");
         assert!(text.contains("【分卷】第一卷 风起"));
-        // 章节顺序：第一章 → 第二章 → 第三章
         let p1 = text.find("第一章").unwrap();
         let p2 = text.find("第二章").unwrap();
         let p3 = text.find("第三章").unwrap();
         assert!(p1 < p2 && p2 < p3);
-        assert!(text.contains("第一章正文\n第二段"), "命中的正文应原样保留");
+        assert!(text.contains("第一章正文"), "命中的正文应原样保留");
         assert!(text.contains("第三章正文内容"));
-        // 未缓存章节只有一个占位块，且没有被跳过
         assert_eq!(text.matches("【未缓存】").count(), 1);
         assert!(text.contains("章节地址：https://x/c2"));
 
@@ -691,37 +701,22 @@ mod tests {
         assert_eq!(out.input.cached_chapters, 2);
         assert_eq!(out.written_cached, 2);
         assert!(out.size_bytes > 0);
-        // UTF-8 往返：中文内容读回后完全一致
         assert!(text.chars().any(|c| c == '风'));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
-    async fn blank_content_is_treated_as_missing() {
-        let pool = export_pool().await;
-        let book = "https://x/book";
-        insert_book(&pool, book).await;
-        // 空串正文不应算“已缓存”
-        sqlx::query("UPDATE library_content SET content = '   ' WHERE url = 'https://x/c1'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let plan = build_plan(&pool, &empty_store(), book).await.unwrap();
-        assert_eq!(plan.cached_chapters, 1, "空白正文按缺失统计");
-        assert_eq!(plan.total_chapters, 3);
-    }
-
-    #[tokio::test]
     async fn empty_toc_is_rejected_with_conflict() {
         let pool = export_pool().await;
-        let err = build_plan(&pool, &empty_store(), "https://x/none")
+        let store = Store::new(temp_dir("empty"));
+        let err = build_plan(&pool, &store, "https://x/none")
             .await
             .err()
             .unwrap();
         assert!(
             matches!(err, AppError::Conflict(_)),
-            "目录未缓存应映射 409，而不是 400"
+            "目录不存在应映射 409，而不是 400"
         );
     }
 
@@ -733,32 +728,7 @@ mod tests {
         assert_eq!(normalize_author("  无语森  "), "无语森");
         assert_eq!(normalize_author(""), "未知");
         assert_eq!(normalize_author("作者："), "未知");
-        // 非行首标签不应误伤
         assert_eq!(normalize_author("原著作者：无语森"), "原著作者：无语森");
-    }
-
-    #[tokio::test]
-    async fn export_header_prints_author_once() {
-        let pool = export_pool().await;
-        let book = "https://x/book";
-        insert_book(&pool, book).await;
-        sqlx::query("UPDATE library_books SET author = '作者：无语森' WHERE book_url = ?1")
-            .bind(book)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let dir = temp_dir("author");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let out = write_export(&pool, dir.to_str().unwrap(), 42, book)
-            .await
-            .unwrap();
-        let text = tokio::fs::read_to_string(&out.path).await.unwrap();
-        assert!(text.contains("作者：无语森"));
-        assert!(
-            !text.contains("作者：作者："),
-            "不应重复输出作者标签: {text}"
-        );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
@@ -771,88 +741,16 @@ mod tests {
         let d = content_disposition("测试书-2026.txt");
         assert!(d.starts_with("attachment;"));
         assert!(d.contains("filename*=UTF-8''"));
-        // 中文必须被百分号编码，响应头才能是合法 ASCII
         assert!(!d.contains('测'));
         assert!(d.contains("%E6%B5%8B"));
-    }
-
-    // 计划信息与导出实际统计应一致（供 /api/book/export/info 复用）
-    #[tokio::test]
-    async fn plan_matches_export_stats() {
-        let pool = export_pool().await;
-        let book = "https://x/book";
-        insert_book(&pool, book).await;
-        let dir = temp_dir("plan");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let out = write_export(&pool, dir.to_str().unwrap(), 42, book)
-            .await
-            .unwrap();
-        let plan = build_plan(&pool, &empty_store(), book).await.unwrap();
-        assert_eq!(plan.total_chapters, out.input.total_chapters);
-        assert_eq!(plan.cached_chapters, out.input.cached_chapters);
-        assert_eq!(plan.cached_bytes, out.input.cached_bytes);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    async fn insert_comic(pool: &SqlitePool) {
-        sqlx::query(
-            "INSERT INTO library_books (book_url, name, author, series_name, series_index) \
-             VALUES ('https://c/book', '漫画书', '作者：画师', '漫画系列', 1)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        for (url, idx) in [("https://c/ch1", 0), ("https://c/ch2", 1)] {
-            sqlx::query(
-                "INSERT INTO library_chapters (book_url, url, title, is_volume, \"index\") \
-                 VALUES ('https://c/book', ?1, ?1, 0, ?2)",
-            )
-            .bind(url)
-            .bind(idx)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
-        sqlx::query(
-            "INSERT INTO library_content (url, origin, book_url, content_type, images, \
-             images_ready) VALUES ('https://c/ch1', 'src', 'https://c/book', 'image', \
-             '{\"images\":[{\"url\":\"https://c/p1\"},{\"url\":\"https://c/p2\"}]}', 1)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO library_content (url, origin, book_url, content_type, images, \
-             images_ready) VALUES ('https://c/ch2', 'src', 'https://c/book', 'image', \
-             '{\"images\":[{\"url\":\"https://c/p3\"}]}', 1)",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        for (url, data) in [
-            ("https://c/p1", b"one".as_slice()),
-            ("https://c/p2", b"two".as_slice()),
-            ("https://c/p3", b"three".as_slice()),
-        ] {
-            sqlx::query(
-                "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-                 VALUES (?1, 'src', 'https://c/book', 'image/jpeg', ?2, ?3)",
-            )
-            .bind(url)
-            .bind(data)
-            .bind(data.len() as i64)
-            .execute(pool)
-            .await
-            .unwrap();
-        }
     }
 
     #[tokio::test]
     async fn cbz_export_packages_pages_and_comicinfo() {
         let pool = export_pool().await;
-        insert_comic(&pool).await;
         let dir = temp_dir("cbz");
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        build_comic_book(&pool, &dir, "https://c/book").await;
 
         let out = write_cbz(&pool, dir.to_str().unwrap(), 42, "https://c/book")
             .await
@@ -876,9 +774,9 @@ mod tests {
     #[tokio::test]
     async fn cbz_export_rejects_text_only_book() {
         let pool = export_pool().await;
-        insert_book(&pool, "https://x/book").await;
         let dir = temp_dir("cbz-none");
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        build_text_book(&pool, &dir, "https://x/book").await;
         let err = write_cbz(&pool, dir.to_str().unwrap(), 42, "https://x/book")
             .await
             .unwrap_err();
@@ -890,9 +788,9 @@ mod tests {
     async fn epub_export_writes_zip_and_text_chapters() {
         let pool = export_pool().await;
         let book = "https://x/book";
-        insert_book(&pool, book).await;
         let dir = temp_dir("epub");
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        build_text_book(&pool, &dir, book).await;
 
         let out = write_epub(&pool, dir.to_str().unwrap(), 42, book)
             .await
@@ -905,7 +803,6 @@ mod tests {
         assert_eq!(out.written_cached, 2);
         assert_eq!(out.size_bytes, bytes.len() as u64);
         assert!(bytes.starts_with(b"PK\x03\x04"), "EPUB 必须是 ZIP");
-        // mimetype 是 OCF 要求的第一条，且必须 store（method=0）
         let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
         assert_eq!(&bytes[30..30 + name_len], b"mimetype");
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 0);
@@ -914,16 +811,16 @@ mod tests {
         assert!(text.contains("OEBPS/nav.xhtml"));
         assert!(text.contains("<dc:title>测试书</dc:title>"));
         assert!(text.contains("第一章正文"));
-        assert!(text.contains("本章正文尚未缓存"), "未缓存章节必须显式占位");
+        assert!(text.contains("本章内容尚未缓存"), "未缓存章节必须显式占位");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn epub_export_rejects_comic_only_book() {
         let pool = export_pool().await;
-        insert_comic(&pool).await;
         let dir = temp_dir("epub-none");
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        build_comic_book(&pool, &dir, "https://c/book").await;
         let err = write_epub(&pool, dir.to_str().unwrap(), 42, "https://c/book")
             .await
             .unwrap_err();

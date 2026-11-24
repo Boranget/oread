@@ -36,44 +36,24 @@ async fn insert_book(
     .expect("insert book");
 }
 
-async fn insert_content(pool: &SqlitePool, book: &str, url: &str, bytes: i64) {
+async fn insert_cached(
+    pool: &SqlitePool,
+    book: &str,
+    chapters: i64,
+    text_bytes: i64,
+    image_bytes: i64,
+) {
     sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content, size_bytes) \
-         VALUES (?1, 'src', ?2, 'x', ?3)",
+        "UPDATE library_books SET cached_chapters = ?2, content_bytes = ?3, image_bytes = ?4 \
+         WHERE book_url = ?1",
     )
-    .bind(url)
     .bind(book)
-    .bind(bytes)
+    .bind(chapters)
+    .bind(text_bytes)
+    .bind(image_bytes)
     .execute(pool)
     .await
-    .expect("insert content");
-}
-
-async fn insert_image(pool: &SqlitePool, book: &str, url: &str, bytes: i64) {
-    sqlx::query(
-        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-         VALUES (?1, 'src', ?2, 'image/jpeg', X'00', ?3)",
-    )
-    .bind(url)
-    .bind(book)
-    .bind(bytes)
-    .execute(pool)
-    .await
-    .expect("insert image");
-}
-
-async fn insert_image_chapter(pool: &SqlitePool, book: &str, url: &str, ready: bool) {
-    sqlx::query(
-        "INSERT INTO library_content (url, origin, book_url, content, content_type, images, \
-           size_bytes, images_ready) \
-         VALUES (?1, 'src', ?2, '', 'image', '[]', 2, ?3)",
-    )
-    .bind(url)
-    .bind(book)
-    .bind(i64::from(ready))
-    .execute(pool)
-    .await
-    .expect("insert image chapter");
+    .expect("insert cached stats");
 }
 
 #[tokio::test]
@@ -115,16 +95,11 @@ async fn cleanup_temp_only_removes_expired_temp_books() {
     insert_book(&p, "keep-collection", TIER_COLLECTION, Some(old), old).await;
     insert_book(&p, "drop-temp", TIER_TEMP, None, old).await;
     insert_book(&p, "keep-temp", TIER_TEMP, None, now_ms()).await;
-    insert_content(&p, "drop-temp", "c1", 100).await;
-    insert_content(&p, "keep-collection", "c2", 200).await;
-    insert_content(&p, "keep-temp", "c3", 300).await;
-
-    insert_image(&p, "drop-temp", "i1", 50).await;
+    insert_cached(&p, "drop-temp", 1, 100, 50).await;
 
     let report = cleanup_temp(&p, 30 * 86_400).await.unwrap();
     assert_eq!(report.books, 1);
     assert_eq!(report.contents, 1);
-    assert_eq!(report.images, 1);
     assert_eq!(report.bytes, 150);
 
     assert!(load_book(&p, "drop-temp").await.unwrap().is_none());
@@ -139,134 +114,19 @@ async fn stats_report_layers_and_expired_books() {
     insert_book(&p, "c1", TIER_COLLECTION, Some(old), old).await;
     insert_book(&p, "t1", TIER_TEMP, None, old).await;
     insert_book(&p, "t2", TIER_TEMP, None, now_ms()).await;
-    insert_content(&p, "c1", "cc1", 10).await;
-    insert_content(&p, "t1", "tt1", 20).await;
-    insert_image(&p, "c1", "ci1", 300).await;
-    insert_image(&p, "t1", "ti1", 40).await;
-    // 冗余统计由 rollup 维护；测试里直接写，避免 refresh_rollup 刷新 TTL 时间。
-    sqlx::query(
-        "UPDATE library_books SET content_bytes = 10, image_bytes = 300 WHERE book_url = 'c1'",
-    )
-    .execute(&p)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE library_books SET content_bytes = 20, image_bytes = 40 WHERE book_url = 't1'",
-    )
-    .execute(&p)
-    .await
-    .unwrap();
+    insert_cached(&p, "c1", 1, 10, 300).await;
+    insert_cached(&p, "t1", 1, 20, 40).await;
 
     let st = stats(&p, 30 * 86_400).await;
     assert_eq!(st.collection_books, 1);
     assert_eq!(st.temp_books, 2);
     assert_eq!(st.content_rows, 2);
     assert_eq!(st.content_bytes, 30);
-    assert_eq!(st.image_rows, 2);
+    assert_eq!(st.image_rows, 0);
     assert_eq!(st.collection_bytes, 10 + 300);
     assert_eq!(st.temp_bytes, 20 + 40);
     assert_eq!(st.total_bytes, 10 + 20 + 300 + 40);
     assert_eq!(st.temp_expired_books, 1, "只有 t1 过期");
-}
-
-#[tokio::test]
-async fn clear_content_drops_images_and_keeps_book() {
-    let p = pool().await;
-    insert_book(&p, "b1", TIER_COLLECTION, Some(now_ms()), now_ms()).await;
-    insert_content(&p, "b1", "c1", 100).await;
-    insert_image(&p, "b1", "i1", 200).await;
-
-    let r = clear_content(&p, "b1").await.unwrap();
-    assert_eq!((r.contents, r.images), (1, 1));
-    assert_eq!(r.bytes, 300);
-    let b = load_book(&p, "b1").await.unwrap().unwrap();
-    assert_eq!(b.content_bytes, 0);
-    assert_eq!(b.image_bytes, 0);
-    assert_eq!(b.cached_chapters, 0);
-}
-
-#[tokio::test]
-async fn library_images_load_and_ready_marker() {
-    let p = pool().await;
-    insert_book(&p, "b1", TIER_COLLECTION, Some(now_ms()), now_ms()).await;
-    assert!(crate::library_images::load(&p, "i1", "src")
-        .await
-        .unwrap()
-        .is_none());
-
-    // 新写入不再落 BLOB；这里模拟旧库遗留行，验证只读回退与清理。
-    sqlx::query(
-        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes, width, height) \
-         VALUES ('i1', 'src', 'b1', 'image/jpeg', X'01020304', 4, 120, 80)",
-    )
-    .execute(&p)
-    .await
-    .unwrap();
-    let loaded = crate::library_images::load(&p, "i1", "src")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(loaded.data, vec![1, 2, 3, 4]);
-    assert_eq!(loaded.mime, "image/jpeg");
-    assert_eq!((loaded.width, loaded.height), (Some(120), Some(80)));
-
-    insert_image_chapter(&p, "b1", "c1", true).await;
-    crate::library_images::mark_chapter_pending(&p, "c1", "src")
-        .await
-        .unwrap();
-    assert!(!cached_chapter_urls(&p, "b1", "v1")
-        .await
-        .unwrap()
-        .contains("c1"));
-    crate::library_images::mark_chapter_ready(&p, "c1", "src")
-        .await
-        .unwrap();
-    insert_content(&p, "b1", "text", 10).await;
-    sqlx::query("UPDATE library_content SET cache_version = 'v1' WHERE book_url = 'b1'")
-        .execute(&p)
-        .await
-        .unwrap();
-    let urls = cached_chapter_urls(&p, "b1", "v1").await.unwrap();
-    assert!(urls.contains("c1"));
-    assert!(urls.contains("text"));
-
-    // 目录接手原始字节后可以删 BLOB；只删当前书、当前 origin。
-    sqlx::query(
-        "INSERT INTO library_images (url, origin, book_url, mime, data, size_bytes) \
-         VALUES ('i1', 'other', 'b1', 'image/jpeg', X'09', 1)",
-    )
-    .execute(&p)
-    .await
-    .unwrap();
-    let removed = crate::library_images::delete_urls(&p, "b1", &["i1".to_string()], "src")
-        .await
-        .unwrap();
-    assert_eq!(removed, 1);
-    assert!(crate::library_images::load(&p, "i1", "src")
-        .await
-        .unwrap()
-        .is_none());
-    assert!(crate::library_images::load(&p, "i1", "other")
-        .await
-        .unwrap()
-        .is_some());
-}
-
-#[tokio::test]
-async fn cached_chapter_urls_requires_images_ready_for_comics() {
-    let p = pool().await;
-    insert_content(&p, "b1", "text-ok", 10).await;
-    insert_image_chapter(&p, "b1", "img-pending", false).await;
-    insert_image_chapter(&p, "b1", "img-ready", true).await;
-    sqlx::query("UPDATE library_content SET cache_version = 'v1' WHERE book_url = 'b1'")
-        .execute(&p)
-        .await
-        .unwrap();
-
-    let urls = cached_chapter_urls(&p, "b1", "v1").await.unwrap();
-    assert!(urls.contains("text-ok"));
-    assert!(urls.contains("img-ready"));
-    assert!(!urls.contains("img-pending"), "图片未下完不算已缓存");
 }
 
 #[tokio::test]
@@ -305,16 +165,15 @@ async fn deferred_job_leaves_the_queue_until_its_time() {
 async fn delete_book_removes_rows_and_cancels_active_jobs() {
     let p = pool().await;
     insert_book(&p, "b1", TIER_TEMP, None, now_ms()).await;
-    insert_content(&p, "b1", "c1", 123).await;
+    insert_cached(&p, "b1", 1, 123, 456).await;
     sqlx::query("INSERT INTO library_chapters (book_url, url, \"index\") VALUES ('b1', 'c1', 0)")
         .execute(&p)
         .await
         .unwrap();
-    insert_image(&p, "b1", "i1", 456).await;
     let job = enqueue_job(&p, "b1", "src", 1).await.unwrap();
 
     let r = delete_book(&p, "b1").await.unwrap();
-    assert_eq!((r.books, r.chapters, r.contents, r.images), (1, 1, 1, 1));
+    assert_eq!((r.books, r.chapters, r.contents, r.images), (1, 1, 1, 0));
     assert_eq!(r.bytes, 123 + 456);
 
     let status: String = sqlx::query_scalar("SELECT status FROM library_jobs WHERE id = ?1")
@@ -401,25 +260,6 @@ fn empty_metadata_patch_is_detected() {
         ..Default::default()
     }
     .is_empty());
-}
-
-#[tokio::test]
-async fn upsert_rollup_creates_book_and_refreshes_stats() {
-    let p = pool().await;
-    insert_content(&p, "b1", "c1", 100).await;
-    insert_content(&p, "b1", "c2", 250).await;
-
-    upsert_rollup(&p, "b1").await.unwrap();
-    let b = load_book(&p, "b1").await.unwrap().expect("自动建书目行");
-    assert_eq!(b.tier, TIER_TEMP);
-    assert_eq!(b.cached_chapters, 2);
-    assert_eq!(b.content_bytes, 350);
-
-    insert_content(&p, "b1", "c3", 50).await;
-    upsert_rollup(&p, "b1").await.unwrap();
-    let b = load_book(&p, "b1").await.unwrap().unwrap();
-    assert_eq!(b.cached_chapters, 3);
-    assert_eq!(b.content_bytes, 400);
 }
 
 #[tokio::test]

@@ -8,8 +8,6 @@
 //! 这里只放「馆藏自己」的读写与统计；正文/目录的读写细节仍在 `routes::books_store`，
 //! 只是换成传馆藏连接池。用户状态（书架、进度、设置、书源登录态）继续留在用户库。
 
-use std::collections::HashSet;
-
 use axum::http::request::Parts;
 use sqlx::SqlitePool;
 
@@ -168,53 +166,6 @@ pub async fn touch_book(pool: &SqlitePool, book_url: &str) {
         .bind(now_ms())
         .execute(pool)
         .await;
-}
-
-/// 重算某本书的冗余统计（已缓存章节数、正文占用字节）。
-///
-/// 写入正文后调用；馆藏列表与监控直接读这两列，避免每次列表都全表聚合。
-pub async fn refresh_rollup(pool: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE library_books SET \
-           cached_chapters = (SELECT COUNT(*) FROM library_content WHERE book_url = ?1 \
-                              AND (content_type <> 'image' OR images_ready = 1)), \
-           content_bytes = (SELECT COALESCE(SUM(size_bytes),0) FROM library_content \
-                            WHERE book_url = ?1), \
-           image_bytes = (SELECT COALESCE(SUM(size_bytes),0) FROM library_images \
-                          WHERE book_url = ?1), \
-           last_accessed_at = ?2 \
-         WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .bind(now_ms())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 写入正文后的「确保书目 + 刷新冗余统计」：一条语句完成。
-///
-/// 与 `ensure_book` + `refresh_rollup` 相比少一次写事务，是逐章落库的热路径。
-pub async fn upsert_rollup(pool: &SqlitePool, book_url: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO library_books \
-           (book_url, last_accessed_at, cached_chapters, content_bytes, image_bytes) \
-         VALUES (?1, ?2, \
-           (SELECT COUNT(*) FROM library_content WHERE book_url = ?1 \
-            AND (content_type <> 'image' OR images_ready = 1)), \
-           (SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1), \
-           (SELECT COALESCE(SUM(size_bytes),0) FROM library_images WHERE book_url = ?1)) \
-         ON CONFLICT(book_url) DO UPDATE SET \
-           cached_chapters = excluded.cached_chapters, \
-           content_bytes = excluded.content_bytes, \
-           image_bytes = excluded.image_bytes, \
-           last_accessed_at = excluded.last_accessed_at",
-    )
-    .bind(book_url)
-    .bind(now_ms())
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 /// 用书源补齐馆藏书目的来源字段（缺什么补什么，不覆盖已有值）。
@@ -454,14 +405,6 @@ pub struct DeleteReport {
     pub bytes: i64,
 }
 
-/// 只清正文（含漫画图片）的结果。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ClearReport {
-    pub contents: u64,
-    pub images: u64,
-    pub bytes: i64,
-}
-
 /// 回收过期的临时缓存：`tier=temp` 且 `last_accessed_at` 早于 `ttl_secs` 的书整本删除。
 ///
 /// 馆藏（`tier=collection`）永不参与，只能由管理员移出后再回收。
@@ -522,28 +465,14 @@ pub async fn cleanup_temp_books(
 pub async fn delete_book(pool: &SqlitePool, book_url: &str) -> anyhow::Result<DeleteReport> {
     let mut tx = pool.begin().await?;
     cancel_jobs_for_book_tx(&mut tx, book_url).await?;
-    let content_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
+    // 旧缓存表已删除；字节与章节数直接读书目上的冗余统计。
+    let stats: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT cached_chapters, content_bytes, image_bytes FROM library_books WHERE book_url = ?1",
     )
     .bind(book_url)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    let image_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes),0) FROM library_images WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .fetch_one(&mut *tx)
-    .await?;
-    let images = sqlx::query("DELETE FROM library_images WHERE book_url = ?1")
-        .bind(book_url)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    let contents = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
-        .bind(book_url)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let (cached, content_bytes, image_bytes) = stats.unwrap_or_default();
     let chapters = sqlx::query("DELETE FROM library_chapters WHERE book_url = ?1")
         .bind(book_url)
         .execute(&mut *tx)
@@ -567,71 +496,10 @@ pub async fn delete_book(pool: &SqlitePool, book_url: &str) -> anyhow::Result<De
     Ok(DeleteReport {
         books,
         chapters,
-        contents,
-        images,
+        contents: cached.max(0) as u64,
+        images: 0,
         bytes: content_bytes + image_bytes,
     })
-}
-
-/// 只删正文（含漫画图片），保留书目与目录（「清空这本书的缓存」）。
-pub async fn clear_content(pool: &SqlitePool, book_url: &str) -> anyhow::Result<ClearReport> {
-    let mut tx = pool.begin().await?;
-    let content_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes),0) FROM library_content WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .fetch_one(&mut *tx)
-    .await?;
-    let image_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes),0) FROM library_images WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .fetch_one(&mut *tx)
-    .await?;
-    let images = sqlx::query("DELETE FROM library_images WHERE book_url = ?1")
-        .bind(book_url)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    let contents = sqlx::query("DELETE FROM library_content WHERE book_url = ?1")
-        .bind(book_url)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    sqlx::query(
-        "UPDATE library_books SET cached_chapters = 0, content_bytes = 0, image_bytes = 0, \
-           last_accessed_at = ?2 WHERE book_url = ?1",
-    )
-    .bind(book_url)
-    .bind(now_ms())
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(ClearReport {
-        contents,
-        images,
-        bytes: content_bytes + image_bytes,
-    })
-}
-
-/// 已缓存到「可离线阅读」程度的章节 URL 集合。
-///
-/// 文本章节按 `cache_version` 判断；图片章节还要求 `images_ready=1`
-/// （图片清单存在不等于图片字节已落盘）。
-pub async fn cached_chapter_urls(
-    pool: &SqlitePool,
-    book_url: &str,
-    cache_version: &str,
-) -> anyhow::Result<HashSet<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT url FROM library_content WHERE book_url = ?1 AND cache_version = ?2 \
-         AND (content_type <> 'image' OR images_ready = 1)",
-    )
-    .bind(book_url)
-    .bind(cache_version)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(url,)| url).collect())
 }
 
 /// 取消某本书所有未完成任务（queued / running）。
@@ -730,22 +598,7 @@ pub struct LibraryStats {
 }
 
 /// `stats()` 的聚合行：顺序与 SQL 的 SELECT 列表一一对应。
-type StatsRow = (
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-);
+type StatsRow = (i64, i64, i64, i64, i64, i64, i64, i64, i64);
 
 pub async fn stats(pool: &SqlitePool, ttl_secs: i64) -> LibraryStats {
     let row: StatsRow = sqlx::query_as(
@@ -758,18 +611,15 @@ pub async fn stats(pool: &SqlitePool, ttl_secs: i64) -> LibraryStats {
                COALESCE(SUM(CASE WHEN tier='temp' THEN cached_chapters ELSE 0 END),0), \
                COALESCE(SUM(CASE WHEN tier='temp' THEN content_bytes ELSE 0 END),0), \
                COALESCE(SUM(CASE WHEN tier='temp' THEN image_bytes ELSE 0 END),0), \
-               COALESCE(SUM(cached_chapters),0), \
-               (SELECT COUNT(*) FROM library_content), \
-               (SELECT COALESCE(SUM(size_bytes),0) FROM library_content), \
-               (SELECT COUNT(*) FROM library_images), \
-               (SELECT COALESCE(SUM(size_bytes),0) FROM library_images), \
                COALESCE(SUM(CASE WHEN tier='temp' AND last_accessed_at < ?1 THEN 1 ELSE 0 END),0) \
              FROM library_books",
     )
     .bind(now_ms() - ttl_secs.max(0) * 1000)
     .fetch_one(pool)
     .await
-    .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let text_bytes = row.2 + row.6;
+    let image_bytes = row.3 + row.7;
     LibraryStats {
         collection_books: row.0,
         collection_chapters: row.1,
@@ -781,13 +631,13 @@ pub async fn stats(pool: &SqlitePool, ttl_secs: i64) -> LibraryStats {
         temp_text_bytes: row.6,
         temp_image_bytes: row.7,
         temp_bytes: row.6 + row.7,
-        total_chapters: row.8,
-        content_rows: row.9,
-        content_bytes: row.10,
-        image_rows: row.11,
-        image_bytes: row.12,
-        total_bytes: row.10 + row.12,
-        temp_expired_books: row.13,
+        total_chapters: row.1 + row.5,
+        content_rows: row.1 + row.5,
+        content_bytes: text_bytes,
+        image_rows: 0,
+        image_bytes,
+        total_bytes: text_bytes + image_bytes,
+        temp_expired_books: row.8,
     }
 }
 

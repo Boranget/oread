@@ -600,33 +600,19 @@ async fn comic_estimate(
     let mut probes: Vec<(String, String)> = Vec::new();
     for &idx in &picks {
         let ch = &chapters[idx];
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT images FROM library_content \
-             WHERE url = ?1 AND origin = ?2 AND content_type = 'image'",
+        let imgs = match crate::web_book::chapter_images_book(
+            s.fetcher.as_ref(),
+            &source,
+            ch,
+            Some(&store),
         )
-        .bind(&ch.url)
-        .bind(&source.book_source_url)
-        .fetch_optional(&s.library)
-        .await?;
-        let imgs = match existing
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<crate::web_book::ChapterImages>(raw).ok())
+        .await
         {
-            Some(v) if !v.images.is_empty() => v,
-            _ => match crate::web_book::chapter_images_book(
-                s.fetcher.as_ref(),
-                &source,
-                ch,
-                Some(&store),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(url = %ch.url, error = %e, "comic estimate: chapter images failed");
-                    continue;
-                }
-            },
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(url = %ch.url, error = %e, "comic estimate: chapter images failed");
+                continue;
+            }
         };
         if imgs.images.is_empty() {
             continue;
@@ -674,13 +660,12 @@ async fn comic_estimate(
     };
     let low = estimate.map(|v| (v as f64 * 0.7).round() as i64);
     let high = estimate.map(|v| (v as f64 * 1.4).round() as i64);
-    let cached_chapters: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM library_content WHERE book_url = ?1 \
-         AND content_type = 'image' AND images_ready = 1",
-    )
-    .bind(&book_url)
-    .fetch_one(&s.library)
-    .await?;
+    let cached_chapters = crate::library_store::usage::book_usage(&s.store(), &book_url)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.cached_chapters)
+        .unwrap_or(0);
     let free = library::free_bytes(std::path::Path::new(&s.cfg.data_dir));
     let floor = s.cfg.library_disk_floor_bytes;
     let enough = match (high, free) {

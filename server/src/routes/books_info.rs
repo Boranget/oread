@@ -167,8 +167,6 @@ pub(super) async fn toc(
                             chapters.len() as i64,
                         )
                         .await;
-                        // 已缓存过正文的章节顺手回填字数，避免 toc 阶段只能给出 0
-                        let _ = backfill_word_counts(&s.library, &q.book_url).await;
                         chapters
                     }
                     // 回源失败：库里还有旧目录就先返回，避免书源失效后整本书打不开。
@@ -461,7 +459,6 @@ pub(super) async fn toc_batch(
                 tracing::warn!(book = %book_url, error = %e, "sync toc to book dir failed");
             }
             let _ = sync_total_chapter_num(&lib, &pool, &book_url, chapters.len() as i64).await;
-            let _ = backfill_word_counts(&lib, &book_url).await;
             let after_total = chapters.len() as i64;
             let new_urls: HashSet<&str> = chapters.iter().map(|c| c.url.as_str()).collect();
             let added = new_urls.iter().filter(|u| !old_urls.contains(**u)).count() as i64;

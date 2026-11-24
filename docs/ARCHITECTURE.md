@@ -48,9 +48,8 @@ boranlib (server)  →  boranlib-ebook    (server/crates/ebook)
 | `auth.rs` | 注册/登录/改密、Bearer 鉴权中间件、管理员、用户库连接池；`/opds` 前缀的 HTTP Basic 校验与 challenge |
 | `db*.rs` / `db_guard*` | `shared.db`、`library.db` 与 `users/<uid>.db` 的建库、迁移、备份、可写探测、崩溃自愈 |
 | `library.rs` | 馆藏分层（`collection`/`temp`）、书目读写、TTL 清理、磁盘水位、采购单任务表 |
-| `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；漫画图片落盘 |
-| `library_images.rs` | 旧库漫画图片 BLOB 的只读回退与清理（新图片直接进书目录） |
-| `ebook_source.rs` | 只读馆藏 + 按章正文/按页图片读取器（`LibraryReader`、`load_book_input`、`load_comic_input`）；存储实现留在服务端 |
+| `library_worker.rs` | 馆藏采购单执行器：后台整本下载、断点续跑、磁盘安全阀、逐章取消；正文/漫画图片直写书目录 |
+| `ebook_source.rs` | 只读书目录 + 按章正文/按页图片读取器（`LibraryReader`、`load_book_input`、`load_comic_input`）；存储实现留在服务端 |
 | `boranlib-ebook` crate | `server/crates/ebook`：导出/转换领域层，**不依赖 sqlx/axum**。`model`（书视图 `BookInput` / `ComicInput` / `Format` / `WriteReport`）、`pipeline`（`ChapterReader` / `FormatWriter`）、`html`（正文 HTML → 语义块）、`xml`（共用转义）、`format/txt`、`format/cbz`、`format/epub`、`zip`（store-only ZIP）。新增格式 = 加一个 writer，路由与存储不变 |
 | `image_fetch.rs` | 图片回源的共用入口：整图抓取（worker 落盘）与只取响应头的体积探测（入馆预估） |
 | `routes/` | HTTP 层；每个域一个入口文件 + 按职责拆出的子模块（`books_*`、`library`、`opds`、`kindle_*`、`image_*`、`sources_*` 等） |
@@ -71,15 +70,16 @@ boranlib (server)  →  boranlib-ebook    (server/crates/ebook)
 GET /api/book/content
  → auth_middleware（Bearer；公开路径白名单）
  → UserDb（users/<uid>.db，LRU 限制同时打开的库数；只取书源登录态/个人覆盖）
- → load_cached_content(library.db)：(chapter_url, origin) + TTL + cache_version 指纹
-     命中 → 更新 last_accessed_at（临时层 TTL 依据）→ 应用替换规则 → 返回
-     未命中 → load_source(shared.db)
+ → 书目录（library_store）：Store::open_book 按 `oread:chapter-url` 读章节 XHTML
+     命中 → 应用替换规则 → 返回（不查缓存、不回源）
+     未命中 → 同用户同章节并发闸门；拿到闸门后重查目录
+             → load_source(shared.db)
              → BookStore(book_key) 预载跨请求变量/cache（用户库）
              → web_book::chapter_content_book(&dyn Fetcher, ...)
                   → req：预算/并发槽/字符集解码
                   → rule_engine：目录/正文规则
              → 正文清洗 + 用户替换规则
-             → save_content_cached(library.db)：写 library_content（全局共享，不设上限）
+             → 目录已存在时 save_text_prefer_dir 写章节文件；目录不存在则本次只返回结果
  → JSON（text 源带 content；image 源带 images）
 ```
 
@@ -89,28 +89,26 @@ GET /api/book/content
 
 ```
 GET /api/book/export/txt
- → ebook::source::load_book_input(library.db)：书目 + 目录 + 缓存统计（只读、不抓网）
- → ebook::source::LibraryReader：按章读 library_content（空白视为未缓存）
+ → ebook::source::load_book_input：书目 + 目录 + 缓存统计（只读书目录、不抓网）
+ → ebook::source::LibraryReader：按章读章节 XHTML（占位章视为未缓存）
  → ebook::format::txt::TxtWriter：逐章流式写临时文件，未缓存章节显式占位
  → routes/export：16 KiB 分块回传，读完即删；中断由 cleanup_stale 兜底
 
 GET /api/book/export/cbz
- → ebook::source::load_comic_input：图片章节 + 声明页数 / 已落盘页数
- → ebook::source::LibraryReader：按章取图片 URL 清单，按页读旧库 BLOB（目录完整时由 pack 直接打包）
- → ebook::format::cbz::CbzWriter：原样打包 + 最小 ComicInfo.xml
+ → ebook::source::load_comic_input：图片章节 + 页表（只读书目录）
+ → library_store::pack：目录完整时直接原样打包（ComicInfo.xml 首条、排除 oread.json）
  → ebook::zip::ZipWriter：store-only、确定性时间戳（不压缩已压缩的图片）
  → routes/export：同样的临时文件流式回传
 
 GET /api/book/export/epub
  → ebook::source::load_book_input：正文页 + 文本章节统计（漫画章不计入）
- → ebook::source::LibraryReader：按章读 library_content
- → ebook::html::to_blocks：HTML / 纯文本 → 标题与段落
- → ebook::format::epub::EpubWriter：XHTML + OPF + nav + CSS
+ → library_store::pack：目录完整时直接原样打包（mimetype 首条）
+ → ebook::format::epub::EpubWriter：仅在目录不完整时逐章生成
  → ebook::zip::ZipWriter：mimetype 首条 store，其余条目同样不压缩
  → routes/export：同样的临时文件流式回传
 ```
 
-换格式只替换 `FormatWriter`；`Format` 枚举与 `WriteReport` 是格式间唯一共享的契约。`ebook` 层不碰 `data_dir` 布局，产物路径由路由决定。TXT/EPUB 读正文，CBZ 读图片；三者共用 `cleanup_stale` 与 16 KiB 回传通道。
+换格式只替换 `FormatWriter`；`Format` 枚举与 `WriteReport` 是格式间唯一共享的契约。`ebook` 层不碰 `data_dir` 布局，产物路径由路由决定。TXT/EPUB 读正文，CBZ 读图片；三者共用 `cleanup_stale` 与 16 KiB 回传通道。目录不存在或形态不符时直接 409，不再回退旧表。
 
 ## 3.2 一次 OPDS 请求
 
@@ -128,7 +126,7 @@ GET /opds/books?kind=text
 GET /opds/download/epub
  → export::epub_download → ebook 管线 → 临时文件 → 16 KiB 流式回传 → 读完即删
 GET /opds/cover
- → library_books.cover_url → image 代理（书源 Referer/UA/Cookie、本地目录/BLOB、墨水屏转码）
+ → library_books.cover_url → image 代理（书源 Referer/UA/Cookie、本地目录文件、墨水屏转码）
 ```
 
 OPDS 与网页端共用同一套导出 writer 和图片代理，不复制第二份文件/图片逻辑；也可直接用
@@ -136,12 +134,11 @@ Bearer 访问 `/opds*`，便于调试。
 
 ## 4. 数据与缓存
 
-> **存储正在迁移中**：目标形态是「每本书一个解压目录 + 可重建索引」，见 §4.1。
-> `boranlib migrate-store` 把旧库导出成目录；进程启动时还会在后台自动补齐尚未导出的书。
-> **文字书与漫画的读路径都已优先走目录**（阅读、目录、书内搜索、TXT/EPUB 导出、`/k` 目录与正文、
-> `/k` 漫画页、图片代理），未迁移或目录缺失时回退 `library.db`。写路径也已切到目录：
-> TOC/正文/漫画页抓取成功后直接落盘，`library.db` 仍同步写一份作为回退；
-> `index.db` 已建立（启动时后台重建 + `doctor` 检查）。
+> **目录即书（已完成切换）**：每本书一个解压目录 + 可重建索引，见 §4.1。
+> `library_content` / `library_images` 已在迁移 `0004_drop_legacy_cache.sql` 中删除；
+> 正文、目录与漫画图片的唯一副本都在书目录里，读写路径不再回退旧表。
+> 旧设备上的正文/图片缓存直接丢弃，不迁移；书重新打开时会按目录重新抓取。
+> `library_chapters` 暂时保留，只作为 TOC 缓存与 `chapter_url → book_url` 反查，后续再移除。
 
 ### 4.1 目标存储：目录即书
 
@@ -156,7 +153,7 @@ Bearer 访问 `/opds*`，便于调试。
   `boranlib doctor --rebuild-index` 可手动重建。
 - 馆藏搜索（`GET /api/library/books?q=`）先查 `index.db`（书名/作者/系列/主题/简介），
   再与 `library.db` 的 `name`/`author` 取并集；写路径（TOC/正文/元数据/封面/漫画页/
-  入馆/移出/删除/迁移）在落盘后增量刷新索引。排序与分页仍用 `library.db` 的访问时间。
+  入馆/移出/删除）在落盘后增量刷新索引。排序与分页仍用 `library.db` 的访问时间。
 - 馆藏列表的「已缓存章节 / 正文 / 图片占用」仍读 `library_books` 的冗余列，但数值由目录计算
   （`library_store::usage`）：文字书逐章读文件、占位章不算，漫画逐页 `stat`。管理员编辑后
   立即重算，`doctor --sync-db` 全量重算；手工放进 `collection/` 的目录书因此也有正确进度，
@@ -167,19 +164,14 @@ Bearer 访问 `/opds*`，便于调试。
 - `promote`（临时→馆藏）= 目录 `rename`；失败写 `.oread-promote` 标记（内容是 `book_url`），
   后台每 60 s 重试；期间读路径优先选有内容的目录，不被空馆藏骨架挡住。`demote` / `move_to_trash`
   同理，删除与 TTL 清理都把目录移进 `trash/`。
-- 迁移命令：`boranlib migrate-store`（只读旧表、只写目录，已存在的书目录跳过）。
-  进程启动时也会在后台跑同一套迁移：只要旧内容表还有行，就补齐仍缺目录的书，
-  已有目录的书直接跳过；失败只记日志，读路径继续回退 `library.db`。
-- 删旧表的前置判据：`boranlib doctor` 会逐本比对 `library_content` / `library_images`
-  与书目录（文字章节要求文件里有正文，漫画页按原始图片 URL），报告「仅 DB」行数与
-  没有目录/目录不完整的书；只有「仅 DB」为 0 时目录才是唯一副本，删表不会丢内容。
+- 不再有迁移命令或启动后台补齐：`library_content` / `library_images` 已随迁移删除，
+  旧设备缓存按「全新开始」直接丢弃；书重新打开时由抓取路径按需重建目录。
 - 写路径（`library_store::write`）：TOC 抓取成功后 `sync_toc` 按章节 URL 合并 spine——
   旧章保留 id/href 只更新标题，新章追加新序号，目录变短只移出 spine、不删文件也不复用序号；
   正文抓取成功后 `save_text_chapter` 写归一化段落（首段等于章节标题时去掉，避免重复）；
   漫画整章所有页都拿到才 `save_comic_pages` 写页表与 `ComicInfo.xml`，部分成功不写，
-  读路径继续回退 DB；页数变少时删除旧的多余页文件。漫画图片下载完直接在内存里写进
-  书目录（`oread.json` 页表 + 扁平图片文件），不再写 `library_images` BLOB；写目录成功后
-  顺手清掉旧版本留下的同章 BLOB，目录是唯一副本。书目录还没建时本章失败、下次任务重下。
+  下次任务重试；页数变少时删除旧的多余页文件。漫画图片下载完直接在内存里写进
+  书目录（`oread.json` 页表 + 扁平图片文件）。书目录还没建时本章失败、下次任务重下。
   所有写入先章节/图片、再 `nav.xhtml`、最后 `content.opf`，并受每本书一把写锁保护。
 - 读路径：`Store::open_book` 解析 OPF，按 `oread:chapter-url` 定位章节文件；`<body>` 还原成
   段落 HTML（去掉与 OPF 重复的首行标题）。未抓取的章节写成带 `oread-pending` 标记的占位文件，
@@ -200,31 +192,30 @@ Bearer 访问 `/opds*`，便于调试。
   识别格式并决定扩展名（只接受 JPEG/WebP），避免把非图片写进目录。本地图片 URL 带
   `?v=<revision>`：换页/换封面后 URL 变化，图片缓存与 ETag 自动失效。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
-  目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（仍靠回退）。
+  目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（该书当前不可读）。
   `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目
   （手工放进 `collection/` 的书目录因此能在列表里出现）。有需要处理的问题时退出码 1，
   便于脚本/定时任务报警。
-- 导出（`library_store::pack`）：目录完整时直接按 store-only ZIP 原样打包——EPUB 把
+- 导出（`library_store::pack`）：直接按 store-only ZIP 原样打包目录——EPUB 把
   `mimetype` 放第一条、随后 `META-INF/container.xml`；CBZ 把 `ComicInfo.xml` 放第一条并排除
-  内部边车 `oread.json`。目录缺失/不完整时才回退到逐章/逐页重新生成，因此导出的字节与
-  磁盘上的书一致（包括管理员编辑结果）。
+  内部边车 `oread.json`。目录不存在或形态不符时直接 409，不再回退逐章/逐页生成；
+  因此导出的字节与磁盘上的书一致（包括管理员编辑结果）。
 
-### 4.2 现状（迁移前）
+### 4.2 数据库分工（现状）
 
 - **`shared.db`**：账户、书源、导入账本、体检语料。全局一份。
-- **`library.db`**：馆藏内容层，全局一份。`library_books`（书目 + `tier` + 汇总，含 `image_bytes`）、`library_chapters`（目录）、`library_content`（正文/图片清单，键 `(url, origin)`，图片章节带 `images_ready`）、`library_images`（漫画图片原始字节 BLOB，键 `(url, origin)`）、`library_identifiers` / `library_tags`（OPF 语义扩展，键 `book_url`）、`library_jobs`/`library_job_items`（采购单）。
+- **`library.db`**：馆藏目录层，全局一份。`library_books`（书目 + `tier` + 冗余统计）、`library_chapters`（TOC 缓存与 `chapter_url → book_url` 反查，后续移除）、`library_identifiers` / `library_tags`（OPF 语义扩展，键 `book_url`）、`library_jobs`/`library_job_items`（采购单）。正文与漫画图片不在库里，只存书目录。
   - `tier=collection`：馆藏，永久保存，不自动淘汰；只有管理员能移出或删除。
   - `tier=temp`：临时缓存，按 `last_accessed_at` 做 TTL 回收（默认 30 天），每小时后台清理。
   - **不设容量上限**，只做占用监控；`/api/healthz` 与 `/api/library/stats` 暴露分层占用。
-  - 登录态书源抓到的内容同样共享（方案 A）：`library_content.scope_uid` 预留，当前恒为 0。
   - **元数据分层**：系列、语言、出版社、出版日期、标识（ISBN 等）、标签属于「谁抓到都一样」的全局字段，写在 `library_books` / `library_identifiers` / `library_tags`；星级、分组、私人标签留在用户库。读写接口见 [API.md](API.md) 6.12.3。
 - **`users/<uid>.db`**：书架、阅读进度、设置、书签、替换规则、书源登录态（`book_vars`/`book_cache`）、个人覆盖字段。物理分桶，连接池有 LRU 上限。`book_meta.total_chapter_num` 保留为馆藏权威值的副本，书架进度口径不变。
-- **正文读取**：先查 `library_content`（TTL + 管线指纹 `cache_version`），命中刷新访问时间；未命中抓取后写馆藏。空正文不落库。
-  - `tier=collection` 的书**不按 TTL 过期**：正文、目录、漫画图片列表都直接读馆藏，书源失效后已入馆的书仍可打开。
-  - 回源失败时（正文/目录）回退到库中旧缓存，正文响应带 `stale=true`；完全无缓存才返回错误。
+- **正文读取**：先按书目录读章节文件，命中直接返回；未命中才抓取，目录存在时写入章节文件，否则本次结果不落盘。
+  - `tier=collection` 的书**不按 TTL 过期**：正文、目录、漫画图片都直接读书目录，书源失效后已入馆的书仍可打开。
+  - 回源失败时不再有旧缓存可回退，正文/目录直接返回错误；已落盘的章节不受影响。
 - **采购单**：入馆时排队，`library_worker` 在服务端整本下载（默认 1 任务 × 3 章并发），进程重启后把 `running` 放回队列断点续跑；剩余磁盘低于 `LIBRARY_DISK_FLOOR_MB`（默认 1 GiB）时暂停，交互阅读不受影响。
 - **冷却与来源回填**：任务开始前查 `source_health.cooldown_until`，冷却中的书源把任务推迟到冷却结束（`library_jobs.updated_at` 即「下次可执行时间」），先跑别的书；worker 加载到真实书源后回填馆藏书目缺失的 `origin` / `origin_name` / `book_source_type`。
-- **漫画图片**：馆藏漫画由 worker 把解密后的原始字节下载到内存，整章直接写进书目录（`oread.json` 页表 + 扁平图片文件），不再写 `library_images` BLOB；单张 > 2 MiB 只留清单不落盘，整章 > 256 MiB 放弃。写目录成功后清掉旧版本遗留的同章 BLOB——目录是唯一副本。`/api/book/image` 优先读目录里的 `oread-img://` 文件，旧 BLOB 只作迁移期回退；墨水屏灰度/WebP 转码变体仍运行时生成，不落盘。
+- **漫画图片**：馆藏漫画由 worker 把解密后的原始字节下载到内存，整章直接写进书目录（`oread.json` 页表 + 扁平图片文件）；单张 > 2 MiB 只留清单不落盘，整章 > 256 MiB 放弃。`/api/book/image` 直接读目录里的 `oread-img://` 文件，不再有 BLOB 回退；墨水屏灰度/WebP 转码变体仍运行时生成，不落盘。
 - **体积预估**：`POST /api/library/comic/estimate` 抽 3 章 × 2 图，只探测响应头（`Range: bytes=0-0` 优先），按 `book_url + source + uid` 缓存 30 分钟；估算只警告不硬拦，前端展示区间与「抽样估算，以实际下载为准」。
 - **图片缓存**：进程内 LRU（`image_cache::stats()`），与正文分开预算。
 - **规则缓存**：`<data_dir>/cache/rule/`，仅 `cache.getFile/putFile` 可写。

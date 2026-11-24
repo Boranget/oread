@@ -128,7 +128,7 @@
 - 还差：
   - 阅读器保留并渲染正文 HTML 中的 `<img>`（当前 `htmlToParas` 直接丢弃，见 3.8）；
   - 漫画阅读布局：单页/连续滚动、缩放、预加载；
-  - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落盘（`library_images`）；迁移后的目录书直接读 CBZ 文件（`oread-img://`），入馆前有体积预估；待真机复测；
+  - ~~图片缓存与代理（外链 403/防盗链）~~：已实现进程内 LRU + 馆藏漫画图片落书目录（CBZ 扁平文件 + `oread.json` 页表），目录书直接读 `oread-img://` 本地文件，入馆前有体积预估；待真机复测；
   - 漫画书源类型识别与图集章节目录；
   - ~~漫画导出/下载（TXT 导出只覆盖文字）~~：已实现 `GET /api/book/export/cbz`（原样打包已落盘页 + ComicInfo.xml），见 [API.md](API.md) 6.11.3 与 TODO 2.9。
 - 依据：[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L199)、[replace.rs](../server/src/routes/replace.rs#L241-L274)、[FEATURE_MATRIX.md](../docs/FEATURE_MATRIX.md) 模块 4 #17 / 模块 5 #17、#21。
@@ -146,10 +146,9 @@
 - 状态：`进行中`。Phase 1（TXT）、Phase 2（CBZ）、Phase 3（EPUB）已完成。
 - 已完成：
   - `model`：`BookInput` / `BookMeta` / `ChapterRef` / `ComicInput` / `Format` / `WriteReport`，元数据含系列、语言、出版信息（Phase 0 字段直接复用）；`BookInput` 区分总章节与文本章节，漫画章不计入 TXT/EPUB 完成度；
-  - `source`：只读馆藏组装书视图（目录缺失 → 409）；文字书优先读目录 OPF/章节文件，
-    漫画优先读 CBZ 目录 + `oread.json` 边车，目录缺失时回退 `library.db`。`LibraryReader`
-    有目录时按章读 XHTML，否则按章读 `library_content`、按页读 `library_images`；
-    占位章与空白正文都视为未缓存；
+  - `source`：只读馆藏组装书视图（目录缺失 → 409）；文字书读目录 OPF/章节文件，
+    漫画读 CBZ 目录 + `oread.json` 边车，没有旧表回退。`LibraryReader` 构造时必须拿到
+    已打开的书目录，按章读 XHTML、按页读本地图片；占位章与空白正文都视为未缓存；
   - 漫画读路径：`/api/book/toc`、`/api/comic/{source,chapter}`、`/k` 漫画页与图片代理都目录优先；
     页地址为 `oread-img://<sha256(book_url)>/<文件名>`，无书源也能读已入馆漫画；
   - `pipeline`：`ChapterReader` / `FormatWriter` 两个 trait，格式与存储/HTTP 解耦；
@@ -185,8 +184,9 @@
 
 ### 2.11 目录即书写路径（`进行中`）
 
-- 状态：`进行中`。读路径（文字书 / 漫画 / `/k` 目录与正文 / 导出 / 图片代理）与一次性迁移已完成；
-  写路径 v1 已接上，`index.db` 已建立（启动时重建 + `doctor` 检查），旧表删除尚未开始。
+- 状态：`进行中`。读路径（文字书 / 漫画 / `/k` 目录与正文 / 导出 / 图片代理）已全部只读书目录；
+  写路径 v1 已接上，`index.db` 已建立（启动时重建 + `doctor` 检查），
+  `library_content` / `library_images` 已在迁移 `0004_drop_legacy_cache.sql` 中删除。
 - 已完成：
   - `library_store::write`：TOC 合并（按 URL 保留章节 id/href、新章追加、删除只移出 spine）、
     文字章节正文落盘、漫画整章页表与 `ComicInfo.xml` 落盘；
@@ -200,33 +200,27 @@
     写入顺序仍是正文/图片 → `nav.xhtml` → `content.opf`（漫画：图片 → `oread.json` → `ComicInfo.xml`）。
   - 整批预取（`/api/book/cache-all`）的文本正文也落书目录；预取与 worker 判断「已缓存章节」
     时先看目录（文字书非占位章、漫画页表非空），目录里已有的章节不再重复抓取。
-  - 老库的书只有 DB 目录时，首次读目录（`/api/book/toc`、`/k/toc`）会顺手把目录同步成
-    书目录（OPF / `oread.json`），后续正文与漫画页才有地方落盘。
+  - 书目录不存在时写路径不落盘：首次抓取只返回结果，等 TOC 同步建目录后下一次才写入。
   - `index.db` v1（`library_store::index`）：书目检索字段 + 修订号 + 章/页计数的派生索引；
     进程启动时后台全量重建，`boranlib doctor [--rebuild-index]` 手动重建并检查
     「目录 ↔ 索引 ↔ `library.db`」三方差异（解析失败、孤立目录、仅 DB 有书目）。
     馆藏搜索（`GET /api/library/books?q=`）已接入索引（书名/作者/系列/主题/简介），
-    写路径（TOC/正文/元数据/封面/漫画页/入馆/移出/删除/迁移）增量刷新。
+    写路径（TOC/正文/元数据/封面/漫画页/入馆/移出/删除）增量刷新。
     `boranlib doctor --sync-db` 把「目录有、`library.db` 没有」的孤立目录补登成书目
-    （手工放进 `collection/` 的书目录因此能在列表里出现）；`doctor` 同时逐本比对旧缓存表
-    `library_content` / `library_images` 的目录覆盖情况，作为「何时可以删旧表」的判据。
+    （手工放进 `collection/` 的书目录因此能在列表里出现），并按目录重算冗余统计。
   - 馆藏列表的缓存统计改为目录来源（`library_store::usage`）：文字书逐章读文件（占位章不算）、
     漫画逐页 `stat`；管理员编辑后立即重算，`doctor --sync-db` 全量重算。OPDS 的
-    EPUB / CBZ acquisition 链接也改读这个计数，不再依赖 `library_content` / `library_images`。
-  - 导出直接打包目录（`library_store::pack`）：EPUB / CBZ 在书目录完整时原样打包
-    （CBZ 排除内部边车 `oread.json`），目录缺失/不完整才回退逐章生成。
+    EPUB / CBZ acquisition 链接也读这个计数。
+  - 导出直接打包目录（`library_store::pack`）：EPUB / CBZ 原样打包
+    （CBZ 排除内部边车 `oread.json`）；目录不存在或形态不符直接 409，不再回退逐章生成。
   - `/k`（Kindle）目录与正文也目录优先：`/k/toc` 先读 OPF spine / `oread.json`，
-    `/k/read` 先读章节文件，管理员编辑与离线阅读立即生效；未命中才查缓存/回源。
-  - 启动时后台补齐旧库：旧内容表还有行时自动跑一次迁移，把仍缺目录的书导出成目录
-    （已有目录跳过，失败只记日志），让读路径逐步收敛到「目录即书」。
-  - 漫画 worker 把整章图片下载到内存后直接写进书目录，不再写 `library_images` BLOB；
-    写目录成功后清掉旧版本遗留的同章 BLOB，同一章在磁盘上只留一份原始图片。
+    `/k/read` 先读章节文件，管理员编辑与离线阅读立即生效；未命中才回源。
+  - 漫画 worker 把整章图片下载到内存后直接写进书目录（`oread.json` 页表 + 扁平图片文件），
+    同一章在磁盘上只留一份原始图片。
 - 还差：
   - `index.db` 提供列表排序/分页（当前排序仍靠 `library.db` 的访问时间）；
-  - 删除 `library.db` 的正文/图片/目录旧表，读路径去掉 DB 回退：
-    `boranlib doctor` 已逐本报告旧缓存行的目录覆盖情况（「仅 DB」为 0 才可删表），
-    馆藏统计与 OPDS acquisition 链接已改为目录来源；剩余是读路径回退与 TTL/删除/导出里
-    对 `library_content` / `library_images` 的直接依赖；
+  - 移除 `library_chapters`：目前只作 TOC 缓存与 `chapter_url → book_url` 反查，
+    读路径已不依赖它的正文信息；
   - 管理员编辑 v2：章节增删/拆分/合并、漫画页数量调整（v1 明确不做）。
 - 纪律：章节文件名序号创建后永不复用/改名；顺序只存 spine；目录是唯一权威。
 
@@ -340,7 +334,7 @@
 - 状态：`待确认`
 - 现象：目录缓存按 `book_url`、正文缓存按 `chapter_url`，都不带 `source`（[books.rs](../server/src/routes/books.rs#L272-L339)）。
 - 影响：两个书源共用同一 URL（镜像站/同源转发）时会串目录/正文；换源后旧缓存也不会主动清理。
-- 建议：缓存键加 `origin`，或在换源成功时清理该书的 `library_chapters/library_content`。
+- 建议：缓存键加 `origin`，或在换源成功时清理该书的书目录与 `library_chapters`。
 - 为什么：影响面取决于书源生态，但一旦踩中就是“换源后内容还是旧的”，很难排查。
 
 ### 3.10 P3：`GET /api/bookshelf` 的 `book_id` 参数被忽略
@@ -373,7 +367,7 @@
 | `read_mode=paged` 无分页数据 | `已完成待验证` | 前端分页模式用 CSS 多列 + `scrollLeft` 计算，已有 `pageIndex/pageCount` 与底栏（[Reader.svelte](../server/web/src/reader/Reader.svelte#L198-L210)、[Reader.svelte](../server/web/src/reader/Reader.svelte#L799-L805)） | 切换 `scroll/paged/fade` 后页码、进度 0..1 还原、窗口缩放后重新测列数 |
 | 构建脚本硬编码旧路径 | `已完成待验证` | 两个脚本都以 `$PSScriptRoot` 推导仓库根，并通过 `CARGO_TARGET_DIR` 输出（[build-dev.ps1](../scripts/build-dev.ps1#L28-L45)、[build-release.ps1](../scripts/build-release.ps1#L33-L45)） | 在仓库根与任意工作目录调用都应成功；当前脚本变量为 `OREAD_TARGET_WIN`/`OREAD_TARGET_MUSL`，工程侧改名后为 `BORANLIB_TARGET_*`（本文以现名为准） |
 
-缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。馆藏漫画的图片字节落在 `library_images`（[library_images.rs](../server/src/library_images.rs)），按 `(url, origin)` 去重，与正文一起删除/清理；图片代理（[image_proxy.rs](../server/src/routes/image_proxy.rs)）优先读本地 BLOB。管理员入馆漫画前会调用 `POST /api/library/comic/estimate` 抽样预估体积并弹确认框，结果按 `book_url+source+uid` 缓存 30 分钟。
+缓存管理已切换为馆藏分层模型：馆藏（`tier=collection`）永久保存，临时层（`tier=temp`）按 30 天 TTL 回收；不设容量上限，只做占用监控。`POST /api/book/cache/clear` 只清临时层，`POST /api/book/cache/trim` 立即回收过期临时缓存；入馆/移出/删除/后台整本下载走 `/api/library/*`（[library.rs](../server/src/library.rs)、[library_worker.rs](../server/src/library_worker.rs)、[routes/library.rs](../server/src/routes/library.rs)、[Library.svelte](../server/web/src/pages/Library.svelte)）。设置页展示馆藏/临时分层占用与 TTL，并提供「回收过期临时缓存」。正文与漫画页只存书目录：正文/图片写进解压后的 EPUB/CBZ 目录，图片代理（[image_proxy.rs](../server/src/routes/image_proxy.rs)）直接读本地文件；清缓存等于把对应目录移进 `trash/` 并归零冗余统计。管理员入馆漫画前会调用 `POST /api/library/comic/estimate` 抽样预估体积并弹确认框，结果按 `book_url+source+uid` 缓存 30 分钟。
 
 ### 3.13 KPW3 真机约束：`/k` 与漫画阅读器必须遵守红线
 

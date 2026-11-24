@@ -1,8 +1,7 @@
 //! 从书目录统计「已缓存章节数 / 正文占用 / 图片占用」。
 //!
-//! 这几个数字以前由 `library_content` / `library_images` 聚合（见
-//! [`crate::library::refresh_rollup`]）；目录成为权威后，管理员编辑、手工放入的
-//! 书目录都不会写旧表，必须能从目录本身算出来，馆藏列表与 OPDS 才不会被旧表绑住。
+//! 目录是唯一权威：管理员编辑、手工放入的书目录都只改目录本身，
+//! 馆藏列表与 OPDS 的冗余统计必须能从目录算出来。
 
 use sqlx::SqlitePool;
 
@@ -58,7 +57,7 @@ pub async fn book_usage(store: &Store, book_url: &str) -> std::io::Result<Option
     Ok(None)
 }
 
-/// 目录里已缓存的章节 URL 集合；目录不存在或无法解析时返回 `None`（调用方回退 DB）。
+/// 目录里已缓存的章节 URL 集合；目录不存在或无法解析时返回 `None`。
 ///
 /// 文字书要求章节文件不是占位章（`parse_chapter` 有正文），漫画要求页表非空。
 /// 卷标题不算章节。没有 `oread:chapter-url` 的老目录条目直接跳过。
@@ -106,7 +105,7 @@ pub async fn cached_chapter_urls(
 
 /// 用目录覆盖 `library_books` 里的冗余统计；不刷新访问时间。
 ///
-/// 返回 `false` 表示目录不存在，数据库里的旧值保持原样（迁移期回退）。
+/// 返回 `false` 表示目录不存在，数据库里的旧值保持原样。
 pub async fn refresh_rollup(
     pool: &SqlitePool,
     store: &Store,

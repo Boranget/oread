@@ -49,16 +49,14 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    // 运维子命令：一次性把旧库正文导出成「目录即书」；doctor 检查/重建派生索引。
-    // 服务本身不带业务参数。
+    // 运维子命令：doctor 检查/重建派生索引。服务本身不带业务参数。
     match std::env::args().nth(1).as_deref() {
-        Some("migrate-store") => rt.block_on(run_migrate_store(cfg))?,
         Some("doctor") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             rt.block_on(run_doctor(cfg, &args))?;
         }
         Some(other) => {
-            eprintln!("未知子命令: {other}\n可用: migrate-store, doctor");
+            eprintln!("未知子命令: {other}\n可用: doctor");
             std::process::exit(2);
         }
         None => rt.block_on(run(cfg))?,
@@ -121,26 +119,10 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
         "目录存在但 library.db 没有（列表里看不到）",
         &v.dir_without_db,
     );
-    print_list("library.db 有但目录缺失（仍靠 DB 回退）", &v.db_without_dir);
-
-    // 旧缓存表能否删：目录已经是唯一副本时才会给出提示。
-    let legacy = boranlib::library_store::migrate::legacy_coverage(&library, &store).await?;
-    if legacy.content_rows + legacy.image_rows > 0 {
-        println!(
-            "旧缓存表：正文 {} 行（目录已覆盖 {}，仅 DB {}）；图片 {} 行（目录已覆盖 {}，仅 DB {}）",
-            legacy.content_rows,
-            legacy.content_covered,
-            legacy.content_only_db(),
-            legacy.image_rows,
-            legacy.image_covered,
-            legacy.image_only_db()
-        );
-        print_list("旧缓存仅 DB（没有书目录）", &legacy.books_without_dir);
-        print_list("旧缓存仅 DB（书目录不完整）", &legacy.books_partial);
-        if legacy.complete() {
-            println!("旧缓存已能全部由书目录重建，可以考虑删除 library_content / library_images");
-        }
-    }
+    print_list(
+        "library.db 有但目录缺失（重新打开时会按书源重建）",
+        &v.db_without_dir,
+    );
 
     if v.has_problems() {
         eprintln!("doctor: 发现需要处理的问题");
@@ -162,33 +144,6 @@ fn print_list(label: &str, items: &[String]) {
     if items.len() > LIMIT {
         println!("  … 还有 {} 条", items.len() - LIMIT);
     }
-}
-
-/// `boranlib migrate-store`：把 `library_content` / `library_images` 导出成书目录。
-///
-/// 只读旧表、只写目录，不删任何数据；已存在的书目录会跳过。
-async fn run_migrate_store(cfg: Config) -> anyhow::Result<()> {
-    let library = db::init_library(&cfg).await?;
-    let store = boranlib::library_store::Store::new(&cfg.data_dir);
-    tracing::info!(root = %store.root().display(), "migrating library store");
-    let mut report = boranlib::library_store::migrate::migrate_from_db(&library, &store).await?;
-    boranlib::library_store::migrate::verify_tree(&store, &mut report);
-    tracing::info!(
-        books = report.books,
-        skipped = report.skipped,
-        chapters = report.chapters,
-        images = report.images,
-        comics = report.comics,
-        failures = report.failures.len(),
-        "migrate-store done"
-    );
-    for failure in &report.failures {
-        eprintln!("失败: {failure}");
-    }
-    if !report.failures.is_empty() {
-        anyhow::bail!("{} 本书迁移失败", report.failures.len());
-    }
-    Ok(())
 }
 
 async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -231,8 +186,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     // 馆藏采购单执行器：低优先级后台整本下载 + 定期回收临时缓存。
     boranlib::library_worker::spawn(state.clone());
-    // 旧库 → 目录：后台补齐仍只在旧表里的书，之后读写都走目录（失败只记日志）。
-    boranlib::library_store::migrate::spawn_bootstrap(state.library.clone(), state.store());
     // index.db：目录的派生索引，后台重建一次；失败不影响服务可用性。
     boranlib::library_store::index::spawn_rebuild(state.store());
     let api = routes::build_router_with_state(state);

@@ -42,46 +42,36 @@ pub(super) async fn read(
                     book = %q.book,
                     url = %chapter.url,
                     error = %err,
-                    "read /k chapter from dir failed; falling back to db"
+                    "read /k chapter from dir failed"
                 );
                 None
             }
         };
     let mut c: BookContent = match dir_content {
         Some(c) => c,
-        None => match load_cached_content(
-            &s.library,
-            &chapter.url,
-            &source.book_source_url,
-            s.cfg.content_ttl_secs,
-        )
-        .await
-        {
-            Ok(Some(c)) => c,
-            _ => {
-                let mut fetched = match web_book::chapter_content(&source, chapter).await {
-                    Ok(c) => c,
-                    Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
-                };
-                fetched.origin = source.book_source_url.clone();
-                if fetched.book_url.trim().is_empty() {
-                    fetched.book_url = q.book.clone();
-                }
-                if fetched.url.trim().is_empty() {
-                    fetched.url = chapter.url.clone();
-                }
-                // 目录优先：写进书目录成功后不再往 DB 写同一份正文。
-                if let Err(err) = save_text_prefer_dir(&s.store(), &s.library, &fetched).await {
-                    tracing::warn!(
-                        book = %q.book,
-                        url = %chapter.url,
-                        error = %err,
-                        "save /k chapter failed"
-                    );
-                }
-                fetched
+        None => {
+            let mut fetched = match web_book::chapter_content(&source, chapter).await {
+                Ok(c) => c,
+                Err(e) => return err_page(&format!("正文抓取失败: {e}"), vp),
+            };
+            fetched.origin = source.book_source_url.clone();
+            if fetched.book_url.trim().is_empty() {
+                fetched.book_url = q.book.clone();
             }
-        },
+            if fetched.url.trim().is_empty() {
+                fetched.url = chapter.url.clone();
+            }
+            // 书目录是正文唯一副本；目录里还没有这一章时只渲染本次结果。
+            if let Err(err) = save_text_prefer_dir(&s.store(), &s.library, &fetched).await {
+                tracing::warn!(
+                    book = %q.book,
+                    url = %chapter.url,
+                    error = %err,
+                    "save /k chapter failed"
+                );
+            }
+            fetched
+        }
     };
     if c.book_url.trim().is_empty() {
         c.book_url = q.book.clone();
