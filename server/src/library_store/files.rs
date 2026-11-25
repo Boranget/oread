@@ -923,10 +923,6 @@ fn check_image_src(issues: &mut Vec<CheckIssue>, root: &Path, chapter: &str, src
         .parent()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
-    let from_dir = from_dir
-        .strip_prefix("OEBPS/")
-        .unwrap_or(&from_dir)
-        .to_string();
     match resolve_inside(root, &from_dir, raw) {
         Some(path) if path.is_file() => {}
         Some(_) => push_issue(
@@ -1598,6 +1594,35 @@ mod tests {
         assert_eq!(applied.revision, meta.revision + 1);
         let (_, read) = read_file(&store, &book_url, chapter).await.unwrap();
         assert!(text_of(read).contains("新段落"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn check_resolves_relative_chapter_images() {
+        let root = temp_root("check_img");
+        let (store, book_url, dir) = text_book(&root).await;
+        let chapter = "OEBPS/chapters/ch-0001-kai-duan.xhtml";
+        let (meta, read) = read_file(&store, &book_url, chapter).await.unwrap();
+        let text = text_of(read).replace(
+            "</body>",
+            "<div class=\"oread-img\"><img src=\"../images/pic.jpg\"/></div></body>",
+        );
+        write_text_file(&store, &book_url, chapter, meta.revision, &text)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.join("OEBPS/images"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("OEBPS/images/pic.jpg"), b"jpeg")
+            .await
+            .unwrap();
+
+        let report = check_book(&store, &book_url).await.unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.code == "image_missing"),
+            "{:?}",
+            report.issues
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -33,6 +33,7 @@
   let coverMime = '';
   let pageBusy = '';
   let thumbUrls = {};
+  let fileDirty = false;
 
   $: selectedChapter = chapters.find((c) => refOf(c) === chapterRef) || null;
   $: if (selectedChapter) loadThumbs();
@@ -51,7 +52,18 @@
   }
 
   function close() {
+    if (tab === 'files' && fileDirty && !confirm('文件编辑器里有未保存修改，关闭会丢弃。继续？')) {
+      return;
+    }
     dispatch('close');
+  }
+
+  function switchTab(next) {
+    if (tab === 'files' && next !== 'files' && fileDirty) {
+      if (!confirm('文件编辑器里有未保存修改，切换会丢弃。继续？')) return;
+      fileDirty = false;
+    }
+    tab = next;
   }
 
   function emptyForm() {
@@ -339,13 +351,13 @@
       <p class="err">{err}</p>
     {:else if data}
       <div class="seg be-tabs">
-        <button class:on={tab === 'meta'} on:click={() => (tab = 'meta')}>元数据</button>
-        <button class:on={tab === 'content'} on:click={() => (tab = 'content')}>
+        <button class:on={tab === 'meta'} on:click={() => switchTab('meta')}>元数据</button>
+        <button class:on={tab === 'content'} on:click={() => switchTab('content')}>
           {kind === 'comic' ? '页面' : '正文'}
         </button>
         {#if kind === 'text'}
-          <button class:on={tab === 'cover'} on:click={() => (tab = 'cover')}>封面</button>
-          <button class:on={tab === 'files'} on:click={() => (tab = 'files')}>文件</button>
+          <button class:on={tab === 'cover'} on:click={() => switchTab('cover')}>封面</button>
+          <button class:on={tab === 'files'} on:click={() => switchTab('files')}>文件</button>
         {/if}
       </div>
 
@@ -476,6 +488,7 @@
           bookUrl={bookUrl}
           {revision}
           on:revision={(e) => (revision = e.detail)}
+          on:dirty={(e) => (fileDirty = e.detail)}
           on:saved={() => dispatch('saved')}
         />
       {/if}

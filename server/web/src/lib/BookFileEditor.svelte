@@ -38,10 +38,15 @@
   let caseSensitive = true;
   let replaceBusy = false;
   let replaceResult = null;
+  let lastDirty = null;
 
   $: if (revision > rev) rev = revision;
   $: filteredFiles = filterFiles(files, filter);
   $: dirty = !!(file && file.kind === 'text' && text !== loadedText);
+  $: if (dirty !== lastDirty) {
+    lastDirty = dirty;
+    dispatch('dirty', dirty);
+  }
   $: canEditText = !!(file && file.kind === 'text' && file.path !== 'mimetype');
   $: canReplaceImage = !!(
     file &&
@@ -307,6 +312,13 @@
   async function runReplace(dryRun) {
     if (!rq.trim()) {
       err = '查找内容不能为空';
+      return;
+    }
+    if (
+      !dryRun &&
+      dirty &&
+      !confirm('当前文件有未保存修改，替换后会重新载入文件并丢弃这些修改。继续？')
+    ) {
       return;
     }
     replaceBusy = true;
