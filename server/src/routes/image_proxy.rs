@@ -304,7 +304,7 @@ pub(crate) async fn proxy(
     let max_bytes = s.cfg.image_max_body_bytes.max(1024);
     // 本地图片 URL 先处理：不需要书源，也不做 SSRF 预检。
     if let Some((book_id, href)) = comic::parse_local_image_url(&q.url) {
-        return proxy_local(&s, &q, &headers, book_id, href, max_bytes).await;
+        return proxy_local(&s, &q, &headers, &book_id, &href, max_bytes).await;
     }
     let source_id = q
         .source

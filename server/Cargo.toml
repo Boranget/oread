@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 boranlib-ebook = { path = "crates/ebook" }
 boranlib-rule-core = { path = "crates/rule-core", features = ["sqlx-row"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
 serde = { version = "1", features = ["derive"] }
@@ -41,6 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 boa_engine = "0.19"         # JS 引擎（Rhino 等价，纯 Rust 便于交叉编译）
 regex = "1"
 url = "2"
+percent-encoding = "2"      # OPF href ↔ 文件路径（%20 等百分号编码）
 encoding_rs = "0.8"         # 响应体解码：UTF-8 / GBK / GB18030 / Big5
 base64 = "0.22"
 # 图片解码/编码：仅开 WebP + JPEG（纯 Rust 实现，不含 libwebp 的 C 绑定，
@@ -52,6 +53,7 @@ sha2 = "0.10"
 hmac = "0.12"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # 路由冒烟测试用 oneshot 直接驱动 Router，不监听端口。

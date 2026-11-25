@@ -113,6 +113,7 @@ pub struct CheckIssue {
     pub message: String,
 }
 
+#[derive(Debug)]
 pub struct CheckReport {
     pub revision: u64,
     pub issues: Vec<CheckIssue>,
@@ -841,7 +842,8 @@ fn parse_package(xml: &str) -> Result<(Vec<ManifestItem>, Vec<String>), String> 
                     }
                     items.push(ManifestItem {
                         id: attr(item, "id"),
-                        href: attr(item, "href"),
+                        // OPF href 是 URI 引用，比较/落盘前统一解码成文件路径。
+                        href: super::href_to_path(&attr(item, "href")),
                         media_type: attr(item, "media-type"),
                         properties: attr(item, "properties"),
                     });
@@ -860,7 +862,7 @@ fn parse_package(xml: &str) -> Result<(Vec<ManifestItem>, Vec<String>), String> 
     Ok((items, spine))
 }
 
-fn parse_container_rootfile(xml: &str) -> Result<String, String> {
+pub(crate) fn parse_container_rootfile(xml: &str) -> Result<String, String> {
     let package = sxd_document::parser::parse(xml).map_err(|e| format!("XML 不良构: {e:?}"))?;
     let doc = package.as_document();
     for child in doc.root().children() {
@@ -909,7 +911,8 @@ fn normalize_book_href(raw: &str) -> Option<String> {
 ///
 /// 章节里的图片地址是 `../images/x.jpg`，不能用 [`safe_join`]（它直接拒绝 `..`）。
 fn resolve_inside(root: &Path, from_dir: &str, href: &str) -> Option<PathBuf> {
-    let href = strip_query_fragment(href.trim());
+    let href = super::href_to_path(strip_query_fragment(href.trim()));
+    let href = href.as_str();
     if href.is_empty() || href.starts_with('/') || href.contains(':') {
         return None;
     }
@@ -1345,10 +1348,11 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
                         );
                         continue;
                     }
-                    let target = strip_query_fragment(href.trim());
+                    let target = super::href_to_path(strip_query_fragment(href.trim()));
                     if target.is_empty() {
                         continue;
                     }
+                    let target = target.as_str();
                     match resolve_path(&opened.dir.join("OEBPS"), target) {
                         Ok(p) if p.is_file() => {
                             if let Some(norm) = normalize_book_href(target) {

@@ -7,6 +7,7 @@ pub mod comic;
 pub mod export;
 pub mod health;
 pub mod image;
+pub mod import_epub;
 pub mod import_url;
 mod inflight;
 pub mod kindle;
@@ -129,6 +130,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .merge(kindle::routes().layer(tower_http::compression::CompressionLayer::new()))
         .merge(comic::routes())
         .merge(import_url::routes())
+        .merge(import_epub::routes())
         .merge(image::routes());
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),

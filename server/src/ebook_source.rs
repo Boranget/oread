@@ -223,7 +223,12 @@ pub async fn load_dir_content(
     // 章内插图存的是 `images/<hash>.jpg` 这类相对路径（EPUB 需要相对地址）；
     // 阅读端统一改成 `oread-img://` 本地 URL，走同一个图片代理（含墨水屏转码）。
     let book_id = Store::book_id(book_url);
-    localize_images(&mut body.blocks, &book_id, opened.meta.revision);
+    localize_images(
+        &mut body.blocks,
+        &format!("OEBPS/{}", item.href),
+        &book_id,
+        opened.meta.revision,
+    );
     let html = store_read::blocks_to_html(&body.blocks);
     let _ = crate::library::touch_book(pool, book_url).await;
     Ok(Some(BookContent {
@@ -239,23 +244,57 @@ pub async fn load_dir_content(
 
 /// 把章内相对图片路径改成带修订号的本地图片 URL；远程地址原样保留。
 ///
-/// 章节文件在 `OEBPS/chapters/`，所以正文里的相对地址形如 `../images/<hash>.jpg`；
-/// 换算成相对 `OEBPS/` 的路径后再拼本地 URL。
-fn localize_images(blocks: &mut [boranlib_ebook::html::Block], book_id: &str, revision: u64) {
+/// 相对地址必须相对**章节文件所在目录**解析。导入的 EPUB 章节不一定在
+/// `OEBPS/chapters/`（可能嵌套多层），所以不能再简单剥一个 `../` 后拼
+/// `OEBPS/`，否则会得到 `OEBPS/../Images/x.jpg` 这类被安全校验拒绝的路径。
+fn localize_images(
+    blocks: &mut [boranlib_ebook::html::Block],
+    chapter_href: &str,
+    book_id: &str,
+    revision: u64,
+) {
     use boranlib_ebook::html::Block;
+    let from_dir = chapter_href
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
     for block in blocks.iter_mut() {
         let Block::Image { src, .. } = block else {
             continue;
         };
         let raw = src.trim();
-        if raw.is_empty() || raw.contains("://") {
+        if raw.is_empty() || raw.contains("://") || raw.starts_with("data:") {
             continue;
         }
-        let mut rel = raw.strip_prefix("./").unwrap_or(raw);
-        rel = rel.strip_prefix("../").unwrap_or(rel);
-        let href = format!("OEBPS/{}", rel.trim_start_matches('/'));
+        let path = crate::library_store::href_to_path(raw.split(['?', '#']).next().unwrap_or(raw));
+        let Some(href) = resolve_relative_path(from_dir, &path) else {
+            continue;
+        };
         *src = comic::local_image_url_v(book_id, &href, revision);
     }
+}
+
+/// 把 `from_dir` 下的相对地址折叠成书根目录下的路径（`OEBPS/...`）。
+/// 越出书根或含绝对路径时返回 `None`，交给后续安全校验拒绝。
+fn resolve_relative_path(from_dir: &str, href: &str) -> Option<String> {
+    if href.starts_with('/') || href.contains(':') || href.contains('\0') {
+        return None;
+    }
+    let mut parts: Vec<&str> = from_dir
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    for seg in href.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s if s.starts_with('.') => return None,
+            s => parts.push(s),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// 漫画导出视图：书目录是唯一来源，按 `oread.json` 页表逐页 `stat`。
@@ -420,7 +459,7 @@ mod tests {
                 alt: String::new(),
             },
         ];
-        localize_images(&mut blocks, "abc123", 7);
+        localize_images(&mut blocks, "OEBPS/chapters/ch-0001.xhtml", "abc123", 7);
         assert_eq!(
             blocks[1],
             Block::Image {

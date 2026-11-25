@@ -112,6 +112,40 @@ async function request(method, path, body, opts = {}) {
   return finish(res.status, await res.text(), path, opts);
 }
 
+// 上传单个文件（multipart）：浏览器负责生成本地边界，XHR 用于回报上传进度。
+// 后端会流式落盘，不会把整本书读进内存。
+function uploadFile(path, file, onProgress, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api' + path);
+    xhr.timeout = opts.timeout || 10 * 60 * 1000;
+    const token = getToken();
+    if (token) xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      try {
+        resolve(finish(xhr.status, xhr.responseText, path, opts));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    xhr.onerror = () => reject(apiError('网络连接失败，请确认后端服务已启动', 0, null));
+    xhr.ontimeout = () => reject(apiError('上传超时，请稍后重试', 0, null));
+    xhr.onabort = () => {
+      const e = apiError('已取消上传', 0, null);
+      e.aborted = true;
+      reject(e);
+    };
+    const form = new FormData();
+    form.append('file', file, file.name || 'import.epub');
+    xhr.send(form);
+  });
+}
+
 // 解析 Content-Disposition：优先 RFC 5987 的 filename*（中文书名），回退 ASCII 名
 function filenameFromDisposition(v) {
   const s = String(v || '');
@@ -601,6 +635,11 @@ export const api = {
   libraryJobs: (opts = {}) =>
     request('GET', `/library/jobs?${buildQuery({ status: opts.status, limit: opts.limit })}`),
   libraryJobCancel: (id) => request('POST', '/library/jobs/cancel', { id }),
+  // 本地 EPUB 导入（管理员）：先 inspect 解压/查重，再按用户选择 commit。
+  libraryImportEpub: (file, onProgress) =>
+    uploadFile('/library/import/epub', file, onProgress),
+  libraryImportCommit: (payload) =>
+    request('POST', '/library/import/commit', payload, { timeout: 120000 }),
   // ---- 管理员编辑（目录即书）----
   // 编辑视图：目录里的权威元数据 + 章节目录（漫画带页表）
   bookEdit: (bookUrl) =>

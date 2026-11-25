@@ -21,6 +21,7 @@
 pub mod comic;
 pub mod edit;
 pub mod files;
+pub mod import;
 pub mod index;
 pub mod opf;
 pub mod pack;
@@ -40,11 +41,13 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use boranlib_ebook::html::Block;
 
-pub use opf::{ChapterItem, CoverItem, ImageItem, OpfMeta};
+pub use opf::{ChapterItem, CoverItem, ImageItem, OpfMeta, ResourceItem};
 
 pub const COLLECTION_DIR: &str = "collection";
 pub const TEMP_DIR: &str = "temp";
 pub const TRASH_DIR: &str = "trash";
+/// 上传中的 EPUB 暂存区。不在 collection/temp 里，索引扫描不会看到半成品。
+pub const IMPORT_DIR: &str = ".import";
 /// 占位章：书刚建目录、还没有任何正文时放进 spine，保证它从第一秒起就是合法 EPUB。
 pub const PENDING_ID: &str = "ch-0000";
 pub const PENDING_HREF: &str = "chapters/ch-0000-pending.xhtml";
@@ -128,10 +131,15 @@ impl Store {
     }
 
     pub fn create_layout(&self) -> io::Result<()> {
-        for sub in [COLLECTION_DIR, TEMP_DIR, TRASH_DIR] {
+        for sub in [COLLECTION_DIR, TEMP_DIR, TRASH_DIR, IMPORT_DIR] {
             std::fs::create_dir_all(self.root.join(sub))?;
         }
         Ok(())
+    }
+
+    /// 一次导入的暂存目录：`<library>/.import/<token>/`。
+    pub fn import_stage_dir(&self, token: &str) -> PathBuf {
+        self.root.join(IMPORT_DIR).join(token)
     }
 
     /// 只建目录骨架（`mimetype` / `META-INF` / `OEBPS` / 样式），不写 OPF。
@@ -649,6 +657,36 @@ pub fn next_chapter_seq<'a>(ids: impl Iterator<Item = &'a str>) -> u32 {
 /// 下一个章节 ID。序号只增不减、永不复用；插入新章不改任何旧文件名。
 pub fn next_chapter_number(chapters: &[ChapterItem]) -> u32 {
     next_chapter_seq(chapters.iter().map(|c| c.id.as_str()))
+}
+
+/// OPF/nav 里的 href 是 URI 引用，文件系统路径需要先解百分号编码。
+///
+/// 例如 `Text/ch%201.xhtml` 对应磁盘上的 `Text/ch 1.xhtml`。
+pub fn href_to_path(href: &str) -> String {
+    percent_encoding::percent_decode_str(href)
+        .decode_utf8_lossy()
+        .to_string()
+}
+
+/// 文件路径 → OPF href。与 [`href_to_path`] 成对使用，保证读写往返稳定。
+pub fn path_to_href(path: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    // 只保留 RFC 3986 路径里安全的字符；`/` 不编码，避免把目录层级写死。
+    const HREF: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'%')
+        .add(b'\\')
+        .add(b'^')
+        .add(b'|');
+    utf8_percent_encode(path, HREF).to_string()
 }
 
 /// 拼接并校验相对 href，拒绝绝对路径与 `..`。

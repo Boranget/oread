@@ -125,10 +125,10 @@ async fn local_image_meta(s: &AppState, url: &str) -> serde_json::Value {
     let Some((book_id, href)) = comic::parse_local_image_url(url) else {
         return err_item(url, "invalid_url", "不是本地图片 URL");
     };
-    let Some((_tier, dir)) = s.store().find_by_id(book_id) else {
+    let Some((_tier, dir)) = s.store().find_by_id(&book_id) else {
         return err_item(url, "local_book_missing", "本地书目录不存在");
     };
-    let path = match crate::library_store::safe_join(&dir, href) {
+    let path = match crate::library_store::safe_join(&dir, &href) {
         Ok(v) => v,
         Err(e) => return err_item(url, "invalid_url", &e.to_string()),
     };
@@ -142,7 +142,7 @@ async fn local_image_meta(s: &AppState, url: &str) -> serde_json::Value {
         "url": url,
         "ok": true,
         "supported": true,
-        "content_type": comic::page_mime(href),
+        "content_type": comic::page_mime(&href),
         "bytes": bytes,
     });
     if let Some((w, h)) = dims {
@@ -312,8 +312,8 @@ pub(crate) async fn probe_dims(
             async move {
                 // 本地漫画页只读文件头，不经过网络；其余仍走回源探测。
                 if let Some((book_id, href)) = comic::parse_local_image_url(&u) {
-                    let d = match store.find_by_id(book_id) {
-                        Some((_tier, dir)) => match crate::library_store::safe_join(&dir, href) {
+                    let d = match store.find_by_id(&book_id) {
+                        Some((_tier, dir)) => match crate::library_store::safe_join(&dir, &href) {
                             Ok(path) => comic::page_dims_async(path).await,
                             Err(_) => None,
                         },

@@ -161,6 +161,7 @@ Bearer 访问 `/opds*`，便于调试。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落 + 图片」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。
+  导入的外部 EPUB 保留原 XHTML（含原有 CSS / 字体），读路径同样解析成语义块，方便以后扩展表格 / 列表。
 - 文字书插图：抓正文时把 `<img>` 下载到 `OEBPS/images/<sha256>.<jpg|webp>`，按内容哈希去重，
   只收 JPEG / WebP（单图 ≤ 8 MiB、单章 ≤ 30 张 / 64 MiB）；正文里写章节相对地址
   `../images/<hash>.jpg`，OPF manifest 登记 `images/<hash>.jpg`。下载失败或超限的图保留远程地址。
@@ -205,6 +206,17 @@ Bearer 访问 `/opds*`，便于调试。
     书锁与原子写；保存非 OPF 文件时只把 OPF 的 `oread:revision` / `dcterms:modified` 文本节点
     替换掉，不重建 manifest，手工加的字体/样式条目不会被覆盖。路径解析拒绝绝对路径与 `..`，
     章节图片的 `../images/...` 由专用解析器在书目录内回退。
+- EPUB 导入（`library_store::import` + `/api/library/import*`）：两步式。inspect 把上传包流式
+  写入 `library/.import/<token>/source.epub`，解压到同目录 `book/`，校验并清理后返回摘要与
+  三层查重；commit 才按用户选择搬进 `collection/`、写 `library.db`、刷新索引与占用，并跑一次
+  Check book。布局以压缩包内所有内容文件的**公共父目录**为基准整棵树平移到 `OEBPS/`，OPF
+  改名为 `OEBPS/content.opf`、重写 `container.xml`，只重写 manifest href（允许 `..`，不能越出
+  书根），章节 / CSS / 图片之间的相对链接保持原样。原 nav 丢弃，按 OPF 重新生成；章节标题取自
+  `oread:chapter-title` → nav → NCX → `<title>` → 首个标题 → 文件名。清理阶段拒绝外网资源、
+  SVG、脚本 / iframe / object / embed / 事件属性 / `javascript:` / meta refresh，以及路径穿越、
+  加密条目与压缩炸弹。查重依次为文件 SHA-256 → 正文指纹（纯文本不足 64 字符不生成）→
+  书名 + 作者；覆盖只允许馆藏书，沿用原 `book_url`、书架位置与 `collected_at`，修订号递增。
+  暂存目录超过 24 小时在下次上传时清理。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（该书当前不可读）。
   `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目

@@ -419,18 +419,24 @@ pub async fn page_dims_async(path: PathBuf) -> Option<(u32, u32)> {
 
 /// 拼一个本地图片 URL。`book_id` 是书目录名（sha256 十六进制）。
 pub fn local_image_url(book_id: &str, href: &str) -> String {
-    format!("{LOCAL_IMAGE_SCHEME}{book_id}/{href}")
+    format!(
+        "{LOCAL_IMAGE_SCHEME}{book_id}/{}",
+        super::path_to_href(href)
+    )
 }
 
 /// 带修订号的本地图片 URL。修订号变化后 URL 变化，图片缓存与 ETag 自动失效，
 /// 换页/换封面后不会继续拿到旧字节。
 pub fn local_image_url_v(book_id: &str, href: &str, revision: u64) -> String {
-    format!("{LOCAL_IMAGE_SCHEME}{book_id}/{href}?v={revision}")
+    format!(
+        "{LOCAL_IMAGE_SCHEME}{book_id}/{}?v={revision}",
+        super::path_to_href(href)
+    )
 }
 
 /// 解析本地图片 URL → `(book_id, href)`；不是本地 URL 返回 `None`。
-/// 忽略 `?v=` 之类的查询串，href 永远是目录内的相对路径。
-pub fn parse_local_image_url(url: &str) -> Option<(&str, &str)> {
+/// 忽略 `?v=` 之类的查询串，href 永远是目录内、已解码的相对路径。
+pub fn parse_local_image_url(url: &str) -> Option<(String, String)> {
     let rest = url.trim().strip_prefix(LOCAL_IMAGE_SCHEME)?;
     let rest = rest.split(['?', '#']).next()?;
     let (id, href) = rest.split_once('/')?;
@@ -442,7 +448,7 @@ pub fn parse_local_image_url(url: &str) -> Option<(&str, &str)> {
     {
         return None;
     }
-    Some((id, href))
+    Some((id.to_string(), super::href_to_path(href)))
 }
 
 #[cfg(test)]
@@ -454,13 +460,19 @@ mod tests {
         let url = local_image_url("abc123", "0001-001.jpg");
         assert_eq!(
             parse_local_image_url(&url),
-            Some(("abc123", "0001-001.jpg"))
+            Some(("abc123".into(), "0001-001.jpg".into()))
         );
         let versioned = local_image_url_v("abc123", "0001-001.jpg", 7);
         assert_eq!(
             parse_local_image_url(&versioned),
-            Some(("abc123", "0001-001.jpg")),
+            Some(("abc123".into(), "0001-001.jpg".into())),
             "查询串只用于缓存失效，不进入文件路径"
+        );
+        let spaced = local_image_url_v("abc123", "OEBPS/Text/a b.png", 1);
+        assert!(spaced.contains("a%20b.png"));
+        assert_eq!(
+            parse_local_image_url(&spaced),
+            Some(("abc123".into(), "OEBPS/Text/a b.png".into()))
         );
         assert!(parse_local_image_url("https://x/a.jpg").is_none());
         assert!(parse_local_image_url("oread-img://abc/../x.jpg").is_none());

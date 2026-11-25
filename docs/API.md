@@ -2585,6 +2585,87 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `GET /api/library/book/edit/check?book_url=` | `{ok, revision, checked_files, errors, warnings, issues[]}` |
 | `POST /api/library/book/edit/preview` | body `{book_url, path, content?}` → `{ok, revision, blocks[], truncated}` |
 
+### 6.12.14 本地 EPUB 导入（`/api/library/import*`，管理员）
+
+> 只接受 DRM-free EPUB；PDF、带 DRM 的 Kindle 书不支持。内容按原结构保留：章节 XHTML、
+> CSS、字体、原图都不重写，只补 OREAD 元数据；阅读时仍解析成语义块。
+
+- 布局：以压缩包内**所有内容文件的公共父目录**为基准，整棵树平移到 `OEBPS/`；
+  OPF 改名为 `OEBPS/content.opf` 并重写 `container.xml`。只重写 OPF manifest 的 href
+  （允许 `..`，但不能越出书根），章节 / CSS / 图片之间的相对链接保持原样。
+- 两步导入：
+  1. `POST /api/library/import/epub`（`multipart/form-data`，字段名 `file`，上限 256 MiB）
+     流式写入 `library/.import/<token>/source.epub` 并算 SHA-256，解压到同目录 `book/`、
+     校验与清理后返回 `token`、摘要和查重结果；此时书**还没有**进馆藏。
+  2. `POST /api/library/import/commit` 带 `token` 与用户选择（新增 / 覆盖 / 取消）。
+- 暂存目录在下次上传时清理超过 24 小时的残留；取消或失败会立即删除。
+
+**inspect 响应**
+
+```json
+{
+  "ok": true,
+  "token": "32 位十六进制",
+  "book": {
+    "book_url": "import:<sha256>",
+    "sha256": "...",
+    "content_fingerprint": "..." ,
+    "file_name": "book.epub",
+    "title": "...",
+    "author": "...",
+    "language": "zh",
+    "publisher": null,
+    "pubdate": null,
+    "chapter_count": 14,
+    "image_count": 3,
+    "has_cover": true,
+    "warnings": []
+  },
+  "duplicates": [
+    { "kind": "file", "book_url": "...", "name": "...", "author": "..." }
+  ]
+}
+```
+
+- `book.content_fingerprint`：正文纯文本（空白归一化后）的 SHA-256；不足 64 个字符
+  （图册 / 宣传册）时为 `null`，不参与内容查重。
+- `duplicates[].kind` 依次为 `file`（文件 SHA-256）→ `content`（正文指纹）→
+  `title_author`（书名 + 作者，忽略大小写与首尾空白）。同一本书只报一条，文件优先。
+- 拒绝：非 ZIP / 缺少 `META-INF/container.xml`、`META-INF/encryption.xml`（DRM 或字体
+  混淆）、`META-INF/rights.xml`、路径穿越 / 绝对路径 / 盘符、加密条目、压缩炸弹、
+  外网资源、SVG、脚本 / iframe / object / embed / 事件属性 / `javascript:` / meta refresh。
+  单条错误按 `400` 返回，暂存目录会清理。
+
+**commit 请求**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `token` | string | 是 | inspect 返回的 token |
+| `mode` | string | 是 | `new`（新增）/ `overwrite`（覆盖）/ `cancel`（取消） |
+| `target_book_url` | string | 覆盖时必填 | 要覆盖的馆藏书 `book_url` |
+
+- `new`：`book_url = import:<sha256>`；若已被占用则追加 `-2`、`-3`……
+- `overwrite`：只允许覆盖 `tier=collection` 的书；沿用原 `book_url`、书架位置与
+  `collected_at`，修订号基于旧 OPF 递增，旧目录移入 `trash/`。
+- `cancel`：删除暂存目录，不写库。
+
+**commit 响应**
+
+```json
+{
+  "ok": true,
+  "book_url": "import:...",
+  "created": true,
+  "overwritten": false,
+  "cancelled": false,
+  "check": { "revision": 1, "checked_files": 10, "issues": [] }
+}
+```
+
+- 成功后同步 `index.db`、刷新占用统计，并对文字书跑一次 Check book（结构同
+  `GET /api/library/book/edit/check`）；`check` 为 `null` 表示检查失败或取消。
+- 错误：`400`（文件无效 / 查重后目标不存在 / 覆盖非馆藏书 / token 过期）、`401`、`403`。
+
 ### 6.13 OPDS 1.2 目录（`/opds*`）
 
 给 KOReader、Moon+ Reader 等阅读器用的标准 Atom 目录。**不是 JSON 接口**，响应统一为

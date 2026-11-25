@@ -17,6 +17,8 @@ use sxd_document::parser;
 
 use boranlib_ebook::xml::xml_escape;
 
+use super::{href_to_path, path_to_href};
+
 /// 我们写进 OPF 的正文语言缺省值。
 pub const DEFAULT_LANGUAGE: &str = "zh";
 
@@ -51,6 +53,19 @@ pub struct ImageItem {
     pub media_type: String,
 }
 
+/// 不在 spine、也不是正文插图的 manifest 项：样式表、字体、NCX 等。
+///
+/// 导入的外部 EPUB 会把这些文件原样保留在书目录里，OPF 也必须继续登记它们，
+/// 否则管理员后续保存元数据时会把 CSS/字体从 manifest 里抹掉。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceItem {
+    pub id: String,
+    pub href: String,
+    pub media_type: String,
+    /// 原样保留的 `properties`（`nav` 除外，导航由我们重新生成）。
+    pub properties: String,
+}
+
 /// 书的元数据（OPF 的内存投影）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpfMeta {
@@ -74,6 +89,8 @@ pub struct OpfMeta {
     pub chapters: Vec<ChapterItem>,
     /// 正文插图；顺序即首次写入顺序，不参与 spine。
     pub images: Vec<ImageItem>,
+    /// 其余 manifest 项（CSS / 字体 / NCX 等），原样登记、原样保留。
+    pub resources: Vec<ResourceItem>,
 }
 
 impl OpfMeta {
@@ -95,6 +112,7 @@ impl OpfMeta {
             cover: None,
             chapters: Vec::new(),
             images: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
@@ -237,12 +255,14 @@ pub fn to_opf_xml(meta: &OpfMeta) -> String {
         "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" \
                 properties=\"nav\"/>\n",
     );
-    s.push_str("    <item id=\"style\" href=\"style.css\" media-type=\"text/css\"/>\n");
+    if !meta.resources.iter().any(|r| r.href == "style.css") {
+        s.push_str("    <item id=\"style\" href=\"style.css\" media-type=\"text/css\"/>\n");
+    }
     if let Some(cover) = &meta.cover {
         let _ = writeln!(
             s,
             "    <item id=\"cover-image\" href=\"{}\" media-type=\"{}\" properties=\"cover-image\"/>",
-            escape_attr(&cover.href),
+            escape_attr(&path_to_href(&cover.href)),
             escape_attr(&cover.media_type)
         );
     }
@@ -251,7 +271,7 @@ pub fn to_opf_xml(meta: &OpfMeta) -> String {
             s,
             "    <item id=\"{}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
             escape_attr(&ch.id),
-            escape_attr(&ch.href)
+            escape_attr(&path_to_href(&ch.href))
         );
     }
     for img in &meta.images {
@@ -259,8 +279,30 @@ pub fn to_opf_xml(meta: &OpfMeta) -> String {
             s,
             "    <item id=\"{}\" href=\"{}\" media-type=\"{}\"/>",
             escape_attr(&img.id),
-            escape_attr(&img.href),
+            escape_attr(&path_to_href(&img.href)),
             escape_attr(&img.media_type)
+        );
+    }
+    for res in &meta.resources {
+        // nav 已经由上面重建；同 href 的 style.css 也由我们统一提供，避免重复登记。
+        if res.properties.split_whitespace().any(|p| p == "nav") {
+            continue;
+        }
+        if res.href == "style.css" && res.media_type == "text/css" {
+            continue;
+        }
+        let props = if res.properties.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" properties=\"{}\"", escape_attr(&res.properties))
+        };
+        let _ = writeln!(
+            s,
+            "    <item id=\"{}\" href=\"{}\" media-type=\"{}\"{}/>",
+            escape_attr(&res.id),
+            escape_attr(&path_to_href(&res.href)),
+            escape_attr(&res.media_type),
+            props
         );
     }
     if meta.chapters.is_empty() {
@@ -303,7 +345,7 @@ pub fn to_nav_xhtml(meta: &OpfMeta) -> String {
         let _ = writeln!(
             s,
             "<li><a href=\"{}\">{}</a></li>",
-            escape_attr(&ch.href),
+            escape_attr(&path_to_href(&ch.href)),
             xml_escape(&ch.title)
         );
     }
@@ -317,6 +359,15 @@ pub fn to_nav_xhtml(meta: &OpfMeta) -> String {
 
 /// 解析 `content.opf`。缺少 `<dc:title>` 视为坏包（目录不再是一本合法的书）。
 pub fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
+    parse_opf_inner(xml, None)
+}
+
+/// 导入外部 EPUB 时使用：原包没有我们的 `book-url` 标识，由调用方给定。
+pub fn parse_opf_import(xml: &str, book_url: &str) -> Result<OpfMeta, String> {
+    parse_opf_inner(xml, Some(book_url))
+}
+
+fn parse_opf_inner(xml: &str, fallback_book_url: Option<&str>) -> Result<OpfMeta, String> {
     let package = parser::parse(xml).map_err(|e| format!("OPF XML 不良构: {e:?}"))?;
     let doc = package.as_document();
     let root = doc
@@ -330,13 +381,13 @@ pub fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
     let mut meta = OpfMeta::new("", "");
     let mut has_title = false;
     let mut spine_refs: Vec<String> = Vec::new();
-    let mut items: Vec<(String, String)> = Vec::new(); // id -> href
+    let mut manifest: Vec<ResourceItem> = Vec::new();
     let mut tags = MetaTags::default();
 
     for child in element_children(root) {
         match child.name().local_part() {
             "metadata" => read_metadata(child, &mut meta, &mut has_title, &mut tags)?,
-            "manifest" => read_manifest(child, &mut items, &mut meta),
+            "manifest" => manifest = read_manifest(child),
             "spine" => {
                 for itemref in element_children(child) {
                     if itemref.name().local_part() == "itemref" {
@@ -351,32 +402,74 @@ pub fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
     }
 
     if !has_title {
-        return Err("OPF 缺少 <dc:title>".into());
+        // 导入外部 EPUB 时允许没有 dc:title，之后用文件名兜底；
+        // 馆藏目录里我们自己写出的 OPF 则必须有标题。
+        if fallback_book_url.is_none() {
+            return Err("OPF 缺少 <dc:title>".into());
+        }
     }
     if meta.book_url.is_empty() {
-        return Err("OPF 缺少 book-url 标识".into());
+        match fallback_book_url {
+            Some(url) if !url.trim().is_empty() => meta.book_url = url.trim().to_string(),
+            _ => return Err("OPF 缺少 book-url 标识".into()),
+        }
     }
 
-    // manifest id -> href，再按 spine 顺序组装章节
+    // 按 spine 顺序组装章节；href 在 manifest 读取时已经解码成文件路径。
     for idref in &spine_refs {
         // 占位章 `ch-0000` 不写进章节清单
         if idref == "ch-0000" {
             continue;
         }
-        let Some(href) = items
-            .iter()
-            .find(|(id, _)| id == idref)
-            .map(|(_, h)| h.clone())
-        else {
+        let Some(item) = manifest.iter().find(|i| &i.id == idref) else {
             continue;
         };
         meta.chapters.push(ChapterItem {
             id: idref.clone(),
-            href,
+            href: item.href.clone(),
             title: tags.take(&tags.titles, idref).unwrap_or_default(),
             url: tags.take(&tags.urls, idref),
             is_volume: tags.volumes.iter().any(|id| id == idref),
         });
+    }
+
+    // 封面：EPUB 3 的 properties="cover-image" 优先；兼容 EPUB 2 的
+    // <meta name="cover" content="cover-id"/> 与 calibre 常用的 id="cover-image"。
+    let cover_item = manifest.iter().find(|i| {
+        i.properties.split_whitespace().any(|p| p == "cover-image")
+            || i.id == "cover-image"
+            || tags.cover_id.as_deref() == Some(i.id.as_str())
+    });
+    if let Some(item) = cover_item {
+        meta.cover = Some(CoverItem {
+            href: item.href.clone(),
+            media_type: item.media_type.clone(),
+        });
+    }
+
+    let spine_ids: std::collections::HashSet<&str> =
+        spine_refs.iter().map(String::as_str).collect();
+    let cover_href = meta.cover.as_ref().map(|c| c.href.as_str());
+    for item in manifest {
+        let is_nav = item.properties.split_whitespace().any(|p| p == "nav");
+        if is_nav || cover_href == Some(item.href.as_str()) {
+            continue;
+        }
+        if spine_ids.contains(item.id.as_str()) {
+            continue;
+        }
+        if item.id == "style" && item.href == "style.css" {
+            continue;
+        }
+        if item.media_type.starts_with("image/") {
+            meta.images.push(ImageItem {
+                id: item.id,
+                href: item.href,
+                media_type: item.media_type,
+            });
+        } else {
+            meta.resources.push(item);
+        }
     }
     Ok(meta)
 }
@@ -387,6 +480,7 @@ struct MetaTags {
     urls: Vec<(String, String)>,
     titles: Vec<(String, String)>,
     volumes: Vec<String>,
+    cover_id: Option<String>,
 }
 
 impl MetaTags {
@@ -410,13 +504,21 @@ fn read_metadata(
         let text = text_of(child);
         match local {
             "title" => {
-                if !text.trim().is_empty() {
+                // 多 dc:title 时第一个是主标题，其余（副标题等）不覆盖它。
+                if !*has_title && !text.trim().is_empty() {
                     meta.title = text;
                     *has_title = true;
                 }
             }
             "language" => meta.language = text,
-            "creator" => meta.author = non_empty(&text).map(str::to_string),
+            "creator" => {
+                if let Some(v) = non_empty(&text) {
+                    meta.author = Some(match meta.author.take() {
+                        Some(prev) => format!("{prev}, {v}"),
+                        None => v.to_string(),
+                    });
+                }
+            }
             "publisher" => meta.publisher = non_empty(&text).map(str::to_string),
             "date" => meta.pubdate = non_empty(&text).map(str::to_string),
             "description" => meta.description = non_empty(&text).map(str::to_string),
@@ -491,42 +593,37 @@ fn read_meta_tag(
         (_, Some("calibre:series_index")) if meta.series_index.is_none() => {
             meta.series_index = content.and_then(|c| c.trim().parse().ok());
         }
+        (_, Some("cover")) => {
+            if let Some(id) = content.and_then(non_empty) {
+                tags.cover_id = Some(id.to_string());
+            }
+        }
         _ => {}
     }
     Ok(())
 }
 
-fn read_manifest(el: Element<'_>, items: &mut Vec<(String, String)>, meta: &mut OpfMeta) {
+fn read_manifest(el: Element<'_>) -> Vec<ResourceItem> {
+    let mut out = Vec::new();
     for child in element_children(el) {
         if child.name().local_part() != "item" {
             continue;
         }
         let id = child.attribute_value("id").unwrap_or("").to_string();
-        let href = child.attribute_value("href").unwrap_or("").to_string();
+        let href = child.attribute_value("href").unwrap_or("");
         let media_type = child.attribute_value("media-type").unwrap_or("");
         let properties = child.attribute_value("properties").unwrap_or("");
         if href.is_empty() || id.is_empty() {
             continue;
         }
-        if id == "cover-image" || properties.split_whitespace().any(|p| p == "cover-image") {
-            meta.cover = Some(CoverItem {
-                href: href.clone(),
-                media_type: media_type.to_string(),
-            });
-        }
-        if id == "nav" || id == "style" || id == "cover-image" {
-            continue;
-        }
-        if media_type.starts_with("image/") {
-            meta.images.push(ImageItem {
-                id,
-                href,
-                media_type: media_type.to_string(),
-            });
-            continue;
-        }
-        items.push((id, href));
+        out.push(ResourceItem {
+            id,
+            href: href_to_path(href),
+            media_type: media_type.to_string(),
+            properties: properties.to_string(),
+        });
     }
+    out
 }
 
 // ---------------------------------------------------------------------------
