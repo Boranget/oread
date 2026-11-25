@@ -18,7 +18,7 @@ use sxd_document::dom::Element;
 use super::edit::{detect_image, require_revision, EditError};
 use super::opf;
 use super::read::{body_blocks, OpenedBook};
-use super::{atomic_write, comic, lock_book, safe_join, OpfMeta, Store};
+use super::{atomic_write, comic, lock_book, safe_join, OpfMeta, Store, PENDING_HREF};
 use boranlib_ebook::html::Block;
 
 pub const MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
@@ -880,6 +880,31 @@ fn strip_query_fragment(raw: &str) -> &str {
     raw.split(['?', '#']).next().unwrap_or(raw)
 }
 
+/// 比较书内 href 用：去掉 query/fragment 与 `./`，并在不越界的前提下折叠 `..`。
+///
+/// 只用于一致性比较，不做文件系统访问；越界时返回 `None`，由调用方按普通问题处理。
+fn normalize_book_href(raw: &str) -> Option<String> {
+    let path = strip_query_fragment(raw.trim());
+    if path.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
 /// 把书内相对引用解析成绝对路径，允许 `..` 在书目录内回退，但不允许越界。
 ///
 /// 章节里的图片地址是 `../images/x.jpg`，不能用 [`safe_join`]（它直接拒绝 `..`）。
@@ -1238,6 +1263,49 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
         );
     }
 
+    // 阅读顺序 / 目录一致性：手工改章节文件后最容易漏改这里。
+    let mut spine_hrefs: Vec<(String, String, bool)> = Vec::new(); // (norm, href, is_xhtml)
+    let mut spine_set: HashSet<String> = HashSet::new();
+    for idref in &spine {
+        let Some(href) = ids.get(idref) else {
+            continue; // 上面已报 spine_idref_missing
+        };
+        let Some(norm) = normalize_book_href(href) else {
+            continue;
+        };
+        let is_xhtml = items
+            .iter()
+            .find(|i| &i.id == idref)
+            .map(|i| i.media_type == "application/xhtml+xml" || i.media_type == "text/html")
+            .unwrap_or(false);
+        if !spine_set.insert(norm.clone()) {
+            push_issue(
+                &mut issues,
+                "warning",
+                "spine_href_duplicate",
+                Some(format!("OEBPS/{href}")),
+                format!("spine 重复引用同一文件: {href}"),
+            );
+        }
+        spine_hrefs.push((norm, href.clone(), is_xhtml));
+    }
+
+    let mut chapter_urls: HashMap<&str, &str> = HashMap::new();
+    for ch in &meta.chapters {
+        let Some(url) = ch.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        if let Some(prev) = chapter_urls.insert(url, ch.href.as_str()) {
+            push_issue(
+                &mut issues,
+                "warning",
+                "chapter_url_duplicate",
+                Some(format!("OEBPS/{}", ch.href)),
+                format!("章节来源 URL 与 {prev} 重复: {url}"),
+            );
+        }
+    }
+
     // nav.xhtml
     let nav_item = items
         .iter()
@@ -1253,6 +1321,8 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
         return finish_check(opened.meta.revision, issues, checked_files);
     };
     let nav_path = resolve_path(&opened.dir.join("OEBPS"), &nav_item.href)?;
+    let mut nav_targets: HashSet<String> = HashSet::new();
+    let mut nav_anchor_count = 0usize;
     match tokio::fs::read_to_string(&nav_path).await {
         Ok(nav) => match sxd_document::parser::parse(&nav) {
             Ok(package) => {
@@ -1280,7 +1350,21 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
                         continue;
                     }
                     match resolve_path(&opened.dir.join("OEBPS"), target) {
-                        Ok(p) if p.is_file() => {}
+                        Ok(p) if p.is_file() => {
+                            if let Some(norm) = normalize_book_href(target) {
+                                nav_anchor_count += 1;
+                                if !spine_set.contains(&norm) {
+                                    push_issue(
+                                        &mut issues,
+                                        "warning",
+                                        "nav_link_not_in_spine",
+                                        Some(format!("OEBPS/{}", nav_item.href)),
+                                        format!("导航项不在阅读顺序中: {href}"),
+                                    );
+                                }
+                                nav_targets.insert(norm);
+                            }
+                        }
                         Ok(_) => push_issue(
                             &mut issues,
                             "error",
@@ -1313,6 +1397,45 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
             Some(format!("OEBPS/{}", nav_item.href)),
             format!("读取 nav 失败: {e}"),
         ),
+    }
+
+    // 有目录项时才检查完整性：空目录本身是另一类问题，避免把每章都报一遍。
+    if nav_anchor_count > 0 {
+        for (norm, href, is_xhtml) in &spine_hrefs {
+            if !is_xhtml || href == PENDING_HREF || nav_targets.contains(norm) {
+                continue;
+            }
+            push_issue(
+                &mut issues,
+                "warning",
+                "nav_missing_spine_item",
+                Some(format!("OEBPS/{href}")),
+                format!("章节没有出现在 nav 目录中: {href}"),
+            );
+        }
+    }
+
+    // manifest 里既不在阅读顺序、也不在目录里的 XHTML，多半是漏登记或残留文件。
+    for item in &items {
+        if item.media_type != "application/xhtml+xml" && item.media_type != "text/html" {
+            continue;
+        }
+        if item.properties.split_whitespace().any(|p| p == "nav") {
+            continue;
+        }
+        let Some(norm) = normalize_book_href(&item.href) else {
+            continue;
+        };
+        if norm == PENDING_HREF || spine_set.contains(&norm) || nav_targets.contains(&norm) {
+            continue;
+        }
+        push_issue(
+            &mut issues,
+            "warning",
+            "manifest_unused_xhtml",
+            Some(format!("OEBPS/{}", item.href)),
+            format!("XHTML 既不在阅读顺序也不在目录中: {}", item.href),
+        );
     }
 
     if let Some(cover) = &meta.cover {
@@ -1548,6 +1671,18 @@ mod tests {
             "{:?}",
             report.issues
         );
+        assert!(
+            !report.issues.iter().any(|i| matches!(
+                i.code.as_str(),
+                "nav_missing_spine_item"
+                    | "nav_link_not_in_spine"
+                    | "manifest_unused_xhtml"
+                    | "spine_href_duplicate"
+                    | "chapter_url_duplicate"
+            )),
+            "fresh book should be structurally consistent: {:?}",
+            report.issues
+        );
 
         let err = write_text_file(&store, &book_url, "../x.xhtml", meta2.revision, "<x/>")
             .await
@@ -1623,6 +1758,91 @@ mod tests {
             "{:?}",
             report.issues
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn check_flags_spine_chapter_missing_from_nav() {
+        let root = temp_root("nav_missing");
+        let (store, book_url, dir) = text_book(&root).await;
+        tokio::fs::copy(
+            dir.join("OEBPS/chapters/ch-0001-kai-duan.xhtml"),
+            dir.join("OEBPS/chapters/ch-0002-extra.xhtml"),
+        )
+        .await
+        .unwrap();
+        let opf_path = dir.join("OEBPS/content.opf");
+        let opf = tokio::fs::read_to_string(&opf_path).await.unwrap();
+        let opf = opf
+            .replace(
+                "</manifest>",
+                "  <item id=\"ch-0002\" href=\"chapters/ch-0002-extra.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n  </manifest>",
+            )
+            .replace("</spine>", "    <itemref idref=\"ch-0002\"/>\n  </spine>");
+        tokio::fs::write(&opf_path, opf).await.unwrap();
+
+        let report = check_book(&store, &book_url).await.unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "nav_missing_spine_item"
+                    && i.path.as_deref() == Some("OEBPS/chapters/ch-0002-extra.xhtml")),
+            "{:?}",
+            report.issues
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn check_flags_nav_extra_duplicate_spine_and_unused_xhtml() {
+        let root = temp_root("nav_extra");
+        let (store, book_url, dir) = text_book(&root).await;
+        for name in ["ch-0002-extra.xhtml", "ch-0003-unused.xhtml"] {
+            tokio::fs::copy(
+                dir.join("OEBPS/chapters/ch-0001-kai-duan.xhtml"),
+                dir.join("OEBPS/chapters").join(name),
+            )
+            .await
+            .unwrap();
+        }
+        let opf_path = dir.join("OEBPS/content.opf");
+        let opf = tokio::fs::read_to_string(&opf_path).await.unwrap();
+        let opf = opf
+            .replace(
+                "</manifest>",
+                "  <item id=\"ch-0002\" href=\"chapters/ch-0002-extra.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n\
+                 \x20 <item id=\"ch-0003\" href=\"chapters/ch-0003-unused.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n  </manifest>",
+            )
+            .replace(
+                "<itemref idref=\"ch-0001\"/>",
+                "<itemref idref=\"ch-0001\"/>\n    <itemref idref=\"ch-0001\"/>",
+            );
+        tokio::fs::write(&opf_path, opf).await.unwrap();
+
+        let nav_path = dir.join("OEBPS/nav.xhtml");
+        let nav = tokio::fs::read_to_string(&nav_path).await.unwrap();
+        let nav = nav.replace(
+            "</ol>",
+            "<li><a href=\"chapters/ch-0002-extra.xhtml\">额外</a></li></ol>",
+        );
+        tokio::fs::write(&nav_path, nav).await.unwrap();
+
+        let report = check_book(&store, &book_url).await.unwrap();
+        for code in [
+            "nav_link_not_in_spine",
+            "spine_href_duplicate",
+            "manifest_unused_xhtml",
+        ] {
+            assert!(
+                report.issues.iter().any(|i| i.code == code),
+                "missing {code}: {:?}",
+                report.issues
+            );
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

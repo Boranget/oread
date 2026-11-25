@@ -2568,7 +2568,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   先 `dry_run` 看命中，再应用。应用前逐文件校验 XML；命中超过 10000 或文件超过
   5000 个直接拒绝。
 - Check book：校验 mimetype、`container.xml`、OPF manifest/spine、nav 链接、XHTML
-  良构与图片存在性；返回 `errors` / `warnings` / `issues[]`。
+  良构与图片存在性；并检查阅读顺序 / 目录一致性（spine 章节缺 nav 项、nav 项不在 spine、
+  spine 重复引用、manifest 里孤立 XHTML、章节来源 URL 重复）。返回 `errors` / `warnings`
+  / `issues[]`，每条问题带文件路径，前端可点击跳转。
 - 预览：把 XHTML 解析成与阅读器相同的语义块（标题/段落/图片），图片地址改写为本地
   代理 URL；只预览，不写盘。
 
