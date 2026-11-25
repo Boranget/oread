@@ -386,7 +386,9 @@
   $: effLine = lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
   $: displayParas = paras.map((p) =>
-    p.type === 'text' || p.type === 'heading' ? { ...p, text: convertZh(p.text, zhMode) } : p
+    p.type === 'text' || p.type === 'heading' || p.type === 'li'
+      ? { ...p, text: convertZh(p.text, zhMode) }
+      : p
   );
   // 空正文不再渲染成“只有标题的空白页”：给出明确原因与可操作入口（重试/换源/下一章/目录）。
   $: chapterEmpty = !!current && !contentError && !contentLoading && displayParas.length === 0 && isEmptyChapter(current);
@@ -610,7 +612,11 @@
     await openChapter(idx, { ratio: 0 });
     // 复用段落定位：找到第一个含关键词的段落再滚过去
     if (!q) return;
-    const p = paras.findIndex((x) => x.type === 'text' && x.text.toLowerCase().includes(q));
+    const p = paras.findIndex(
+      (x) =>
+        (x.type === 'text' || x.type === 'li' || x.type === 'code') &&
+        x.text.toLowerCase().includes(q)
+    );
     if (p < 0) return;
     await new Promise((r) => setTimeout(r, 320));
     await jumpToParagraph(p);

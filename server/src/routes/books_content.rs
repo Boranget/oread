@@ -229,6 +229,14 @@ fn blocks_json(html: &str) -> serde_json::Value {
                 json!({"type": "heading", "level": level, "text": text})
             }
             Block::Paragraph(text) => json!({"type": "paragraph", "text": text}),
+            Block::List(items) => json!({
+                "type": "list",
+                "items": items
+                    .into_iter()
+                    .map(|i| json!({"level": i.level, "ordered": i.ordered, "text": i.text}))
+                    .collect::<Vec<_>>()
+            }),
+            Block::Code(text) => json!({"type": "code", "text": text}),
             Block::Image { src, alt } => json!({"type": "image", "src": src, "alt": alt}),
         })
         .collect();
@@ -825,14 +833,21 @@ mod tests {
     fn blocks_json_maps_heading_paragraph_and_image() {
         let v = blocks_json(
             "<h2>标题</h2><p>正文</p>\
-             <div class=\"oread-img\"><img src=\"https://a.test/x.jpg\" alt=\"图\"/></div>",
+             <div class=\"oread-img\"><img src=\"https://a.test/x.jpg\" alt=\"图\"/></div>\
+             <ul><li>一</li><li>二</li></ul>\
+             <pre>fn main() {\n    ok();\n}</pre>",
         );
         assert_eq!(
             v,
             serde_json::json!([
                 {"type": "heading", "level": 2, "text": "标题"},
                 {"type": "paragraph", "text": "正文"},
-                {"type": "image", "src": "https://a.test/x.jpg", "alt": "图"}
+                {"type": "image", "src": "https://a.test/x.jpg", "alt": "图"},
+                {"type": "list", "items": [
+                    {"level": 0, "ordered": false, "text": "一"},
+                    {"level": 0, "ordered": false, "text": "二"}
+                ]},
+                {"type": "code", "text": "fn main() {\n    ok();\n}"}
             ])
         );
     }

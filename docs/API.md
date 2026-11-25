@@ -1589,7 +1589,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `url` | string | 否 | 章节 URL |
 | `title` | string | 是 | 章节标题；优先缓存值，其次请求参数 `title`，再按 `chapter_url` 反查 `library_chapters.title`；都拿不到才为 `null` |
 | `content` | string | 是 | 正文 HTML（经用户替换规则 + 图片样式处理），保留给 `/k` 与旧客户端 |
-| `blocks` | array | 否 | 语义块：`{type:"heading",level,text}` / `{type:"paragraph",text}` / `{type:"image",src,alt}`；Web 阅读器优先用它渲染。图片 `src` 可能是远程 http(s)，也可能是 `oread-img://<book_id>/OEBPS/images/<hash>` 本地地址，两者都交给 `/api/book/image` 代理 |
+| `blocks` | array | 否 | 语义块：`{type:"heading",level,text}` / `{type:"paragraph",text}` / `{type:"list",items:[{level,ordered,text}]}` / `{type:"code",text}` / `{type:"image",src,alt}`；Web 阅读器优先用它渲染。图片 `src` 可能是远程 http(s)，也可能是 `oread-img://<book_id>/OEBPS/images/<hash>` 本地地址，两者都交给 `/api/book/image` 代理 |
 | `chapter_index` | integer | 否 | 章节下标；新抓取时恒 0（前端用目录数据补全） |
 | `resource_url` | string | 是 | 当前 null |
 | `is_local` | boolean | 否 | 当前 false |
@@ -2571,8 +2571,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   良构与图片存在性；并检查阅读顺序 / 目录一致性（spine 章节缺 nav 项、nav 项不在 spine、
   spine 重复引用、manifest 里孤立 XHTML、章节来源 URL 重复）。返回 `errors` / `warnings`
   / `issues[]`，每条问题带文件路径，前端可点击跳转。
-- 预览：把 XHTML 解析成与阅读器相同的语义块（标题/段落/图片），图片地址改写为本地
-  代理 URL；只预览，不写盘。
+- 预览：把 XHTML 解析成与阅读器相同的语义块（标题/段落/列表/代码块/图片），图片地址
+  改写为本地代理 URL；只预览，不写盘。
 
 | 端点 | 说明 |
 |---|---|

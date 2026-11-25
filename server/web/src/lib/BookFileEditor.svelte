@@ -458,6 +458,14 @@
                   <h4>{b.text}</h4>
                 {:else if b.type === 'paragraph'}
                   <p>{b.text}</p>
+                {:else if b.type === 'list'}
+                  <ul class="fe-list">
+                    {#each b.items || [] as it}
+                      <li style={`margin-left:${(it.level || 0) * 1.2}em`}>{it.text}</li>
+                    {/each}
+                  </ul>
+                {:else if b.type === 'code'}
+                  <pre class="fe-pre">{b.text}</pre>
                 {:else if b.type === 'image'}
                   {#if previewImages[b.src]}
                     <img src={previewImages[b.src]} alt={b.alt || ''} />
@@ -649,6 +657,21 @@
     max-width: 100%;
     display: block;
     margin: 8px auto;
+  }
+  .fe-preview ul {
+    margin: 6px 0;
+    padding-left: 1.2em;
+  }
+  .fe-preview .fe-pre {
+    margin: 8px 0;
+    padding: 8px;
+    overflow: auto;
+    background: var(--panel-2, #f6f6f6);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .fe-image {
     max-width: 100%;

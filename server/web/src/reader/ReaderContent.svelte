@@ -171,6 +171,14 @@
                 </div>
               {:else if p.type === 'heading'}
                 <p class="rd-p rd-h" data-para={i}>{p.text}</p>
+              {:else if p.type === 'li'}
+                <p
+                  class="rd-p rd-li"
+                  style={`margin-left:${(p.level || 0) * 1.4}em`}
+                  data-para={i}
+                ><span class="rd-li-mark">{p.marker}</span>{p.text}</p>
+              {:else if p.type === 'code'}
+                <pre class="rd-code" data-para={i}>{p.text}</pre>
               {:else}
                 <p class="rd-p" data-para={i}>{p.text}</p>
               {/if}
@@ -249,6 +257,7 @@
   .rd-content.paged .rd-meta,
   .rd-content.paged .rd-chapter-title,
   .rd-content.paged .rd-p,
+  .rd-content.paged .rd-code,
   .rd-content.paged .rd-navrow {
     padding-left: 18px;
     padding-right: 18px;
@@ -299,6 +308,23 @@
     margin: 1.2em 0 0.6em;
     text-indent: 0;
     font-weight: 600;
+  }
+  .rd-li {
+    text-indent: 0;
+  }
+  .rd-li-mark {
+    display: inline-block;
+    min-width: 1.6em;
+  }
+  .rd-code {
+    margin: 0 0 0.85em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    tab-size: 4;
   }
   /* 内嵌图片：桌面居中 + max-width；手机满宽（颜色交给服务端灰度转码） */
   .rd-img {

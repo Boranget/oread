@@ -161,7 +161,7 @@ Bearer 访问 `/opds*`，便于调试。
 - 保存顺序固定：正文文件 → `nav.xhtml` → `content.opf` → 索引事务；单文件同目录临时文件 + `fsync` + `rename`（Windows 退避重试）。
 - 章节文件序号只增不复用、永不改名；顺序只存在于 `spine`，插入新章不需要重写任何 href。
 - 章节正文是归一化后的「标题 + 段落 + 图片」XHTML；段落编辑保存时由服务端重新序列化，结构上写不出非法文件。
-  导入的外部 EPUB 保留原 XHTML（含原有 CSS / 字体），读路径同样解析成语义块，方便以后扩展表格 / 列表。
+  导入的外部 EPUB 保留原 XHTML（含原有 CSS / 字体），读路径同样解析成语义块；列表与代码块已支持，表格留待样本。
 - 文字书插图：抓正文时把 `<img>` 下载到 `OEBPS/images/<sha256>.<jpg|webp>`，按内容哈希去重，
   只收 JPEG / WebP（单图 ≤ 8 MiB、单章 ≤ 30 张 / 64 MiB）；正文里写章节相对地址
   `../images/<hash>.jpg`，OPF manifest 登记 `images/<hash>.jpg`。下载失败或超限的图保留远程地址。
@@ -256,7 +256,7 @@ Bearer 访问 `/opds*`，便于调试。
 - 首屏只静态引入 Login/Bookshelf/Discover；Reader、ComicReader 与统计/馆藏/书源/替换/设置页均 `import()` 懒加载，失败有可见错误与重试。
 - **阅读器独立目录 `src/reader/`**：`Reader.svelte`、`ComicReader.svelte`、`Reader*.svelte`、`reader*.js` 与其单测都在这里。硬规则：`reader/` 只能 import `./` 与 `../lib/`，**不许 import `pages/`**——管理端组件里的 `object-fit`/`transform`/`vw` 会让 KPW3 阅读页白屏，而故障现场在别处。门禁 `node scripts/check-reader-boundary.mjs`（CI 的 web job 已接入）。
 - **PC 与移动端共用同一阅读器**：不按 UA 分叉，只按视口/触控/键盘调整页宽、手势与控制栏；`/k` 是唯一的第二套前端（服务端渲染，无业务 JS）。
-- **正文长期模型是语义块**（标题/段落/图片）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。`/api/book/content` 同时下发 `content`（HTML，给 `/k` 与旧客户端）和 `blocks`（Web 阅读器优先使用）；旧数据没有 `blocks` 时前端回退解析 HTML。
+- **正文长期模型是语义块**（标题/段落/列表/代码块/图片，表格待做）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。`/api/book/content` 同时下发 `content`（HTML，给 `/k` 与旧客户端）和 `blocks`（Web 阅读器优先使用）；旧数据没有 `blocks` 时前端回退解析 HTML。
 - 馆藏页（`pages/Library.svelte`）所有登录账号可浏览占用与进度；入馆/移出/删除/回收临时缓存按 `getRole() === 'admin'` 收口。
 - 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`searchJobsModel`（任务状态/进度/时间纯函数）、`readingPrefs`、`theme` 等，均有 `node --test` 单测；阅读器相关的 `readerHtml/images/stats/auto/progress/gestures/math` 已随阅读器移入 `src/reader/`。
 - 搜索任务共享状态在 `lib/searchJobsStore.js`：App 登录后轮询 `/api/search/jobs`（有运行中任务 2.5s、空闲 15s），退出时停止并清空；Discover 的 `SearchJobsPanel` 只读取 store，支持取消、移除与「查看结果」重新挂载（运行中继续轮询，已结束直接读快照）。

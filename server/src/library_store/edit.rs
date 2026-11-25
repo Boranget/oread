@@ -240,9 +240,10 @@ pub async fn chapter_paragraphs(
     }
     let paragraphs = body_blocks(&xhtml, &item.title)
         .into_iter()
-        .filter_map(|b| match b {
-            Block::Heading(_, text) | Block::Paragraph(text) => Some(text),
-            Block::Image { .. } => None,
+        .flat_map(|b| match b {
+            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => vec![text],
+            Block::List(items) => items.into_iter().map(|i| i.text).collect(),
+            Block::Image { .. } => Vec::new(),
         })
         .filter(|text| !text.trim().is_empty())
         .collect();
@@ -274,11 +275,14 @@ pub async fn save_chapter(
     if item.is_volume {
         return Err(EditError::BadRequest("卷标题没有正文".into()));
     }
-    // v1 的编辑接口只提交纯文本段落，整章保存会丢图片块：含插图的章节先只读。
+    // v1 的编辑接口只提交纯文本段落，整章保存会丢图片 / 列表 / 代码块：含这些块的章节先只读。
     if let Some(xhtml) = store.read_chapter(&opened.dir, &item.href).await? {
-        if body_blocks(&xhtml, &item.title).iter().any(Block::is_image) {
+        let structured = body_blocks(&xhtml, &item.title)
+            .iter()
+            .any(|b| !matches!(b, Block::Heading(..) | Block::Paragraph(..)));
+        if structured {
             return Err(EditError::BadRequest(
-                "本章含插图，v1 暂不支持整章编辑；插图会在后续版本随段落一起保留".into(),
+                "本章含插图、列表或代码块，v1 暂不支持整章编辑；请用文件编辑器".into(),
             ));
         }
     }

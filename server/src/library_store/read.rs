@@ -6,7 +6,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use boranlib_ebook::html::{to_blocks, Block};
+use boranlib_ebook::html::{code_to_html, list_to_html, to_blocks, Block};
 use boranlib_ebook::xml::xml_escape;
 
 use super::{comic, is_pending_html, ChapterItem, OpfMeta, Store, Tier};
@@ -146,6 +146,8 @@ pub fn blocks_to_html(blocks: &[Block]) -> String {
             Block::Paragraph(text) => {
                 out.push_str(&format!("<p>{}</p>", xml_escape(text)));
             }
+            Block::List(items) => out.push_str(&list_to_html(items)),
+            Block::Code(text) => out.push_str(&code_to_html(text)),
             Block::Image { src, alt } => {
                 out.push_str(&format!(
                     "<div class=\"oread-img\"><img src=\"{}\" alt=\"{}\"/></div>",
@@ -162,7 +164,19 @@ pub fn blocks_to_text(blocks: &[Block]) -> String {
     let mut out = String::new();
     for block in blocks {
         let text = match block {
-            Block::Heading(_, text) | Block::Paragraph(text) => text,
+            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => text.as_str(),
+            Block::List(items) => {
+                for item in items {
+                    if item.text.trim().is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&item.text);
+                }
+                continue;
+            }
             Block::Image { .. } => continue,
         };
         if text.trim().is_empty() {

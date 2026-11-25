@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs::File;
 
 use crate::format::txt::normalize_author;
-use crate::html::{to_blocks, Block};
+use crate::html::{code_to_html, list_to_html, to_blocks, Block};
 use crate::model::{BookInput, BookMeta, ChapterRef, Format, WriteReport};
 use crate::pipeline::{ChapterReader, FormatWriter};
 use crate::xml::xml_escape;
@@ -131,6 +131,8 @@ fn chapter_xhtml(meta: &BookMeta, ch: &ChapterRef, blocks: &[Block]) -> String {
             Block::Paragraph(text) => {
                 body.push_str(&format!("<p>{}</p>\n", xml_escape(text)));
             }
+            Block::List(items) => body.push_str(&list_to_html(items)),
+            Block::Code(text) => body.push_str(&code_to_html(text)),
             Block::Image { src, alt } => {
                 body.push_str(&format!(
                     "<div class=\"figure\"><img src=\"{}\" alt=\"{}\"/></div>\n",

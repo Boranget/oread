@@ -53,6 +53,28 @@ test('htmlToParas 忽略无法归一的图片地址', () => {
   ]);
 });
 
+test('blocksToParas 展开列表并保留代码块', () => {
+  const blocks = [
+    {
+      type: 'list',
+      items: [
+        { level: 0, ordered: false, text: '一' },
+        { level: 1, ordered: true, text: '甲' },
+        { level: 1, ordered: true, text: '乙' },
+        { level: 0, ordered: false, text: '二' },
+      ],
+    },
+    { type: 'code', text: 'fn main() {\n    ok();\n}\n' },
+  ];
+  assert.deepEqual(blocksToParas(blocks, 'https://a.test/'), [
+    { type: 'li', level: 0, marker: '•', text: '一' },
+    { type: 'li', level: 1, marker: '1.', text: '甲' },
+    { type: 'li', level: 1, marker: '2.', text: '乙' },
+    { type: 'li', level: 0, marker: '•', text: '二' },
+    { type: 'code', text: 'fn main() {\n    ok();\n}' },
+  ]);
+});
+
 test('blocksToParas 按语义块渲染标题、段落与图片', () => {
   const blocks = [
     { type: 'heading', level: 2, text: '小标题' },

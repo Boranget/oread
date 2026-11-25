@@ -606,6 +606,22 @@ pub(super) fn para_lines(s: &str, em: f64) -> usize {
     lines
 }
 
+/// 预格式化文本一行占用的行数（`<pre>` 没有段首缩进）。
+fn pre_lines(s: &str, em: f64) -> usize {
+    let mut lines = 1usize;
+    let mut used = 0.0f64;
+    for c in s.chars() {
+        let w = char_em(c);
+        if used + w > em {
+            lines += 1;
+            used = w;
+        } else {
+            used += w;
+        }
+    }
+    lines
+}
+
 /// 从段落头部取不超过 cap 行的一段，返回 (该段字节长度, 实际行数)
 pub(super) fn split_para(s: &str, cap: usize, em: f64) -> (usize, usize) {
     let mut lines = 1usize;
@@ -705,14 +721,15 @@ pub(super) fn paginate_lines(
     pages
 }
 
-/// `/k` 的一页：文字页或整页插图。
+/// `/k` 的一页：文字页、预格式化页或整页插图。
 pub(super) enum KPage {
     Text(String),
+    Pre(String),
     Image { src: String, alt: String },
 }
 
 /// 正文块 → `/k` 页表。文字按行预算分页，插图单独成页（一张一页），
-/// 避免在老 Kindle 内核上做复杂的图文混排高度测量。
+/// 代码块用 `<pre>` 保留缩进并按行预算切页。
 pub(super) fn plan_doc_pages(
     blocks: &[boranlib_ebook::html::Block],
     spec: &FsSpec,
@@ -739,6 +756,64 @@ pub(super) fn plan_doc_pages(
         text.clear();
     }
 
+    fn push_text(t: &str, text: &mut String, remaining: &mut usize, truncated: &mut bool) {
+        let t = t.trim();
+        if t.is_empty() {
+            return;
+        }
+        if *remaining == 0 {
+            *truncated = true;
+            return;
+        }
+        let count = t.chars().count();
+        if count > *remaining {
+            let cut = t
+                .char_indices()
+                .nth(*remaining)
+                .map(|(i, _)| i)
+                .unwrap_or(t.len());
+            text.push_str(&t[..cut]);
+            text.push('\n');
+            *truncated = true;
+            *remaining = 0;
+        } else {
+            text.push_str(t);
+            text.push('\n');
+            *remaining -= count;
+        }
+    }
+
+    fn paginate_pre(text: &str, spec: &FsSpec, budget: usize, text_w: usize) -> Vec<String> {
+        let em = line_em(spec, text_w);
+        let budget = budget.max(1);
+        let mut pages = Vec::new();
+        let mut cur = String::new();
+        let mut used = 0usize;
+        for line in text.split('\n') {
+            let need = pre_lines(line, em).min(budget);
+            if used + need > budget && !cur.is_empty() {
+                pages.push(std::mem::take(&mut cur));
+                used = 0;
+            }
+            if !cur.is_empty() {
+                cur.push('\n');
+            }
+            cur.push_str(line);
+            used += need;
+            if used >= budget {
+                pages.push(std::mem::take(&mut cur));
+                used = 0;
+            }
+        }
+        if !cur.is_empty() {
+            pages.push(cur);
+        }
+        if pages.is_empty() {
+            pages.push(String::new());
+        }
+        pages
+    }
+
     let mut pages = Vec::new();
     let mut text = String::new();
     let mut remaining = max_chars;
@@ -746,29 +821,60 @@ pub(super) fn plan_doc_pages(
     for block in blocks {
         match block {
             Block::Heading(_, t) | Block::Paragraph(t) => {
-                let t = t.trim();
-                if t.is_empty() {
-                    continue;
+                push_text(t, &mut text, &mut remaining, &mut truncated);
+            }
+            Block::List(items) => {
+                let mut counters: Vec<usize> = Vec::new();
+                for item in items {
+                    let level = (item.level as usize).min(8);
+                    counters.truncate(level + 1);
+                    while counters.len() < level + 1 {
+                        counters.push(0);
+                    }
+                    let marker = if item.ordered {
+                        counters[level] += 1;
+                        format!("{}.", counters[level])
+                    } else {
+                        counters[level] = 0;
+                        match level {
+                            0 => "•".to_string(),
+                            1 => "◦".to_string(),
+                            _ => "▪".to_string(),
+                        }
+                    };
+                    push_text(
+                        &format!("{marker} {}", item.text),
+                        &mut text,
+                        &mut remaining,
+                        &mut truncated,
+                    );
                 }
+            }
+            Block::Code(t) => {
+                flush(&mut text, &mut pages, spec, budget, text_w);
                 if remaining == 0 {
                     truncated = true;
                     continue;
                 }
-                let count = t.chars().count();
+                let mut code = t.clone();
+                let count = code.chars().count();
                 if count > remaining {
-                    let cut = t
+                    let cut = code
                         .char_indices()
                         .nth(remaining)
                         .map(|(i, _)| i)
-                        .unwrap_or(t.len());
-                    text.push_str(&t[..cut]);
-                    text.push('\n');
+                        .unwrap_or(code.len());
+                    code.truncate(cut);
                     truncated = true;
                     remaining = 0;
                 } else {
-                    text.push_str(t);
-                    text.push('\n');
                     remaining -= count;
+                }
+                if code.trim().is_empty() {
+                    continue;
+                }
+                for chunk in paginate_pre(&code, spec, budget, text_w) {
+                    pages.push(KPage::Pre(chunk));
                 }
             }
             Block::Image { src, alt } => {

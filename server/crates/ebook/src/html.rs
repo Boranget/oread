@@ -14,11 +14,23 @@ use ego_tree::NodeRef;
 use scraper::node::Element;
 use scraper::{Html, Node};
 
+/// 列表项。列表按文档顺序拍平，`level` 从 0 开始，`ordered` 表示该项所在列表的序号样式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    pub level: u8,
+    pub ordered: bool,
+    pub text: String,
+}
+
 /// 归一化后的正文块。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Heading(u8, String),
     Paragraph(String),
+    /// 列表；嵌套项用 `level` 表示层级，渲染时自行决定缩进与序号。
+    List(Vec<ListItem>),
+    /// 预格式化文本（`<pre>` / 代码块）：保留换行与缩进，不做空白折叠。
+    Code(String),
     /// `src` 原样保留（相对地址由调用方按章节 URL 归一化），`alt` 可为空。
     Image {
         src: String,
@@ -30,6 +42,50 @@ impl Block {
     pub fn is_image(&self) -> bool {
         matches!(self, Block::Image { .. })
     }
+}
+
+/// 列表块 → XHTML 片段。输出真正的嵌套 `ul` / `ol`，并带内联缩进：
+/// 旧客户端即使重置了列表样式也能看出层级；同时保证 HTML 重新解析后仍能
+/// 还原成同样的 `Block::List`（`/api/book/content` 的 blocks 由 content 再解析）。
+pub fn list_to_html(items: &[ListItem]) -> String {
+    use crate::xml::xml_escape;
+
+    /// 从 `start` 开始渲染同一层级、同样式的一段列表；返回下一项下标。
+    fn render(items: &[ListItem], start: usize, level: u8, out: &mut String) -> usize {
+        let ordered = items[start].ordered;
+        let (open, close) = if ordered {
+            ("<ol", "</ol>")
+        } else {
+            ("<ul", "</ul>")
+        };
+        out.push_str(open);
+        out.push_str(" style=\"margin:0.4em 0 0.4em 1.2em;padding-left:1.2em\">\n");
+        let mut i = start;
+        while i < items.len() && items[i].level == level && items[i].ordered == ordered {
+            out.push_str("<li>");
+            out.push_str(&xml_escape(&items[i].text));
+            i += 1;
+            while i < items.len() && items[i].level > level {
+                i = render(items, i, items[i].level, out);
+            }
+            out.push_str("</li>\n");
+        }
+        out.push_str(close);
+        out.push('\n');
+        i
+    }
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < items.len() {
+        i = render(items, i, items[i].level, &mut out);
+    }
+    out
+}
+
+/// 代码块 → XHTML 片段。`<pre>` 保留换行与行首缩进。
+pub fn code_to_html(text: &str) -> String {
+    format!("<pre>{}</pre>\n", crate::xml::xml_escape(text))
 }
 
 /// 把一章正文转成块序列。纯文本输入同样适用（按换行断段）。
@@ -100,6 +156,23 @@ fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
                 b.flush();
                 return;
             }
+            if name == "ul" || name == "ol" {
+                b.flush();
+                let mut items = Vec::new();
+                collect_list(node, 0, name == "ol", &mut items);
+                if !items.is_empty() {
+                    b.blocks.push(Block::List(items));
+                }
+                return;
+            }
+            if name == "pre" {
+                b.flush();
+                let text = pre_text(&node);
+                if !text.trim().is_empty() {
+                    b.blocks.push(Block::Code(text));
+                }
+                return;
+            }
             let block = is_block(name);
             if block {
                 b.flush();
@@ -142,6 +215,88 @@ fn inline_text<'a>(node: &NodeRef<'a, Node>) -> String {
         }
     }
     out
+}
+
+/// 列表里的纯文字（跳过嵌套列表、脚本与图片）。
+fn list_item_text(node: &NodeRef<'_, Node>) -> String {
+    let mut out = String::new();
+    let mut stack: Vec<NodeRef<'_, Node>> = node.children().collect();
+    stack.reverse();
+    while let Some(n) = stack.pop() {
+        match n.value() {
+            Node::Text(t) => out.push_str(t.text.as_ref()),
+            Node::Element(el) => {
+                let name = el.name();
+                if name == "ul" || name == "ol" || is_skip(name) {
+                    continue;
+                }
+                if name == "br" {
+                    out.push(' ');
+                    continue;
+                }
+                let children: Vec<_> = n.children().collect();
+                stack.extend(children.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    collapse(&out)
+}
+
+/// 把一个 `ul` / `ol` 拍平成带层级的列表项。
+fn collect_list(node: NodeRef<'_, Node>, level: u8, ordered: bool, out: &mut Vec<ListItem>) {
+    for child in node.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        if el.name() != "li" {
+            continue;
+        }
+        let text = list_item_text(&child);
+        if !text.is_empty() {
+            out.push(ListItem {
+                level,
+                ordered,
+                text,
+            });
+        }
+        // 嵌套列表是 `li` 的直接子元素；层级 +1，序号样式由子列表自己决定。
+        for sub in child.children() {
+            let Node::Element(sub_el) = sub.value() else {
+                continue;
+            };
+            let name = sub_el.name();
+            if name == "ul" || name == "ol" {
+                collect_list(sub, level.saturating_add(1), name == "ol", out);
+            }
+        }
+    }
+}
+
+/// `<pre>` 的原始文字：保留换行与行首缩进，只统一换行符并去掉首尾空行。
+fn pre_text(node: &NodeRef<'_, Node>) -> String {
+    fn collect(node: NodeRef<'_, Node>, out: &mut String) {
+        for child in node.children() {
+            match child.value() {
+                Node::Text(t) => out.push_str(t.text.as_ref()),
+                Node::Element(el) => {
+                    let name = el.name();
+                    if name == "br" {
+                        out.push('\n');
+                    } else if !is_skip(name) {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    collect(*node, &mut out);
+    out.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_matches('\n')
+        .to_string()
 }
 
 fn is_skip(name: &str) -> bool {
@@ -277,7 +432,7 @@ fn collapse(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{to_blocks, Block};
+    use super::{list_to_html, to_blocks, Block, ListItem};
 
     #[test]
     fn plain_text_splits_on_newlines() {
@@ -304,8 +459,110 @@ mod tests {
                 Block::Paragraph("换行".into()),
                 Block::Heading(2, "小标题".into()),
                 Block::Paragraph("正文 加粗 结束".into()),
-                Block::Paragraph("• 一".into()),
-                Block::Paragraph("• 二".into()),
+                Block::List(vec![
+                    ListItem {
+                        level: 0,
+                        ordered: false,
+                        text: "一".into(),
+                    },
+                    ListItem {
+                        level: 0,
+                        ordered: false,
+                        text: "二".into(),
+                    },
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_keep_order_and_nesting() {
+        let blocks = to_blocks(
+            "<ul><li>一<ul><li>甲</li><li>乙</li></ul></li><li>二</li></ul>\
+             <ol><li>first</li><li>second</li></ol>",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::List(vec![
+                    ListItem {
+                        level: 0,
+                        ordered: false,
+                        text: "一".into(),
+                    },
+                    ListItem {
+                        level: 1,
+                        ordered: false,
+                        text: "甲".into(),
+                    },
+                    ListItem {
+                        level: 1,
+                        ordered: false,
+                        text: "乙".into(),
+                    },
+                    ListItem {
+                        level: 0,
+                        ordered: false,
+                        text: "二".into(),
+                    },
+                ]),
+                Block::List(vec![
+                    ListItem {
+                        level: 0,
+                        ordered: true,
+                        text: "first".into(),
+                    },
+                    ListItem {
+                        level: 0,
+                        ordered: true,
+                        text: "second".into(),
+                    },
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_html_round_trips_through_parser() {
+        let items = vec![
+            ListItem {
+                level: 0,
+                ordered: false,
+                text: "一 & <二>".into(),
+            },
+            ListItem {
+                level: 1,
+                ordered: true,
+                text: "甲".into(),
+            },
+            ListItem {
+                level: 1,
+                ordered: true,
+                text: "乙".into(),
+            },
+            ListItem {
+                level: 0,
+                ordered: false,
+                text: "三".into(),
+            },
+        ];
+        let html = list_to_html(&items);
+        assert!(html.contains("<ul"));
+        assert!(html.contains("<ol"));
+        assert_eq!(to_blocks(&html), vec![Block::List(items)]);
+    }
+
+    #[test]
+    fn pre_keeps_line_breaks_and_indent() {
+        let blocks = to_blocks(
+            "<p>前</p><pre><code>fn main() {\n    println!(\"hi\");\n}\n</code></pre><p>后</p>",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("前".into()),
+                Block::Code("fn main() {\n    println!(\"hi\");\n}".into()),
+                Block::Paragraph("后".into()),
             ]
         );
     }

@@ -74,6 +74,28 @@ export function blocksToParas(blocks, base) {
     } else if (type === 'paragraph') {
       const text = String(b.text || '').trim();
       if (text) out.push({ type: 'text', text });
+    } else if (type === 'list') {
+      const items = Array.isArray(b.items) ? b.items : [];
+      const counters = [];
+      for (const it of items) {
+        const text = String((it && it.text) || '').trim();
+        if (!text) continue;
+        const level = Math.max(0, Math.min(8, Number(it.level) || 0));
+        while (counters.length <= level) counters.push(0);
+        counters.length = level + 1;
+        let marker;
+        if (it.ordered) {
+          counters[level] += 1;
+          marker = `${counters[level]}.`;
+        } else {
+          counters[level] = 0;
+          marker = level === 0 ? '•' : level === 1 ? '◦' : '▪';
+        }
+        out.push({ type: 'li', level, marker, text });
+      }
+    } else if (type === 'code') {
+      const text = String(b.text || '').replace(/[\r\n]+$/, '');
+      if (text.trim()) out.push({ type: 'code', text });
     }
   }
   return out;

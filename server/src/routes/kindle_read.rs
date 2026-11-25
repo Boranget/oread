@@ -129,9 +129,9 @@ pub(super) async fn read(
 
     let mut paras = String::new();
     let gap = para_gap_px(spec.line);
+    let mut first_para = true;
     match page {
         KPage::Text(cur) => {
-            let mut first_para = true;
             for para in cur.split('\n') {
                 let para = para.trim();
                 if para.is_empty() {
@@ -147,6 +147,16 @@ pub(super) async fn read(
                     para = esc(para)
                 ));
             }
+        }
+        KPage::Pre(cur) => {
+            let mt = if first_para { 0 } else { gap };
+            paras.push_str(&format!(
+                "<pre style=\"font-family:monospace;font-size:{size}px;line-height:{line}px;white-space:pre-wrap;word-wrap:break-word;margin:{mt}px 0 0\">{cur}</pre>",
+                size = spec.size,
+                line = spec.line,
+                mt = mt,
+                cur = esc(cur)
+            ));
         }
         KPage::Image { src, alt } => {
             // 插图单独成页，走与漫画相同的图片代理（墨水屏灰度/限宽在服务端生成）。

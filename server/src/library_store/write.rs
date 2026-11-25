@@ -25,7 +25,10 @@ pub fn markup_to_blocks(html: &str) -> Vec<Block> {
     to_blocks(html)
         .into_iter()
         .filter(|block| match block {
-            Block::Heading(_, text) | Block::Paragraph(text) => !text.trim().is_empty(),
+            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => {
+                !text.trim().is_empty()
+            }
+            Block::List(items) => !items.is_empty(),
             Block::Image { .. } => true,
         })
         .collect()
@@ -36,9 +39,10 @@ pub fn markup_to_blocks(html: &str) -> Vec<Block> {
 pub fn markup_to_paragraphs(html: &str) -> Vec<String> {
     markup_to_blocks(html)
         .into_iter()
-        .filter_map(|block| match block {
-            Block::Paragraph(text) | Block::Heading(_, text) => Some(text),
-            Block::Image { .. } => None,
+        .flat_map(|block| match block {
+            Block::Paragraph(text) | Block::Heading(_, text) | Block::Code(text) => vec![text],
+            Block::List(items) => items.into_iter().map(|i| i.text).collect(),
+            Block::Image { .. } => Vec::new(),
         })
         .collect()
 }
@@ -47,7 +51,10 @@ fn blocks_of(xhtml: &str, title: &str) -> Vec<Block> {
     body_blocks(xhtml, title)
         .into_iter()
         .filter(|block| match block {
-            Block::Heading(_, text) | Block::Paragraph(text) => !text.trim().is_empty(),
+            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => {
+                !text.trim().is_empty()
+            }
+            Block::List(items) => !items.is_empty(),
             Block::Image { .. } => true,
         })
         .collect()
@@ -517,7 +524,7 @@ pub async fn save_text_chapter_tracked(
         .first()
         .map(|b| match b {
             Block::Heading(_, text) | Block::Paragraph(text) => text.trim() == item.title.trim(),
-            Block::Image { .. } => false,
+            Block::List(_) | Block::Code(_) | Block::Image { .. } => false,
         })
         .unwrap_or(false);
     if first_is_title {

@@ -227,6 +227,45 @@ fn plan_doc_pages_keeps_image_order_and_truncates_text() {
     assert!(matches!(&pages[0], KPage::Text(t) if t == "第一"));
 }
 
+#[test]
+fn plan_doc_pages_renders_lists_and_code() {
+    use boranlib_ebook::html::{Block, ListItem};
+
+    let blocks = vec![
+        Block::List(vec![
+            ListItem {
+                level: 0,
+                ordered: true,
+                text: "一".into(),
+            },
+            ListItem {
+                level: 1,
+                ordered: false,
+                text: "甲".into(),
+            },
+        ]),
+        Block::Code("fn main() {\n    ok();\n}".into()),
+    ];
+    let (pages, truncated) = plan_doc_pages(
+        &blocks,
+        &FS_SPECS[1],
+        budget(&FS_SPECS[1]),
+        vp().page_w(),
+        K_MAX_TEXT_CHARS,
+    );
+    assert!(!truncated);
+    assert!(
+        matches!(&pages[0], KPage::Text(t) if t.contains("1. 一") && t.contains("◦ 甲")),
+        "列表项应带序号/项目符号"
+    );
+    assert!(
+        pages
+            .iter()
+            .any(|p| matches!(p, KPage::Pre(t) if t.contains("    ok();"))),
+        "代码块应保留缩进"
+    );
+}
+
 /// 目录含分卷行：总数只算非分卷章节，分页按过滤后的列表，链接 index 保持原始值。
 #[test]
 fn toc_skips_volumes_and_keeps_original_index() {
