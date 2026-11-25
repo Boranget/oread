@@ -447,6 +447,7 @@ cd server
 & '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor
 & '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --rebuild-index
 & '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --sync-db
+& '<local-tools>\cache\target-dev\debug\boranlib.exe' doctor --check-books
 ```
 
 `doctor` 默认只读比对「书目录 ↔ `index.db` ↔ `library.db`」：目录解析失败、索引滞后/残留、
@@ -457,6 +458,10 @@ cd server
 它还会用书目录重算每本书的「已缓存章节 / 正文 / 图片占用」，手工放入的目录也能显示正确进度
 （占位章不计入已缓存章节）。
 索引滞后本身不算问题（重建即可）；解析失败或补登后仍有孤立目录时退出码为 1。
+`--check-books` 对 `collection/` 下所有文字书跑一次只读 Check book（复用管理员编辑器同一套规则）：
+逐本报告错误/警告、缺失章节/图片、nav 与 spine 不一致、未登记文件等；漫画只计数不检查，
+`temp/` 抓取缓存不体检。error 级问题或打不开的书目录会让退出码为 1，warning 不会。
+可与 `--rebuild-index` / `--sync-db` 组合，用于部署前或磁盘异常后的整库体检。
 
 部署到板子（绝不在板上 `cargo build`，链接期会 OOM）：
 

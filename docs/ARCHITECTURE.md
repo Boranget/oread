@@ -209,7 +209,8 @@ Bearer 访问 `/opds*`，便于调试。
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（该书当前不可读）。
   `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目
   （手工放进 `collection/` 的书目录因此能在列表里出现）。有需要处理的问题时退出码 1，
-  便于脚本/定时任务报警。
+  便于脚本/定时任务报警。`--check-books` 再对馆藏文字书逐本跑 Check book（与编辑器同一套规则），
+  汇总错误/警告与打不开的目录；漫画只计数，`temp/` 不体检。
 - 导出（`library_store::pack`）：直接按 store-only ZIP 原样打包目录——EPUB 把
   `mimetype` 放第一条、随后 `META-INF/container.xml`；CBZ 把 `ComicInfo.xml` 放第一条并排除
   内部边车 `oread.json`。目录不存在或形态不符时直接 409，不再回退逐章/逐页生成；

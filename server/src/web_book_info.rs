@@ -227,9 +227,7 @@ fn parse_series_index(raw: &str) -> Option<f64> {
         return None;
     }
     let text = text.trim_start_matches("第").trim();
-    let text = text
-        .trim_end_matches(|c: char| matches!(c, '卷' | '部' | '册' | '集' | '季'))
-        .trim();
+    let text = text.trim_end_matches(['卷', '部', '册', '集', '季']).trim();
     let first = text.split(['/', '／']).next().unwrap_or(text).trim();
     if let Ok(v) = first.parse::<f64>() {
         return (v.is_finite() && v >= 0.0).then_some(v);
@@ -300,9 +298,7 @@ fn clean_tag(raw: &str) -> String {
         .strip_prefix("标签")
         .or_else(|| tag.strip_prefix("分类"))
         .unwrap_or(tag);
-    let tag = tag
-        .trim_start_matches(|c: char| matches!(c, ':' | '：' | '·' | '-'))
-        .trim();
+    let tag = tag.trim_start_matches([':', '：', '·', '-']).trim();
     tag.chars().take(MAX_TAG_CHARS).collect()
 }
 

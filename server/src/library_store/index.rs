@@ -612,7 +612,7 @@ fn dir_name(dir: &Path) -> String {
 }
 
 /// 枚举 `collection/` 与 `temp/` 下的书目录（一层，不递归）。
-async fn scan_dirs(store: &Store) -> std::io::Result<Vec<(Tier, PathBuf)>> {
+pub async fn scan_dirs(store: &Store) -> std::io::Result<Vec<(Tier, PathBuf)>> {
     let mut out = Vec::new();
     for tier in [Tier::Collection, Tier::Temp] {
         let base = store.root().join(tier.as_str());

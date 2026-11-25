@@ -24,6 +24,8 @@
 - `Check book` 增加阅读顺序 / 目录一致性检查：spine 章节缺 nav 项、nav 项不在 spine、
   spine 重复引用同一文件、manifest 里既不在 spine 也不在 nav 的孤立 XHTML、章节来源 URL
   重复都会列出，并标明涉及的文件，方便手工增删章节后核对。
+- `boranlib doctor --check-books`：对 `collection/` 下所有文字书逐本跑只读 Check book，
+  汇总错误/警告与打不开的书目录；漫画只计数，`temp/` 抓取缓存不体检。
 
 - 搜索任务可查看、可取消、可恢复（迁移 `0017`，表 `search_jobs`）：发现页新增「搜索任务」
   面板，列出当前用户的后台任务、实时进度与失败/取消源数；运行中的任务可取消（立即停止

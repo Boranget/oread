@@ -64,19 +64,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `boranlib doctor [--rebuild-index]`：检查目录、`index.db` 与 `library.db` 是否一致。
+/// `boranlib doctor [--rebuild-index] [--sync-db] [--check-books]`：
+/// 检查目录、`index.db` 与 `library.db` 是否一致；`--check-books` 再逐本检查书目录。
 ///
 /// 目录是权威：`index.db` 随时可以重建，`library.db` 里没有的目录说明书在磁盘上、
 /// 但用户在馆藏列表里看不到（需要重新入馆或手工补书目）。
 async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
     let mut rebuild = false;
     let mut sync_db = false;
+    let mut check_books = false;
     for arg in args {
         match arg.as_str() {
             "--rebuild-index" => rebuild = true,
             "--sync-db" => sync_db = true,
+            "--check-books" => check_books = true,
             other => anyhow::bail!(
-                "未知参数: {other}\n用法: boranlib doctor [--rebuild-index] [--sync-db]"
+                "未知参数: {other}\n用法: boranlib doctor [--rebuild-index] [--sync-db] [--check-books]"
             ),
         }
     }
@@ -124,12 +127,65 @@ async fn run_doctor(cfg: Config, args: &[String]) -> anyhow::Result<()> {
         &v.db_without_dir,
     );
 
-    if v.has_problems() {
+    let report = if check_books {
+        let report = boranlib::library_store::files::check_all_books(&store).await?;
+        println!(
+            "馆藏体检：文字书 {} 本，漫画 {} 本（未检查）；错误 {}，警告 {}，无问题 {} 本",
+            report.text_books,
+            report.comics,
+            report.errors,
+            report.warnings,
+            report.clean_books()
+        );
+        print_list("体检失败", &report.failed);
+        print_book_issues(&report.books);
+        Some(report)
+    } else {
+        None
+    };
+
+    if v.has_problems() || report.as_ref().is_some_and(|r| r.has_problems()) {
         eprintln!("doctor: 发现需要处理的问题");
         std::process::exit(1);
     }
     println!("doctor: OK");
     Ok(())
+}
+
+fn print_book_issues(books: &[boranlib::library_store::files::BookCheck]) {
+    if books.is_empty() {
+        return;
+    }
+    const MAX_BOOKS: usize = 10;
+    const MAX_ISSUES: usize = 8;
+    println!("有问题的书：{} 本", books.len());
+    for book in books.iter().take(MAX_BOOKS) {
+        let errors = book.issues.iter().filter(|i| i.severity == "error").count();
+        println!(
+            "  - 《{}》 错误 {} / 警告 {}：{}",
+            book.title,
+            errors,
+            book.issues.len() - errors,
+            book.book_url
+        );
+        for issue in book.issues.iter().take(MAX_ISSUES) {
+            let path = issue
+                .path
+                .as_deref()
+                .map(|p| format!(" {p}"))
+                .unwrap_or_default();
+            println!(
+                "      {} [{}]{}: {}",
+                issue.severity, issue.code, path, issue.message
+            );
+        }
+        if book.issues.len() > MAX_ISSUES {
+            println!("      … 还有 {} 条", book.issues.len() - MAX_ISSUES);
+        }
+    }
+    if books.len() > MAX_BOOKS {
+        println!("  … 还有 {} 本", books.len() - MAX_BOOKS);
+    }
 }
 
 fn print_list(label: &str, items: &[String]) {

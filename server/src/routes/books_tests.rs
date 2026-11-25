@@ -416,7 +416,7 @@ async fn detail_save_keeps_personal_fields() {
     };
     save_book_meta(&pool, &pool, &detail).await.unwrap();
 
-    let row: (
+    type MetaRow = (
         String,
         Option<i64>,
         Option<String>,
@@ -424,7 +424,8 @@ async fn detail_save_keeps_personal_fields() {
         Option<String>,
         bool,
         i64,
-    ) = sqlx::query_as(
+    );
+    let row: MetaRow = sqlx::query_as(
         "SELECT name, \"group\", custom_tag, custom_cover_url, custom_intro, \
                     can_update, \"order\" FROM book_meta WHERE book_url = ?1",
     )

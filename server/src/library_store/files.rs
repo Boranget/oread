@@ -18,7 +18,7 @@ use sxd_document::dom::Element;
 use super::edit::{detect_image, require_revision, EditError};
 use super::opf;
 use super::read::{body_blocks, OpenedBook};
-use super::{atomic_write, comic, lock_book, safe_join, OpfMeta, Store, PENDING_HREF};
+use super::{atomic_write, comic, lock_book, safe_join, OpfMeta, Store, Tier, PENDING_HREF};
 use boranlib_ebook::html::Block;
 
 pub const MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
@@ -1505,6 +1505,95 @@ fn finish_check(
     })
 }
 
+/// 一本书的体检结果（只含有问题的书）。
+#[derive(Debug, Clone)]
+pub struct BookCheck {
+    pub title: String,
+    pub book_url: String,
+    pub issues: Vec<CheckIssue>,
+}
+
+/// 全馆体检结果。只读：不会修改任何书目录。
+#[derive(Debug, Default)]
+pub struct BooksCheckReport {
+    /// 已检查的文字书数。
+    pub text_books: usize,
+    /// 跳过的漫画目录数。
+    pub comics: usize,
+    /// 无法打开/解析的书目录，形如 `collection/<id>: 原因`。
+    pub failed: Vec<String>,
+    /// 有 error / warning 的书，按「先有 error、再按书名」排序。
+    pub books: Vec<BookCheck>,
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+impl BooksCheckReport {
+    /// 有问题指「有书打不开」或「有 error 级问题」；warning 不影响退出码。
+    pub fn has_problems(&self) -> bool {
+        !self.failed.is_empty() || self.errors > 0
+    }
+
+    pub fn clean_books(&self) -> usize {
+        self.text_books.saturating_sub(self.books.len())
+    }
+}
+
+/// 对 `collection/` 下的所有文字书跑一遍 [`check_book`]。
+///
+/// 只体检馆藏层：`temp/` 是随时可能被回收的抓取缓存，检查它没有长期意义。
+/// 目录解析失败与漫画目录只计数，不展开。
+pub async fn check_all_books(store: &Store) -> io::Result<BooksCheckReport> {
+    let mut report = BooksCheckReport::default();
+    for (tier, dir) in super::index::scan_dirs(store).await? {
+        if tier != Tier::Collection {
+            continue;
+        }
+        let label = dir
+            .strip_prefix(store.root())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| dir.to_string_lossy().into_owned());
+        if !dir.join("OEBPS").join("content.opf").is_file() {
+            if comic::is_comic_dir(&dir) {
+                report.comics += 1;
+            }
+            continue;
+        }
+        let meta = match store.read_opf(&dir).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                report.failed.push(format!("{label}: 读取 OPF 失败: {e}"));
+                continue;
+            }
+        };
+        report.text_books += 1;
+        match check_book(store, &meta.book_url).await {
+            Ok(r) => {
+                let errors = r.issues.iter().filter(|i| i.severity == "error").count();
+                report.errors += errors;
+                report.warnings += r.issues.len() - errors;
+                if !r.issues.is_empty() {
+                    report.books.push(BookCheck {
+                        title: meta.title.clone(),
+                        book_url: meta.book_url.clone(),
+                        issues: r.issues,
+                    });
+                }
+            }
+            Err(e) => report.failed.push(format!("{label}: {e}")),
+        }
+    }
+    report.books.sort_by(|a, b| {
+        let a_err = a.issues.iter().any(|i| i.severity == "error");
+        let b_err = b.issues.iter().any(|i| i.severity == "error");
+        b_err
+            .cmp(&a_err)
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.book_url.cmp(&b.book_url))
+    });
+    Ok(report)
+}
+
 // ---------------------------------------------------------------------------
 // 实时预览
 // ---------------------------------------------------------------------------
@@ -1589,6 +1678,10 @@ mod tests {
     }
 
     async fn text_book(root: &Path) -> (Store, String, PathBuf) {
+        text_book_at(root, Tier::Temp).await
+    }
+
+    async fn text_book_at(root: &Path, tier: Tier) -> (Store, String, PathBuf) {
         let store = Store::at(root.join("library"));
         store.create_layout().unwrap();
         let book_url = "https://example.com/book/files".to_string();
@@ -1601,7 +1694,7 @@ mod tests {
             is_volume: false,
         };
         meta.chapters.push(item.clone());
-        let dir = store.ensure_skeleton(Tier::Temp, &meta).await.unwrap();
+        let dir = store.ensure_skeleton(tier, &meta).await.unwrap();
         store
             .write_chapter(
                 &dir,
@@ -1843,6 +1936,31 @@ mod tests {
                 report.issues
             );
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn check_all_books_scans_collection_only() {
+        let root = temp_root("check_all");
+        let (store, _book_url, dir) = text_book_at(&root, Tier::Collection).await;
+
+        let healthy = check_all_books(&store).await.unwrap();
+        assert_eq!(healthy.text_books, 1);
+        assert_eq!(healthy.comics, 0);
+        assert!(healthy.failed.is_empty(), "{:?}", healthy.failed);
+        assert!(!healthy.has_problems(), "{:?}", healthy.books);
+        assert_eq!(healthy.clean_books(), 1);
+
+        tokio::fs::remove_file(dir.join("OEBPS/chapters/ch-0001-kai-duan.xhtml"))
+            .await
+            .unwrap();
+        let broken = check_all_books(&store).await.unwrap();
+        assert_eq!(broken.text_books, 1);
+        assert!(broken.has_problems());
+        assert!(broken.errors >= 1);
+        assert_eq!(broken.books.len(), 1);
+        assert_eq!(broken.books[0].title, "文件书");
+        assert!(broken.books[0].issues.iter().any(|i| i.severity == "error"));
         std::fs::remove_dir_all(root).ok();
     }
 
