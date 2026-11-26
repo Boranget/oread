@@ -185,6 +185,8 @@ struct Totals {
     table_chapters: usize,
     math_chapters: usize,
     image_blocks: usize,
+    images_ok: usize,
+    image_failures: usize,
     word_bytes: usize,
 }
 
@@ -506,12 +508,45 @@ async fn real_books_import_and_read() {
                 totals.empty_blocks += 1;
             }
             let mut images = 0usize;
+            let mut image_srcs: Vec<String> = Vec::new();
             let mut types = std::collections::BTreeMap::new();
             for b in &blocks {
                 let t = b["type"].as_str().unwrap_or("?");
                 *types.entry(t.to_string()).or_insert(0usize) += 1;
                 if t == "image" {
                     images += 1;
+                    if image_srcs.len() < 3 {
+                        if let Some(src) = b["src"].as_str() {
+                            image_srcs.push(src.to_string());
+                        }
+                    }
+                }
+            }
+            // 图片块存在不等于能读：真正走一次图片代理，确认本地路径与格式都能出图。
+            for src in image_srcs {
+                let uri = format!(
+                    "/api/book/image?{}",
+                    query(&[("url", &src), ("book_url", book_url)])
+                );
+                let resp = app.clone().oneshot(authed_get(&uri, &token)).await.unwrap();
+                let status = resp.status();
+                let ctype = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = axum::body::to_bytes(resp.into_body(), MAX_JSON)
+                    .await
+                    .unwrap();
+                if status == StatusCode::OK && ctype.starts_with("image/") && !bytes.is_empty() {
+                    totals.images_ok += 1;
+                } else {
+                    totals.image_failures += 1;
+                    println!(
+                        "    [图片失败] {src} → {status} {ctype} {} bytes",
+                        bytes.len()
+                    );
                 }
             }
             book_images += images;
@@ -531,13 +566,15 @@ async fn real_books_import_and_read() {
 
     println!(
         "\n=== 汇总 ===\n书={} 章节总数={} 抽样={} 正文失败={} 空块章节={} \
-         图片块={} 含表格章节={} 含 MathML 章节={} 正文字节={}",
+         图片块={} 图片可读={} 图片失败={} 含表格章节={} 含 MathML 章节={} 正文字节={}",
         totals.books,
         totals.chapters,
         totals.sampled,
         totals.content_failures,
         totals.empty_blocks,
         totals.image_blocks,
+        totals.images_ok,
+        totals.image_failures,
         totals.table_chapters,
         totals.math_chapters,
         totals.word_bytes,
@@ -545,4 +582,5 @@ async fn real_books_import_and_read() {
 
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(totals.content_failures, 0, "存在导入/正文失败，见上方日志");
+    assert_eq!(totals.image_failures, 0, "存在图片读取失败，见上方日志");
 }

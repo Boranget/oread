@@ -33,9 +33,12 @@
 4. 移动端次级入口：桌面侧栏的图书馆快捷链接（想读 / 在读 / 已读 / 浏览维度）在手机上隐藏，
    目前由图书馆页内 tabs 与「浏览维度」入口承担；若后续入口变多再加抽屉。
 5. 真实馆藏验收：23 本真实 EPUB 已完成导入 / 目录 / 正文 / 详情 / 分面 / 首页 / 状态的
-   接口级验收（`server/tests/real_books_acceptance.rs`，手动设置 `BORANLIB_BOOKS_DIR` 运行）；
-   剩余 `data/library/collection` 的界面目视验收，导入 2–3 本后在真实馆藏上走一遍。
-6. 可选：导出产物缓存、AZW3 生成/推送、PDF 导入（后期）。
+   接口级验收（`server/tests/real_books_acceptance.rs`，手动设置 `BORANLIB_BOOKS_DIR` 运行），
+   含抽样图片经图片代理实际出图；剩余 `data/library/collection` 的界面目视验收，导入 2–3 本后
+   在真实馆藏上走一遍。
+6. 固定版式 EPUB：正文画在 SVG 里的书目前读不出（`Sous le vent` 13 章全空，文字是 SVG
+   `<tspan>`）；`<svg><image>` 包栅格封面的情况（`诡秘之主` titlepage）可先提取图片。
+7. 可选：导出产物缓存、AZW3 生成/推送、PDF 导入（后期）。
 
 ## 三、已完成（保留记录，避免重复设计）
 
