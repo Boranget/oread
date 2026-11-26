@@ -368,7 +368,8 @@ pub fn parse_opf_import(xml: &str, book_url: &str) -> Result<OpfMeta, String> {
 }
 
 fn parse_opf_inner(xml: &str, fallback_book_url: Option<&str>) -> Result<OpfMeta, String> {
-    let package = parser::parse(xml).map_err(|e| format!("OPF XML 不良构: {e:?}"))?;
+    let package = parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
+        .map_err(|e| format!("OPF XML 不良构: {e:?}"))?;
     let doc = package.as_document();
     let root = doc
         .root()

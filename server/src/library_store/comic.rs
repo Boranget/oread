@@ -326,7 +326,8 @@ async fn read_comic_info(dir: &Path) -> ComicInfo {
 }
 
 fn parse_comic_info(xml: &str) -> ComicInfo {
-    let Ok(package) = sxd_document::parser::parse(xml) else {
+    let Ok(package) = sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
+    else {
         return ComicInfo::default();
     };
     let doc = package.as_document();

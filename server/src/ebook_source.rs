@@ -218,7 +218,22 @@ pub async fn load_dir_content(
         return Ok(None);
     }
     let Some(mut body) = store_read::load_chapter(&opened.dir, item).await? else {
-        return Ok(None);
+        // 书源书的章节文件只是抓取缓存/占位，解析不出正文时仍应回退到网络；
+        // 只有本地合成章节（`local:<book>#<id>`）没有书源可回退，返回空正文让
+        // 阅读端显示空白页（SVG 封面、空页），而不是落到「source not found」。
+        if !chapter_url.starts_with("local:") {
+            return Ok(None);
+        }
+        let _ = crate::library::touch_book(pool, book_url).await;
+        return Ok(Some(BookContent {
+            book_url: book_url.to_string(),
+            url: chapter_url.to_string(),
+            title: Some(item.title.clone()),
+            content: Some(String::new()),
+            chapter_index: pos as i64,
+            content_type: "text".into(),
+            ..Default::default()
+        }));
     };
     // 章内插图存的是 `images/<hash>.jpg` 这类相对路径（EPUB 需要相对地址）；
     // 阅读端统一改成 `oread-img://` 本地 URL，走同一个图片代理（含墨水屏转码）。

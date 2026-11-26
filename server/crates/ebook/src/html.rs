@@ -5,7 +5,7 @@
 //!
 //! - 标题（`h1`–`h6`）保留层级；
 //! - 块级元素（`p`/`div`/`li`/`blockquote`/表格单元）各自成段；
-//! - `<br>` 与文本里的换行断段；
+//! - `<br>` 断段；纯文本块（无行内元素）里的换行也断段，含行内元素的块按排版空白折叠；
 //! - 行内标签只取文字（不强求保留粗体/颜色，阅读器可自行排版）；
 //! - `<img>` 成为独立图片块（兼容懒加载属性，过滤非法地址与跟踪像素）；
 //! - `script`/`style`/`svg`/视频等直接丢弃，避免 EPUB 里出现脚本与外链资源。
@@ -123,6 +123,13 @@ impl Builder {
 fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
     match node.value() {
         Node::Text(t) => {
+            // 换行只在“块级文本”里当分段：纯文本正文、`<div>一行\n两行</div>`。
+            // 行内元素里的换行（排版过的 XHTML、MathML 的 `<mi>`/`<mo>` 之间）只是
+            // 空白，必须折叠成空格；否则每个符号都会变成独立段落。
+            if !text_breaks_paragraphs(&node) {
+                b.push(&t.text);
+                return;
+            }
             let mut first = true;
             for part in t.text.split('\n') {
                 if !first {
@@ -415,6 +422,30 @@ fn is_block(name: &str) -> bool {
     )
 }
 
+/// 文本节点里的换行是否应当分段。
+///
+/// 只有直接挂在块级容器（`p`/`div`/`td`…）或文档根上、且该容器里没有任何
+/// 子元素的文本才按换行分段（纯文本正文、`<div>一行\n两行</div>`）。
+/// 一旦块里有行内元素（`<b>`、MathML、`<img>`…），换行就只是源码排版，
+/// 必须折叠成空格；否则排版过的 XHTML 会把一句话拆成多段，公式会一个符号一段。
+fn text_breaks_paragraphs(node: &NodeRef<'_, Node>) -> bool {
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    match parent.value() {
+        Node::Element(el) => {
+            let name = el.name();
+            let block = is_block(name) || name == "body" || name == "html";
+            block
+                && !parent
+                    .children()
+                    .any(|c| matches!(c.value(), Node::Element(_)))
+        }
+        Node::Document | Node::Fragment => true,
+        _ => true,
+    }
+}
+
 /// 折叠 HTML 空白：连续空白（含 `&nbsp;`、全角空格）变一个空格。
 fn collapse(s: &str) -> String {
     let cleaned: String = s
@@ -618,5 +649,50 @@ mod tests {
         assert!(to_blocks("").is_empty());
         assert!(to_blocks(" \n\t \n").is_empty());
         assert!(to_blocks("<div>   </div>").is_empty());
+    }
+
+    #[test]
+    fn newlines_inside_inline_markup_are_spaces() {
+        let blocks = to_blocks("<p>Hello <b>world\nagain</b> end</p>");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph("Hello world again end".into())]
+        );
+    }
+
+    #[test]
+    fn newlines_in_block_text_still_split_paragraphs() {
+        let blocks = to_blocks("<div>第一行\n第二行</div>");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("第一行".into()),
+                Block::Paragraph("第二行".into()),
+            ]
+        );
+    }
+
+    // 真实 EPUB 的 MathML 是逐元素排版的；换行不能被当成段落分隔，否则矩阵会
+    // 变成一个符号一段。这里保证公式整体落在一个段落里，符号之间保留空格。
+    #[test]
+    fn pretty_printed_mathml_stays_in_one_paragraph() {
+        let blocks = to_blocks(
+            "<p><math>\n  <mrow>\n    <mi>A</mi>\n    <mo>=</mo>\n    <mn>1</mn>\n  </mrow>\n</math></p>",
+        );
+        assert_eq!(blocks, vec![Block::Paragraph("A = 1".into())]);
+    }
+
+    // 含行内元素的块里，源码换行只是排版，不能把一句话拆成多段。
+    #[test]
+    fn pretty_printed_prose_with_inline_math_stays_one_paragraph() {
+        let blocks = to_blocks(
+            "<p>Suppose\n<math><mi>A</mi></math>\nis a square matrix\nof size <math><mi>n</mi></math>.</p>",
+        );
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(
+                "Suppose A is a square matrix of size n.".into()
+            )]
+        );
     }
 }

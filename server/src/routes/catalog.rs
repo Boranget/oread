@@ -486,13 +486,29 @@ async fn book_detail(
     let status = user.status.get(&book_url).cloned().unwrap_or_default();
     let group = user.group.get(&book_url).cloned().unwrap_or_default();
 
-    let chapters: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+    let mut chapters: Vec<(String, Option<String>, i64)> = sqlx::query_as(
         "SELECT url, title, \"index\" FROM library_chapters \
          WHERE book_url = ?1 ORDER BY \"index\" LIMIT 20000",
     )
     .bind(&book_url)
     .fetch_all(&s.library)
     .await?;
+    if chapters.is_empty() {
+        // 本地导入 / 管理员建目录的书，章节只在书目录（OPF spine / 边车）里，
+        // `library_chapters` 是书源缓存表。详情页与 `/api/book/toc` 必须看到同一份目录。
+        match crate::ebook_source::load_dir_toc(&s.store(), &book_url).await {
+            Ok(Some(dir_chapters)) => {
+                chapters = dir_chapters
+                    .into_iter()
+                    .map(|c| (c.url, c.title, c.index))
+                    .collect();
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(book_url, error = %err, "read dir toc for detail failed");
+            }
+        }
+    }
     let toc = chapters
         .iter()
         .map(|(url, title, index)| {

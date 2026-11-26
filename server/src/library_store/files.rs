@@ -398,7 +398,7 @@ fn validate_text(rel: &str, text: &str, book_url: &str) -> Result<(), EditError>
     }
     let ext = ext_of(rel);
     if matches!(ext.as_str(), "xhtml" | "html" | "xml" | "opf" | "ncx") {
-        sxd_document::parser::parse(text)
+        sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(text))
             .map_err(|e| EditError::BadRequest(format!("{rel} 不是良构 XML: {e:?}")))?;
     }
     if ext == "opf" {
@@ -822,7 +822,8 @@ struct ManifestItem {
 }
 
 fn parse_package(xml: &str) -> Result<(Vec<ManifestItem>, Vec<String>), String> {
-    let package = sxd_document::parser::parse(xml).map_err(|e| format!("XML 不良构: {e:?}"))?;
+    let package = sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
+        .map_err(|e| format!("XML 不良构: {e:?}"))?;
     let doc = package.as_document();
     let root = doc
         .root()
@@ -863,7 +864,8 @@ fn parse_package(xml: &str) -> Result<(Vec<ManifestItem>, Vec<String>), String> 
 }
 
 pub(crate) fn parse_container_rootfile(xml: &str) -> Result<String, String> {
-    let package = sxd_document::parser::parse(xml).map_err(|e| format!("XML 不良构: {e:?}"))?;
+    let package = sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
+        .map_err(|e| format!("XML 不良构: {e:?}"))?;
     let doc = package.as_document();
     for child in doc.root().children() {
         if let Some(el) = child.element() {
@@ -1197,7 +1199,11 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
         if item.media_type == "application/xhtml+xml" || item.media_type == "text/html" {
             match tokio::fs::read_to_string(&path).await {
                 Ok(xhtml) => {
-                    if sxd_document::parser::parse(&xhtml).is_err() {
+                    if sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(
+                        &xhtml,
+                    ))
+                    .is_err()
+                    {
                         push_issue(
                             &mut issues,
                             "error",
@@ -1327,73 +1333,75 @@ pub async fn check_book(store: &Store, book_url: &str) -> Result<CheckReport, Ed
     let mut nav_targets: HashSet<String> = HashSet::new();
     let mut nav_anchor_count = 0usize;
     match tokio::fs::read_to_string(&nav_path).await {
-        Ok(nav) => match sxd_document::parser::parse(&nav) {
-            Ok(package) => {
-                let doc = package.as_document();
-                let mut anchors = Vec::new();
-                for child in doc.root().children() {
-                    if let Some(el) = child.element() {
-                        find_all(el, "a", &mut anchors);
-                    }
-                }
-                for a in anchors {
-                    let href = attr(a, "href");
-                    if href.trim().is_empty() {
-                        push_issue(
-                            &mut issues,
-                            "warning",
-                            "nav_link_empty",
-                            Some(format!("OEBPS/{}", nav_item.href)),
-                            "导航链接缺少 href",
-                        );
-                        continue;
-                    }
-                    let target = super::href_to_path(strip_query_fragment(href.trim()));
-                    if target.is_empty() {
-                        continue;
-                    }
-                    let target = target.as_str();
-                    match resolve_path(&opened.dir.join("OEBPS"), target) {
-                        Ok(p) if p.is_file() => {
-                            if let Some(norm) = normalize_book_href(target) {
-                                nav_anchor_count += 1;
-                                if !spine_set.contains(&norm) {
-                                    push_issue(
-                                        &mut issues,
-                                        "warning",
-                                        "nav_link_not_in_spine",
-                                        Some(format!("OEBPS/{}", nav_item.href)),
-                                        format!("导航项不在阅读顺序中: {href}"),
-                                    );
-                                }
-                                nav_targets.insert(norm);
-                            }
+        Ok(nav) => {
+            match sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(&nav)) {
+                Ok(package) => {
+                    let doc = package.as_document();
+                    let mut anchors = Vec::new();
+                    for child in doc.root().children() {
+                        if let Some(el) = child.element() {
+                            find_all(el, "a", &mut anchors);
                         }
-                        Ok(_) => push_issue(
-                            &mut issues,
-                            "error",
-                            "nav_link_missing",
-                            Some(format!("OEBPS/{}", nav_item.href)),
-                            format!("导航链接指向的文件不存在: {href}"),
-                        ),
-                        Err(_) => push_issue(
-                            &mut issues,
-                            "error",
-                            "nav_link_path",
-                            Some(format!("OEBPS/{}", nav_item.href)),
-                            format!("导航链接路径越界: {href}"),
-                        ),
+                    }
+                    for a in anchors {
+                        let href = attr(a, "href");
+                        if href.trim().is_empty() {
+                            push_issue(
+                                &mut issues,
+                                "warning",
+                                "nav_link_empty",
+                                Some(format!("OEBPS/{}", nav_item.href)),
+                                "导航链接缺少 href",
+                            );
+                            continue;
+                        }
+                        let target = super::href_to_path(strip_query_fragment(href.trim()));
+                        if target.is_empty() {
+                            continue;
+                        }
+                        let target = target.as_str();
+                        match resolve_path(&opened.dir.join("OEBPS"), target) {
+                            Ok(p) if p.is_file() => {
+                                if let Some(norm) = normalize_book_href(target) {
+                                    nav_anchor_count += 1;
+                                    if !spine_set.contains(&norm) {
+                                        push_issue(
+                                            &mut issues,
+                                            "warning",
+                                            "nav_link_not_in_spine",
+                                            Some(format!("OEBPS/{}", nav_item.href)),
+                                            format!("导航项不在阅读顺序中: {href}"),
+                                        );
+                                    }
+                                    nav_targets.insert(norm);
+                                }
+                            }
+                            Ok(_) => push_issue(
+                                &mut issues,
+                                "error",
+                                "nav_link_missing",
+                                Some(format!("OEBPS/{}", nav_item.href)),
+                                format!("导航链接指向的文件不存在: {href}"),
+                            ),
+                            Err(_) => push_issue(
+                                &mut issues,
+                                "error",
+                                "nav_link_path",
+                                Some(format!("OEBPS/{}", nav_item.href)),
+                                format!("导航链接路径越界: {href}"),
+                            ),
+                        }
                     }
                 }
+                Err(e) => push_issue(
+                    &mut issues,
+                    "error",
+                    "nav_invalid",
+                    Some(format!("OEBPS/{}", nav_item.href)),
+                    format!("nav 不是良构 XML: {e:?}"),
+                ),
             }
-            Err(e) => push_issue(
-                &mut issues,
-                "error",
-                "nav_invalid",
-                Some(format!("OEBPS/{}", nav_item.href)),
-                format!("nav 不是良构 XML: {e:?}"),
-            ),
-        },
+        }
         Err(e) => push_issue(
             &mut issues,
             "error",

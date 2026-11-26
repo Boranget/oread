@@ -803,7 +803,13 @@ fn sanitize_tree(book_dir: &Path) -> Result<(), ImportError> {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if matches!(ext.as_str(), "xhtml" | "html" | "htm") {
-                let raw = fs::read_to_string(&path)?;
+                let bytes = fs::read(&path)?;
+                let Ok(raw) = String::from_utf8(bytes) else {
+                    // 不符合 EPUB 规范但真实存在：非 UTF-8 章节。不能按 UTF-8 重写，
+                    // 否则正文会被替换成乱码；保留原文件，读取端仍用容错 HTML 解析。
+                    tracing::warn!(file = %rel, "XHTML 不是 UTF-8，跳过脚本清理");
+                    continue;
+                };
                 validate_xhtml_resources(&raw, &rel)?;
                 let clean = sanitize_xhtml(&raw);
                 if clean != raw {
@@ -811,8 +817,10 @@ fn sanitize_tree(book_dir: &Path) -> Result<(), ImportError> {
                 }
                 validate_xhtml_resources(&fs::read_to_string(&path)?, &rel)?;
             } else if ext == "css" {
-                let raw = fs::read_to_string(&path)?;
-                validate_css(&raw, &rel)?;
+                // CSS 只做外链检查，不需要重写；真实 EPUB 里常有 Shift_JIS 注释，
+                // 按 UTF-8 读会直接让整次导入失败。ASCII 规则在 lossy 解码后仍然可靠。
+                let raw = fs::read(&path)?;
+                validate_css(&String::from_utf8_lossy(&raw), &rel)?;
             }
         }
     }
@@ -906,7 +914,8 @@ fn check_resource_url(raw: &str, file: &str, tag: &str) -> Result<(), ImportErro
 // ---------------------------------------------------------------------------
 
 fn manifest_items(xml: &str) -> Vec<(String, String, String, String)> {
-    let Ok(package) = sxd_document::parser::parse(xml) else {
+    let Ok(package) = sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
+    else {
         return Vec::new();
     };
     let doc = package.as_document();
@@ -979,7 +988,8 @@ fn ncx_titles(book_dir: &Path, meta: &opf::OpfMeta) -> Option<HashMap<String, St
         })
         .map(|r| r.href.clone())?;
     let xml = fs::read_to_string(book_dir.join("OEBPS").join(&ncx_href)).ok()?;
-    let package = sxd_document::parser::parse(&xml).ok()?;
+    let package =
+        sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(&xml)).ok()?;
     let doc = package.as_document();
     let dir = parent_dir(&ncx_href);
     let mut out = HashMap::new();
