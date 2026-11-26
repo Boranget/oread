@@ -74,6 +74,8 @@ export function blocksToParas(blocks, base) {
     } else if (type === 'paragraph') {
       const text = String(b.text || '').trim();
       if (text) out.push({ type: 'text', text });
+    } else if (type === 'divider') {
+      out.push({ type: 'divider' });
     } else if (type === 'list') {
       const items = Array.isArray(b.items) ? b.items : [];
       const counters = [];
@@ -96,6 +98,30 @@ export function blocksToParas(blocks, base) {
     } else if (type === 'code') {
       const text = String(b.text || '').replace(/[\r\n]+$/, '');
       if (text.trim()) out.push({ type: 'code', text });
+    } else if (type === 'table') {
+      const rows = (Array.isArray(b.rows) ? b.rows : [])
+        .map((row) => ({
+          header: !!row.header,
+          cells: (Array.isArray(row.cells) ? row.cells : [])
+            .map((cell) => ({
+              text: String((cell && cell.text) || '').trim(),
+              colspan: Math.max(1, Math.min(64, Number(cell && cell.colspan) || 1)),
+              rowspan: Math.max(1, Math.min(64, Number(cell && cell.rowspan) || 1)),
+              header: !!(cell && cell.header),
+            })),
+        }))
+        .filter((row) => row.cells.length);
+      if (rows.length) {
+        const caption = String(b.caption || '').trim();
+        const text = [caption, ...rows.map((r) => r.cells.map((c) => c.text).join(' | '))]
+          .filter(Boolean)
+          .join('\n');
+        out.push({ type: 'table', caption, rows, text });
+      }
+    } else if (type === 'math') {
+      const mathml = String(b.mathml || '').trim();
+      const text = String(b.text || '').trim();
+      if (mathml || text) out.push({ type: 'math', mathml, text });
     }
   }
   return out;

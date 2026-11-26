@@ -39,7 +39,7 @@ use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use boranlib_ebook::html::{code_to_html, list_to_html, Block};
+use boranlib_ebook::html::{code_to_html, list_to_html, math_to_html, table_to_html, Block};
 
 pub use opf::{ChapterItem, CoverItem, ImageItem, OpfMeta, ResourceItem};
 
@@ -624,6 +624,9 @@ fn chapter_xhtml_marked(language: &str, title: &str, blocks: &[Block], pending: 
                     boranlib_ebook::xml::xml_escape(alt)
                 );
             }
+            Block::Table(table) => s.push_str(&table_to_html(table)),
+            Block::Math { mathml, text } => s.push_str(&math_to_html(mathml, text)),
+            Block::Divider => s.push_str("<hr/>\n"),
         }
     }
     s.push_str("</body>\n</html>\n");

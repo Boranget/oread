@@ -8,8 +8,8 @@
 //! cargo test --test real_books_acceptance -- --ignored --nocapture
 //! ```
 //!
-//! 每个采样章节都会打印块类型统计；表格与 MathML 目前只作为纯文本进入块，
-//! 这里统计命中章节数，供后续 `Block::Table` / 公式设计取样。
+//! 每个采样章节都会打印块类型统计；表格 / MathML / SVG 章节会额外取正文，
+//! 断言真表格、独立公式、纯 SVG 正文与 SVG 封面都能恢复成对应块。
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -190,6 +190,35 @@ struct Totals {
     word_bytes: usize,
 }
 
+/// 单本书的专项探针：真表格、独立公式、SVG 正文与封面的恢复情况。
+#[derive(Default)]
+struct BookProbe {
+    table_blocks: usize,
+    math_blocks: usize,
+    svg_checked: usize,
+    svg_empty: usize,
+    svg_with_text: usize,
+    svg_with_images: usize,
+}
+
+async fn fetch_blocks(
+    app: &axum::Router,
+    token: &str,
+    book_url: &str,
+    url: &str,
+) -> Option<Vec<Value>> {
+    let uri = format!(
+        "/api/book/content?{}",
+        query(&[("source", ""), ("chapter_url", url), ("book_url", book_url),])
+    );
+    let resp = app.clone().oneshot(authed_get(&uri, token)).await.ok()?;
+    if resp.status() != StatusCode::OK {
+        return None;
+    }
+    let body = body_json(resp).await;
+    Some(body["blocks"].as_array().cloned().unwrap_or_default())
+}
+
 #[tokio::test]
 #[ignore = "需要 BORANLIB_BOOKS_DIR 指向真实 EPUB 目录"]
 async fn real_books_import_and_read() {
@@ -351,6 +380,7 @@ async fn real_books_import_and_read() {
     }
 
     println!("\n=== 逐本详情 + 抽样正文 ===");
+    let mut probes: Vec<(String, BookProbe)> = Vec::new();
     for (book_url, file_name, expect_chapters) in &imported {
         let resp = app
             .clone()
@@ -409,14 +439,17 @@ async fn real_books_import_and_read() {
             .collect();
         totals.chapters += read_urls.len();
 
-        // 表格 / MathML 只在原始章节文件里还认得出来：归一化成块以后表格会变成
-        // 逐个单元格的段落。这里扫源文件，给后续 `Block::Table` / 公式设计取样。
+        // 表格 / MathML / SVG 只在原始章节文件里还认得出来；这里扫源文件并收集
+        // 章节地址，随后逐章取正文，验证归一化后的块类型。
         let mut raw_tables = 0usize;
         let mut raw_math = 0usize;
         let mut raw_svg = 0usize;
         let mut table_chapters = 0usize;
         let mut math_chapters = 0usize;
         let mut first_table: Option<(String, String)> = None;
+        let mut svg_urls: Vec<(String, String)> = Vec::new();
+        let mut table_urls: Vec<(String, String)> = Vec::new();
+        let mut math_urls: Vec<(String, String)> = Vec::new();
         if let Ok(Some(opened)) = store.open_book(book_url).await {
             for item in &opened.meta.chapters {
                 if item.is_volume {
@@ -426,32 +459,39 @@ async fn real_books_import_and_read() {
                 else {
                     continue;
                 };
+                let url = item.url.clone().unwrap_or_else(|| {
+                    boranlib::ebook_source::local_chapter_url(book_url, &item.id)
+                });
                 let t = raw.matches("<table").count();
                 let m = raw.matches("<math").count();
+                let s = raw.matches("<svg").count();
                 raw_tables += t;
                 raw_math += m;
-                raw_svg += raw.matches("<svg").count();
+                raw_svg += s;
                 if t > 0 {
                     table_chapters += 1;
+                    table_urls.push((url.clone(), item.title.clone()));
                     if first_table.is_none() {
-                        let url = item.url.clone().unwrap_or_else(|| {
-                            boranlib::ebook_source::local_chapter_url(book_url, &item.id)
-                        });
-                        first_table = Some((url, item.title.clone()));
+                        first_table = Some((url.clone(), item.title.clone()));
                     }
                 }
                 if m > 0 {
                     math_chapters += 1;
+                    math_urls.push((url.clone(), item.title.clone()));
+                }
+                if s > 0 {
+                    svg_urls.push((url, item.title.clone()));
                 }
             }
         }
         totals.table_chapters += table_chapters;
         totals.math_chapters += math_chapters;
         println!(
-            "    源文件：table={raw_tables}（{table_chapters} 章） math={raw_math}（{math_chapters} 章） svg={raw_svg}"
+            "    源文件：table={raw_tables}（{table_chapters} 章） math={raw_math}（{math_chapters} 章） svg={raw_svg}（{} 章）",
+            svg_urls.len()
         );
 
-        // 表格章节取样：直接看归一化后的块长什么样，确认当前“拆成单元格段落”的行为。
+        // 表格章节取样：直接看归一化后的块长什么样。
         if let Some((url, title)) = first_table {
             let uri = format!(
                 "/api/book/content?{}",
@@ -483,6 +523,48 @@ async fn real_books_import_and_read() {
                 println!("    [表格章节读取失败] {status}: {body}");
             }
         }
+
+        // 专项探针：SVG 正文/封面、真表格、独立公式。
+        let mut probe = BookProbe::default();
+        for (url, _title) in svg_urls.iter().take(40) {
+            if let Some(blocks) = fetch_blocks(&app, &token, book_url, url).await {
+                probe.svg_checked += 1;
+                if blocks.is_empty() {
+                    probe.svg_empty += 1;
+                }
+                if blocks.iter().any(|b| b["type"] == "image") {
+                    probe.svg_with_images += 1;
+                }
+                if blocks.iter().any(|b| {
+                    matches!(
+                        b["type"].as_str(),
+                        Some("paragraph") | Some("heading") | Some("list")
+                    )
+                }) {
+                    probe.svg_with_text += 1;
+                }
+            }
+        }
+        for (url, _title) in table_urls.iter().take(40) {
+            if let Some(blocks) = fetch_blocks(&app, &token, book_url, url).await {
+                probe.table_blocks += blocks.iter().filter(|b| b["type"] == "table").count();
+            }
+        }
+        for (url, _title) in math_urls.iter().take(40) {
+            if let Some(blocks) = fetch_blocks(&app, &token, book_url, url).await {
+                probe.math_blocks += blocks.iter().filter(|b| b["type"] == "math").count();
+            }
+        }
+        println!(
+            "    专项：SVG 章={} 空={} 含文字={} 含图={} table 块={} math 块={}",
+            probe.svg_checked,
+            probe.svg_empty,
+            probe.svg_with_text,
+            probe.svg_with_images,
+            probe.table_blocks,
+            probe.math_blocks
+        );
+        probes.push((file_name.clone(), probe));
 
         let picked = sample_indices(read_urls.len(), 25);
         let mut book_images = 0usize;
@@ -579,6 +661,59 @@ async fn real_books_import_and_read() {
         totals.math_chapters,
         totals.word_bytes,
     );
+
+    let probe_of = |needle: &str| -> &BookProbe {
+        probes
+            .iter()
+            .find(|(name, _)| name.contains(needle))
+            .map(|(_, p)| p)
+            .unwrap_or_else(|| panic!("未找到验收书：{needle}"))
+    };
+
+    // P0：固定版式 SVG 正文必须恢复出文字，SVG 封面必须恢复为图片块。
+    let sous = probe_of("Sous le vent");
+    assert_eq!(sous.svg_checked, 13, "Sous le vent 应有 13 个 SVG 章节");
+    assert!(
+        sous.svg_with_text >= 10,
+        "Sous le vent 应恢复出至少 10 章 SVG 文字，实际 {}",
+        sous.svg_with_text
+    );
+    assert!(
+        sous.svg_with_images >= 2,
+        "Sous le vent 应恢复出至少 2 页 SVG 图片，实际 {}",
+        sous.svg_with_images
+    );
+    assert!(
+        sous.svg_empty <= 1,
+        "Sous le vent 只允许 1 个真正的空白 SVG 页，实际 {}",
+        sous.svg_empty
+    );
+    let secret = probe_of("诡秘之主");
+    assert!(secret.svg_checked >= 1, "诡秘之主 应有 SVG 封面章节");
+    assert!(
+        secret.svg_with_images >= 1,
+        "诡秘之主 的 SVG 封面应恢复为图片块"
+    );
+
+    // P1：真表格识别；单格公式包装表与 1 行 2 图版式表保持原状。
+    let spec = probe_of("EPUB 3.0 Specification");
+    assert!(
+        spec.table_blocks >= 1,
+        "EPUB 3.0 规范应识别出真表格，实际 {} 个",
+        spec.table_blocks
+    );
+    let la = probe_of("A First Course in Linear Algebra");
+    assert!(
+        la.math_blocks >= 1,
+        "线性代数应识别出独立公式，实际 {} 个",
+        la.math_blocks
+    );
+    assert_eq!(
+        la.table_blocks, 0,
+        "线性代数的 505 个单格公式包装表不应变成数据表"
+    );
+    let jack = probe_of("The House That Jack Built");
+    assert_eq!(jack.table_blocks, 0, "绘本的 1 行 2 图版式表不应变成数据表");
 
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(totals.content_failures, 0, "存在导入/正文失败，见上方日志");

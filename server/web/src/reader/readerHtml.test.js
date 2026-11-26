@@ -89,3 +89,45 @@ test('blocksToParas 按语义块渲染标题、段落与图片', () => {
   ]);
   assert.deepEqual(blocksToParas(null, 'https://a.test/'), []);
 });
+
+test('blocksToParas 保留表格行列与公式', () => {
+  const blocks = [
+    {
+      type: 'table',
+      caption: '参数',
+      rows: [
+        { header: true, cells: [{ text: '名称', colspan: 1, rowspan: 1, header: true }] },
+        {
+          header: false,
+          cells: [
+            { text: 'A', colspan: 2, rowspan: 1, header: false },
+            { text: '', colspan: 1, rowspan: 1, header: false },
+          ],
+        },
+      ],
+    },
+    { type: 'math', mathml: '<math><mi>x</mi></math>', text: 'x' },
+  ];
+  assert.deepEqual(blocksToParas(blocks, 'https://a.test/'), [
+    {
+      type: 'table',
+      caption: '参数',
+      rows: [
+        { header: true, cells: [{ text: '名称', colspan: 1, rowspan: 1, header: true }] },
+        {
+          header: false,
+          cells: [
+            { text: 'A', colspan: 2, rowspan: 1, header: false },
+            { text: '', colspan: 1, rowspan: 1, header: false },
+          ],
+        },
+      ],
+      text: '参数\n名称\nA | ',
+    },
+    { type: 'math', mathml: '<math><mi>x</mi></math>', text: 'x' },
+  ]);
+});
+
+test('blocksToParas 保留分隔线', () => {
+  assert.deepEqual(blocksToParas([{ type: 'divider' }], 'https://a.test/'), [{ type: 'divider' }]);
+});

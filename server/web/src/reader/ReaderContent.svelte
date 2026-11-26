@@ -179,6 +179,31 @@
                 ><span class="rd-li-mark">{p.marker}</span>{p.text}</p>
               {:else if p.type === 'code'}
                 <pre class="rd-code" data-para={i}>{p.text}</pre>
+              {:else if p.type === 'divider'}
+                <hr class="rd-divider" data-para={i}>
+              {:else if p.type === 'table'}
+                <div class="rd-table-wrap" data-para={i}>
+                  <table class="rd-table">
+                    {#if p.caption}<caption>{p.caption}</caption>{/if}
+                    <tbody>
+                      {#each p.rows as row}
+                        <tr class:rd-thead={row.header}>
+                          {#each row.cells as cell}
+                            {#if cell.header || row.header}
+                              <th colspan={cell.colspan} rowspan={cell.rowspan}>{cell.text}</th>
+                            {:else}
+                              <td colspan={cell.colspan} rowspan={cell.rowspan}>{cell.text}</td>
+                            {/if}
+                          {/each}
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else if p.type === 'math'}
+                <div class="rd-math" data-para={i}>
+                  {#if p.mathml}{@html p.mathml}{:else}{p.text}{/if}
+                </div>
               {:else}
                 <p class="rd-p" data-para={i}>{p.text}</p>
               {/if}
@@ -325,6 +350,57 @@
     word-break: break-word;
     overflow-wrap: anywhere;
     tab-size: 4;
+  }
+  .rd-divider {
+    border: none;
+    border-top: 1px solid var(--rd-border, #bbb);
+    margin: 1.4em 0;
+  }
+  .rd-table-wrap {
+    margin: 0 0 1em;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .rd-content.paged .rd-table-wrap,
+  .rd-content.paged .rd-math {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+  .rd-table {
+    border-collapse: collapse;
+    min-width: 100%;
+    font-size: 0.92em;
+    line-height: 1.45;
+  }
+  .rd-table caption {
+    caption-side: top;
+    text-align: left;
+    font-weight: 600;
+    padding: 0 0 0.45em;
+  }
+  .rd-table th,
+  .rd-table td {
+    border: 1px solid var(--rd-border, #bbb);
+    padding: 0.35em 0.55em;
+    text-align: left;
+    vertical-align: top;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .rd-table th,
+  .rd-table tr.rd-thead td {
+    font-weight: 600;
+    background: rgba(127, 127, 127, 0.12);
+  }
+  .rd-math {
+    margin: 0.9em 0;
+    overflow-x: auto;
+    text-align: center;
+  }
+  .rd-math math {
+    font-size: 1.05em;
   }
   /* 内嵌图片：桌面居中 + max-width；手机满宽（颜色交给服务端灰度转码） */
   .rd-img {

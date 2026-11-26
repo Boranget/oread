@@ -18,19 +18,13 @@ use super::comic::{self, ComicChapter, ComicMeta, ComicPage};
 use super::read::{body_blocks, read_chapter_file};
 use super::{lock_book, text_blocks, ChapterItem, ImageItem, OpfMeta, Store, Tier};
 use crate::entities::{BookChapter, BookSource};
-use boranlib_ebook::html::{to_blocks, Block};
+use boranlib_ebook::html::{table_to_text, to_blocks, Block};
 
 /// 旧正文 HTML → 语义块。标题保留层级，图片保留图片块；空文本块丢弃。
 pub fn markup_to_blocks(html: &str) -> Vec<Block> {
     to_blocks(html)
         .into_iter()
-        .filter(|block| match block {
-            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => {
-                !text.trim().is_empty()
-            }
-            Block::List(items) => !items.is_empty(),
-            Block::Image { .. } => true,
-        })
+        .filter(Block::has_content)
         .collect()
 }
 
@@ -42,21 +36,19 @@ pub fn markup_to_paragraphs(html: &str) -> Vec<String> {
         .flat_map(|block| match block {
             Block::Paragraph(text) | Block::Heading(_, text) | Block::Code(text) => vec![text],
             Block::List(items) => items.into_iter().map(|i| i.text).collect(),
+            Block::Table(table) => vec![table_to_text(&table)],
+            Block::Math { text, .. } => vec![text],
+            Block::Divider => Vec::new(),
             Block::Image { .. } => Vec::new(),
         })
+        .filter(|text| !text.trim().is_empty())
         .collect()
 }
 
 fn blocks_of(xhtml: &str, title: &str) -> Vec<Block> {
     body_blocks(xhtml, title)
         .into_iter()
-        .filter(|block| match block {
-            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => {
-                !text.trim().is_empty()
-            }
-            Block::List(items) => !items.is_empty(),
-            Block::Image { .. } => true,
-        })
+        .filter(Block::has_content)
         .collect()
 }
 
@@ -524,7 +516,12 @@ pub async fn save_text_chapter_tracked(
         .first()
         .map(|b| match b {
             Block::Heading(_, text) | Block::Paragraph(text) => text.trim() == item.title.trim(),
-            Block::List(_) | Block::Code(_) | Block::Image { .. } => false,
+            Block::List(_)
+            | Block::Code(_)
+            | Block::Image { .. }
+            | Block::Table(_)
+            | Block::Math { .. }
+            | Block::Divider => false,
         })
         .unwrap_or(false);
     if first_is_title {

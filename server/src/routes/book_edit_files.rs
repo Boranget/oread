@@ -75,6 +75,23 @@ fn blocks_json(blocks: Vec<boranlib_ebook::html::Block>) -> Value {
                 }),
                 Block::Code(text) => json!({"type": "code", "text": text}),
                 Block::Image { src, alt } => json!({"type": "image", "src": src, "alt": alt}),
+                Block::Table(table) => json!({
+                    "type": "table",
+                    "caption": table.caption,
+                    "rows": table.rows.into_iter().map(|row| json!({
+                        "header": row.header,
+                        "cells": row.cells.into_iter().map(|cell| json!({
+                            "text": cell.text,
+                            "colspan": cell.colspan,
+                            "rowspan": cell.rowspan,
+                            "header": cell.header,
+                        })).collect::<Vec<_>>()
+                    })).collect::<Vec<_>>()
+                }),
+                Block::Divider => json!({"type": "divider"}),
+                Block::Math { mathml, text } => {
+                    json!({"type": "math", "mathml": mathml, "text": text})
+                }
             })
             .collect(),
     )

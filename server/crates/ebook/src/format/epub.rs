@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs::File;
 
 use crate::format::txt::normalize_author;
-use crate::html::{code_to_html, list_to_html, to_blocks, Block};
+use crate::html::{code_to_html, list_to_html, math_to_html, table_to_html, to_blocks, Block};
 use crate::model::{BookInput, BookMeta, ChapterRef, Format, WriteReport};
 use crate::pipeline::{ChapterReader, FormatWriter};
 use crate::xml::xml_escape;
@@ -33,6 +33,10 @@ p { margin: 0 0 0.7em; text-indent: 2em; }
 ul, ol { margin: 0 0 0.7em 1.4em; padding: 0; }
 li { margin: 0 0 0.3em; }
 blockquote { margin: 0.6em 1em; }
+table { border-collapse: collapse; margin: 0.8em 0; width: 100%; }
+th, td { border: 1px solid #999; padding: 0.3em 0.5em; text-align: left; vertical-align: top; }
+caption { font-weight: bold; margin-bottom: 0.4em; }
+.oread-math { margin: 0.8em 0; overflow-x: auto; }
 ";
 
 /// EPUB 写入器。
@@ -140,6 +144,9 @@ fn chapter_xhtml(meta: &BookMeta, ch: &ChapterRef, blocks: &[Block]) -> String {
                     xml_escape(alt)
                 ));
             }
+            Block::Table(table) => body.push_str(&table_to_html(table)),
+            Block::Math { mathml, text } => body.push_str(&math_to_html(mathml, text)),
+            Block::Divider => body.push_str("<hr/>\n"),
         }
     }
     format!(

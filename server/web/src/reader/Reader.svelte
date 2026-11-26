@@ -385,11 +385,25 @@
   $: effFont = font;
   $: effLine = lineHeight;
   $: displayTitle = convertZh(current?.title || chapters[currentPos]?.title || (info && info.name) || book.name || '', zhMode);
-  $: displayParas = paras.map((p) =>
-    p.type === 'text' || p.type === 'heading' || p.type === 'li'
-      ? { ...p, text: convertZh(p.text, zhMode) }
-      : p
-  );
+  $: displayParas = paras.map((p) => {
+    if (p.type === 'text' || p.type === 'heading' || p.type === 'li') {
+      return { ...p, text: convertZh(p.text, zhMode) };
+    }
+    if (p.type === 'table') {
+      return {
+        ...p,
+        caption: p.caption ? convertZh(p.caption, zhMode) : '',
+        rows: p.rows.map((row) => ({
+          ...row,
+          cells: row.cells.map((cell) => ({ ...cell, text: convertZh(cell.text, zhMode) })),
+        })),
+      };
+    }
+    if (p.type === 'math') {
+      return { ...p, text: convertZh(p.text || '', zhMode) };
+    }
+    return p;
+  });
   // 空正文不再渲染成“只有标题的空白页”：给出明确原因与可操作入口（重试/换源/下一章/目录）。
   $: chapterEmpty = !!current && !contentError && !contentLoading && displayParas.length === 0 && isEmptyChapter(current);
   $: emptyIsVolume = chapterEmpty && isVolumeTitle(displayTitle);
@@ -614,8 +628,12 @@
     if (!q) return;
     const p = paras.findIndex(
       (x) =>
-        (x.type === 'text' || x.type === 'li' || x.type === 'code') &&
-        x.text.toLowerCase().includes(q)
+        (x.type === 'text' ||
+          x.type === 'li' ||
+          x.type === 'code' ||
+          x.type === 'table' ||
+          x.type === 'math') &&
+        String(x.text || '').toLowerCase().includes(q)
     );
     if (p < 0) return;
     await new Promise((r) => setTimeout(r, 320));

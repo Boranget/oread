@@ -1589,7 +1589,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `url` | string | 否 | 章节 URL |
 | `title` | string | 是 | 章节标题；优先缓存值，其次请求参数 `title`，再按 `chapter_url` 反查 `library_chapters.title`；都拿不到才为 `null` |
 | `content` | string | 是 | 正文 HTML（经用户替换规则 + 图片样式处理），保留给 `/k` 与旧客户端 |
-| `blocks` | array | 否 | 语义块：`{type:"heading",level,text}` / `{type:"paragraph",text}` / `{type:"list",items:[{level,ordered,text}]}` / `{type:"code",text}` / `{type:"image",src,alt}`；Web 阅读器优先用它渲染。图片 `src` 可能是远程 http(s)，也可能是 `oread-img://<book_id>/OEBPS/images/<hash>` 本地地址，两者都交给 `/api/book/image` 代理 |
+| `blocks` | array | 否 | 语义块：`{type:"heading",level,text}` / `{type:"paragraph",text}` / `{type:"list",items:[{level,ordered,text}]}` / `{type:"code",text}` / `{type:"divider"}` / `{type:"image",src,alt}` / `{type:"table",caption,rows:[{header,cells:[{text,colspan,rowspan,header}]}]}` / `{type:"math",mathml,text}`；Web 阅读器优先用它渲染。图片 `src` 可能是远程 http(s)，也可能是 `oread-img://<book_id>/OEBPS/images/<hash>` 本地地址，两者都交给 `/api/book/image` 代理。表格只收多行多列、无图片的真表格；独立公式的 `mathml` 是清理后的原始标记，`text` 是给 `/k`、TXT 导出与搜索的回退文本 |
 | `chapter_index` | integer | 否 | 章节下标；新抓取时恒 0（前端用目录数据补全） |
 | `resource_url` | string | 是 | 当前 null |
 | `is_local` | boolean | 否 | 当前 false |
@@ -2195,9 +2195,12 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - `OEBPS/ch001.xhtml ...`：一章一文件（目录直接打包时保留目录内实际文件名，
     如 `OEBPS/chapters/ch-0001-*.xhtml`，不重命名）。
 - 正文归一化（`ebook::html`）：
-  - `h1`–`h6` 保留标题层级；`p` / `div` / `li` / `blockquote` / 表格单元等块级元素各成段；
+  - `h1`–`h6` 保留标题层级；`p` / `div` / `li` / `blockquote` 等块级元素各成段；
+  - 真表格导出为 `<table>`（保留表头、`colspan` / `rowspan`），独立公式导出为清理后的
+    MathML（空则退回纯文本）；
   - `<br>` 与文本换行断段；行内标签只取文字；
-  - `script` / `style` / `img` / `svg` / 音视频直接丢弃，避免 EPUB 里出现外链资源；
+  - `script` / `style` / 音视频直接丢弃；SVG 的 `<text>` / `<tspan>` 还原为段落，
+    `<image>` 还原为图片块，避免 EPUB 里出现外链资源；
   - 未缓存章节写占位段落，不静默丢章。
 - 元数据：
   - `dc:title` / `dc:language`（空则 `und`）/ `dc:creator`（剥“作者：”标签）；
@@ -2571,8 +2574,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   良构与图片存在性；并检查阅读顺序 / 目录一致性（spine 章节缺 nav 项、nav 项不在 spine、
   spine 重复引用、manifest 里孤立 XHTML、章节来源 URL 重复）。返回 `errors` / `warnings`
   / `issues[]`，每条问题带文件路径，前端可点击跳转。
-- 预览：把 XHTML 解析成与阅读器相同的语义块（标题/段落/列表/代码块/图片），图片地址
-  改写为本地代理 URL；只预览，不写盘。
+- 预览：把 XHTML 解析成与阅读器相同的语义块（标题 / 段落 / 列表 / 代码块 / 分隔线 / 图片 /
+  表格 / 公式），图片地址改写为本地代理 URL；表格与公式在预览里只读，要改请直接编辑源码。
+  只预览，不写盘。
 
 | 端点 | 说明 |
 |---|---|

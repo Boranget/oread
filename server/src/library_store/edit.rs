@@ -243,6 +243,9 @@ pub async fn chapter_paragraphs(
         .flat_map(|b| match b {
             Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => vec![text],
             Block::List(items) => items.into_iter().map(|i| i.text).collect(),
+            Block::Table(table) => vec![boranlib_ebook::html::table_to_text(&table)],
+            Block::Math { text, .. } => vec![text],
+            Block::Divider => Vec::new(),
             Block::Image { .. } => Vec::new(),
         })
         .filter(|text| !text.trim().is_empty())

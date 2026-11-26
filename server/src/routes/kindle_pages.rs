@@ -722,6 +722,7 @@ pub(super) fn paginate_lines(
 }
 
 /// `/k` 的一页：文字页、预格式化页或整页插图。
+#[derive(Debug)]
 pub(super) enum KPage {
     Text(String),
     Pre(String),
@@ -780,6 +781,109 @@ pub(super) fn plan_doc_pages(
             text.push_str(t);
             text.push('\n');
             *remaining -= count;
+        }
+    }
+
+    /// 表格按行转文本：表头在每页重复，按行预算分页，不做横向滚动。
+    fn push_table(
+        table: &boranlib_ebook::html::Table,
+        pages: &mut Vec<KPage>,
+        spec: &FsSpec,
+        budget: usize,
+        text_w: usize,
+        remaining: &mut usize,
+        truncated: &mut bool,
+    ) {
+        let em = line_em(spec, text_w);
+        let budget = budget.max(1);
+        let caption = table
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let row_line = |row: &boranlib_ebook::html::TableRow| {
+            row.cells
+                .iter()
+                .map(|c| c.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+
+        let mut header: Vec<String> = Vec::new();
+        let mut body: Vec<String> = Vec::new();
+        let mut seen_data = false;
+        for row in &table.rows {
+            let line = row_line(row);
+            if line.is_empty() {
+                continue;
+            }
+            let is_header = row.header || row.cells.iter().all(|c| c.header);
+            if is_header && !seen_data && header.len() < 2 {
+                header.push(line);
+            } else {
+                seen_data = true;
+                if *remaining == 0 {
+                    *truncated = true;
+                    break;
+                }
+                let count = line.chars().count() + 1;
+                if count > *remaining {
+                    let cut = line
+                        .char_indices()
+                        .nth(*remaining)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    body.push(line[..cut].to_string());
+                    *remaining = 0;
+                    *truncated = true;
+                    break;
+                }
+                *remaining -= count;
+                body.push(line);
+            }
+        }
+        if caption.is_none() && header.is_empty() && body.is_empty() {
+            return;
+        }
+
+        let mut cur = String::new();
+        let mut used = 0usize;
+        let mut cur_has_body = false;
+        let start = |cur: &mut String, used: &mut usize, caption: Option<&str>| {
+            *used = 0;
+            if let Some(c) = caption {
+                cur.push_str(c);
+                cur.push('\n');
+                *used += pre_lines(c, em);
+            }
+            for h in &header {
+                cur.push_str(h);
+                cur.push('\n');
+                *used += pre_lines(h, em);
+            }
+        };
+        start(&mut cur, &mut used, caption);
+
+        for line in &body {
+            let need = pre_lines(line, em).min(budget);
+            if cur_has_body && used + need > budget {
+                pages.push(KPage::Text(std::mem::take(&mut cur)));
+                start(&mut cur, &mut used, None);
+            }
+            cur.push_str(line);
+            cur.push('\n');
+            used += need;
+            cur_has_body = true;
+            if used >= budget {
+                pages.push(KPage::Text(std::mem::take(&mut cur)));
+                start(&mut cur, &mut used, None);
+                cur_has_body = false;
+            }
+        }
+        if cur_has_body || (pages.is_empty() && !cur.trim().is_empty()) {
+            pages.push(KPage::Text(cur));
         }
     }
 
@@ -883,6 +987,24 @@ pub(super) fn plan_doc_pages(
                     src: src.clone(),
                     alt: alt.clone(),
                 });
+            }
+            Block::Table(table) => {
+                flush(&mut text, &mut pages, spec, budget, text_w);
+                push_table(
+                    table,
+                    &mut pages,
+                    spec,
+                    budget,
+                    text_w,
+                    &mut remaining,
+                    &mut truncated,
+                );
+            }
+            Block::Divider => {
+                push_text("———", &mut text, &mut remaining, &mut truncated);
+            }
+            Block::Math { text: math, .. } => {
+                push_text(math, &mut text, &mut remaining, &mut truncated);
             }
         }
     }

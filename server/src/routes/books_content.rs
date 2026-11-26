@@ -238,6 +238,23 @@ fn blocks_json(html: &str) -> serde_json::Value {
             }),
             Block::Code(text) => json!({"type": "code", "text": text}),
             Block::Image { src, alt } => json!({"type": "image", "src": src, "alt": alt}),
+            Block::Table(table) => json!({
+                "type": "table",
+                "caption": table.caption,
+                "rows": table.rows.into_iter().map(|row| json!({
+                    "header": row.header,
+                    "cells": row.cells.into_iter().map(|cell| json!({
+                        "text": cell.text,
+                        "colspan": cell.colspan,
+                        "rowspan": cell.rowspan,
+                        "header": cell.header,
+                    })).collect::<Vec<_>>()
+                })).collect::<Vec<_>>()
+            }),
+            Block::Divider => json!({"type": "divider"}),
+            Block::Math { mathml, text } => {
+                json!({"type": "math", "mathml": mathml, "text": text})
+            }
         })
         .collect();
     json!(items)
@@ -848,6 +865,33 @@ mod tests {
                     {"level": 0, "ordered": false, "text": "二"}
                 ]},
                 {"type": "code", "text": "fn main() {\n    ok();\n}"}
+            ])
+        );
+    }
+
+    #[test]
+    fn blocks_json_maps_table_and_math() {
+        let v = blocks_json(
+            "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\
+             <div><math display=\"block\"><mfrac><mn>1</mn><mn>2</mn></mfrac></math></div>",
+        );
+        assert_eq!(v[0]["type"], "table");
+        assert_eq!(v[0]["rows"][0]["header"], true);
+        assert_eq!(v[0]["rows"][1]["cells"][1]["text"], "2");
+        assert_eq!(v[1]["type"], "math");
+        assert_eq!(v[1]["text"], "(1)/(2)");
+        assert!(v[1]["mathml"].as_str().unwrap().contains("<mfrac>"));
+    }
+
+    #[test]
+    fn blocks_json_maps_divider() {
+        let v = blocks_json("<p>上</p><hr/><p>下</p>");
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"type": "paragraph", "text": "上"},
+                {"type": "divider"},
+                {"type": "paragraph", "text": "下"}
             ])
         );
     }

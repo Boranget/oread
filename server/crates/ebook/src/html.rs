@@ -8,7 +8,11 @@
 //! - `<br>` 断段；纯文本块（无行内元素）里的换行也断段，含行内元素的块按排版空白折叠；
 //! - 行内标签只取文字（不强求保留粗体/颜色，阅读器可自行排版）；
 //! - `<img>` 成为独立图片块（兼容懒加载属性，过滤非法地址与跟踪像素）；
-//! - `script`/`style`/`svg`/视频等直接丢弃，避免 EPUB 里出现脚本与外链资源。
+//! - 真正的数据表保留行列、表头与 `colspan` / `rowspan`，版式表仍按普通内容降级；
+//! - 独立公式保留原始 MathML 给浏览器，另带一份纯文本给 `/k`、导出与搜索；
+//! - SVG 里的 `<image>` 提取为图片块，`<text>` / `<tspan>` 按行还原为段落；
+//! - `<hr>` 成为分隔块；`ruby` 只保留底字，`rt` / `rp` 注音丢弃，避免正文重复；
+//! - `script`/`style`/视频等直接丢弃，避免 EPUB 里出现脚本与外链资源。
 
 use ego_tree::NodeRef;
 use scraper::node::Element;
@@ -22,6 +26,30 @@ pub struct ListItem {
     pub text: String,
 }
 
+/// 表格单元格。`colspan` / `rowspan` 只保留布局信息，不在这里展开网格。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub text: String,
+    pub colspan: u8,
+    pub rowspan: u8,
+    pub header: bool,
+}
+
+/// 表格行。`header` 表示整行都是表头（`thead` 或全部 `th`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRow {
+    pub header: bool,
+    pub cells: Vec<TableCell>,
+}
+
+/// 数据表。只收多行多列、且不含图片的“真表格”；单格公式包装表和版式表
+/// 继续走原来的段落/图片路径，避免把版式当数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub caption: Option<String>,
+    pub rows: Vec<TableRow>,
+}
+
 /// 归一化后的正文块。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -31,16 +59,37 @@ pub enum Block {
     List(Vec<ListItem>),
     /// 预格式化文本（`<pre>` / 代码块）：保留换行与缩进，不做空白折叠。
     Code(String),
+    /// 分隔线（`<hr>`）：场景切换等，本身没有文字。
+    Divider,
     /// `src` 原样保留（相对地址由调用方按章节 URL 归一化），`alt` 可为空。
     Image {
         src: String,
         alt: String,
+    },
+    /// 数据表；行列与合并单元格信息保留，渲染时自行决定边框和分页。
+    Table(Table),
+    /// 独立公式：`mathml` 是清理后的原始标记，`text` 是给纯文本出口的回退。
+    Math {
+        mathml: String,
+        text: String,
     },
 }
 
 impl Block {
     pub fn is_image(&self) -> bool {
         matches!(self, Block::Image { .. })
+    }
+
+    /// 这一块有没有可见内容（图片、表格、公式都算）。
+    pub fn has_content(&self) -> bool {
+        match self {
+            Block::Heading(_, t) | Block::Paragraph(t) | Block::Code(t) => !t.trim().is_empty(),
+            Block::List(items) => items.iter().any(|i| !i.text.trim().is_empty()),
+            Block::Image { .. } => true,
+            Block::Divider => true,
+            Block::Table(table) => table.rows.iter().any(|r| !r.cells.is_empty()),
+            Block::Math { text, mathml } => !text.trim().is_empty() || !mathml.trim().is_empty(),
+        }
     }
 }
 
@@ -86,6 +135,108 @@ pub fn list_to_html(items: &[ListItem]) -> String {
 /// 代码块 → XHTML 片段。`<pre>` 保留换行与行首缩进。
 pub fn code_to_html(text: &str) -> String {
     format!("<pre>{}</pre>\n", crate::xml::xml_escape(text))
+}
+
+/// 表格 → XHTML 片段。样式内联，导出 EPUB 与阅读器都不依赖外部 CSS。
+pub fn table_to_html(table: &Table) -> String {
+    use crate::xml::xml_escape;
+
+    let mut out = String::from(
+        "<table style=\"border-collapse:collapse;width:100%;margin:0.8em 0;table-layout:auto\">\n",
+    );
+    if let Some(caption) = table.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+        out.push_str(&format!("<caption>{}</caption>\n", xml_escape(caption)));
+    }
+    for row in &table.rows {
+        out.push_str("<tr>\n");
+        for cell in &row.cells {
+            let tag = if cell.header || row.header {
+                "th"
+            } else {
+                "td"
+            };
+            out.push_str(&format!(
+                "<{tag} colspan=\"{}\" rowspan=\"{}\" style=\"border:1px solid #999;padding:0.3em 0.5em;text-align:left;vertical-align:top\">{}</{tag}>\n",
+                cell.colspan.max(1),
+                cell.rowspan.max(1),
+                xml_escape(&cell.text)
+            ));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</table>\n");
+    out
+}
+
+/// 公式 → XHTML 片段。MathML 为空时退回纯文本，保证任何出口都不出现空白。
+pub fn math_to_html(mathml: &str, text: &str) -> String {
+    use crate::xml::xml_escape;
+
+    if mathml.trim().is_empty() {
+        let text = text.trim();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("<p>{}</p>\n", xml_escape(text))
+        }
+    } else {
+        format!("<div class=\"oread-math\">{mathml}</div>\n")
+    }
+}
+
+/// 表格 → 纯文本：一行一条，单元格用 ` | ` 分隔，表头在前。
+pub fn table_to_text(table: &Table) -> String {
+    let mut lines = Vec::new();
+    if let Some(caption) = table.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+        lines.push(caption.trim().to_string());
+    }
+    for row in &table.rows {
+        let cells: Vec<&str> = row
+            .cells
+            .iter()
+            .map(|c| c.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !cells.is_empty() {
+            lines.push(cells.join(" | "));
+        }
+    }
+    lines.join("\n")
+}
+
+/// 块序列 → 纯文本。TXT 导出、搜索与 `/k` 共用同一套降级规则。
+pub fn blocks_to_text(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    let mut push = |text: &str| {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    };
+    for block in blocks {
+        match block {
+            Block::Heading(_, text) | Block::Paragraph(text) | Block::Code(text) => push(text),
+            Block::List(items) => {
+                for item in items {
+                    push(&item.text);
+                }
+            }
+            Block::Image { .. } => {}
+            Block::Divider => push("———"),
+            Block::Table(table) => push(&table_to_text(table)),
+            Block::Math { text, .. } => push(text),
+        }
+    }
+    out
+}
+
+/// 正文 HTML → 纯文本。保留段落换行，表格按行、公式按回退文本输出。
+pub fn to_text(html: &str) -> String {
+    blocks_to_text(&to_blocks(html))
 }
 
 /// 把一章正文转成块序列。纯文本输入同样适用（按换行断段）。
@@ -144,6 +295,32 @@ fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
             if is_skip(name) {
                 return;
             }
+            if name == "svg" {
+                b.flush();
+                walk_svg(node, b);
+                b.flush();
+                return;
+            }
+            if name == "table" {
+                if let Some(table) = table_of(&node) {
+                    b.flush();
+                    b.blocks.push(Block::Table(table));
+                    b.flush();
+                    return;
+                }
+                // 版式表（1 行 2 图、单格公式等）继续按普通内容走。
+            }
+            if name == "math" {
+                let (mathml, text) = math_of(&node);
+                if is_block_math(&node) && (!mathml.is_empty() || !text.is_empty()) {
+                    b.flush();
+                    b.blocks.push(Block::Math { mathml, text });
+                    b.flush();
+                } else if !text.is_empty() {
+                    b.push(&text);
+                }
+                return;
+            }
             if name == "img" {
                 b.flush();
                 if let Some((src, alt)) = image_of(el) {
@@ -161,6 +338,11 @@ fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
             }
             if name == "br" {
                 b.flush();
+                return;
+            }
+            if name == "hr" {
+                b.flush();
+                b.blocks.push(Block::Divider);
                 return;
             }
             if name == "ul" || name == "ol" {
@@ -215,6 +397,10 @@ fn inline_text<'a>(node: &NodeRef<'a, Node>) -> String {
                     out.push(' ');
                     continue;
                 }
+                if name == "math" {
+                    out.push_str(&math_text(n));
+                    continue;
+                }
                 let children: Vec<_> = n.children().collect();
                 stack.extend(children.into_iter().rev());
             }
@@ -239,6 +425,10 @@ fn list_item_text(node: &NodeRef<'_, Node>) -> String {
                 }
                 if name == "br" {
                     out.push(' ');
+                    continue;
+                }
+                if name == "math" {
+                    out.push_str(&math_text(n));
                     continue;
                 }
                 let children: Vec<_> = n.children().collect();
@@ -309,7 +499,615 @@ fn pre_text(node: &NodeRef<'_, Node>) -> String {
 fn is_skip(name: &str) -> bool {
     matches!(
         name,
-        "script" | "style" | "noscript" | "iframe" | "video" | "audio" | "source" | "svg"
+        "script" | "style" | "noscript" | "iframe" | "video" | "audio" | "source" | "rt" | "rp"
+    )
+}
+
+/// SVG 里只关心 `<image>` 与 `<text>`；`defs` 等定义树不参与正文。
+fn is_svg_skip(name: &str) -> bool {
+    matches!(
+        name,
+        "defs"
+            | "style"
+            | "script"
+            | "title"
+            | "desc"
+            | "metadata"
+            | "clippath"
+            | "mask"
+            | "pattern"
+            | "lineargradient"
+            | "radialgradient"
+            | "filter"
+            | "marker"
+            | "symbol"
+            | "use"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// SVG：固定版式书把文字画在 <text>/<tspan>，封面/扫描页放在 <image>
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SvgLine {
+    x: f64,
+    y: f64,
+    text: String,
+}
+
+fn walk_svg(node: NodeRef<'_, Node>, b: &mut Builder) {
+    for child in node.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        let name = el.name();
+        if is_svg_skip(name) {
+            continue;
+        }
+        if name == "image" {
+            if let Some((src, alt)) = svg_image_of(el) {
+                b.blocks.push(Block::Image { src, alt });
+            }
+            continue;
+        }
+        if name == "text" {
+            let (tx, ty) = transform_origin(el);
+            let base_x = tx + first_number(el, "x").unwrap_or(0.0);
+            let base_y = ty + first_number(el, "y").unwrap_or(0.0);
+            let mut lines = Vec::new();
+            collect_svg_text(child, base_x, base_y, &mut lines);
+            for text in svg_lines_to_paragraphs(lines) {
+                b.blocks.push(Block::Paragraph(text));
+            }
+            continue;
+        }
+        walk_svg(child, b);
+    }
+}
+
+/// 跨命名空间取属性：SVG 的 `xlink:href` 在 scraper 里是带命名空间的 `href`，
+/// `Element::attr("href")` 只找无命名空间属性，会漏掉封面图。
+fn attr_any_ns(el: &Element, name: &str) -> Option<String> {
+    let suffix = format!(":{name}");
+    el.attrs()
+        .find(|(k, _)| {
+            let key = k.to_string();
+            key == name || key.ends_with(&suffix)
+        })
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn svg_image_of(el: &Element) -> Option<(String, String)> {
+    let src = attr_any_ns(el, "href").or_else(|| attr_any_ns(el, "src"))?;
+    if !valid_img_src(&src) {
+        return None;
+    }
+    if let (Some(w), Some(h)) = (dim_attr(el, "width"), dim_attr(el, "height")) {
+        if w <= 2 && h <= 2 {
+            return None;
+        }
+    }
+    let alt = attr(el, "alt")
+        .or_else(|| attr(el, "aria-label"))
+        .unwrap_or_default();
+    Some((src, alt.chars().take(200).collect()))
+}
+
+fn collect_svg_text(node: NodeRef<'_, Node>, x: f64, y: f64, out: &mut Vec<SvgLine>) {
+    for child in node.children() {
+        match child.value() {
+            Node::Text(t) => {
+                let text = collapse(&t.text);
+                if !text.is_empty() {
+                    out.push(SvgLine { x, y, text });
+                }
+            }
+            Node::Element(el) => {
+                let name = el.name();
+                if is_svg_skip(name) {
+                    continue;
+                }
+                if name == "tspan" {
+                    let tx = first_number(el, "x").unwrap_or(0.0);
+                    let ty = first_number(el, "y").unwrap_or(0.0);
+                    let nx = x + tx;
+                    let ny = y + ty;
+                    let has_elements = child
+                        .children()
+                        .any(|c| matches!(c.value(), Node::Element(_)));
+                    if has_elements {
+                        collect_svg_text(child, nx, ny, out);
+                    } else {
+                        let text = collapse(&inline_text(&child));
+                        if !text.is_empty() {
+                            out.push(SvgLine { x: nx, y: ny, text });
+                        }
+                    }
+                    continue;
+                }
+                collect_svg_text(child, x, y, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 同一 `<text>` 里的多行按行距分组：行距突然变大或缩进变化就另起一段。
+fn svg_lines_to_paragraphs(lines: Vec<SvgLine>) -> Vec<String> {
+    let mut lines: Vec<SvgLine> = lines
+        .into_iter()
+        .filter(|l| !l.text.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut gaps: Vec<f64> = lines
+        .windows(2)
+        .map(|w| w[1].y - w[0].y)
+        .filter(|g| *g > 0.0 && *g < 1000.0)
+        .collect();
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // 最小行距比中位数稳：段落之间的大间距不会把基准抬高到看不出断段。
+    let base_gap = gaps.first().copied().unwrap_or(15.0).max(1.0);
+
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<SvgLine> = None;
+    for line in lines.drain(..) {
+        let brk = prev.as_ref().is_some_and(|p| {
+            let gap = line.y - p.y;
+            gap < -1.0 || gap > base_gap * 1.75 || (line.x - p.x).abs() > 4.0
+        });
+        if brk && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            join_svg_text(&mut cur, &line.text);
+        } else {
+            cur = line.text.trim().to_string();
+        }
+        prev = Some(line);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn join_svg_text(out: &mut String, next: &str) {
+    let next = next.trim();
+    if next.is_empty() {
+        return;
+    }
+    let last = out.chars().last();
+    let first = next.chars().next();
+    if out.ends_with('-') && first.is_some_and(|c| c.is_ascii_lowercase()) {
+        out.pop();
+    } else if last.is_some_and(is_cjk) || first.is_some_and(is_cjk) {
+        // 中日韩文字换行不加空格
+    } else {
+        out.push(' ');
+    }
+    out.push_str(next);
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F
+    ) || matches!(
+        c,
+        '\u{3001}'
+            | '\u{3002}'
+            | '\u{FF0C}'
+            | '\u{FF1A}'
+            | '\u{FF1B}'
+            | '\u{FF1F}'
+            | '\u{FF01}'
+            | '\u{300A}'
+            | '\u{300B}'
+            | '\u{3008}'
+            | '\u{3009}'
+    )
+}
+
+fn first_number(el: &Element, name: &str) -> Option<f64> {
+    let raw = el.attr(name)?;
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .find_map(|s| s.trim().parse::<f64>().ok())
+}
+
+/// `<text transform="matrix(a b c d e f)">` / `translate(x y)` 的平移量。
+fn transform_origin(el: &Element) -> (f64, f64) {
+    let Some(raw) = el.attr("transform") else {
+        return (0.0, 0.0);
+    };
+    let lower = raw.to_ascii_lowercase();
+    for (head, count) in [("matrix(", 6usize), ("translate(", 2)] {
+        if let Some(start) = lower.find(head) {
+            let rest = &raw[start + head.len()..];
+            let end = rest.find(')').unwrap_or(rest.len());
+            let nums: Vec<f64> = rest[..end]
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .collect();
+            if nums.len() >= count {
+                return if count == 6 {
+                    (nums[4], nums[5])
+                } else {
+                    (nums[0], nums[1])
+                };
+            }
+        }
+    }
+    (0.0, 0.0)
+}
+
+// ---------------------------------------------------------------------------
+// 表格：只收多行多列、无图片的数据表
+// ---------------------------------------------------------------------------
+
+fn table_of(node: &NodeRef<'_, Node>) -> Option<Table> {
+    if has_image_descendant(*node) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    collect_table_rows(*node, false, &mut rows);
+    if rows.len() < 2 {
+        return None;
+    }
+    let cols = rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.colspan.max(1) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    if cols < 2 {
+        return None;
+    }
+    let caption = first_descendant_text(*node, "caption").filter(|s| !s.is_empty());
+    Some(Table { caption, rows })
+}
+
+fn collect_table_rows(node: NodeRef<'_, Node>, in_thead: bool, out: &mut Vec<TableRow>) {
+    for child in node.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        match el.name() {
+            "thead" => collect_table_rows(child, true, out),
+            "tbody" | "tfoot" => collect_table_rows(child, false, out),
+            "tr" => {
+                if let Some(row) = table_row_of(child, in_thead) {
+                    out.push(row);
+                }
+            }
+            "table" => {}
+            _ => collect_table_rows(child, in_thead, out),
+        }
+    }
+}
+
+fn table_row_of(node: NodeRef<'_, Node>, in_thead: bool) -> Option<TableRow> {
+    let mut cells = Vec::new();
+    for child in node.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        let name = el.name();
+        if name != "td" && name != "th" {
+            continue;
+        }
+        let text = collapse(&inline_text(&child));
+        cells.push(TableCell {
+            text,
+            colspan: span_attr(el, "colspan"),
+            rowspan: span_attr(el, "rowspan"),
+            header: name == "th" || in_thead,
+        });
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    let header = in_thead || cells.iter().all(|c| c.header);
+    Some(TableRow { header, cells })
+}
+
+fn span_attr(el: &Element, name: &str) -> u8 {
+    el.attr(name)
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(1)
+        .clamp(1, 64) as u8
+}
+
+fn first_descendant_text(node: NodeRef<'_, Node>, tag: &str) -> Option<String> {
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            if el.name() == tag {
+                let text = collapse(&inline_text(&child));
+                return Some(text);
+            }
+            if let Some(found) = first_descendant_text(child, tag) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn has_image_descendant(node: NodeRef<'_, Node>) -> bool {
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            if matches!(el.name(), "img" | "image") || has_image_descendant(child) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// MathML：原始标记给浏览器，纯文本给 /k、导出与搜索
+// ---------------------------------------------------------------------------
+
+fn is_block_math(node: &NodeRef<'_, Node>) -> bool {
+    let Node::Element(node_el) = node.value() else {
+        return false;
+    };
+    let display = node_el
+        .attr("display")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if display == "block" {
+        return true;
+    }
+    if display == "inline" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    let Node::Element(el) = parent.value() else {
+        return true;
+    };
+    let name = el.name();
+    if !(is_block(name) || matches!(name, "td" | "th" | "li")) {
+        return false;
+    }
+    let mut significant = 0usize;
+    for child in parent.children() {
+        match child.value() {
+            Node::Element(_) => significant += 1,
+            Node::Text(t) if !t.text.trim().is_empty() => significant += 1,
+            _ => {}
+        }
+    }
+    significant <= 1
+}
+
+fn math_of(node: &NodeRef<'_, Node>) -> (String, String) {
+    let text = collapse(&math_text(*node));
+    let mut mathml = String::new();
+    mathml_node(*node, &mut mathml);
+    if mathml.len() > 32 * 1024 {
+        mathml.clear();
+    }
+    (mathml, text)
+}
+
+fn math_text(node: NodeRef<'_, Node>) -> String {
+    let Node::Element(el) = node.value() else {
+        return collapse(&inline_text(&node));
+    };
+    let name = el.name();
+    let children = || -> Vec<String> {
+        node.children()
+            .filter_map(|c| {
+                let s = math_text(c);
+                (!s.trim().is_empty()).then_some(s)
+            })
+            .collect()
+    };
+    match name {
+        "annotation" | "annotation-xml" | "none" | "mspace" => {
+            if name == "mspace" {
+                " ".to_string()
+            } else {
+                String::new()
+            }
+        }
+        "mi" | "mn" | "mo" | "mtext" | "ms" | "mglyph" => collapse(&inline_text(&node)),
+        "semantics" => node
+            .children()
+            .find(|c| {
+                c.value()
+                    .as_element()
+                    .is_some_and(|el| !matches!(el.name(), "annotation" | "annotation-xml"))
+            })
+            .map(math_text)
+            .unwrap_or_default(),
+        "mfrac" => {
+            let c = children();
+            format!(
+                "({})/({})",
+                c.first().map(String::as_str).unwrap_or(""),
+                c.get(1).map(String::as_str).unwrap_or("")
+            )
+        }
+        "msup" | "msub" | "mover" | "munder" => {
+            let c = children();
+            let base = c.first().map(String::as_str).unwrap_or("");
+            let script = c.get(1).map(String::as_str).unwrap_or("");
+            let op = if name == "msup" || name == "mover" {
+                "^"
+            } else {
+                "_"
+            };
+            format!("{base}{op}{}", script_paren(script))
+        }
+        "msubsup" | "munderover" => {
+            let c = children();
+            let base = c.first().map(String::as_str).unwrap_or("");
+            let sub = c.get(1).map(String::as_str).unwrap_or("");
+            let sup = c.get(2).map(String::as_str).unwrap_or("");
+            format!("{base}_{}{}", script_paren(sub), script_paren(sup))
+        }
+        "msqrt" => format!("√({})", children().join(" ")),
+        "mroot" => {
+            let c = children();
+            format!(
+                "√[{}]({})",
+                c.get(1).map(String::as_str).unwrap_or(""),
+                c.first().map(String::as_str).unwrap_or("")
+            )
+        }
+        "mfenced" => {
+            let open = el.attr("open").unwrap_or("(");
+            let close = el.attr("close").unwrap_or(")");
+            let sep = el.attr("separators").unwrap_or(",");
+            format!("{open}{}{close}", children().join(sep))
+        }
+        "mtable" => {
+            let mut rows = Vec::new();
+            for c in node.children() {
+                if c.value().as_element().is_some_and(|el| el.name() == "mtr") {
+                    rows.push(math_text(c));
+                }
+            }
+            rows.join("; ")
+        }
+        "mtr" => {
+            let mut cells = Vec::new();
+            for c in node.children() {
+                if c.value().as_element().is_some_and(|el| el.name() == "mtd") {
+                    cells.push(math_text(c));
+                }
+            }
+            cells.join(" | ")
+        }
+        _ => children().join(" "),
+    }
+}
+
+fn script_paren(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= 1 {
+        s.to_string()
+    } else {
+        format!("({s})")
+    }
+}
+
+fn mathml_node(node: NodeRef<'_, Node>, out: &mut String) {
+    match node.value() {
+        Node::Text(t) => out.push_str(&crate::xml::xml_escape(t.text.as_ref())),
+        Node::Element(el) => {
+            let name = el.name();
+            if !matches!(
+                name,
+                "math"
+                    | "mrow"
+                    | "mi"
+                    | "mn"
+                    | "mo"
+                    | "mtext"
+                    | "ms"
+                    | "mspace"
+                    | "mfrac"
+                    | "msqrt"
+                    | "mroot"
+                    | "mstyle"
+                    | "merror"
+                    | "mpadded"
+                    | "mphantom"
+                    | "mtable"
+                    | "mtr"
+                    | "mtd"
+                    | "munder"
+                    | "mover"
+                    | "munderover"
+                    | "msub"
+                    | "msup"
+                    | "msubsup"
+                    | "mfenced"
+                    | "menclose"
+                    | "semantics"
+                    | "annotation"
+                    | "mmultiscripts"
+                    | "mprescripts"
+                    | "none"
+                    | "maligngroup"
+                    | "malignmark"
+                    | "maction"
+                    | "mglyph"
+            ) {
+                return;
+            }
+            out.push('<');
+            out.push_str(name);
+            if name == "math" && el.attr("xmlns").is_none() {
+                out.push_str(" xmlns=\"http://www.w3.org/1998/Math/MathML\"");
+            }
+            for (attr_name, value) in el.attrs() {
+                if mathml_attr_allowed(attr_name) {
+                    out.push(' ');
+                    out.push_str(attr_name);
+                    out.push_str("=\"");
+                    out.push_str(&crate::xml::xml_escape(value));
+                    out.push('"');
+                }
+            }
+            out.push('>');
+            for child in node.children() {
+                mathml_node(child, out);
+            }
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+        }
+        _ => {}
+    }
+}
+
+fn mathml_attr_allowed(name: &str) -> bool {
+    if name.starts_with("on") || name.contains("href") {
+        return false;
+    }
+    matches!(
+        name,
+        "xmlns"
+            | "display"
+            | "mathvariant"
+            | "displaystyle"
+            | "scriptlevel"
+            | "columnalign"
+            | "rowalign"
+            | "columnlines"
+            | "rowlines"
+            | "columnspacing"
+            | "rowspacing"
+            | "frame"
+            | "fence"
+            | "separators"
+            | "open"
+            | "close"
+            | "stretchy"
+            | "largeop"
+            | "movablelimits"
+            | "accent"
+            | "accentunder"
+            | "linethickness"
+            | "bevelled"
+            | "notation"
+            | "encoding"
+            | "class"
     )
 }
 
@@ -406,6 +1204,13 @@ fn is_block(name: &str) -> bool {
             | "main"
             | "aside"
             | "blockquote"
+            | "figure"
+            | "figcaption"
+            | "details"
+            | "summary"
+            | "address"
+            | "hgroup"
+            | "center"
             | "ul"
             | "ol"
             | "li"
@@ -673,13 +1478,16 @@ mod tests {
     }
 
     // 真实 EPUB 的 MathML 是逐元素排版的；换行不能被当成段落分隔，否则矩阵会
-    // 变成一个符号一段。这里保证公式整体落在一个段落里，符号之间保留空格。
+    // 变成一个符号一段。公式独占一个块时保留为 Math，符号之间仍保留空格。
     #[test]
-    fn pretty_printed_mathml_stays_in_one_paragraph() {
+    fn pretty_printed_mathml_stays_in_one_block() {
         let blocks = to_blocks(
             "<p><math>\n  <mrow>\n    <mi>A</mi>\n    <mo>=</mo>\n    <mn>1</mn>\n  </mrow>\n</math></p>",
         );
-        assert_eq!(blocks, vec![Block::Paragraph("A = 1".into())]);
+        assert!(matches!(
+            &blocks[0],
+            Block::Math { text, .. } if text == "A = 1"
+        ));
     }
 
     // 含行内元素的块里，源码换行只是排版，不能把一句话拆成多段。
@@ -694,5 +1502,145 @@ mod tests {
                 "Suppose A is a square matrix of size n.".into()
             )]
         );
+    }
+
+    #[test]
+    fn real_tables_keep_header_cells_and_spans() {
+        let blocks = to_blocks(
+            "<table><caption>参数</caption>\
+             <thead><tr><th>名称</th><th colspan=\"2\">值</th></tr></thead>\
+             <tbody><tr><td rowspan=\"2\">A</td><td>1</td><td>2</td></tr>\
+             <tr><td>3</td><td>4</td></tr></tbody></table>",
+        );
+        let Block::Table(table) = &blocks[0] else {
+            panic!("应识别为数据表: {blocks:?}");
+        };
+        assert_eq!(table.caption.as_deref(), Some("参数"));
+        assert_eq!(table.rows.len(), 3);
+        assert!(table.rows[0].header);
+        assert_eq!(table.rows[0].cells[1].colspan, 2);
+        assert_eq!(table.rows[1].cells[0].rowspan, 2);
+        assert_eq!(table.rows[1].cells[1].text, "1");
+    }
+
+    #[test]
+    fn layout_tables_and_single_cell_wrappers_are_not_data_tables() {
+        let blocks = to_blocks(
+            "<table><tr><td><img src=\"a.jpg\"></td><td><img src=\"b.jpg\"></td></tr></table>\
+             <table><tr><td><math><mi>x</mi></math></td></tr></table>",
+        );
+        assert!(!blocks.iter().any(|b| matches!(b, Block::Table(_))));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, Block::Image { src, .. } if src == "a.jpg")));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, Block::Math { text, .. } if text == "x")));
+    }
+
+    #[test]
+    fn block_and_inline_math_are_distinguished() {
+        let blocks = to_blocks(
+            "<div><math display=\"block\"><mrow><mi>A</mi><mo>=</mo><mn>1</mn></mrow></math></div>\
+             <p>当 <math><mi>n</mi><mo>&gt;</mo><mn>0</mn></math> 时成立。</p>",
+        );
+        assert!(matches!(
+            &blocks[0],
+            Block::Math { text, mathml }
+                if text == "A = 1" && mathml.contains("<math") && mathml.contains("<mi>A</mi>")
+        ));
+        assert_eq!(blocks[1], Block::Paragraph("当 n > 0 时成立。".into()));
+    }
+
+    #[test]
+    fn svg_text_lines_and_images_are_recovered() {
+        let blocks = to_blocks(
+            "<div class=\"page\"><svg xmlns=\"http://www.w3.org/2000/svg\" \
+             xmlns:xlink=\"http://www.w3.org/1999/xlink\">\
+             <image xlink:href=\"../Images/cover.jpeg\" width=\"600\" height=\"800\"/>\
+             <text transform=\"matrix(1 0 0 1 56.6929 104.567)\">\
+               <tspan x=\"0\" y=\"0\">le vent serait</tspan>\
+               <tspan x=\"0\" y=\"15.249\">chaud.</tspan>\
+               <tspan x=\"12.99\" y=\"45.747\">Nouveau paragraphe</tspan>\
+             </text></svg></div>",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Image {
+                    src: "../Images/cover.jpeg".into(),
+                    alt: "".into()
+                },
+                Block::Paragraph("le vent serait chaud.".into()),
+                Block::Paragraph("Nouveau paragraphe".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn table_and_math_serialize_to_xhtml() {
+        let blocks = to_blocks(
+            "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>\
+             <div><math display=\"block\"><mfrac><mn>1</mn><mn>2</mn></mfrac></math></div>",
+        );
+        let html = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Table(t) => super::table_to_html(t),
+                Block::Math { mathml, text } => super::math_to_html(mathml, text),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(html.contains("<table"));
+        assert!(html.contains("<th colspan=\"1\""));
+        assert!(html.contains("<math"));
+        assert_eq!(super::to_blocks(&html).len(), 2);
+    }
+
+    #[test]
+    fn ruby_annotation_text_is_not_duplicated() {
+        let blocks = to_blocks("<p>漢<ruby>字<rt>じ</rt><rp>(</rp></ruby>です。</p>");
+        assert_eq!(blocks, vec![Block::Paragraph("漢字です。".into())]);
+    }
+
+    #[test]
+    fn figure_caption_and_details_stay_separate_blocks() {
+        let blocks = to_blocks(
+            "<div>前<figure><img src=\"a.jpg\"/><figcaption>图 1</figcaption></figure>后</div>",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("前".into()),
+                Block::Image {
+                    src: "a.jpg".into(),
+                    alt: "".into()
+                },
+                Block::Paragraph("图 1".into()),
+                Block::Paragraph("后".into()),
+            ]
+        );
+        let blocks = to_blocks("<details><summary>展开</summary><p>内容</p></details>");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("展开".into()),
+                Block::Paragraph("内容".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hr_becomes_divider() {
+        let blocks = to_blocks("<p>上</p><hr/><p>下</p>");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("上".into()),
+                Block::Divider,
+                Block::Paragraph("下".into()),
+            ]
+        );
+        assert_eq!(super::blocks_to_text(&blocks), "上\n———\n下");
     }
 }

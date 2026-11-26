@@ -466,12 +466,37 @@
                   </ul>
                 {:else if b.type === 'code'}
                   <pre class="fe-pre">{b.text}</pre>
+                {:else if b.type === 'divider'}
+                  <hr class="fe-divider" />
                 {:else if b.type === 'image'}
                   {#if previewImages[b.src]}
                     <img src={previewImages[b.src]} alt={b.alt || ''} />
                   {:else}
                     <p class="muted tiny-note">[图片] {b.src}</p>
                   {/if}
+                {:else if b.type === 'table'}
+                  <div class="fe-table-wrap">
+                    <table class="fe-table">
+                      {#if b.caption}<caption>{b.caption}</caption>{/if}
+                      <tbody>
+                        {#each b.rows || [] as row}
+                          <tr>
+                            {#each row.cells || [] as cell}
+                              {#if cell.header || row.header}
+                                <th colspan={cell.colspan} rowspan={cell.rowspan}>{cell.text}</th>
+                              {:else}
+                                <td colspan={cell.colspan} rowspan={cell.rowspan}>{cell.text}</td>
+                              {/if}
+                            {/each}
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                {:else if b.type === 'math'}
+                  <div class="fe-math">
+                    {#if b.mathml}{@html b.mathml}{:else}{b.text}{/if}
+                  </div>
                 {/if}
               {:else}
                 <p class="muted tiny-note">没有可预览的正文块。</p>
@@ -661,6 +686,42 @@
   .fe-preview ul {
     margin: 6px 0;
     padding-left: 1.2em;
+  }
+  .fe-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 8px 0;
+  }
+  .fe-table {
+    border-collapse: collapse;
+    font-size: 12px;
+    min-width: 100%;
+  }
+  .fe-table caption {
+    text-align: left;
+    font-weight: 600;
+    padding-bottom: 4px;
+  }
+  .fe-table th,
+  .fe-table td {
+    border: 1px solid var(--border, #ccc);
+    padding: 4px 6px;
+    text-align: left;
+    vertical-align: top;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .fe-table th {
+    background: rgba(127, 127, 127, 0.12);
+  }
+  .fe-math {
+    margin: 8px 0;
+    overflow-x: auto;
+  }
+  .fe-divider {
+    border: none;
+    border-top: 1px solid var(--border, #ccc);
+    margin: 12px 0;
   }
   .fe-preview .fe-pre {
     margin: 8px 0;

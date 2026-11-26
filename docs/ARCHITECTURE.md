@@ -192,8 +192,9 @@ Bearer 访问 `/opds*`，便于调试。
   图片代理的 WebP→灰度 JPEG、长条切片与 ETag 逻辑与数据库图片完全共用。
 - `/k`（Kindle/Silk）与 SPA 同源：`/k` 的目录（`ensure_chapters`）先读 OPF spine / `oread.json`，
   `/k/read` 的正文先读章节文件；命中后管理员编辑与离线阅读立即生效，未命中才查缓存/回源。
-  正文按语义块服务端分页：文字按行预算切页，插图单独成页并走 `/api/book/image`（`eink=1`）。
-  书源已失效或不存在时合成一个「馆藏」书源，阅读路径按目录实际形态选择正文或漫画。
+  正文按语义块服务端分页：文字按行预算切页，插图单独成页并走 `/api/book/image`（`eink=1`）；
+  表格按行转文本、每页重复表头，公式用回退文本。书源已失效或不存在时合成一个「馆藏」书源，
+  阅读路径按目录实际形态选择正文或漫画。
 - 管理员编辑（`library_store::edit` / `library_store::files` + `/api/library/book/edit*`）：
   只改已归一化的目录内容。v1 覆盖元数据、正文段落、封面、漫画单页。元数据复用
   `/api/library/book/meta`，DB 更新后同步写 `content.opf` / `oread.json`；正文与图片直接写文件，
@@ -213,8 +214,8 @@ Bearer 访问 `/opds*`，便于调试。
   改名为 `OEBPS/content.opf`、重写 `container.xml`，只重写 manifest href（允许 `..`，不能越出
   书根），章节 / CSS / 图片之间的相对链接保持原样。原 nav 丢弃，按 OPF 重新生成；章节标题取自
   `oread:chapter-title` → nav → NCX → `<title>` → 首个标题 → 文件名。清理阶段拒绝外网资源、
-  SVG、脚本 / iframe / object / embed / 事件属性 / `javascript:` / meta refresh，以及路径穿越、
-  加密条目与压缩炸弹。查重依次为文件 SHA-256 → 正文指纹（纯文本不足 64 字符不生成）→
+  SVG 图片条目（`image/svg+xml`；章节内联 `<svg>` 允许）、脚本 / iframe / object / embed /
+  事件属性 / `javascript:` / meta refresh，以及路径穿越、加密条目与压缩炸弹。查重依次为文件 SHA-256 → 正文指纹（纯文本不足 64 字符不生成）→
   书名 + 作者；覆盖只允许馆藏书，沿用原 `book_url`、书架位置与 `collected_at`，修订号递增。
   暂存目录超过 24 小时在下次上传时清理。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
@@ -265,7 +266,7 @@ Bearer 访问 `/opds*`，便于调试。
 - 首屏只静态引入 Login / Home / Catalog；Browse、BookDetail、Stats、Account、Admin 与 Reader、ComicReader 均 `import()` 懒加载，失败有可见错误与重试。
 - **阅读器独立目录 `src/reader/`**：`Reader.svelte`、`ComicReader.svelte`、`Reader*.svelte`、`reader*.js` 与其单测都在这里。硬规则：`reader/` 只能 import `./` 与 `../lib/`，**不许 import `pages/`**——管理端组件里的 `object-fit`/`transform`/`vw` 会让 KPW3 阅读页白屏，而故障现场在别处。门禁 `node scripts/check-reader-boundary.mjs`（CI 的 web job 已接入）。
 - **PC 与移动端共用同一阅读器**：不按 UA 分叉，只按视口/触控/键盘调整页宽、手势与控制栏；`/k` 是唯一的第二套前端（服务端渲染，无业务 JS）。
-- **正文长期模型是语义块**（标题/段落/列表/代码块/图片，表格待做）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。`/api/book/content` 同时下发 `content`（HTML，给 `/k` 与旧客户端）和 `blocks`（Web 阅读器优先使用）；旧数据没有 `blocks` 时前端回退解析 HTML。
+- **正文长期模型是语义块**（标题 / 段落 / 列表 / 代码块 / 分隔线 / 图片 / 表格 / 公式）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。真表格保留表头与 `colspan` / `rowspan`，单格公式包装表与 1 行 2 图版式表仍走段落 / 图片；独立公式保留清理后的 MathML，`/k`、TXT 导出与搜索使用回退文本。Ruby 只保留底字（`rt` / `rp` 注音丢弃），`<hr>` 成为分隔块。`/api/book/content` 同时下发 `content`（HTML，给 `/k` 与旧客户端）和 `blocks`（Web 阅读器优先使用）；旧数据没有 `blocks` 时前端回退解析 HTML。
 - 馆藏维护页（`pages/admin/CollectionAdmin.svelte`）所有登录账号可浏览占用与进度；入馆/移出/删除/回收临时缓存按 `getRole() === 'admin'` 收口。管理页只是前端归类，后端每个管理接口的权限校验保持原样。
 - 书卡统一用 `lib/BookCard.svelte`；页面只向上抛 `read`（或发现页的 `open`），由 `App.svelte` 的 `openReader(book)` 统一打开阅读器。
 - 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`searchJobsModel`（任务状态/进度/时间纯函数）、`readingPrefs`、`theme` 等，均有 `node --test` 单测；阅读器相关的 `readerHtml/images/stats/auto/progress/gestures/math` 已随阅读器移入 `src/reader/`。

@@ -6,7 +6,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use boranlib_ebook::html::{code_to_html, list_to_html, to_blocks, Block};
+use boranlib_ebook::html::{
+    code_to_html, list_to_html, math_to_html, table_to_html, table_to_text, to_blocks, Block,
+};
 use boranlib_ebook::xml::xml_escape;
 
 use super::{comic, is_pending_html, ChapterItem, OpfMeta, Store, Tier};
@@ -155,6 +157,9 @@ pub fn blocks_to_html(blocks: &[Block]) -> String {
                     xml_escape(alt)
                 ));
             }
+            Block::Table(table) => out.push_str(&table_to_html(table)),
+            Block::Math { mathml, text } => out.push_str(&math_to_html(mathml, text)),
+            Block::Divider => out.push_str("<hr/>"),
         }
     }
     out
@@ -178,6 +183,19 @@ pub fn blocks_to_text(blocks: &[Block]) -> String {
                 continue;
             }
             Block::Image { .. } => continue,
+            Block::Divider => "———",
+            Block::Table(table) => {
+                let text = table_to_text(table);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&text);
+                continue;
+            }
+            Block::Math { text, .. } => text.as_str(),
         };
         if text.trim().is_empty() {
             continue;
@@ -200,8 +218,8 @@ pub fn parse_chapter(xhtml: &str, title: &str) -> Option<ChapterBody> {
         return None;
     }
     let text = blocks_to_text(&blocks);
-    // 纯图片章节也可以有内容；只有既没有文字也没有图片时才视为空章。
-    if text.trim().is_empty() && !blocks.iter().any(Block::is_image) {
+    // 纯图片 / 纯表格 / 纯公式章节也可以有内容。
+    if !blocks.iter().any(Block::has_content) {
         return None;
     }
     Some(ChapterBody {

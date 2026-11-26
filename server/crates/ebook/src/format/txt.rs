@@ -10,6 +10,7 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+use crate::html::to_text;
 use crate::model::{BookInput, Format, WriteReport};
 use crate::pipeline::{ChapterReader, FormatWriter};
 
@@ -79,7 +80,8 @@ impl FormatWriter for TxtWriter {
 
             match reader.chapter_text(&ch.url).await? {
                 Some(body) => {
-                    file.write_all(body.trim().as_bytes()).await?;
+                    let text = to_text(body.trim());
+                    file.write_all(text.trim().as_bytes()).await?;
                     file.write_all(b"\n").await?;
                     written_chapters += 1;
                 }

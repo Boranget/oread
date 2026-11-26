@@ -7,7 +7,8 @@
 //!   相对 href、章节里的 `../Images/x.jpg`、CSS 的字体路径全部保持原样。
 //! - **OPF 仍是权威**：只补 `book-url` / `oread:revision` / `dcterms:modified` /
 //!   章节标题，并原样登记 CSS、字体、NCX 等 manifest 项。
-//! - **安全优先**：拒绝路径穿越、加密、压缩炸弹、外网资源、SVG、脚本与内联事件。
+//! - **安全优先**：拒绝路径穿越、加密、压缩炸弹、外网资源、SVG 图片条目、脚本与
+//!   内联事件；章节内联 SVG 与 spine 里的独立 SVG 页清洗后保留。
 //! - **两步导入**：`stage` 解压并校验到 `.import/<token>/book`，`commit` 才搬进
 //!   馆藏；查重弹窗发生在两步之间，避免用户确认时重复上传大文件。
 //!
@@ -802,12 +803,12 @@ fn sanitize_tree(book_dir: &Path) -> Result<(), ImportError> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if matches!(ext.as_str(), "xhtml" | "html" | "htm") {
+            if matches!(ext.as_str(), "xhtml" | "html" | "htm" | "svg") {
                 let bytes = fs::read(&path)?;
                 let Ok(raw) = String::from_utf8(bytes) else {
                     // 不符合 EPUB 规范但真实存在：非 UTF-8 章节。不能按 UTF-8 重写，
                     // 否则正文会被替换成乱码；保留原文件，读取端仍用容错 HTML 解析。
-                    tracing::warn!(file = %rel, "XHTML 不是 UTF-8，跳过脚本清理");
+                    tracing::warn!(file = %rel, "XHTML / SVG 不是 UTF-8，跳过脚本清理");
                     continue;
                 };
                 validate_xhtml_resources(&raw, &rel)?;
@@ -838,9 +839,9 @@ fn validate_xhtml_resources(xhtml: &str, file: &str) -> Result<(), ImportError> 
     let doc = Html::parse_document(xhtml);
     for el in doc.select(&RESOURCE_TAGS) {
         let tag = el.value().name();
-        for attr in ["src", "href", "data", "xlink:href", "poster"] {
-            if let Some(raw) = el.value().attr(attr) {
-                check_resource_url(raw, file, tag)?;
+        for attr in ["src", "href", "data", "poster"] {
+            if let Some(raw) = attr_any_ns(&el, attr) {
+                check_resource_url(&raw, file, tag)?;
             }
         }
         if let Some(srcset) = el.value().attr("srcset") {
@@ -858,6 +859,20 @@ fn validate_xhtml_resources(xhtml: &str, file: &str) -> Result<(), ImportError> 
         return Err(bad(format!("XHTML 的样式引用了外网资源：{file}")));
     }
     Ok(())
+}
+
+/// 跨命名空间取属性：HTML 解析器会把 SVG 的 `xlink:href` 变成带命名空间的
+/// `href`，直接 `Element::attr("href")` 会漏掉。
+fn attr_any_ns(el: &scraper::ElementRef<'_>, name: &str) -> Option<String> {
+    let suffix = format!(":{name}");
+    el.value()
+        .attrs()
+        .find(|(k, _)| {
+            let key = k.to_string();
+            key == name || key.ends_with(&suffix)
+        })
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn check_resource_url(raw: &str, file: &str, tag: &str) -> Result<(), ImportError> {
@@ -1549,6 +1564,41 @@ mod tests {
         let err = validate_xhtml_resources(
             r#"<html><body><img src="../../outside.jpg"/></body></html>"#,
             "Text/ch.xhtml",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn sanitize_tree_cleans_svg_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "boranlib-import-svg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let oebps = dir.join("OEBPS");
+        fs::create_dir_all(&oebps).unwrap();
+        let page = oebps.join("page.svg");
+        fs::write(
+            &page,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" onload="evil()"><script>alert(1)</script><image xlink:href="Images/a.jpg"/></svg>"#,
+        )
+        .unwrap();
+        sanitize_tree(&dir).unwrap();
+        let clean = fs::read_to_string(&page).unwrap();
+        assert!(!clean.contains("<script"));
+        assert!(!clean.contains("onload"));
+        assert!(clean.contains("Images/a.jpg"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_remote_image_in_svg() {
+        let err = validate_xhtml_resources(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><image xlink:href="https://x/a.jpg"/></svg>"#,
+            "page.svg",
         );
         assert!(err.is_err());
     }

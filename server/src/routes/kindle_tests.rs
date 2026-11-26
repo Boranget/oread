@@ -228,6 +228,92 @@ fn plan_doc_pages_keeps_image_order_and_truncates_text() {
 }
 
 #[test]
+fn plan_doc_pages_renders_divider_as_text() {
+    use boranlib_ebook::html::Block;
+
+    let blocks = vec![
+        Block::Paragraph("上".into()),
+        Block::Divider,
+        Block::Paragraph("下".into()),
+    ];
+    let (pages, truncated) = plan_doc_pages(
+        &blocks,
+        &FS_SPECS[1],
+        budget(&FS_SPECS[1]),
+        vp().page_w(),
+        K_MAX_TEXT_CHARS,
+    );
+    assert!(!truncated);
+    let joined: String = pages
+        .iter()
+        .filter_map(|p| match p {
+            KPage::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains('上'));
+    assert!(joined.contains("———"));
+    assert!(joined.contains('下'));
+}
+
+#[test]
+fn plan_doc_pages_repeats_table_header_on_each_page() {
+    use boranlib_ebook::html::{Block, Table, TableCell, TableRow};
+
+    let cell = |text: &str, header: bool| TableCell {
+        text: text.into(),
+        colspan: 1,
+        rowspan: 1,
+        header,
+    };
+    let table = Table {
+        caption: Some("参数".into()),
+        rows: vec![
+            TableRow {
+                header: true,
+                cells: vec![cell("名称", true), cell("值", true)],
+            },
+            TableRow {
+                header: false,
+                cells: vec![cell("甲", false), cell("1", false)],
+            },
+            TableRow {
+                header: false,
+                cells: vec![cell("乙", false), cell("2", false)],
+            },
+            TableRow {
+                header: false,
+                cells: vec![cell("丙", false), cell("3", false)],
+            },
+        ],
+    };
+    let blocks = vec![Block::Table(table)];
+    let (pages, truncated) =
+        plan_doc_pages(&blocks, &FS_SPECS[1], 3, vp().page_w(), K_MAX_TEXT_CHARS);
+    assert!(!truncated);
+    assert!(pages.len() >= 2, "表格应按行预算分页");
+    for page in &pages {
+        let KPage::Text(t) = page else {
+            panic!("表格页应为文字页: {page:?}");
+        };
+        assert!(t.contains("名称 | 值"), "每页都要重复表头: {t}");
+        assert!(t.contains(" | "), "单元格应以 | 分隔: {t}");
+    }
+    let joined: String = pages
+        .iter()
+        .map(|p| match p {
+            KPage::Text(t) => t.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    for row in ["甲", "乙", "丙"] {
+        assert!(joined.contains(row), "表格数据不能丢: {row}");
+    }
+    assert!(joined.contains("参数"), "表格标题应保留在首页: {joined}");
+}
+
+#[test]
 fn plan_doc_pages_renders_lists_and_code() {
     use boranlib_ebook::html::{Block, ListItem};
 
