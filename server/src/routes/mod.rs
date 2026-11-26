@@ -3,6 +3,7 @@ pub mod book_edit_files;
 pub mod bookmarks;
 pub mod books;
 pub mod bookshelf;
+pub mod catalog;
 pub mod comic;
 pub mod export;
 pub mod health;
@@ -117,6 +118,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .merge(books::routes())
         .merge(export::routes())
         .merge(bookshelf::routes())
+        .merge(catalog::routes())
         .merge(bookmarks::routes())
         .merge(replace::routes())
         .merge(stats::routes())

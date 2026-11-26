@@ -603,6 +603,38 @@ export const api = {
   // /api/healthz：进程指标 + 馆藏/临时缓存占用（只读）
   healthz: () => request('GET', '/healthz'),
 
+  // ---- 个人图书馆读接口（目录 / 详情 / 分面 / 首页）----
+  // 目录：status=all|want|reading|finished|none，group=all|ungrouped|<分组名>，
+  // 维度 author/series/tag/publisher/language 为精确匹配，q 为模糊搜索。
+  libraryCatalog: (opts = {}) =>
+    request(
+      'GET',
+      `/library/catalog?${buildQuery({
+        status: opts.status,
+        group: opts.group,
+        author: opts.author,
+        series: opts.series,
+        tag: opts.tag,
+        publisher: opts.publisher,
+        language: opts.language,
+        q: opts.q,
+        shelf: opts.shelf,
+        sort: opts.sort,
+        page: opts.page,
+        limit: opts.limit,
+      })}`
+    ),
+  libraryBook: (bookUrl) =>
+    request('GET', `/library/book?${buildQuery({ book_url: bookUrl })}`),
+  libraryFacets: () => request('GET', '/library/facets'),
+  libraryHome: () => request('GET', '/library/home'),
+  // 阅读状态：want / reading / finished；传空串清除
+  setReadingStatus: (bookIds, status) =>
+    request('POST', '/bookshelf/status', {
+      book_ids: Array.isArray(bookIds) ? bookIds : [bookIds],
+      status: status || '',
+    }),
+
   // ---- library（馆藏：全局共享内容层）----
   libraryStats: () => request('GET', '/library/stats'),
   // tier=collection|temp|all；cursor 为 keyset 游标（原样回传 next_cursor）

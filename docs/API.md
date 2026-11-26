@@ -2666,6 +2666,102 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   `GET /api/library/book/edit/check`）；`check` 为 `null` 表示检查失败或取消。
 - 错误：`400`（文件无效 / 查重后目标不存在 / 覆盖非馆藏书 / token 过期）、`401`、`403`。
 
+### 6.12.15 个人图书馆读接口（目录 / 详情 / 分面 / 首页，登录）
+
+> 内容层仍是全局 `library.db`，个人状态（`reading_status`、`bookshelf`、`reading_progress`、
+> `book_stats`）在用户库。服务端先读个人状态到内存，再与馆藏行合并、过滤、排序、分页；
+> 不做跨库 `ATTACH`，也不改变落盘结构。
+
+#### `GET /api/library/catalog`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `status` | string | 否 | `all`（默认）/ `want` / `reading` / `finished` / `none`（未标记） |
+| `group` | string | 否 | `all`（默认）/ `ungrouped` / 分组名（精确匹配） |
+| `shelf` | string | 否 | `1` / `true` / `yes` 只看书架内的书 |
+| `author` / `series` / `tag` / `publisher` / `language` | string | 否 | 精确匹配；`tag` 走 `library_tags` |
+| `q` | string | 否 | 模糊搜索书名、作者、系列、标签（`LIKE`，`%`/`_` 已转义） |
+| `sort` | string | 否 | `recent`（默认，最近阅读）/ `added` / `title` / `author` / `series` / `progress` |
+| `page` | integer | 否 | 从 1 开始，默认 1 |
+| `limit` | integer | 否 | 默认 24，范围 1–200 |
+
+成功 `200`：`{ok, items[], total, page, pages, limit, sort, status, group}`。
+
+`items[]` 每行包含馆藏元数据（`book_url/name/author/cover_url/language/publisher/pubdate/series_name/series_index/total_chapter_num/cached_chapters/collected_at/kind/book_source_type/tags`）与个人覆盖层：
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `status` | string | 否 | `want` / `reading` / `finished`，未标记为空串 |
+| `group` | string | 否 | 分组名，未分组为空串 |
+| `on_shelf` | boolean | 否 | 是否在书架 |
+| `added_at` | string | 是 | 加入书架时间 |
+| `chapter_index` | integer | 否 | 当前章下标，无进度为 0 |
+| `position` | number | 否 | 章内位置 0–1 |
+| `total_chapters` | integer | 否 | 优先 `library_books.total_chapter_num`，否则 `book_stats` |
+| `reading_progress` | number | 否 | 0–100，含章内比例 |
+| `last_read_at` | string | 是 | 最近阅读时间 |
+
+- 只返回 `tier='collection'` 的永久馆藏；临时缓存不进目录。
+- 分页发生在个人状态过滤与排序之后，`total/pages` 是过滤后的结果。
+- 错误：`sort`/`status` 非法 → `400`；`401`。
+
+#### `GET /api/library/book?book_url=...`
+
+单书详情。参数兼容 `url=` 别名。成功 `200`：
+
+```json
+{
+  "ok": true,
+  "book": {
+    "book_url": "...", "name": "...", "author": "...", "intro": "...",
+    "kind": "text", "book_source_type": 1, "cover_url": "...",
+    "language": "...", "publisher": "...", "pubdate": "...",
+    "series_name": "...", "series_index": 1.0,
+    "origin": "...", "origin_name": "...", "tier": "collection",
+    "collected_at": 1700000000000, "total_chapter_num": 120,
+    "cached_chapters": 120, "content_bytes": 123456, "image_bytes": 0,
+    "tags": ["..."], "identifiers": [{ "scheme": "isbn", "value": "..." }],
+    "status": "reading", "group": "", "on_shelf": true, "added_at": "...",
+    "chapter_index": 3, "position": 0.42, "total_chapters": 120,
+    "reading_progress": 2.85, "last_read_at": "...",
+    "toc": [{ "url": "...", "title": "...", "index": 0 }]
+  }
+}
+```
+
+- `toc` 最多返回 20000 章，按 `library_chapters."index"` 升序。
+- 错误：缺参 → `400`；书不存在 → `404`；`401`。
+
+#### `GET /api/library/facets`
+
+返回 `{ok, authors[], series[], tags[], publishers[], languages[]}`，每项 `{value, count}`，
+只统计 `tier='collection'`，按数量降序、`value COLLATE NOCASE` 升序，每类上限 500。
+
+#### `GET /api/library/home`
+
+首页聚合：`{ok, stats:{collection,shelf,want,reading,finished}, continue[], recent[], want[]}`。
+
+- `continue`：有进度且未标记 `finished`，按 `reading_progress.updated_at DESC` 取 8 本。
+- `recent`：最近入藏的 12 本（`collected_at DESC`）。
+- `want`：状态为 `want` 的 12 本（`reading_status.updated_at DESC`）。
+- 三个列表的元素与目录行同构，额外带 `section`（`continue`/`recent`/`want`）。
+
+#### `POST /api/bookshelf/status`
+
+设置或清除个人阅读状态（单本或批量）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `book_id` | string | 二选一 | 单本 |
+| `book_ids` | string[] | 二选一 | 批量；`trim`、去空、去重 |
+| `status` | string | 是 | `want` / `reading` / `finished`；空串或 `null` 清除 |
+
+成功 `200`：`{ok, updated, status}`。`updated` 为提交的有效 ID 数（不清除是否存在）。
+错误：无有效 ID → `400`；`status` 非法 → `400`；`401`。
+
+- 阅读进度写入（7.10）会自动推进状态：无记录 → `reading`；`want` → `reading`；
+  `finished` 不回退。手动清除状态后再次阅读会重新进入 `reading`。
+
 ### 6.13 OPDS 1.2 目录（`/opds*`）
 
 给 KOReader、Moon+ Reader 等阅读器用的标准 Atom 目录。**不是 JSON 接口**，响应统一为
@@ -3693,19 +3789,19 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 
 ### 12.1 覆盖统计
 
-- **实际存在并已注册的 JSON HTTP 接口：78 个**（另有 `/k/*` 8 个 HTML 路由，不计入）
+- **实际存在并已注册的 JSON HTTP 接口：83 个**（另有 `/k/*` 8 个 HTML 路由，不计入）
   - 鉴权 3 个（register / login / **password**）
   - 管理员 2 个（**users / users/status**）
   - 书源 14 个（原 9 个 + **health/check、health、health/reset、prune、quarantine**）
   - 搜索与发现 6 个（含两段式 **search/start** 与 **search/result**）
   - 书籍与正文 14 个（info / toc / **toc/batch** / content / **book/search** / **cache-all** / **cache/clear** / switch-source / **export/info** / **export/txt** / **export/cbz{,/info}** / **export/epub{,/info}**）
-  - 书架/分组/进度/批量 12 个（含 **bookshelf/batch**；`DELETE /api/bookshelf/groups` 与 `/groups/delete` 是两个注册路径、同一 handler）
+  - 书架/分组/进度/批量/阅读状态 13 个（含 **bookshelf/batch** 与 **bookshelf/status**；`DELETE /api/bookshelf/groups` 与 `/groups/delete` 是两个注册路径、同一 handler）
   - 书签 3 个（**GET/POST `/api/bookmarks`、DELETE `/api/bookmarks/delete`**）
   - 替换规则 6 个（CRUD + 导出/导入/预览）
   - 设置 2 个
   - 统计 2 个
   - 缓存维护 1 个（`POST /api/book/cache/trim`）
-  - 馆藏 8 个（stats / books / collect / release / delete / temp/clean / jobs / jobs/cancel）
+  - 馆藏 12 个（stats / books / collect / release / delete / temp/clean / jobs / jobs/cancel / **catalog / book / facets / home**）
   - 健康检查 3 个（`/api/health`、`/healthz`、`/api/healthz`）
   - K 埋点 2 个（`/api/k/metrics`、`/api/k/metrics/export`，仅管理员）
 - **另有 OPDS 1.2 路由 5 个**（`/opds`、`/opds/books`、`/opds/download/epub`、`/opds/download/cbz`、`/opds/cover`），响应为 Atom XML / 文件流，不计入上面的 JSON 接口数；鉴权为 HTTP Basic（也接受 Bearer）。
@@ -3799,6 +3895,11 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 81 | GET | `/opds/download/epub` | Basic / JWT | 否 | `book_url` | 同 #78（EPUB 附件） |
 | 82 | GET | `/opds/download/cbz` | Basic / JWT | 否 | `book_url` | 同 #76（CBZ 附件） |
 | 83 | GET | `/opds/cover` | Basic / JWT | 否 | `book_url` | 封面图片 / `302` 源站 / `404` |
+| 84 | GET | `/api/library/catalog` | JWT | 否 | `status?,group?,shelf?,author?,series?,tag?,publisher?,language?,q?,sort?,page?,limit?` | `{ok,items[],total,page,pages,limit,sort,status,group}` |
+| 85 | GET | `/api/library/book` | JWT | 否 | `book_url`（别名 `url`） | `{ok,book{...toc[]}}` |
+| 86 | GET | `/api/library/facets` | JWT | 否 | — | `{ok,authors[],series[],tags[],publishers[],languages[]}` |
+| 87 | GET | `/api/library/home` | JWT | 否 | — | `{ok,stats,continue[],recent[],want[]}` |
+| 88 | POST | `/api/bookshelf/status` | JWT | 否 | `book_id?/book_ids?,status` | `{ok,updated,status}` |
 
 ---
 

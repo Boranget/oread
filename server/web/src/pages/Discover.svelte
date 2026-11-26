@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { api, describeSourceError, describeFailure } from '../lib/api.js';
+  import { navigate } from '../lib/router.js';
   import { loadHistory, rememberKey } from '../lib/searchHistory.js';
   import DiscoverHistory from '../lib/DiscoverHistory.svelte';
   import DiscoverScopePicker from '../lib/DiscoverScopePicker.svelte';
@@ -68,9 +69,9 @@
     sourceScope = 'all';
     doSearch();
   }
-  // 空态引导：切到「书源管理」（App.svelte 监听 oread:tab 事件）
+  // 空态引导：切到管理区的「书源」页
   function goSources() {
-    window.dispatchEvent(new CustomEvent('oread:tab', { detail: 'sources' }));
+    navigate('/admin?tab=sources');
   }
   let requestedScope = 'all'; // 本次请求携带的 scope（用户意图）
   let searchScope = 'all'; // 后端实际使用的 scope

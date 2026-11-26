@@ -86,6 +86,19 @@ pub(crate) async fn record_progress(
     .bind(changed as i64)
     .execute(pool)
     .await?;
+
+    // 阅读状态自动推进：没标过的书从「想读」进入「在读」；
+    // 已手动标为「已读」的不回退，避免重读一章就把完成状态打回。
+    let _ = sqlx::query(
+        "INSERT INTO reading_status (book_id, status, updated_at) \
+         VALUES (?1, 'reading', datetime('now')) \
+         ON CONFLICT(book_id) DO UPDATE SET status = 'reading', \
+         updated_at = datetime('now') \
+         WHERE reading_status.status = 'want'",
+    )
+    .bind(book_id)
+    .execute(pool)
+    .await;
     Ok(())
 }
 

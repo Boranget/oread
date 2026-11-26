@@ -1,8 +1,8 @@
 <script>
-  import { createEventDispatcher, onMount } from 'svelte';
+  import { onMount } from 'svelte';
   import { api } from '../lib/api.js';
+  import { navigate } from '../lib/router.js';
 
-  const dispatch = createEventDispatcher();
   const RANGES = [7, 30, 90];
 
   let days = RANGES.includes(Number(localStorage.getItem('oread_stats_days')))
@@ -127,7 +127,7 @@
       打开任意一本书读一会儿，系统会按分钟记录阅读时长与字数。连续天数从第一次上报开始计算，
       统计只保存在你的账号下。
     </p>
-    <button on:click={() => dispatch('go', { tab: 'bookshelf' })}>去书架选一本</button>
+    <button on:click={() => navigate('/library')}>去图书馆选一本</button>
   </div>
 {:else}
   <div class="kpi-grid">

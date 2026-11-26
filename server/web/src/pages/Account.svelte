@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, describeFailure, describeSourceError, getRole, getToken, parseJwt, clearToken } from '../lib/api.js';
   import { THEMES, THEME_LABELS, setTheme } from '../lib/theme.js';
+  import { href } from '../lib/router.js';
   import {
     FONT_OPTIONS,
     PAGE_WIDTH_PX,
@@ -37,7 +38,6 @@
   const claims = parseJwt(getToken());
   let accountName = String(claims.username || '');
   let accountRole = String(claims.role || getRole());
-  let accountId = Number(claims.sub) || 0;
   const isAdmin = accountRole === 'admin';
 
   let pwOld = '';
@@ -46,12 +46,6 @@
   let pwBusy = false;
   let pwErr = '';
   let pwNotice = '';
-
-  let users = [];
-  let usersLoading = false;
-  let usersErr = '';
-  let userBusy = 0;
-  $: enabledAdminCount = users.filter((u) => u.role === 'admin' && !u.disabled).length;
 
   function roleText(r) {
     return r === 'admin' ? '管理员' : '普通用户';
@@ -88,42 +82,6 @@
     } finally {
       pwBusy = false;
     }
-  }
-
-  async function loadUsers() {
-    if (!isAdmin) return;
-    usersLoading = true;
-    usersErr = '';
-    try {
-      const res = await api.adminUsers();
-      users = (res && res.users) || [];
-    } catch (e) {
-      usersErr = describeFailure(e, '读取用户列表');
-    } finally {
-      usersLoading = false;
-    }
-  }
-
-  async function toggleUser(u) {
-    userBusy = u.id;
-    usersErr = '';
-    try {
-      await api.adminSetUserStatus(u.id, !u.disabled);
-      await loadUsers();
-    } catch (e) {
-      usersErr = describeFailure(e, u.disabled ? '启用账号' : '停用账号');
-    } finally {
-      userBusy = 0;
-    }
-  }
-
-  // 后端时间均为 UTC datetime('now') 字符串，换成本机时区展示；空值表示从未网页登录
-  function fmtServerTime(s) {
-    if (!s) return '从未登录';
-    const d = new Date(String(s).replace(' ', 'T') + 'Z');
-    if (Number.isNaN(d.getTime())) return String(s);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
   // 页宽 / 字体族：服务端 user_settings 为准，本机 key 只做离线兜底
@@ -330,7 +288,6 @@
     error = '';
     loadHealth();
     loadShelfBooks();
-    if (isAdmin) loadUsers();
     try {
       const s = await api.settings();
       const merged = { ...DEFAULTS, ...(s || {}) };
@@ -391,8 +348,12 @@
 </script>
 
 <div class="page-head">
-  <h2>阅读设置</h2>
-  <span class="page-count">按账号保存</span>
+  <h2>我的</h2>
+  <span class="page-count">设置按账号保存</span>
+  <div class="page-actions">
+    <a class="ghost-link" href={href('/stats')}>阅读统计</a>
+    {#if isAdmin}<a class="ghost-link" href={href('/admin')}>管理后台</a>{/if}
+  </div>
 </div>
 
 {#if error}<p class="err">{error}</p>{/if}
@@ -445,48 +406,6 @@
       </div>
     </div>
   </div>
-
-  {#if isAdmin}
-    <div class="card">
-      <div class="row" style="margin-bottom:10px">
-        <h3 style="margin:0">用户管理</h3>
-        <div class="spacer"></div>
-        <button class="ghost" on:click={loadUsers} disabled={usersLoading}>
-          {usersLoading ? '读取中…' : '刷新'}
-        </button>
-      </div>
-      {#if usersErr}<p class="err">{usersErr}</p>{/if}
-      {#if users.length}
-        <div class="user-table">
-          <div class="user-row user-head">
-            <span>用户名</span><span>角色</span><span>状态</span><span>最后登录</span><span></span>
-          </div>
-          {#each users as u (u.id)}
-            <div class="user-row">
-              <span class="user-name">
-                {u.username}{#if u.id === accountId}<span class="muted">（当前）</span>{/if}
-              </span>
-              <span class="user-meta user-role" data-label="角色">{roleText(u.role)}</span>
-              <span class="user-meta user-state" class:user-off={u.disabled} data-label="状态">{u.disabled ? '已停用' : '启用中'}</span>
-              <span class="user-meta user-login muted" data-label="最后登录">{fmtServerTime(u.last_login_at)}</span>
-              <span class="user-op">
-                <button
-                  class="ghost"
-                  on:click={() => toggleUser(u)}
-                  disabled={userBusy === u.id || u.id === accountId || (u.role === 'admin' && !u.disabled && enabledAdminCount <= 1)}
-                >
-                  {userBusy === u.id ? '处理中…' : u.disabled ? '启用' : '停用'}
-                </button>
-              </span>
-            </div>
-          {/each}
-        </div>
-        <div class="muted field-hint">停用会立即让该账号所有已登录设备失效；重新启用后仍需重新登录。不能停用当前账号或最后一个启用中的管理员。</div>
-      {:else if !usersLoading}
-        <p class="muted field-hint">暂无用户。</p>
-      {/if}
-    </div>
-  {/if}
 
   <div class="card">
     <h3>正文净化</h3>
@@ -584,17 +503,6 @@
   </div>
 
   <div class="card">
-    <h3>刷新</h3>
-    <label class="switch-row">
-      <span>
-        <b>自动刷新</b>
-        <span class="muted">打开书架时自动检查更新（每 24 小时最多一次，仅刷新未停更的书）</span>
-      </span>
-      <input type="checkbox" bind:checked={settings.auto_refresh} />
-    </label>
-  </div>
-
-  <div class="card">
     <div class="row" style="margin-bottom:10px">
       <h3 style="margin:0">书籍缓存</h3>
       <div class="spacer"></div>
@@ -667,7 +575,7 @@
       </div>
       <p class="muted field-hint">缓存整本按服务端预算分批抓取，可能需要几十秒，请保持页面打开。目录必须先缓存：在阅读器打开这本书即可。</p>
     {:else if !shelfLoading}
-      <p class="muted field-hint">书架为空。先在书架加入书籍，再回来缓存整本。</p>
+      <p class="muted field-hint">书架为空。先在图书馆把书加入书架，再回来缓存整本。</p>
     {/if}
     <div class="cache-actions cache-global">
       <button class="ghost" on:click={clearAllCache} disabled={cacheBusy}>
@@ -749,6 +657,16 @@
 </div>
 
 <style>
+  .ghost-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 14px;
+  }
   .settings-wrap h3 { margin-bottom: 12px; }
   .account-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .account-head b { font-size: 15px; }

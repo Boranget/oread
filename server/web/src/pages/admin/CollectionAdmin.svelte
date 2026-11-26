@@ -1,10 +1,9 @@
 <script>
-  import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-  import { api, getRole } from '../lib/api.js';
-  import { describeFailure } from '../lib/apiErrors.js';
-  import BookEditor from '../lib/BookEditor.svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { api, getRole } from '../../lib/api.js';
+  import { describeFailure } from '../../lib/apiErrors.js';
+  import BookEditor from '../../lib/BookEditor.svelte';
 
-  const dispatch = createEventDispatcher();
   // 入馆 / 移出 / 删除 / 回收临时缓存都要管理员；浏览与占用所有登录账号可读。
   const isAdmin = getRole() === 'admin';
 

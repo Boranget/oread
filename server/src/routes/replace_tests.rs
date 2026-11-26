@@ -159,21 +159,21 @@ fn auto_refresh_has_a_real_consumer() {
     assert!(SETTINGS_DEFAULTS
         .iter()
         .any(|(k, v)| *k == "auto_refresh" && *v == "1"));
-    let bookshelf = include_str!("../../web/src/pages/Bookshelf.svelte");
+    let catalog = include_str!("../../web/src/pages/Catalog.svelte");
     assert!(
-        bookshelf.contains("/settings") || bookshelf.contains("api.settings"),
-        "书架页应读取 /api/settings"
+        catalog.contains("/settings") || catalog.contains("api.settings"),
+        "图书馆页应读取 /api/settings"
     );
     assert!(
-        bookshelf.contains("auto_refresh"),
-        "书架页未消费 auto_refresh，开关仍是假的"
+        catalog.contains("auto_refresh"),
+        "图书馆页未消费 auto_refresh，开关仍是假的"
     );
     assert!(
-        bookshelf.contains("oread_autorefresh_last"),
+        catalog.contains("oread_autorefresh_last"),
         "自动刷新必须有 24h 节流键，避免每次打开都刷"
     );
     assert!(
-        bookshelf.contains("enable_update !== false"),
+        catalog.contains("enable_update !== false"),
         "自动刷新只应作用于未停更的书"
     );
 }

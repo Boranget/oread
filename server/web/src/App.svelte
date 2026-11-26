@@ -1,58 +1,67 @@
 <script>
   import { onMount } from 'svelte';
   import Login from './pages/Login.svelte';
-  import Bookshelf from './pages/Bookshelf.svelte';
-  import Discover from './pages/Discover.svelte';
+  import Home from './pages/Home.svelte';
+  import Catalog from './pages/Catalog.svelte';
+  import AppShell from './layout/AppShell.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
+  import { route, startRouter, navigate } from './lib/router.js';
   import { syncTheme, applyTheme } from './lib/theme.js';
   import {
-    searchJobs,
     startSearchJobsPolling,
     stopSearchJobsPolling,
   } from './lib/searchJobsStore.js';
 
   let loggedIn = false;
   let role = 'user';
-  let tab = 'bookshelf';
-  // 阅读器通过 {bookUrl, sourceId, name, author, coverUrl, intro} 打开；后四项是详情 seed
+  // 阅读器通过 {bookUrl, sourceId, name, author, coverUrl, intro, bookType} 打开。
   let reader = null;
 
-  // 首屏只留 登录/书架/发现。阅读器（含正文解析与图片缓存）与管理页按需 import()，
-  // 不进首屏包；失败时给出可见错误与重试，不静默吞掉。
+  // 首屏只留首页与图书馆；其余页面按需 import()，不进首屏包。
+  const LAZY = {
+    browse: () => import('./pages/Browse.svelte'),
+    book: () => import('./pages/BookDetail.svelte'),
+    stats: () => import('./pages/Stats.svelte'),
+    me: () => import('./pages/Account.svelte'),
+    admin: () => import('./pages/admin/Admin.svelte'),
+  };
+  let comps = {};
+  let errs = {};
+  let pending = {};
+
   let ComicReader = null;
   let comicError = '';
   let comicLoading = null;
-  // 小说阅读器连同正文解析/图片缓存/统计等模块按需加载，不进首屏包。
   let Reader = null;
   let readerError = '';
   let readerLoading = null;
 
-  const LAZY_TABS = {
-    stats: () => import('./pages/Stats.svelte'),
-    library: () => import('./pages/Library.svelte'),
-    sources: () => import('./pages/Sources.svelte'),
-    replace: () => import('./pages/ReplaceRules.svelte'),
-    settings: () => import('./pages/Settings.svelte'),
-  };
-  let lazyComps = {};
-  let lazyErrs = {};
+  $: page = pageOf($route.path);
+  $: if (loggedIn && LAZY[page] && !(page === 'admin' && role !== 'admin')) ensure(page);
 
-  const TABS = [
-    { id: 'bookshelf', label: '书架', short: '书架' },
-    { id: 'discover', label: '发现', short: '发现' },
-    { id: 'stats', label: '统计', short: '统计' },
-    // 馆藏浏览所有登录账号可读；入馆/移出等写操作在页面内按管理员收口
-    { id: 'library', label: '馆藏', short: '馆藏' },
-    // 普通用户也可见，进入后是只读态，避免出现可点击但必然 403 的按钮
-    { id: 'sources', label: '书源管理', short: '书源' },
-    { id: 'replace', label: '替换规则', short: '替换' },
-    { id: 'settings', label: '设置', short: '设置' },
-  ];
+  function pageOf(path) {
+    if (!path || path === '/') return 'home';
+    if (path === '/library') return 'library';
+    if (path === '/browse' || path === '/book' || path === '/stats' || path === '/me' || path === '/admin') {
+      return path.slice(1);
+    }
+    return 'notfound';
+  }
 
-  // 其它页面（如 Discover 的空态引导）用事件请求切换 tab
-  function onTabRequest(e) {
-    const id = e && e.detail;
-    if (id && TABS.some((t) => t.id === id)) selectTab(id);
+  function ensure(id) {
+    if (comps[id] || pending[id] || !LAZY[id]) return;
+    pending[id] = true;
+    errs[id] = '';
+    LAZY[id]()
+      .then((mod) => {
+        comps[id] = mod.default;
+      })
+      .catch((e) => {
+        errs[id] = `页面加载失败：${e && e.message ? e.message : e}`;
+      })
+      .finally(() => {
+        pending[id] = false;
+      });
   }
 
   // ---- 渲染期错误兜底 ----
@@ -111,7 +120,7 @@
   }
 
   onMount(() => {
-    window.addEventListener('oread:tab', onTabRequest);
+    const stopRouter = startRouter();
     window.addEventListener('error', onWindowError);
     window.addEventListener('unhandledrejection', onWindowRejection);
     if (getToken()) {
@@ -121,8 +130,9 @@
       // 任务列表与登录态解耦：关掉页面/重新登录后仍能看到后端仍在跑的任务。
       startSearchJobsPolling();
     }
+    if (!location.hash) navigate('/', { replace: true });
     return () => {
-      window.removeEventListener('oread:tab', onTabRequest);
+      stopRouter();
       window.removeEventListener('error', onWindowError);
       window.removeEventListener('unhandledrejection', onWindowRejection);
     };
@@ -131,32 +141,18 @@
   function onLogin(r) {
     loggedIn = true;
     role = r || getRole();
-    tab = 'bookshelf';
     syncTheme();
     startSearchJobsPolling();
   }
+
   function onLogout() {
     clearToken();
     loggedIn = false;
     role = 'user';
     reader = null;
-    tab = 'bookshelf';
     applyTheme('light');
     stopSearchJobsPolling();
-  }
-
-  function selectTab(id) {
-    tab = id;
-    const load = LAZY_TABS[id];
-    if (!load || lazyComps[id]) return;
-    lazyErrs[id] = '';
-    load()
-      .then((mod) => {
-        lazyComps[id] = mod.default;
-      })
-      .catch((e) => {
-        lazyErrs[id] = `页面加载失败：${e && e.message ? e.message : e}`;
-      });
+    navigate('/', { replace: true });
   }
 
   function loadComicReader() {
@@ -191,13 +187,28 @@
     return readerLoading;
   }
 
+  function normalizeBook(raw) {
+    if (!raw) return null;
+    const type = Number(raw.book_source_type);
+    return {
+      bookUrl: raw.bookUrl || raw.book_url || raw.book_id || '',
+      sourceId: raw.sourceId || raw.source_id || raw.origin || '',
+      name: raw.name || raw.title || '',
+      author: raw.author || '',
+      coverUrl: raw.coverUrl || raw.cover_url || raw.cover || '',
+      intro: raw.intro || '',
+      bookType: raw.bookType || raw.type || (type === 2 ? 'image' : type === 1 ? 'text' : ''),
+    };
+  }
+
   let openSeq = 0;
-  // 漫画与小说共用入口：搜索结果已带 type；书架条目没有类型时，
+  // 漫画与小说共用入口：搜索结果已带类型；书架/馆藏条目没有类型时，
   // 用 /api/comic/source 轻量探测书源类型（不发回源请求），失败则按小说打开。
-  async function openReader(book) {
-    if (!book) return;
+  async function openReader(raw) {
+    const book = normalizeBook(raw);
+    if (!book || !book.bookUrl) return;
     const my = ++openSeq;
-    const known = book.bookType || book.type;
+    const known = book.bookType;
     if (known === 'image' || known === 'text') {
       reader = { ...book, bookType: known };
       if (known === 'image') loadComicReader();
@@ -221,7 +232,10 @@
     reader = { ...book, bookType: 'text' };
     loadReader();
   }
-  function closeReader() { reader = null; }
+
+  function closeReader() {
+    reader = null;
+  }
 </script>
 
 {#if !loggedIn}
@@ -260,42 +274,37 @@
     {/if}
   {/key}
 {:else}
-  <div class="nav">
-    <div class="brand">Boranlib</div>
-    <div class="tabs">
-      {#each TABS as t}
-        <div class="tab" class:active={tab === t.id} on:click={() => selectTab(t.id)}>
-          <span class="tab-full">{t.label}</span><span class="tab-short">{t.short}</span>{#if t.id ===
-          'discover' && $searchJobs.active > 0}<span
-            class="tab-badge"
-            aria-label={`${$searchJobs.active} 个搜索任务运行中`}
-          >{$searchJobs.active}</span>{/if}
-        </div>
-      {/each}
-    </div>
-    <div class="right">
-      <button class="ghost" on:click={onLogout}>退出</button>
-    </div>
-  </div>
-
-  <div class="container">
-    {#if tab === 'bookshelf'}
-      <Bookshelf on:open={ (e) => openReader(e.detail) } />
-    {:else if tab === 'discover'}
-      <Discover on:open={ (e) => openReader(e.detail) } />
-    {:else if LAZY_TABS[tab]}
-      {#if lazyComps[tab]}
-        <svelte:component this={lazyComps[tab]} on:go={(e) => selectTab(e.detail.tab)} />
-      {:else if lazyErrs[tab]}
-        <div class="load-fail">
-          <p class="err">{lazyErrs[tab]}</p>
-          <button class="ghost" on:click={() => selectTab(tab)}>重试</button>
-        </div>
-      {:else}
-        <p class="empty">正在加载…</p>
-      {/if}
+  <AppShell {role} onLogout={onLogout}>
+    {#if page === 'home'}
+      <Home {role} on:read={(e) => openReader(e.detail)} />
+    {:else if page === 'library'}
+      <Catalog on:read={(e) => openReader(e.detail)} />
+    {:else if page === 'admin' && role !== 'admin'}
+      <div class="card">
+        <p class="err">需要管理员权限。</p>
+        <a class="ghost-link" href="#/">返回首页</a>
+      </div>
+    {:else if page === 'notfound'}
+      <div class="card">
+        <p>页面不存在。</p>
+        <a class="ghost-link" href="#/">返回首页</a>
+      </div>
+    {:else if comps[page]}
+      <svelte:component
+        this={comps[page]}
+        {role}
+        on:read={(e) => openReader(e.detail)}
+        on:open={(e) => openReader(e.detail)}
+      />
+    {:else if errs[page]}
+      <div class="card">
+        <p class="err">{errs[page]}</p>
+        <button class="ghost" on:click={() => ensure(page)}>重试</button>
+      </div>
+    {:else}
+      <p class="loading">正在加载…</p>
     {/if}
-  </div>
+  </AppShell>
 {/if}
 
 <style>
@@ -307,4 +316,14 @@
     margin: 16px;
   }
   .load-fail button { margin-right: 8px; margin-top: 4px; }
+  .ghost-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 14px;
+  }
 </style>
