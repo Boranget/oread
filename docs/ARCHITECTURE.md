@@ -218,6 +218,15 @@ Bearer 访问 `/opds*`，便于调试。
   事件属性 / `javascript:` / meta refresh，以及路径穿越、加密条目与压缩炸弹。查重依次为文件 SHA-256 → 正文指纹（纯文本不足 64 字符不生成）→
   书名 + 作者；覆盖只允许馆藏书，沿用原 `book_url`、书架位置与 `collected_at`，修订号递增。
   暂存目录超过 24 小时在下次上传时清理。
+- CBZ 导入（`library_store::import_cbz` + `/api/library/import/cbz`）：同一套两步流程
+  （inspect 解压到 `.import/<token>/book`，commit 搬入 `collection/`）。ZIP 条目先做路径
+  穿越 / 加密 / 条目数 / 单条与总大小 / 压缩比检查，图片再按文件头识别格式
+  （JPEG / PNG / WebP / GIF），其余条目跳过并告警。图片按自然序扁平化为
+  `{章:04}-{页:03}.{ext}`，同一父目录算一章、根目录固定第 1 章；随后写 `oread.json` 与
+  `ComicInfo.xml`（含 `Title` / `Writer` / `Series` / `Summary` / `Publisher` / 日期）。
+  入库时 `kind='comic'`、`book_source_type=2`、`tier='collection'`，刷新索引与占用；
+  查重与 EPUB 相同，内容指纹为按页顺序的「扩展名 + 图片字节」SHA-256。覆盖导入要求目标
+  也是漫画；EPUB 覆盖同样拒绝漫画。CBZ 不生成独立封面，阅读器用第一页。
 - 运维检查：`boranlib doctor` 只读比对「目录 ↔ `index.db` ↔ `library.db`」，报告解析失败的
   目录、索引滞后/残留、目录存在但 DB 没有（馆藏列表里看不到）、DB 有但目录缺失（该书当前不可读）。
   `--rebuild-index` 先重建索引再检查；`--sync-db` 隐含重建，并把孤立目录补登成书目

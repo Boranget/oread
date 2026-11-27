@@ -667,9 +667,11 @@ export const api = {
   libraryJobs: (opts = {}) =>
     request('GET', `/library/jobs?${buildQuery({ status: opts.status, limit: opts.limit })}`),
   libraryJobCancel: (id) => request('POST', '/library/jobs/cancel', { id }),
-  // 本地 EPUB 导入（管理员）：先 inspect 解压/查重，再按用户选择 commit。
+  // 本地 EPUB / CBZ 导入（管理员）：先 inspect 解压/查重，再按用户选择 commit。
   libraryImportEpub: (file, onProgress) =>
     uploadFile('/library/import/epub', file, onProgress),
+  libraryImportCbz: (file, onProgress) =>
+    uploadFile('/library/import/cbz', file, onProgress),
   libraryImportCommit: (payload) =>
     request('POST', '/library/import/commit', payload, { timeout: 120000 }),
   // ---- 管理员编辑（目录即书）----

@@ -29,14 +29,14 @@ use sha2::{Digest, Sha256};
 use super::{comic, files, index, opf, usage, Store, CONTAINER_XML, STYLE_CSS};
 use crate::library;
 
-/// 上传的 EPUB 上限（压缩包本身）。
+/// 上传包上限（EPUB / CBZ 压缩包本身）。
 pub const MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ENTRIES: usize = 10_000;
-const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(super) const MAX_ENTRIES: usize = 10_000;
+pub(super) const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// 解压比可疑阈值：大文件才检查，避免误伤高度可压缩的纯文本。
-const MAX_RATIO: u64 = 200;
-const MAX_RATIO_MIN_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_RATIO: u64 = 200;
+pub(super) const MAX_RATIO_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ImportError {
@@ -89,9 +89,16 @@ fn zip_err(e: zip::result::ZipError) -> ImportError {
 // 暂存信息
 // ---------------------------------------------------------------------------
 
+fn default_kind() -> String {
+    "text".to_string()
+}
+
 /// 暂存区里的 sidecar：commit 时不需要重新解析整本书。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageInfo {
+    /// `text`（EPUB）或 `comic`（CBZ）。旧暂存信息没有该字段时按文字书处理。
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub book_url: String,
     pub sha256: String,
     pub content_fingerprint: Option<String>,
@@ -102,7 +109,10 @@ pub struct StageInfo {
     pub publisher: Option<String>,
     pub pubdate: Option<String>,
     pub chapter_count: usize,
+    /// 文字书是插图数；漫画是总页数（与 `page_count` 相同）。
     pub image_count: usize,
+    #[serde(default)]
+    pub page_count: usize,
     pub has_cover: bool,
     pub warnings: Vec<String>,
 }
@@ -151,6 +161,7 @@ pub async fn stage(
     .map_err(|e| ImportError::Internal(format!("解压任务失败：{e}")))??;
 
     let info = StageInfo {
+        kind: "text".into(),
         book_url,
         sha256,
         content_fingerprint: outcome.fingerprint,
@@ -167,6 +178,7 @@ pub async fn stage(
             .filter(|c| !c.is_volume)
             .count(),
         image_count: outcome.meta.images.len(),
+        page_count: 0,
         has_cover: outcome.meta.cover.is_some(),
         warnings: outcome.warnings,
     };
@@ -221,7 +233,7 @@ pub fn import_book_url(sha256: &str) -> String {
     format!("import:{}", sha256.trim().to_ascii_lowercase())
 }
 
-fn validate_token(token: &str) -> Result<(), ImportError> {
+pub(super) fn validate_token(token: &str) -> Result<(), ImportError> {
     if token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
@@ -237,6 +249,10 @@ pub fn new_token() -> Result<String, ImportError> {
 }
 
 fn sanitize_file_name(raw: &str) -> String {
+    sanitize_file_name_with(raw, "import.epub")
+}
+
+pub(super) fn sanitize_file_name_with(raw: &str, fallback: &str) -> String {
     let base = raw
         .rsplit(['/', '\\'])
         .next()
@@ -245,7 +261,7 @@ fn sanitize_file_name(raw: &str) -> String {
         .trim_matches('.');
     let mut out: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
     if out.is_empty() {
-        out = "import.epub".into();
+        out = fallback.into();
     }
     out
 }
@@ -456,7 +472,7 @@ fn read_entry<R: Read + io::Seek>(
     read_limited(e, MAX_ENTRY_BYTES)
 }
 
-fn read_limited<R: Read>(mut reader: R, max: u64) -> Result<Vec<u8>, ImportError> {
+pub(super) fn read_limited<R: Read>(mut reader: R, max: u64) -> Result<Vec<u8>, ImportError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -479,7 +495,7 @@ fn find_entry(entries: &[ZipEntryMeta], name: &str) -> Option<usize> {
         .map(|e| e.index)
 }
 
-fn validate_entry_name(name: &str) -> Result<(), ImportError> {
+pub(super) fn validate_entry_name(name: &str) -> Result<(), ImportError> {
     if name.is_empty() {
         return Err(bad("ZIP 含空文件名"));
     }
@@ -542,7 +558,7 @@ fn is_reserved_windows_name(name: &str) -> bool {
     )
 }
 
-fn is_junk_entry(name: &str) -> bool {
+pub(super) fn is_junk_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.starts_with("__macosx/")
         || lower.ends_with("/.ds_store")
@@ -551,7 +567,7 @@ fn is_junk_entry(name: &str) -> bool {
         || lower.ends_with("/desktop.ini")
 }
 
-fn normalize_zip_path(raw: &str) -> String {
+pub(super) fn normalize_zip_path(raw: &str) -> String {
     raw.trim()
         .trim_start_matches('/')
         .split('/')
@@ -1356,6 +1372,9 @@ pub async fn commit(
             if existing.tier != super::Tier::Collection.as_str() {
                 return Err(bad("只能覆盖馆藏书籍；临时缓存请先加入馆藏"));
             }
+            if existing.book_source_type == 2 {
+                return Err(bad("目标书是漫画，不能用 EPUB 覆盖"));
+            }
             target.to_string()
         }
         CommitMode::Cancel => unreachable!(),
@@ -1386,18 +1405,17 @@ pub async fn commit(
         tokio::fs::create_dir_all(parent).await?;
     }
     let overwritten = dest.exists();
-    if overwritten {
-        let aside = store.trash_target(&final_url, "import-overwrite");
+    let aside = overwritten.then(|| store.trash_target(&final_url, "import-overwrite"));
+    if let Some(aside) = aside.as_deref() {
         tokio::fs::create_dir_all(store.root().join(super::TRASH_DIR)).await?;
-        super::rename_retry(&dest, &aside)
+        super::rename_retry(&dest, aside)
             .await
             .map_err(|e| ImportError::Internal(format!("旧书目录移入回收站失败：{e}")))?;
     }
     if let Err(e) = super::rename_retry(&book_dir, &dest).await {
         // rename 失败时尽量把旧书搬回来，别留下「馆藏里没有这本书」的状态。
-        if overwritten {
-            let aside = store.trash_target(&final_url, "import-overwrite");
-            let _ = super::rename_retry(&aside, &dest).await;
+        if let Some(aside) = aside.as_deref() {
+            let _ = super::rename_retry(aside, &dest).await;
         }
         return Err(ImportError::Internal(format!("搬入馆藏失败：{e}")));
     }
@@ -1418,7 +1436,7 @@ pub async fn commit(
     })
 }
 
-async fn unique_book_url(
+pub(super) async fn unique_book_url(
     store: &Store,
     pool: &sqlx::SqlitePool,
     base: &str,

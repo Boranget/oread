@@ -164,7 +164,7 @@
       <div class="card">
         <h3>管理入口</h3>
         <div class="quick-links">
-          <button class="ghost" on:click={() => setTab('collection')}>导入 EPUB / 维护馆藏</button>
+          <button class="ghost" on:click={() => setTab('collection')}>导入 EPUB / CBZ / 维护馆藏</button>
           <button class="ghost" on:click={() => setTab('sources')}>书源管理</button>
           <button class="ghost" on:click={() => setTab('replace')}>替换规则</button>
           <button class="ghost" on:click={() => setTab('users')}>用户</button>

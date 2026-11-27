@@ -24,6 +24,7 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::{ensure_admin, AuthUser};
 use crate::error::{AppError, AppResult};
 use crate::library_store::import::{self, CommitMode, ImportError, StageInfo};
+use crate::library_store::import_cbz;
 use crate::routes::AppState;
 
 /// 上传包上限；解压后的体积另有校验。
@@ -33,7 +34,8 @@ const STAGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/library/import/epub", post(inspect))
+        .route("/api/library/import/epub", post(inspect_epub))
+        .route("/api/library/import/cbz", post(inspect_cbz))
         .route("/api/library/import/commit", post(commit))
         .layer(DefaultBodyLimit::max(
             MAX_UPLOAD_BYTES.min(usize::MAX as u64) as usize,
@@ -56,12 +58,30 @@ struct InspectResp {
     duplicates: Vec<import::DuplicateHit>,
 }
 
-async fn inspect(
+async fn inspect_epub(
     State(s): State<AppState>,
     u: AuthUser,
+    multipart: Multipart,
+) -> AppResult<Json<InspectResp>> {
+    inspect_upload(s, u, multipart, false).await
+}
+
+async fn inspect_cbz(
+    State(s): State<AppState>,
+    u: AuthUser,
+    multipart: Multipart,
+) -> AppResult<Json<InspectResp>> {
+    inspect_upload(s, u, multipart, true).await
+}
+
+async fn inspect_upload(
+    s: AppState,
+    u: AuthUser,
     mut multipart: Multipart,
+    cbz: bool,
 ) -> AppResult<Json<InspectResp>> {
     ensure_admin(&u)?;
+    let label = if cbz { "CBZ" } else { "EPUB" };
     let store = s.store();
     // 先顺手清理上次进程中断留下的暂存目录；失败不影响本次导入。
     import::prune_stages(&store, STAGE_TTL).await;
@@ -69,7 +89,7 @@ async fn inspect(
     let token = import::new_token().map_err(import_error)?;
     let stage_dir = store.import_stage_dir(&token);
     tokio::fs::create_dir_all(&stage_dir).await?;
-    let source = stage_dir.join("source.epub");
+    let source = stage_dir.join(if cbz { "source.cbz" } else { "source.epub" });
 
     let mut field = loop {
         let item = multipart
@@ -78,7 +98,7 @@ async fn inspect(
             .map_err(|e| AppError::BadRequest(format!("读取上传数据失败：{e}")))?;
         let Some(field) = item else {
             cleanup(&stage_dir).await;
-            return Err(AppError::BadRequest("没有收到 EPUB 文件".into()));
+            return Err(AppError::BadRequest(format!("没有收到 {label} 文件")));
         };
         if field.name() == Some("file") {
             break field;
@@ -86,7 +106,10 @@ async fn inspect(
         // 忽略其他字段（例如表单里的注释）。
     };
 
-    let file_name = field.file_name().unwrap_or("import.epub").to_string();
+    let file_name = field
+        .file_name()
+        .unwrap_or(if cbz { "import.cbz" } else { "import.epub" })
+        .to_string();
     let mut out = tokio::fs::File::create(&source).await?;
     let mut hasher = Sha256::new();
     let mut written = 0u64;
@@ -107,7 +130,7 @@ async fn inspect(
         if written > MAX_UPLOAD_BYTES {
             cleanup(&stage_dir).await;
             return Err(AppError::BadRequest(format!(
-                "EPUB 超过 {} MiB 上限",
+                "{label} 超过 {} MiB 上限",
                 MAX_UPLOAD_BYTES / 1024 / 1024
             )));
         }
@@ -126,15 +149,22 @@ async fn inspect(
 
     if written == 0 {
         cleanup(&stage_dir).await;
-        return Err(AppError::BadRequest("上传的 EPUB 是空文件".into()));
+        return Err(AppError::BadRequest(format!("上传的 {label} 是空文件")));
     }
     if head != b"PK\x03\x04" && head != b"PK\x05\x06" {
         cleanup(&stage_dir).await;
-        return Err(AppError::BadRequest("不是有效的 EPUB（ZIP）文件".into()));
+        return Err(AppError::BadRequest(format!(
+            "不是有效的 {label}（ZIP）文件"
+        )));
     }
 
     let sha256 = format!("{:x}", hasher.finalize());
-    let info = match import::stage(&store, &token, source, &file_name, sha256).await {
+    let staged = if cbz {
+        import_cbz::stage(&store, &token, source, &file_name, sha256).await
+    } else {
+        import::stage(&store, &token, source, &file_name, sha256).await
+    };
+    let info = match staged {
         Ok(v) => v,
         Err(e) => {
             cleanup(&stage_dir).await;
@@ -171,14 +201,34 @@ async fn commit(
 ) -> AppResult<Json<Value>> {
     ensure_admin(&u)?;
     let mode = CommitMode::parse(&req.mode).map_err(import_error)?;
-    let result = import::commit(
-        &s.store(),
-        &s.library,
-        req.token.trim(),
-        mode,
-        req.target_book_url.as_deref(),
-    )
-    .await
+    let token = req.token.trim();
+    // 取消只清理暂存，即使暂存已过期也应成功；其余模式先看 sidecar 判断书类型。
+    let result = if mode == CommitMode::Cancel {
+        import::commit(&s.store(), &s.library, token, mode, None).await
+    } else {
+        let info = import::read_stage_info(&s.store(), token)
+            .await
+            .map_err(import_error)?;
+        if info.kind == "comic" {
+            import_cbz::commit(
+                &s.store(),
+                &s.library,
+                token,
+                mode,
+                req.target_book_url.as_deref(),
+            )
+            .await
+        } else {
+            import::commit(
+                &s.store(),
+                &s.library,
+                token,
+                mode,
+                req.target_book_url.as_deref(),
+            )
+            .await
+        }
+    }
     .map_err(import_error)?;
 
     let check = result.check.map(|c| {

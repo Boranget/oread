@@ -45,7 +45,7 @@
   let jobsErr = '';
   let jobsLoading = false;
   let pollTimer = null;
-  // 本地 EPUB 导入：inspect（上传+解压+查重）→ 用户确认 → commit。
+  // 本地 EPUB / CBZ 导入：inspect（上传+解压+查重）→ 用户确认 → commit。
   let fileInput = null;
   let importing = false;
   let committing = false;
@@ -309,17 +309,18 @@
     }
   }
 
-  function pickEpub() {
+  function pickBook() {
     importErr = '';
     fileInput?.click();
   }
 
-  async function onEpubChosen(ev) {
+  async function onBookChosen(ev) {
     const file = ev.currentTarget.files?.[0];
     ev.currentTarget.value = '';
     if (!file) return;
-    if (!/\.epub$/i.test(file.name)) {
-      importErr = '请选择 .epub 文件';
+    const isCbz = /\.cbz$/i.test(file.name);
+    if (!isCbz && !/\.epub$/i.test(file.name)) {
+      importErr = '请选择 .epub 或 .cbz 文件';
       return;
     }
     importErr = '';
@@ -330,7 +331,8 @@
     importDups = [];
     importTarget = '';
     try {
-      const res = await api.libraryImportEpub(file, (loaded, total) => {
+      const upload = isCbz ? api.libraryImportCbz : api.libraryImportEpub;
+      const res = await upload(file, (loaded, total) => {
         importProgress = { loaded, total };
       });
       importToken = res.token;
@@ -338,7 +340,7 @@
       importDups = res.duplicates || [];
       importTarget = importDups[0]?.book_url || '';
     } catch (e) {
-      if (!e.aborted) importErr = describeFailure(e, '导入 EPUB');
+      if (!e.aborted) importErr = describeFailure(e, isCbz ? '导入 CBZ' : '导入 EPUB');
     } finally {
       importing = false;
       importProgress = null;
@@ -408,13 +410,13 @@
     {#if isAdmin}
       <input
         type="file"
-        accept=".epub,application/epub+zip"
+        accept=".epub,.cbz,application/epub+zip,application/vnd.comicbook+zip"
         bind:this={fileInput}
-        on:change={onEpubChosen}
+        on:change={onBookChosen}
         hidden
       />
-      <button class="ghost" on:click={pickEpub} disabled={importing}>
-        {importing ? '导入中…' : '导入 EPUB'}
+      <button class="ghost" on:click={pickBook} disabled={importing}>
+        {importing ? '导入中…' : '导入 EPUB / CBZ'}
       </button>
     {/if}
     <button class="ghost" on:click={() => { loadStats(); loadPage(true); }} disabled={loading}>刷新</button>
@@ -546,8 +548,8 @@
 
 {#if importing || importBook || importErr}
   <div class="modal-mask" on:click|self={() => (importBook ? cancelImport() : closeImport())}>
-    <div class="modal" role="dialog" aria-modal="true" aria-label="导入 EPUB">
-      <h3>导入 EPUB</h3>
+    <div class="modal" role="dialog" aria-modal="true" aria-label="导入书籍">
+      <h3>导入书籍</h3>
       {#if importing}
         <p class="muted tiny-note">正在上传并解析，完成后会先查重，不会直接写入馆藏。</p>
         {#if importPercent() != null}
@@ -562,8 +564,12 @@
           {#if importBook.author}<span class="muted"> · {importBook.author}</span>{/if}
         </p>
         <p class="muted tiny-note">
-          {importBook.chapter_count} 章 · {importBook.image_count} 张插图
-          {#if importBook.has_cover} · 有封面{/if}
+          {#if importBook.kind === 'comic'}
+            {importBook.chapter_count} 章 · {importBook.page_count} 页
+          {:else}
+            {importBook.chapter_count} 章 · {importBook.image_count} 张插图
+            {#if importBook.has_cover} · 有封面{/if}
+          {/if}
           {#if importBook.file_name} · {importBook.file_name}{/if}
         </p>
         {#if importBook.warnings?.length}

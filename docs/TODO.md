@@ -37,8 +37,14 @@
 - EPUB 归一化收尾：`<sub>` / `<sup>` 的数字与运算符降级为 Unicode 上下标（字母保持原样，
   避免 `1st` 变成 `1ˢᵗ` 破坏搜索）；`epub:type="pagebreak"` **不整块跳过**——HTML 解析器
   不认非空元素的自闭合写法，整块跳过会把后续文字一起吞掉，页码标记按空内容保留。
-  真实 CBZ 验收：4 本 / 81 页，目录反推页表、章节图片列表与首图代理均通过。
   `/healthz` 补进程累计写盘量（Linux）与图片 LRU 命中率。
+- CBZ 导入：与 EPUB 共用两步 inspect / commit（新增 `/api/library/import/cbz`）。
+  安全解压后按自然序扁平化为 `{章:04}-{页:03}.{ext}`，同一父目录分章、根目录固定第 1 章，
+  写 `oread.json` + `ComicInfo.xml`（含出版社与日期），入库 `kind='comic'` /
+  `book_source_type=2` / `tier='collection'` 并刷新索引与占用。接受 JPEG / PNG / WebP /
+  GIF，坏图与非图片条目跳过并告警；查重复用文件 SHA-256 + 按页内容指纹 + 书名/作者。
+  真实 CBZ 验收已改为走导入接口：4 本 / 81 页全部导入、页表与章节图片一致、首图经代理
+  出图，重复上传命中文件查重；管理端上传同时接受 `.epub` / `.cbz` 并显示漫画页数。
 
 - 表格 / MathML / SVG 正文（P0/P1/P2）：新增 `Block::Table`（`caption` / 行 / 单元格
   `colspan` / `rowspan` / 表头）、`Block::Math { mathml, text }` 与 `Block::Divider`；

@@ -22,6 +22,7 @@ pub mod comic;
 pub mod edit;
 pub mod files;
 pub mod import;
+pub mod import_cbz;
 pub mod index;
 pub mod opf;
 pub mod pack;

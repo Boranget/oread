@@ -186,7 +186,20 @@ pub fn to_comic_info(meta: &ComicMeta) -> String {
     field("Writer", meta.author.as_deref());
     field("Series", meta.series.as_deref());
     field("Summary", meta.description.as_deref());
+    field("Publisher", meta.publisher.as_deref());
     field("LanguageISO", meta.language.as_deref());
+    if let Some(pubdate) = meta.pubdate.as_deref().map(str::trim) {
+        let mut parts = pubdate.split('-');
+        if let Some(year) = parts.next().filter(|v| !v.is_empty()) {
+            field("Year", Some(year));
+            if let Some(month) = parts.next().filter(|v| !v.is_empty()) {
+                field("Month", Some(month));
+                if let Some(day) = parts.next().filter(|v| !v.is_empty()) {
+                    field("Day", Some(day));
+                }
+            }
+        }
+    }
     let pages: usize = meta.chapters.iter().map(|c| c.pages.len()).sum();
     let _ = writeln!(s, "  <PageCount>{pages}</PageCount>");
     s.push_str("</ComicInfo>\n");
@@ -234,6 +247,8 @@ async fn synth_meta(dir: &Path, book_url: &str) -> io::Result<ComicMeta> {
     meta.series = info.series;
     meta.description = info.summary;
     meta.language = info.language;
+    meta.publisher = info.publisher;
+    meta.pubdate = info.pubdate;
 
     let mut files = list_image_files(dir).await?;
     files.sort();
@@ -310,12 +325,14 @@ async fn list_image_files(dir: &Path) -> io::Result<Vec<String>> {
 }
 
 #[derive(Default)]
-struct ComicInfo {
-    title: Option<String>,
-    writer: Option<String>,
-    series: Option<String>,
-    summary: Option<String>,
-    language: Option<String>,
+pub(super) struct ComicInfo {
+    pub(super) title: Option<String>,
+    pub(super) writer: Option<String>,
+    pub(super) series: Option<String>,
+    pub(super) summary: Option<String>,
+    pub(super) language: Option<String>,
+    pub(super) publisher: Option<String>,
+    pub(super) pubdate: Option<String>,
 }
 
 async fn read_comic_info(dir: &Path) -> ComicInfo {
@@ -325,7 +342,7 @@ async fn read_comic_info(dir: &Path) -> ComicInfo {
     parse_comic_info(&xml)
 }
 
-fn parse_comic_info(xml: &str) -> ComicInfo {
+pub(super) fn parse_comic_info(xml: &str) -> ComicInfo {
     let Ok(package) = sxd_document::parser::parse(&boranlib_ebook::xml::strip_doctype_and_bom(xml))
     else {
         return ComicInfo::default();
@@ -341,6 +358,7 @@ fn parse_comic_info(xml: &str) -> ComicInfo {
         return ComicInfo::default();
     };
     let mut info = ComicInfo::default();
+    let (mut year, mut month, mut day) = (None, None, None);
     for child in root.children().into_iter().filter_map(|c| c.element()) {
         let text = text_of(child);
         let text = text.trim();
@@ -353,10 +371,33 @@ fn parse_comic_info(xml: &str) -> ComicInfo {
             "Series" => info.series = Some(text.to_string()),
             "Summary" => info.summary = Some(text.to_string()),
             "LanguageISO" => info.language = Some(text.to_string()),
+            "Publisher" => info.publisher = Some(text.to_string()),
+            "Year" => year = Some(text.to_string()),
+            "Month" => month = Some(text.to_string()),
+            "Day" => day = Some(text.to_string()),
             _ => {}
         }
     }
+    info.pubdate = compose_pubdate(year, month, day);
     info
+}
+
+fn compose_pubdate(
+    year: Option<String>,
+    month: Option<String>,
+    day: Option<String>,
+) -> Option<String> {
+    let year = year?;
+    let mut out = year;
+    if let Some(month) = month {
+        out.push('-');
+        out.push_str(&month);
+        if let Some(day) = day {
+            out.push('-');
+            out.push_str(&day);
+        }
+    }
+    Some(out)
 }
 
 fn text_of(el: sxd_document::dom::Element<'_>) -> String {

@@ -126,6 +126,30 @@ fn epub_upload(file_name: &str, bytes: Vec<u8>, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn cbz_upload(file_name: &str, bytes: Vec<u8>, token: &str) -> Request<Body> {
+    const BOUNDARY: &str = "----oread-cbz-acceptance-boundary";
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n\
+             Content-Type: application/vnd.comicbook+zip\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    Request::builder()
+        .method("POST")
+        .uri("/api/library/import/cbz")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn query(pairs: &[(&str, &str)]) -> String {
     let mut ser = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in pairs {
@@ -720,25 +744,11 @@ async fn real_books_import_and_read() {
     assert_eq!(totals.image_failures, 0, "存在图片读取失败，见上方日志");
 }
 
-fn is_cbz_image(name: &str) -> bool {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "jpg" | "jpeg" | "png" | "webp" | "gif" | "avif" | "bmp"
-    )
-}
-
-/// 真实 CBZ 验收：按“手工放入的漫画目录”读取（无 `oread.json`，从文件名/ComicInfo 反推）。
-///
-/// 这里不做 CBZ 导入（导入管线只接受 EPUB）；只验证解压后的目录能被漫画读路径识别、
-/// 页表数量正确，并且图片代理能实际读出图片。
+/// 真实 CBZ 验收：走真正的导入接口（上传 → 解压 → 查重 → commit），
+/// 再从馆藏目录读页表、章节图片与首图，确认导入后的漫画能被阅读链路直接使用。
 #[tokio::test]
 #[ignore = "需要 BORANLIB_BOOKS_DIR 指向真实 CBZ 目录"]
-async fn real_cbz_comics_read_from_directory() {
+async fn real_cbz_import_and_read() {
     let Ok(books_dir) = std::env::var("BORANLIB_BOOKS_DIR") else {
         eprintln!("跳过：未设置 BORANLIB_BOOKS_DIR");
         return;
@@ -761,72 +771,70 @@ async fn real_cbz_comics_read_from_directory() {
     let token = register_admin(&app, &pool).await;
     let mut total_pages = 0usize;
 
-    println!("\n=== 读取 {} 本 CBZ ===", files.len());
-    for path in &files {
+    println!("\n=== 导入 {} 本 CBZ ===", files.len());
+    for (file_index, path) in files.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let book_url = format!("local:cbz:{name}");
-        let book_dir = store.dir_for(boranlib::library_store::Tier::Collection, &book_url);
-        std::fs::create_dir_all(&book_dir).expect("创建漫画目录");
+        let bytes = std::fs::read(path).expect("读取 CBZ");
+        let started = Instant::now();
+        let resp = app
+            .clone()
+            .oneshot(cbz_upload(&name, bytes.clone(), &token))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "inspect {name}: {body}");
+        assert_eq!(body["ok"], true, "inspect {name}: {body}");
+        let book = &body["book"];
+        assert_eq!(book["kind"], "comic", "{name} 应识别为漫画");
+        let pages = book["page_count"].as_u64().unwrap_or(0) as usize;
+        assert!(pages > 0, "{name} 没有导入任何页");
+        println!(
+            "  [inspect] {name}\n            标题={} 作者={} 章节={} 页={pages} 耗时={:?}",
+            book["title"].as_str().unwrap_or("?"),
+            book["author"].as_str().unwrap_or("-"),
+            book["chapter_count"].as_u64().unwrap_or(0),
+            started.elapsed(),
+        );
+        for w in book["warnings"].as_array().into_iter().flatten() {
+            println!("            警告: {w}");
+        }
 
-        let mut archive =
-            zip::ZipArchive::new(std::fs::File::open(path).expect("打开 CBZ")).expect("解析 CBZ");
-        let mut images = 0usize;
-        let mut comic_info: Option<Vec<u8>> = None;
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).expect("读取 ZIP 条目");
-            if entry.is_dir() {
-                continue;
-            }
-            let entry_name = entry.name().expect("ZIP 条目名").to_string();
-            let base = entry_name
-                .rsplit('/')
-                .next()
-                .unwrap_or(entry_name.as_str())
-                .to_string();
-            if base.is_empty() || base.starts_with('.') {
-                continue;
-            }
-            if base.eq_ignore_ascii_case("ComicInfo.xml") {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut buf).expect("读取 ComicInfo");
-                comic_info = Some(buf);
-                continue;
-            }
-            if !is_cbz_image(&base) {
-                continue;
-            }
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf).expect("读取图片");
-            // 不同子目录可能有同名文件：加序号前缀避免互相覆盖。
-            let file_name = if book_dir.join(&base).exists() {
-                format!("{i:04}-{base}")
-            } else {
-                base
-            };
-            std::fs::write(book_dir.join(file_name), buf).expect("写入图片");
-            images += 1;
-        }
-        assert!(images > 0, "{name} 没有图片");
-        match comic_info {
-            Some(bytes) => std::fs::write(book_dir.join("ComicInfo.xml"), bytes).unwrap(),
-            None => std::fs::write(
-                book_dir.join("ComicInfo.xml"),
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-                     <ComicInfo><Title>{}</Title></ComicInfo>",
-                    boranlib_ebook::xml::xml_escape(name.trim_end_matches(".cbz"))
-                ),
-            )
-            .unwrap(),
-        }
+        let commit_body = serde_json::json!({
+            "token": body["token"],
+            "mode": "new",
+        })
+        .to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed_json_post(
+                "/api/library/import/commit",
+                &commit_body,
+                &token,
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "commit {name}: {body}");
+        assert_eq!(body["created"], true, "commit {name}: {body}");
+        let book_url = body["book_url"].as_str().expect("book_url").to_string();
 
         let opened = store
             .open_comic(&book_url)
             .await
             .expect("打开漫画目录")
             .unwrap_or_else(|| panic!("{name} 未被识别为漫画"));
-        let pages: usize = opened.meta.chapters.iter().map(|c| c.pages.len()).sum();
-        assert_eq!(pages, images, "{name} 页表与图片数不一致");
+        let imported_pages: usize = opened.meta.chapters.iter().map(|c| c.pages.len()).sum();
+        assert_eq!(imported_pages, pages, "{name} 页表与导入摘要不一致");
+        assert!(
+            opened.dir.join("oread.json").is_file(),
+            "{name} 缺少 oread.json"
+        );
+        assert!(
+            opened.dir.join("ComicInfo.xml").is_file(),
+            "{name} 缺少 ComicInfo.xml"
+        );
 
         let resp = app
             .clone()
@@ -859,7 +867,7 @@ async fn real_cbz_comics_read_from_directory() {
         let body = body_json(resp).await;
         assert_eq!(status, StatusCode::OK, "漫画章节 {name}: {body}");
         let urls = body["images"].as_array().cloned().unwrap_or_default();
-        assert_eq!(urls.len(), images, "{name} 章节图片数不一致");
+        assert!(!urls.is_empty(), "{name} 章节图片为空");
         assert!(
             urls.iter().any(|v| v["width"].as_u64().unwrap_or(0) > 0),
             "{name} 至少应解析出一张图的宽度"
@@ -884,22 +892,59 @@ async fn real_cbz_comics_read_from_directory() {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = axum::body::to_bytes(resp.into_body(), MAX_JSON)
+        let image_bytes = axum::body::to_bytes(resp.into_body(), MAX_JSON)
             .await
             .unwrap();
         assert!(
-            status == StatusCode::OK && ctype.starts_with("image/") && !bytes.is_empty(),
+            status == StatusCode::OK && ctype.starts_with("image/") && !image_bytes.is_empty(),
             "{name} 首图读取失败：{status} {ctype} {} bytes",
-            bytes.len()
+            image_bytes.len()
         );
 
         println!(
-            "  {name}: 图片={images} 页={pages} 章节={} 首图={} {} bytes",
+            "  [commit] {name}: 页={imported_pages} 章节={} 首图={} {} bytes",
             opened.meta.chapters.len(),
             ctype,
-            bytes.len()
+            image_bytes.len()
         );
-        total_pages += pages;
+        total_pages += imported_pages;
+
+        // 同一文件再传一次：文件 SHA-256 应命中，确认查重链路对 CBZ 生效。
+        if file_index == 0 {
+            let resp = app
+                .clone()
+                .oneshot(cbz_upload(&name, bytes, &token))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = body_json(resp).await;
+            assert_eq!(status, StatusCode::OK, "重复 inspect {name}: {body}");
+            let dup_kinds: Vec<&str> = body["duplicates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d["kind"].as_str())
+                .collect();
+            assert!(
+                dup_kinds.contains(&"file"),
+                "{name} 重复上传应命中文件查重：{dup_kinds:?}"
+            );
+            let cancel_body = serde_json::json!({
+                "token": body["token"],
+                "mode": "cancel",
+            })
+            .to_string();
+            let resp = app
+                .clone()
+                .oneshot(authed_json_post(
+                    "/api/library/import/commit",
+                    &cancel_body,
+                    &token,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "取消重复导入 {name}");
+        }
     }
 
     let _ = std::fs::remove_dir_all(&dir);

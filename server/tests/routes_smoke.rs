@@ -93,6 +93,52 @@ fn authed_post(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn cbz_upload(file_name: &str, bytes: Vec<u8>, token: &str) -> Request<Body> {
+    const BOUNDARY: &str = "----oread-smoke-cbz-boundary";
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n\
+             Content-Type: application/vnd.comicbook+zip\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    Request::builder()
+        .method("POST")
+        .uri("/api/library/import/cbz")
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}
+
+fn write_cbz(path: &Path, files: &[(&str, Vec<u8>)]) {
+    use std::io::Write;
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in files {
+        zip.start_file(*name, opts).unwrap();
+        zip.write_all(data).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
 fn authed_delete(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
@@ -1173,6 +1219,221 @@ async fn library_browse_and_admin_actions() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// CBZ 导入：上传 → 解压成漫画目录 → commit 入库 → 漫画读路径与图片代理可用。
+#[tokio::test]
+async fn cbz_import_creates_readable_comic() {
+    let dir = temp_dir("cbz-import");
+    let cfg = test_config(&dir);
+    let shared = db::init_shared(&cfg).await.expect("初始化共享库");
+    let library = db::init_library(&cfg).await.expect("初始化馆藏库");
+    let app = routes::build_router(shared.clone(), library.clone(), cfg);
+    let admin = register_admin(&app, &shared, "cbzadmin").await;
+    let store = Store::new(&dir);
+    store.create_layout().unwrap();
+
+    let source = dir.join("My Comic.cbz");
+    write_cbz(
+        &source,
+        &[
+            ("pages/01.png", png_bytes(8, 12)),
+            ("pages/02.png", png_bytes(9, 13)),
+            (
+                "ComicInfo.xml",
+                r#"<ComicInfo><Title>冒烟漫画</Title><Writer>画师</Writer></ComicInfo>"#
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ],
+    );
+    let bytes = std::fs::read(&source).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(cbz_upload("My Comic.cbz", bytes.clone(), &admin))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["book"]["kind"], "comic", "{body}");
+    assert_eq!(body["book"]["title"], "冒烟漫画", "{body}");
+    assert_eq!(body["book"]["page_count"], 2, "{body}");
+
+    let commit_body = serde_json::json!({
+        "token": body["token"],
+        "mode": "new",
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/import/commit",
+            &commit_body,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], true, "{body}");
+    let book_url = body["book_url"].as_str().expect("book_url").to_string();
+
+    let row: (Option<String>, i64, String) = sqlx::query_as(
+        "SELECT kind, book_source_type, tier FROM library_books WHERE book_url = ?1",
+    )
+    .bind(&book_url)
+    .fetch_one(&library)
+    .await
+    .unwrap();
+    assert_eq!(row.0.as_deref(), Some("comic"));
+    assert_eq!(row.1, 2);
+    assert_eq!(row.2, "collection");
+
+    let opened = store
+        .open_comic(&book_url)
+        .await
+        .unwrap()
+        .expect("漫画目录");
+    assert_eq!(opened.meta.chapters.len(), 1);
+    assert_eq!(opened.meta.chapters[0].pages.len(), 2);
+    assert!(opened.dir.join("oread.json").is_file());
+    assert!(opened.dir.join("ComicInfo.xml").is_file());
+
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("book_url", &book_url)
+        .finish();
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!("/api/comic/chapter?{encoded}&index=1"),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let chapter = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{chapter}");
+    assert_eq!(chapter["count"], 2, "{chapter}");
+    assert_eq!(chapter["local"], true, "{chapter}");
+    let first = chapter["images"][0]["url"].as_str().expect("首图 URL");
+    assert!(first.starts_with("oread-img://"), "{first}");
+
+    let resp = app
+        .clone()
+        .oneshot(authed_get(
+            &format!(
+                "/api/book/image?{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("url", first)
+                    .finish()
+            ),
+            &admin,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    let image = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!image.is_empty());
+
+    // 同一文件再传一次：文件 SHA-256 命中查重。
+    let resp = app
+        .clone()
+        .oneshot(cbz_upload("My Comic.cbz", bytes, &admin))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let dup_kinds: Vec<&str> = body["duplicates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["kind"].as_str())
+        .collect();
+    assert!(dup_kinds.contains(&"file"), "{dup_kinds:?}");
+    let cancel = serde_json::json!({
+        "token": body["token"],
+        "mode": "cancel",
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed_post("/api/library/import/commit", &cancel, &admin))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 覆盖导入：换一本漫画覆盖刚导入的书，沿用原 book_url、修订号递增、旧目录进回收站。
+    let replacement = dir.join("Replacement.cbz");
+    write_cbz(
+        &replacement,
+        &[
+            ("01.png", png_bytes(16, 20)),
+            (
+                "ComicInfo.xml",
+                r#"<ComicInfo><Title>覆盖后的漫画</Title><Writer>新画师</Writer></ComicInfo>"#
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ],
+    );
+    let replacement_bytes = std::fs::read(&replacement).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(cbz_upload("Replacement.cbz", replacement_bytes, &admin))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let overwrite = serde_json::json!({
+        "token": body["token"],
+        "mode": "overwrite",
+        "target_book_url": book_url.as_str(),
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/library/import/commit",
+            &overwrite,
+            &admin,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["overwritten"], true, "{body}");
+    assert_eq!(body["created"], false, "{body}");
+    assert_eq!(body["book_url"], book_url.as_str(), "{body}");
+
+    let opened = store
+        .open_comic(&book_url)
+        .await
+        .unwrap()
+        .expect("覆盖后漫画目录");
+    assert_eq!(opened.meta.title, "覆盖后的漫画");
+    assert_eq!(opened.meta.author.as_deref(), Some("新画师"));
+    assert_eq!(opened.meta.revision, 2);
+    let pages: usize = opened.meta.chapters.iter().map(|c| c.pages.len()).sum();
+    assert_eq!(pages, 1);
+    let row: (String, String) =
+        sqlx::query_as("SELECT name, author FROM library_books WHERE book_url = ?1")
+            .bind(&book_url)
+            .fetch_one(&library)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "覆盖后的漫画");
+    assert_eq!(row.1, "新画师");
 
     let _ = std::fs::remove_dir_all(dir);
 }
