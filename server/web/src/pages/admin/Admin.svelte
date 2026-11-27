@@ -3,6 +3,7 @@
   import { api } from '../../lib/api.js';
   import { route, navigate, href, buildPath } from '../../lib/router.js';
   import { searchJobs } from '../../lib/searchJobsStore.js';
+  import SystemHealth from './SystemHealth.svelte';
 
   export let role = 'user';
 
@@ -146,10 +147,10 @@
             <a class="more" href={href('/library')}>去图书馆</a>
           </div>
           <div class="mini-stats">
-            <a href={href('/library?status=reading')}><b>{home.stats.reading}</b><span>在读</span></a>
-            <a href={href('/library?status=want')}><b>{home.stats.want}</b><span>想读</span></a>
-            <a href={href('/library?status=finished')}><b>{home.stats.finished}</b><span>已读</span></a>
-            <a href={href('/library')}><b>{home.stats.shelf}</b><span>在书架</span></a>
+            <a href={href('/shelf?status=reading')}><b>{home.stats.reading}</b><span>在读</span></a>
+            <a href={href('/shelf?status=want')}><b>{home.stats.want}</b><span>想读</span></a>
+            <a href={href('/shelf?status=finished')}><b>{home.stats.finished}</b><span>已读</span></a>
+            <a href={href('/shelf')}><b>{home.stats.shelf}</b><span>在书架</span></a>
           </div>
         </div>
       {/if}
@@ -164,12 +165,16 @@
       <div class="card">
         <h3>管理入口</h3>
         <div class="quick-links">
-          <button class="ghost" on:click={() => setTab('collection')}>导入 EPUB / CBZ / 维护馆藏</button>
+          <button class="ghost" on:click={() => setTab('collection')}>馆藏维护（入馆 / 导入 / 清理）</button>
           <button class="ghost" on:click={() => setTab('sources')}>书源管理</button>
           <button class="ghost" on:click={() => setTab('replace')}>替换规则</button>
           <button class="ghost" on:click={() => setTab('users')}>用户</button>
           <button class="ghost" on:click={() => setTab('discover')}>发现搜书</button>
         </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <SystemHealth />
       </div>
     {/if}
   {:else if comps[tab]}

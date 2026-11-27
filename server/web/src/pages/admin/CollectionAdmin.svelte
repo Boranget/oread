@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { api, getRole } from '../../lib/api.js';
   import { describeFailure } from '../../lib/apiErrors.js';
+  import { href } from '../../lib/router.js';
   import BookEditor from '../../lib/BookEditor.svelte';
 
   // 入馆 / 移出 / 删除 / 回收临时缓存都要管理员；浏览与占用所有登录账号可读。
@@ -41,6 +42,8 @@
   let estimatingUrl = '';
   let armedUrl = '';
   let armedTimer = null;
+  let clearAllArmed = false;
+  let clearAllTimer = null;
   let jobs = [];
   let jobsErr = '';
   let jobsLoading = false;
@@ -70,6 +73,7 @@
   onDestroy(() => {
     clearInterval(pollTimer);
     clearTimeout(armedTimer);
+    clearTimeout(clearAllTimer);
   });
 
   function hasActiveJobs() {
@@ -100,6 +104,23 @@
     if (Number(b.book_source_type) === 2) return true;
     const kind = String(b.kind || '').toLowerCase();
     return kind === 'comic' || kind === 'manga' || kind === '漫画';
+  }
+
+  // 入馆入口：本地导入固定写 origin_name='本地导入'，用来源类型区分 EPUB / CBZ。
+  function isLocal(b) {
+    return b.origin_name === '本地导入';
+  }
+
+  function sourceLabel(b) {
+    if (isLocal(b)) return isComic(b) ? '本地 CBZ' : '本地 EPUB';
+    if (b.origin_name) return b.origin_name;
+    if (b.origin) return '在线书源';
+    return '未知来源';
+  }
+
+  function progressLabel(b) {
+    if (b.download_percent == null) return '下载进度未知';
+    return b.download_percent >= 100 ? '已下载完整' : `下载 ${b.download_percent}%`;
   }
 
   function fmtSpace(v) {
@@ -296,6 +317,35 @@
     }
   }
 
+  // 清空全部临时缓存：两步确认，只删 tier='temp'，馆藏不受影响。
+  function armClearAll() {
+    if (!isAdmin) return;
+    if (!clearAllArmed) {
+      clearAllArmed = true;
+      clearTimeout(clearAllTimer);
+      clearAllTimer = setTimeout(() => (clearAllArmed = false), 4000);
+      return;
+    }
+    clearTimeout(clearAllTimer);
+    clearAllArmed = false;
+    clearAllTemp();
+  }
+
+  async function clearAllTemp() {
+    busyUrl = '*';
+    error = '';
+    notice = '';
+    try {
+      const res = await api.cacheClear('');
+      notice = `已清空全部临时缓存：删除 ${res.deleted} 章，释放 ${fmtBytes(res.bytes_freed)}；馆藏不受影响`;
+      await reload();
+    } catch (e) {
+      error = describeFailure(e, '清空临时缓存');
+    } finally {
+      busyUrl = '';
+    }
+  }
+
   async function cancelJob(j) {
     if (!isAdmin) return;
     error = '';
@@ -415,9 +465,6 @@
         on:change={onBookChosen}
         hidden
       />
-      <button class="ghost" on:click={pickBook} disabled={importing}>
-        {importing ? '导入中…' : '导入 EPUB / CBZ'}
-      </button>
     {/if}
     <button class="ghost" on:click={() => { loadStats(); loadPage(true); }} disabled={loading}>刷新</button>
   </div>
@@ -456,6 +503,34 @@
   {/if}
 {/if}
 
+{#if isAdmin}
+  <div class="card entry-group">
+    <div class="entry-head">
+      <h3 style="margin:0">入馆入口</h3>
+      <span class="muted tiny-note">永久入馆仅管理员</span>
+    </div>
+    <div class="entry-grid">
+      <div class="entry">
+        <b>本地文件</b>
+        <p class="muted tiny-note">EPUB / CBZ。先解析查重，确认后才写入馆藏。</p>
+        <button class="ghost" on:click={pickBook} disabled={importing}>
+          {importing ? '导入中…' : '选择 EPUB / CBZ'}
+        </button>
+      </div>
+      <div class="entry">
+        <b>在线书源</b>
+        <p class="muted tiny-note">在发现页搜索并打开书，阅读产生临时缓存后，可转为永久馆藏。</p>
+        <a class="ghost-link" href={href('/admin?tab=discover')}>去发现搜书</a>
+      </div>
+      <div class="entry">
+        <b>临时缓存转馆藏</b>
+        <p class="muted tiny-note">在下方临时缓存列表点「入馆」，即可永久保存；也可先清空过期缓存。</p>
+        <button class="ghost" on:click={() => setTier('temp')} disabled={tier === 'temp'}>查看临时缓存</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <div class="seg lib-tabs">
   {#each TIERS as t}
     <button class:on={tier === t.id} on:click={() => setTier(t.id)}>{t.label}</button>
@@ -472,6 +547,9 @@
   <button class="ghost" on:click={search} disabled={loading}>搜索</button>
   {#if isAdmin && tier !== 'collection'}
     <button class="ghost" on:click={cleanTemp} disabled={busyUrl === '*'}>回收过期临时缓存</button>
+    <button class="ghost" on:click={armClearAll} disabled={busyUrl === '*'}>
+      {clearAllArmed ? '再次点击确认清空' : '清空全部临时缓存'}
+    </button>
   {/if}
 </div>
 
@@ -489,7 +567,7 @@
   <p class="loading">加载中…</p>
 {:else if items.length === 0}
   <div class="empty">
-    {tier === 'collection' ? '馆藏还是空的。在书架或发现页把书入馆后，服务端会后台下载整本。' : '没有符合条件的书。'}
+    {tier === 'collection' ? '馆藏还是空的。用上方「入馆入口」导入本地 EPUB / CBZ，或把临时缓存转为馆藏。' : '没有符合条件的书。'}
   </div>
 {:else}
   <div class="lib-list">
@@ -499,12 +577,17 @@
           <div class="lib-book-head">
             <b class="lib-book-name">{b.name || b.book_url}</b>
             <span class="badge">{tierLabel(b.tier)}</span>
-            {#if b.origin_name}<span class="muted tiny-note">{b.origin_name}</span>{/if}
+            <span class="badge src-badge">{sourceLabel(b)}</span>
+            {#if b.tier === 'collection' && b.collected_at}
+              <span class="badge">{fmtDate(b.collected_at)} 入馆</span>
+            {/if}
+            {#if b.download_percent != null}
+              <span class="badge" class:ok={b.download_percent >= 100}>{progressLabel(b)}</span>
+            {/if}
           </div>
           <div class="muted tiny-note">
             {b.author || '佚名'}{#if b.series_name} · {b.series_name}{#if b.series_index != null} #{b.series_index}{/if}{/if} · 已缓存 {b.cached_chapters} / {b.total_chapter_num || '?'} 章 · 正文 {fmtBytes(b.content_bytes)}{#if b.image_bytes} · 图片 {fmtBytes(b.image_bytes)}{/if}
             · 最近访问 {fmtDate(b.last_accessed_at)}
-            {#if b.tier === 'collection' && b.collected_at} · 入馆 {fmtDate(b.collected_at)}{/if}
           </div>
           {#if b.download_percent != null}
             <div class="lib-meter" aria-hidden="true"><div style={`width:${b.download_percent}%`}></div></div>
@@ -667,6 +750,15 @@
     gap: 12px;
     margin-bottom: 12px;
   }
+  .entry-group { margin-bottom: 12px; }
+  .entry-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .entry-head .tiny-note { margin: 0; }
+  .entry-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .entry { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
+  .entry .tiny-note { margin: 0 0 4px; }
+  .entry .ghost-link { padding: 6px 12px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); text-decoration: none; font-size: 14px; }
+  .src-badge { font-weight: 600; }
+  .badge.ok { border-color: var(--accent); color: var(--accent); }
   .lib-stat { padding: 14px 16px; }
   .lib-stat-label { font-size: 12px; color: var(--muted); }
   .lib-stat-num { font-size: 22px; font-weight: 700; line-height: 1.35; margin: 2px 0; }

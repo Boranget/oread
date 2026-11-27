@@ -1867,8 +1867,8 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ### 6.9 `POST /api/book/cache/clear`
 
-- 鉴权：登录
-- 验证状态：**已验证**（冒烟 `cache_usage_and_trim_are_exposed` 等；馆藏分层改造后复跑）
+- 鉴权：管理员
+- 验证状态：**已验证**（冒烟 `cache_usage_and_trim_are_admin_only`）
 - 用途：清理**临时缓存层**的正文；馆藏（`tier=collection`）不参与，需管理员先「移出馆藏」（见 6.12）。
 - 请求体：可为空对象 `{}`；字段全部可选：
 
@@ -1898,17 +1898,17 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `bytes_freed` | integer | 否 | 冗余统计的正文 + 图片字节合计（近似释放字节） |
 | `trashed` | integer | 否 | 移进回收站的书目录数（书目录是唯一副本，清缓存必须同时移走文件） |
 
-- 错误：JSON 非法 → 400/422 纯文本；`400 {"error":"该书已入馆，请先移出馆藏再清理正文"}`；`401`；`500`。
+- 错误：JSON 非法 → 400/422 纯文本；`400 {"error":"该书已入馆，请先移出馆藏再清理正文"}`；`401`；`403`（非管理员）；`500`。
 - 行为：
   - **只清书目录 + 归零 `library_books` 的冗余统计**，不动 `library_chapters`、书目行、书架/进度/统计；对应目录移进 `trash/`，读路径立刻失效、下次重新抓取。
-  - 按书清理时若该书仍在馆藏，直接 `400`，避免任意账号删除全局共享内容。
+  - 按书清理时若该书仍在馆藏，直接 `400`；非管理员一律 `403`。全局临时缓存属于运维操作，不再对普通账号开放。
   - 删除不存在的书返回 `deleted=0`，仍 `ok:true`。
   - 清理后服务端会尝试回收 SQLite 空闲页，文件大小不保证立即下降。
 
 ### 6.9.1 `POST /api/book/cache/trim`
 
-- 鉴权：登录
-- 验证状态：**已验证**（单测 `cleanup_temp_*`、冒烟 `cache_usage_and_trim_are_exposed`）
+- 鉴权：管理员
+- 验证状态：**已验证**（单测 `cleanup_temp_*`、冒烟 `cache_usage_and_trim_are_admin_only`）
 - 用途：立即回收**过期临时缓存**（`tier=temp` 且超过 TTL 未访问），不等每小时后台任务。馆藏永久保存，不参与回收。
 - 请求体：无（`{}` 即可）。
 - 成功 `200`（示例为伪造值）：
@@ -1925,11 +1925,12 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 | `books_deleted` | integer | 否 | 被整本移除的过期临时书目数 |
 | `bytes_freed` | integer | 否 | 前后占用差（≥0） |
 
-- 错误：`401`；`500`（SQLite 查询失败）。
+- 错误：`401`；`403`（非管理员）；`500`（SQLite 查询失败）。
 - 行为：
   - 以 `library_books.last_accessed_at < now - LIBRARY_TEMP_TTL_DAYS` 为过期口径（默认 30 天）。
   - 只删 `tier=temp` 的书目/目录/正文；馆藏不受影响。
   - 后台每小时自动执行同一函数（见 `library_worker::cleanup_loop`），本接口用于「立即回收」。
+  - 普通账号调用返回 `403`；界面入口在「管理 → 馆藏维护 → 临时缓存」。
 
 ### 6.10 `GET /api/book/export/info`
 
@@ -3895,7 +3896,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 47 | POST | `/api/book/toc/batch` | JWT | 否 | `book_urls`（别名 `book_ids`）`,source?` | `{ok,total,updated,failed,skipped,results[],elapsed_ms}` |
 | 48 | GET | `/api/book/search` | JWT | 否 | `book_id,q,limit?` | `{ok,book_id,query,limit,truncated,hits[],total_chapters,cached_chapters,uncached_chapters,complete,note,elapsed_ms}` |
 | 49 | POST | `/api/book/cache-all` | JWT | 否 | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/limited/...`） |
-| 50 | POST | `/api/book/cache/clear` | JWT | 否 | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed,trashed}`（只清临时层，目录移回收站） |
+| 50 | POST | `/api/book/cache/clear` | JWT | **是** | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed,trashed}`（只清临时层，目录移回收站） |
 | 51 | GET | `/api/bookmarks` | JWT | 否 | `book_id?` | `Bookmark[]`（裸数组） |
 | 52 | POST | `/api/bookmarks` | JWT | 否 | `book_id,chapter_index?,position?,chapter_title?,note?` | `Bookmark` |
 | 53 | DELETE | `/api/bookmarks/delete` | JWT | 否 | `id` | `{ok,deleted}` |
@@ -3911,7 +3912,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 63 | POST | `/api/sources/quarantine` | JWT | **是** | `{source_ids,reason?}` | `{ok,affected,missing[],reason}` |
 | 64 | GET | `/api/k/metrics` | JWT | **是** | `date?` | 按路径聚合的埋点统计 |
 | 65 | GET | `/api/k/metrics/export` | JWT | **是** | `date?` | 该日 JSONL 原文 |
-| 66 | POST | `/api/book/cache/trim` | JWT | 否 | — | `{ok,used_bytes_before,used_bytes_after,deleted,books_deleted,bytes_freed}`（回收过期临时缓存） |
+| 66 | POST | `/api/book/cache/trim` | JWT | **是** | — | `{ok,used_bytes_before,used_bytes_after,deleted,books_deleted,bytes_freed}`（回收过期临时缓存） |
 | 67 | GET | `/api/library/stats` | JWT | 否 | — | `{ok,collection,temp,total,disk}` |
 | 68 | GET | `/api/library/books` | JWT | 否 | `tier?,sort?,q?,cursor?,limit?` | `{ok,tier,sort,limit,items[],next_cursor}` |
 | 69 | POST | `/api/library/collect` | JWT | **是** | `book_url`（别名 `book_id`）`,source?` | `{ok,book_url,newly_collected,job_id,queued}` |

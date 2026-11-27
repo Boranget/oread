@@ -219,11 +219,11 @@ async fn healthz_returns_ok_without_auth() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-// 馆藏监控：/api/healthz 暴露分层占用（不设上限）；/api/book/cache/trim 回收临时缓存。
+// 馆藏监控：/api/healthz 暴露分层占用（不设上限）；临时缓存清理仅管理员。
 #[tokio::test]
-async fn cache_usage_and_trim_are_exposed() {
-    let (app, _pool, dir) = test_app("cache-trim").await;
-    let token = register(&app, "trimmer").await;
+async fn cache_usage_and_trim_are_admin_only() {
+    let (app, pool, dir) = test_app("cache-trim").await;
+    let token = register_admin(&app, &pool, "trimmer").await;
 
     let resp = app
         .clone()
@@ -249,6 +249,21 @@ async fn cache_usage_and_trim_are_exposed() {
         body["used_bytes_before"], body["used_bytes_after"],
         "未删除时前后占用应一致: {body}"
     );
+
+    // 普通用户不能清理全局缓存，也不能回收临时缓存。
+    let user = register(&app, "cacheuser").await;
+    for (uri, payload) in [
+        ("/api/book/cache/trim", "{}"),
+        ("/api/book/cache/clear", "{}"),
+        ("/api/book/cache/clear", r#"{"book_id":"book-1"}"#),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(authed_post(uri, payload, &user))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri} {payload}");
+    }
 
     let _ = std::fs::remove_dir_all(dir);
 }

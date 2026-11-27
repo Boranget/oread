@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { api, describeFailure, describeSourceError, getRole, getToken, parseJwt, clearToken } from '../lib/api.js';
   import { THEMES, THEME_LABELS, setTheme } from '../lib/theme.js';
-  import { href } from '../lib/router.js';
   import {
     FONT_OPTIONS,
     PAGE_WIDTH_PX,
@@ -36,9 +35,8 @@
 
   // 账户：用户名/角色来自本地 JWT claims；服务端权限判定始终以签名校验结果为准
   const claims = parseJwt(getToken());
-  let accountName = String(claims.username || '');
-  let accountRole = String(claims.role || getRole());
-  const isAdmin = accountRole === 'admin';
+  const accountName = String(claims.username || '');
+  const accountRole = String(claims.role || getRole());
 
   let pwOld = '';
   let pwNew = '';
@@ -122,7 +120,7 @@
     saveLayoutField({ font_family: fontServerValue(id) }, '字体族');
   }
 
-  // 整本缓存 / 清理缓存
+  // 整本缓存：这里只做预取；全局占用、清理与回收统一在管理页
   let shelfBooks = [];
   let shelfLoading = false;
   let cacheBook = '';
@@ -130,13 +128,6 @@
   let cacheErr = '';
   let cacheNotice = '';
   let cacheRes = null;
-  let clearRes = null;
-  let clearArmed = false;
-  let clearTimer = null;
-  // 全库清理：作用域为当前账号全部正文缓存，与按书清理一样两步确认
-  let clearAllRes = null;
-  let clearAllArmed = false;
-  let clearAllTimer = null;
 
   function fmtBytes(n) {
     const v = Number(n) || 0;
@@ -163,7 +154,6 @@
     cacheErr = '';
     cacheNotice = '';
     cacheRes = null;
-    clearRes = null;
     try {
       // 书架里的 source_id 直接带上，避免书未记录 origin 时后端报缺少 source
       const src = (shelfBooks.find((b) => b.book_id === cacheBook) || {}).source_id || '';
@@ -172,82 +162,10 @@
         Number(cacheRes.attempted) === 0
           ? '这本书的章节已全部缓存，无需再抓取'
           : `缓存完成：成功 ${cacheRes.cached} 章`;
-      await loadHealth();
     } catch (e) {
       cacheErr = /目录未缓存/.test(String(e && e.message))
         ? '缓存整本失败：这本书的目录还没缓存。请先在阅读器打开这本书，加载目录后再试。'
         : describeFailure(e, '缓存整本');
-    } finally {
-      cacheBusy = false;
-    }
-  }
-
-  async function clearBookCache() {
-    if (!cacheBook) return;
-    // 两步确认，不依赖原生 confirm：墨水屏和移动端都不弹系统对话框
-    if (!clearArmed) {
-      clearArmed = true;
-      clearTimeout(clearTimer);
-      clearTimer = setTimeout(() => (clearArmed = false), 4000);
-      return;
-    }
-    clearArmed = false;
-    clearTimeout(clearTimer);
-    cacheBusy = true;
-    cacheErr = '';
-    cacheNotice = '';
-    cacheRes = null;
-    clearRes = null;
-    try {
-      clearRes = await api.cacheClear(cacheBook);
-      cacheNotice = `已清理 ${clearRes.deleted} 章缓存`;
-      await loadHealth();
-    } catch (e) {
-      cacheErr = describeFailure(e, '清理缓存');
-    } finally {
-      cacheBusy = false;
-    }
-  }
-
-  async function clearAllCache() {
-    // 两步确认，和按书清理同一套交互；4 秒内不点第二次则自动复位
-    if (!clearAllArmed) {
-      clearAllArmed = true;
-      clearTimeout(clearAllTimer);
-      clearAllTimer = setTimeout(() => (clearAllArmed = false), 4000);
-      return;
-    }
-    clearAllArmed = false;
-    clearTimeout(clearAllTimer);
-    cacheBusy = true;
-    cacheErr = '';
-    cacheNotice = '';
-    cacheRes = null;
-    clearRes = null;
-    clearAllRes = null;
-    try {
-      clearAllRes = await api.cacheClear('');
-      cacheNotice = `已清理临时缓存：${clearAllRes.deleted} 章`;
-      await loadHealth();
-    } catch (e) {
-      cacheErr = describeFailure(e, '清理临时缓存');
-    } finally {
-      cacheBusy = false;
-    }
-  }
-
-  async function trimCache() {
-    cacheBusy = true;
-    cacheErr = '';
-    cacheNotice = '';
-    try {
-      const res = await api.cacheTrim();
-      cacheNotice = res.deleted
-        ? `已回收 ${res.books_deleted ?? 0} 本过期临时缓存（${res.deleted} 章），释放 ${fmtBytes(res.bytes_freed)}`
-        : '没有过期的临时缓存，无需回收';
-      await loadHealth();
-    } catch (e) {
-      cacheErr = describeFailure(e, '回收临时缓存');
     } finally {
       cacheBusy = false;
     }
@@ -260,11 +178,6 @@
     { id: 'fade', label: '仿真翻页（淡入 + 简化 3D）' },
   ];
 
-  // 只读健康指标
-  let health = null;
-  let healthErr = '';
-  let healthLoading = false;
-
   // 主题：四项与全局主题共用同一份账号偏好，点击即生效并持久化
   function pickTheme(t) {
     if (!THEMES.includes(t)) return;
@@ -272,21 +185,8 @@
     setTheme(t);
   }
 
-  async function loadHealth() {
-    healthLoading = true;
-    healthErr = '';
-    try {
-      health = await api.healthz();
-    } catch (e) {
-      healthErr = e.message;
-    } finally {
-      healthLoading = false;
-    }
-  }
-
   onMount(async () => {
     error = '';
-    loadHealth();
     loadShelfBooks();
     try {
       const s = await api.settings();
@@ -328,7 +228,6 @@
         builtin_clean: !!settings.builtin_clean,
       });
       notice = '已保存';
-      loadHealth();
       setTimeout(() => (notice = ''), 1800);
     } catch (e) {
       // 400 时 api.js 会把后端 {"error":"..."} 原样透出，按提示修改即可
@@ -350,10 +249,6 @@
 <div class="page-head">
   <h2>我的</h2>
   <span class="page-count">设置按账号保存</span>
-  <div class="page-actions">
-    <a class="ghost-link" href={href('/stats')}>阅读统计</a>
-    {#if isAdmin}<a class="ghost-link" href={href('/admin')}>管理后台</a>{/if}
-  </div>
 </div>
 
 {#if error}<p class="err">{error}</p>{/if}
@@ -508,54 +403,6 @@
       <div class="spacer"></div>
       <button class="ghost" on:click={loadShelfBooks} disabled={shelfLoading}>{shelfLoading ? '读取中…' : '刷新书目'}</button>
     </div>
-    {#if health && health.cache}
-      <div class="cache-usage">
-        <div class="cache-usage-head">
-          <b>{fmtBytes(health.cache.bytes)}</b>
-          <span class="muted">
-            {health.cache.rows} 章 · 馆藏 {health.cache.collection?.books ?? 0} 本 / 临时 {health.cache.temp?.books ?? 0} 本
-          </span>
-        </div>
-        <div class="health-grid" style="margin-top:8px">
-          <div>
-            <span class="muted">馆藏（永久）</span>
-            <b>{fmtBytes(health.cache.collection?.bytes ?? 0)} · {health.cache.collection?.chapters ?? 0} 章</b>
-          </div>
-          <div>
-            <span class="muted">临时缓存</span>
-            <b>{fmtBytes(health.cache.temp?.bytes ?? 0)} · {health.cache.temp?.chapters ?? 0} 章</b>
-          </div>
-          <div>
-            <span class="muted">临时 TTL</span>
-            <b>{health.cache.temp?.ttl_days ?? 30} 天未访问自动回收</b>
-          </div>
-        </div>
-        {#if Number(health.cache.temp?.expired_books) > 0}
-          <p class="cache-warn">有 {health.cache.temp.expired_books} 本临时缓存已过期，可立即回收。</p>
-        {/if}
-        {#if Number(health.cache.image_cache_bytes) > 0}
-          <p class="muted field-hint">另有图片缓存 {fmtBytes(health.cache.image_cache_bytes)}（进程级、所有账号共享）。</p>
-        {/if}
-        {#if (health.cache.books || []).length}
-          <ol class="cache-books">
-            {#each health.cache.books as b}
-              <li>
-                <div class="cache-book-row">
-                  <span class="cache-book-name">{b.name || b.book_url}</span>
-                  <b>{fmtBytes(b.bytes)}</b>
-                </div>
-              </li>
-            {/each}
-          </ol>
-        {/if}
-        <div class="cache-actions">
-          <button class="ghost" on:click={trimCache} disabled={cacheBusy}>
-            {cacheBusy ? '处理中…' : '回收过期临时缓存'}
-          </button>
-          <span class="muted field-hint" style="margin:0">只回收临时层；馆藏永久保存，不受影响。</span>
-        </div>
-      </div>
-    {/if}
     {#if shelfBooks.length}
       <div class="field">
         <div class="field-label">选择书籍</div>
@@ -569,20 +416,12 @@
         <button class="primary" on:click={cacheWholeBook} disabled={cacheBusy || !cacheBook}>
           {cacheBusy ? '处理中…' : '缓存整本'}
         </button>
-        <button class="ghost" on:click={clearBookCache} disabled={cacheBusy || !cacheBook}>
-          {clearArmed ? '再次点击确认清理' : '清理本书缓存'}
-        </button>
       </div>
       <p class="muted field-hint">缓存整本按服务端预算分批抓取，可能需要几十秒，请保持页面打开。目录必须先缓存：在阅读器打开这本书即可。</p>
+      <p class="muted field-hint">缓存占用、清理与过期回收属于全局维护，已移到「管理 → 馆藏维护 → 临时缓存」。</p>
     {:else if !shelfLoading}
       <p class="muted field-hint">书架为空。先在图书馆把书加入书架，再回来缓存整本。</p>
     {/if}
-    <div class="cache-actions cache-global">
-      <button class="ghost" on:click={clearAllCache} disabled={cacheBusy}>
-        {clearAllArmed ? '再次点击确认清理全部' : '清理全部临时缓存'}
-      </button>
-      <span class="muted field-hint" style="margin:0">只删除临时层的正文；已入馆的书不受影响，需要先移出馆藏。</span>
-    </div>
     {#if cacheErr}<p class="err">{cacheErr}</p>{/if}
     {#if cacheNotice}<p class="ok-line">{cacheNotice}</p>{/if}
     {#if cacheRes}
@@ -609,38 +448,6 @@
         {/if}
       </div>
     {/if}
-    {#if clearRes}
-      <p class="muted">已清理 {clearRes.deleted} 章，释放 {fmtBytes(clearRes.bytes_freed)}。</p>
-    {/if}
-    {#if clearAllRes}
-      <p class="muted">
-        临时缓存清理完成（{clearAllRes.scope === 'temp' ? '全部临时层' : '单本'}）：删除 {clearAllRes.deleted} 章，释放 {fmtBytes(clearAllRes.bytes_freed)}。
-      </p>
-    {/if}
-  </div>
-
-  <div class="card">
-    <div class="row" style="margin-bottom:10px">
-      <h3 style="margin:0">服务状态</h3>
-      <div class="spacer"></div>
-      <button class="ghost" on:click={loadHealth} disabled={healthLoading}>{healthLoading ? '读取中…' : '刷新'}</button>
-    </div>
-    {#if healthErr}<p class="err">{healthErr}</p>{/if}
-    {#if health}
-      <div class="health-grid">
-        <div><span class="muted">当前服务版本</span><b>{health.version ? `v${health.version}` : '未返回'}</b></div>
-        <div><span class="muted">进程内存 RSS</span><b>{health.rss_mb == null ? '当前平台不可用' : health.rss_mb + ' MB'}</b></div>
-        <div><span class="muted">打开的用户库</span><b>{health.open_user_dbs ?? 0}</b></div>
-        <div><span class="muted">馆藏正文（永久）</span><b>{health.cache ? `${fmtBytes(health.cache.collection?.bytes ?? 0)} · ${health.cache.collection?.books ?? 0} 本` : '未返回'}</b></div>
-        <div><span class="muted">临时缓存</span><b>{health.cache ? `${fmtBytes(health.cache.temp?.bytes ?? 0)} · ${health.cache.temp?.books ?? 0} 本` : '未返回'}</b></div>
-        <div><span class="muted">HTTP 并发 / 超时</span><b>{health.http?.concurrency ?? '?'} / {health.http?.timeout_secs ?? '?'}s</b></div>
-        <div><span class="muted">请求体上限</span><b>{health.http?.max_body_mb ?? '?'} MB</b></div>
-        <div><span class="muted">JS 规则</span><b>{health.js?.enabled ? '开启' : '关闭'} · {health.js?.last_ms ?? 0} / {health.js?.max_ms ?? 0} ms</b></div>
-      </div>
-      <p class="muted field-hint">只读指标，来自 /api/healthz；不含书籍与账号内容。</p>
-    {:else if healthLoading}
-      <p class="loading">读取状态…</p>
-    {/if}
   </div>
 
   <div class="card">
@@ -657,16 +464,6 @@
 </div>
 
 <style>
-  .ghost-link {
-    display: inline-flex;
-    align-items: center;
-    padding: 8px 14px;
-    border: 1px solid var(--accent);
-    border-radius: 8px;
-    color: var(--accent);
-    text-decoration: none;
-    font-size: 14px;
-  }
   .settings-wrap h3 { margin-bottom: 12px; }
   .account-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .account-head b { font-size: 15px; }
@@ -681,10 +478,6 @@
   .switch-row span { display: flex; flex-direction: column; gap: 3px; font-size: 14px; }
   .switch-row span .muted { font-size: 12px; }
   .switch-row input { width: 20px; min-width: 20px; height: 20px; }
-  .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-  .health-grid > div { display: flex; flex-direction: column; gap: 2px; }
-  .health-grid span { font-size: 12px; }
-  .health-grid b { font-size: 15px; font-variant-numeric: tabular-nums; }
   .k-link {
     display: inline-block;
     padding: 8px 14px;
@@ -697,14 +490,6 @@
   .k-link:hover { background: var(--card); }
 
   .cache-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
-  .cache-global { align-items: center; border-top: 1px solid var(--border, #d8d8d8); padding-top: 10px; }
-  .cache-usage { border: 1px solid var(--border, #d8d8d8); padding: 10px 12px; margin-bottom: 14px; }
-  .cache-usage-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
-  .cache-usage-head b { font-size: 18px; }
-  .cache-books { margin: 8px 0 0; padding-left: 20px; font-size: 12px; line-height: 1.7; }
-  .cache-book-row { display: flex; justify-content: space-between; gap: 10px; }
-  .cache-book-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cache-books b { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .cache-result {
     border: 1px solid var(--border, #d8d8d8);
     padding: 10px 12px;

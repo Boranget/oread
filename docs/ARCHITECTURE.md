@@ -264,19 +264,20 @@ Bearer 访问 `/opds*`，便于调试。
 ## 5. 前端（SPA）
 
 - Svelte 4 + Vite，产物 `server/web/dist`，由 `ServeDir` 托管。
-- **信息架构**：一级导航固定为「首页 / 图书馆 / 统计 / 我的」，管理（`/admin`）只对管理员出现；「发现搜书」与书源整块退入管理区。阅读器全屏覆盖，不占一级导航。
+- **信息架构**：一级导航固定为「首页 / 图书馆 / 书架 / 统计 / 我的」，管理（`/admin`）只对管理员出现；「发现搜书」与书源整块退入管理区。阅读器全屏覆盖，不占一级导航。
   - `pages/Home.svelte`：统计卡 + 继续阅读 / 最近加入 / 想读，数据来自 `GET /api/library/home`。
-  - `pages/Catalog.svelte`：唯一目录。状态 tabs（全部 / 未标记 / 想读 / 在读 / 已读）、只看书架、搜索、排序、网格/列表、维度筛选、分页与批量管理（状态 / 加入书架 / 分组 / 移出书架）。URL query 是唯一状态源。
+  - `pages/Catalog.svelte`：图书馆（全局馆藏）与书架（当前账号已借阅 + 个人阅读状态）共用同一目录组件；状态 tabs（全部 / 未标记 / 想读 / 在读 / 已读）、搜索、排序、网格/列表、维度筛选、分页与批量管理（状态 / 加入书架 / 分组 / 移出书架）。URL query 是唯一状态源。
   - `pages/BookDetail.svelte`：`#/book?url=...`，元数据、标签、标识、目录、简介、阅读状态与书架操作。
   - `pages/Browse.svelte`：作者 / 系列 / 标签 / 出版社 / 语言索引，点击跳到带筛选的图书馆。
-  - `pages/Account.svelte`（我的）：账户与改密、阅读排版、正文净化、缓存、服务状态、`/k` 入口。
-  - `pages/admin/Admin.svelte`：`#/admin?tab=overview|collection|sources|replace|users|discover`，重页面继续 `import()` 懒加载。
+  - `pages/Account.svelte`（我的）：只保留个人账户与改密、阅读排版、正文净化、书架缓存预取、`/k` 入口；全局缓存占用与清理移到管理。
+  - `pages/admin/Admin.svelte`：`#/admin?tab=overview|collection|sources|replace|users|discover`，重页面继续 `import()` 懒加载；总览内嵌只读「系统状态」（`admin/SystemHealth.svelte`）。
+  - `pages/admin/CollectionAdmin.svelte`：馆藏维护顶部固定「入馆入口」分组（本地 EPUB / CBZ、在线书源、临时缓存转馆藏），列表标注来源、入馆时间与下载进度。
 - **路由是 hash 路由**（`lib/router.js`，无第三方依赖）：`ServeDir` 没有 SPA 回退，hash 刷新 / 分享 / 后退都可用；阅读器仍是 overlay 状态，不进路由。
 - 首屏只静态引入 Login / Home / Catalog；Browse、BookDetail、Stats、Account、Admin 与 Reader、ComicReader 均 `import()` 懒加载，失败有可见错误与重试。
 - **阅读器独立目录 `src/reader/`**：`Reader.svelte`、`ComicReader.svelte`、`Reader*.svelte`、`reader*.js` 与其单测都在这里。硬规则：`reader/` 只能 import `./` 与 `../lib/`，**不许 import `pages/`**——管理端组件里的 `object-fit`/`transform`/`vw` 会让 KPW3 阅读页白屏，而故障现场在别处。门禁 `node scripts/check-reader-boundary.mjs`（CI 的 web job 已接入）。
 - **PC 与移动端共用同一阅读器**：不按 UA 分叉，只按视口/触控/键盘调整页宽、手势与控制栏；`/k` 是唯一的第二套前端（服务端渲染，无业务 JS）。
 - **正文长期模型是语义块**（标题 / 段落 / 列表 / 代码块 / 分隔线 / 图片 / 表格 / 公式）：Web 与 `/k` 从同一份块数据各自渲染，不把书源 HTML 直接注入 DOM——插值天然防注入，分页与墨水屏布局也可预测。真表格保留表头与 `colspan` / `rowspan`，单格公式包装表与 1 行 2 图版式表仍走段落 / 图片；独立公式保留清理后的 MathML，`/k`、TXT 导出与搜索使用回退文本。Ruby 只保留底字（`rt` / `rp` 注音丢弃），`<hr>` 成为分隔块，`<sub>` / `<sup>` 的数字与运算符降级为 Unicode 上下标。`/api/book/content` 同时下发 `content`（HTML，给 `/k` 与旧客户端）和 `blocks`（Web 阅读器优先使用）；旧数据没有 `blocks` 时前端回退解析 HTML。
-- 馆藏维护页（`pages/admin/CollectionAdmin.svelte`）所有登录账号可浏览占用与进度；入馆/移出/删除/回收临时缓存按 `getRole() === 'admin'` 收口。管理页只是前端归类，后端每个管理接口的权限校验保持原样。
+- 馆藏维护页（`pages/admin/CollectionAdmin.svelte`）所有登录账号可浏览占用与进度；入馆/移出/删除/回收临时缓存按 `getRole() === 'admin'` 收口。管理页只是前端归类，后端每个管理接口的权限校验保持原样：`POST /api/book/cache/clear` 与 `/api/book/cache/trim` 同样要求管理员。
 - 书卡统一用 `lib/BookCard.svelte`；页面只向上抛 `read`（或发现页的 `open`），由 `App.svelte` 的 `openReader(book)` 统一打开阅读器。
 - 纯逻辑下沉在 `src/lib/`：`api.js`（请求封装，错误/URL 拆到 `apiErrors.js`、`apiUrl.js`）、`searchJobsModel`（任务状态/进度/时间纯函数）、`readingPrefs`、`theme` 等，均有 `node --test` 单测；阅读器相关的 `readerHtml/images/stats/auto/progress/gestures/math` 已随阅读器移入 `src/reader/`。
 - 搜索任务共享状态在 `lib/searchJobsStore.js`：App 登录后轮询 `/api/search/jobs`（有运行中任务 2.5s、空闲 15s），退出时停止并清空；Discover 的 `SearchJobsPanel` 只读取 store，支持取消、移除与「查看结果」重新挂载（运行中继续轮询，已结束直接读快照）。

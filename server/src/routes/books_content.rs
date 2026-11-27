@@ -769,10 +769,11 @@ pub(crate) async fn clear_content_cache(
 
 pub(super) async fn cache_clear(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     _db: UserDb,
     Json(q): Json<CacheClearQ>,
 ) -> AppResult<Json<serde_json::Value>> {
+    crate::auth::ensure_admin(&u)?;
     let scope = q
         .book_id
         .as_deref()
@@ -796,9 +797,10 @@ pub(super) async fn cache_clear(
 /// 馆藏永不参与（不设容量上限，只做占用监控）。
 pub(super) async fn cache_trim(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     _db: UserDb,
 ) -> AppResult<Json<serde_json::Value>> {
+    crate::auth::ensure_admin(&u)?;
     let used_before = library::stats(&s.library, s.cfg.library_temp_ttl_secs)
         .await
         .total_bytes;
