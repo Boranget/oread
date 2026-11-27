@@ -42,6 +42,7 @@
   function pageOf(path) {
     if (!path || path === '/') return 'home';
     if (path === '/library') return 'library';
+    if (path === '/shelf') return 'shelf';
     if (path === '/browse' || path === '/book' || path === '/stats' || path === '/me' || path === '/admin') {
       return path.slice(1);
     }
@@ -279,6 +280,8 @@
       <Home {role} on:read={(e) => openReader(e.detail)} />
     {:else if page === 'library'}
       <Catalog on:read={(e) => openReader(e.detail)} />
+    {:else if page === 'shelf'}
+      <Catalog mode="shelf" on:read={(e) => openReader(e.detail)} />
     {:else if page === 'admin' && role !== 'admin'}
       <div class="card">
         <p class="err">需要管理员权限。</p>

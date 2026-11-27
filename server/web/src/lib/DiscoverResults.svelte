@@ -245,8 +245,8 @@
         </button>
         <div class="title" on:click={() => dispatch('open', r)}>{r.name || r.book_url}</div>
         <div class="author">{r.author || '未知作者'}{#if r.origin_name} · {r.origin_name}{/if}{#if r.retry} <span class="retry-tag">重试命中</span>{/if}</div>
-        {#if r.latest_chapter_title}<div class="author muted clamp1">{r.latest_chapter_title}</div>{/if}
-        <div class="row" style="margin-top:8px">
+        <div class="author muted clamp1 latest">{r.latest_chapter_title || ''}</div>
+        <div class="row card-actions">
           <button style="flex:1" on:click={() => dispatch('open', r)}>阅读</button>
           <button class="ghost" disabled={shelfIds.has(r.book_url)} on:click={() => dispatch('addShelf', r)}>{shelfIds.has(r.book_url) ? '已加入' : '加入书架'}</button>
         </div>
@@ -335,4 +335,10 @@
     font-size: 11px;
     color: var(--accent);
   }
+  /* 搜索结果卡：内容行数不一致时按钮仍对齐到卡片底部 */
+  .card.book { display: flex; flex-direction: column; gap: 4px; height: 100%; }
+  .card.book .author { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .latest { min-height: 1.45em; }
+  .card-actions { margin-top: auto; padding-top: 8px; align-items: stretch; }
+  .card-actions > button { min-height: 32px; padding: 6px 10px; font-size: 12px; }
 </style>

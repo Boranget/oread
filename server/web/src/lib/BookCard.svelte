@@ -52,16 +52,22 @@
     </span>
   </a>
 
-  <a class="title" href={detailHref}>{title}</a>
-  <div class="author">{author}</div>
-  {#if series}<div class="series muted">{series}</div>{/if}
+  <a class="title" href={detailHref} title={title}>{title}</a>
+  <div class="author" title={author}>{author}</div>
+  <!-- 系列行始终占位：没有系列的书也保留同样高度，卡片底部才能对齐 -->
+  <div class="series muted" aria-hidden={!series}>{series}</div>
 
-  {#if pct > 0}
+  <!-- 进度区固定高度：有无进度都占两行（进度条 + 文案） -->
+  <div class="progress">
     <div class="pg-track" aria-hidden="true"><div class="pg-fill" style={`width:${pct}%`}></div></div>
-    <div class="muted tiny">已读 {pct.toFixed(0)}%</div>
-  {:else}
-    <div class="muted tiny">{book.on_shelf ? '在书架' : '未收藏'}</div>
-  {/if}
+    <div class="muted tiny progress-label">
+      {#if pct > 0}
+        已读 {pct.toFixed(0)}%
+      {:else}
+        {book.on_shelf ? '在书架 · 未开始' : '未开始'}
+      {/if}
+    </div>
+  </div>
 
   <div class="actions">
     <button class="ghost mini" on:click={() => dispatch('read', book)}>阅读</button>
@@ -75,6 +81,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    height: 100%;
     padding: 10px;
     cursor: default;
   }
@@ -130,8 +137,22 @@
   }
   .title:hover { color: var(--accent); }
   .author, .series { font-size: 12px; color: var(--muted); }
-  .series { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .author {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 固定一行高度，空串也占位 */
+  .series {
+    min-height: 1.45em;
+    line-height: 1.45;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .tiny { font-size: 11px; }
+  .progress { display: grid; gap: 2px; }
+  .progress-label { min-height: 1.4em; line-height: 1.4; }
   .pg-track {
     height: 6px;
     margin-top: 4px;
@@ -140,16 +161,34 @@
     overflow: hidden;
   }
   .pg-fill { height: 100%; background: var(--accent); }
-  .actions { display: flex; gap: 6px; margin-top: 6px; }
-  .actions > * { flex: 1 1 0; text-align: center; }
-  .mini { padding: 6px 10px; font-size: 12px; min-height: 32px; }
-  .detail-link {
+  /* 按钮统一高度并吸到卡片底部，同一行的卡片才会对齐 */
+  .actions {
+    display: flex;
+    align-items: stretch;
+    gap: 6px;
+    margin-top: auto;
+    padding-top: 6px;
+  }
+  .actions > * {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 32px;
+    padding: 6px 10px;
+    font-size: 12px;
+    line-height: 1;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+  }
+  .mini { padding: 6px 10px; font-size: 12px; min-height: 32px; }
+  .detail-link {
+    color: var(--accent);
+    background: transparent;
+    border: 1px solid var(--accent);
     text-decoration: none;
     border-radius: 8px;
   }
+  .detail-link:hover { background: var(--accent-weak, rgba(179, 57, 47, 0.08)); }
   .pick {
     position: absolute;
     top: 8px;

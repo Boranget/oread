@@ -347,6 +347,7 @@
   .pg-fill { height: 100%; background: var(--accent); }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
   .status-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  .mini { min-height: 32px; padding: 4px 12px; font-size: 12px; }
   .status-chip { min-height: 32px; padding: 4px 14px; }
   .status-chip.on { background: var(--accent); color: var(--on-accent, #fff); border-color: var(--accent); }
   .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }

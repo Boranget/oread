@@ -11,28 +11,23 @@
     ? 'home'
     : path.startsWith('/library') || path.startsWith('/browse')
       ? 'library'
-      : path.startsWith('/stats')
-        ? 'stats'
-        : path.startsWith('/admin')
-          ? 'admin'
-          : path.startsWith('/me')
-            ? 'me'
-            : '';
+      : path.startsWith('/shelf')
+        ? 'shelf'
+        : path.startsWith('/stats')
+          ? 'stats'
+          : path.startsWith('/admin')
+            ? 'admin'
+            : path.startsWith('/me')
+              ? 'me'
+              : '';
 
   $: mainNav = [
     { id: 'home', label: '首页', to: '/' },
     { id: 'library', label: '图书馆', to: '/library' },
+    { id: 'shelf', label: '书架', to: '/shelf' },
     { id: 'stats', label: '统计', to: '/stats' },
     { id: 'me', label: '我的', to: '/me' },
     ...(isAdmin ? [{ id: 'admin', label: '管理', to: '/admin' }] : []),
-  ];
-
-  const libLinks = [
-    { label: '全部馆藏', to: '/library' },
-    { label: '想读', to: '/library?status=want' },
-    { label: '在读', to: '/library?status=reading' },
-    { label: '已读', to: '/library?status=finished' },
-    { label: '浏览维度', to: '/browse' },
   ];
 
   let q = '';
@@ -42,15 +37,6 @@
     const term = q.trim();
     if (!term) return;
     navigate(buildPath('/library', { q: term }));
-  }
-
-  function isLibLinkOn(to) {
-    if (!$route.path.startsWith('/library') && !$route.path.startsWith('/browse')) return false;
-    const [p, qs] = String(to).split('?');
-    if (p !== $route.path) return false;
-    if (!qs) return !$route.query.status;
-    const status = new URLSearchParams(qs).get('status') || '';
-    return ($route.query.status || '') === status;
   }
 </script>
 
@@ -65,13 +51,6 @@
             <span class="nav-badge" aria-label={`${$searchJobs.active} 个搜索任务运行中`}>{$searchJobs.active}</span>
           {/if}
         </a>
-      {/each}
-    </nav>
-
-    <div class="side-label">图书馆</div>
-    <nav class="nav-sub">
-      {#each libLinks as link}
-        <a class="nav-sub-item" class:on={isLibLinkOn(link.to)} href={href(link.to)}>{link.label}</a>
       {/each}
     </nav>
 
@@ -130,8 +109,8 @@
     text-decoration: none;
     letter-spacing: 0.2px;
   }
-  .nav-main, .nav-sub { display: flex; flex-direction: column; gap: 2px; }
-  .nav-item, .nav-sub-item {
+  .nav-main { display: flex; flex-direction: column; gap: 2px; }
+  .nav-item {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -141,7 +120,7 @@
     text-decoration: none;
     font-size: 14px;
   }
-  .nav-item:hover, .nav-sub-item:hover { background: var(--soft-bg, #f0f0f2); }
+  .nav-item:hover { background: var(--soft-bg, #f0f0f2); }
   .nav-item.on { background: var(--accent); color: #fff; font-weight: 600; }
   .nav-item.on:hover { background: var(--accent-d); }
   .nav-badge {
@@ -155,14 +134,6 @@
     text-align: center;
   }
   .nav-item.on .nav-badge { background: #fff; color: var(--accent); }
-  .side-label {
-    margin: 16px 10px 4px;
-    font-size: 11px;
-    color: var(--muted);
-    letter-spacing: 0.06em;
-  }
-  .nav-sub-item { color: var(--muted); font-size: 13px; padding: 6px 10px; }
-  .nav-sub-item.on { color: var(--accent); font-weight: 600; background: var(--accent-weak, rgba(179, 57, 47, 0.08)); }
   .side-spacer { flex: 1; }
   .logout { width: 100%; }
 

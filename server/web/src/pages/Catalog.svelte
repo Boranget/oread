@@ -9,6 +9,11 @@
     dispatch('read', book);
   }
 
+  // library = 全部馆藏（找书/借阅）；shelf = 我的书架（已借阅的书 + 个人阅读状态）
+  export let mode = 'library';
+  $: isShelf = mode === 'shelf';
+  $: basePath = isShelf ? '/shelf' : '/library';
+
   const STATUS_TABS = [
     { id: 'all', label: '全部' },
     { id: 'none', label: '未标记' },
@@ -97,22 +102,23 @@
   }
 
   $: query = $route.query;
-  $: status = query.status || 'all';
+  // 个人阅读状态只在书架页生效；图书馆只负责全局馆藏。
+  $: status = isShelf ? query.status || 'all' : 'all';
   $: page = Math.max(1, Number(query.page) || 1);
   $: sort = query.sort || 'recent';
-  $: group = query.group || 'all';
+  $: group = isShelf ? query.group || 'all' : 'all';
   $: q = query.q || '';
-  $: shelfOnly = query.shelf === '1';
+  $: shelfOnly = isShelf;
   $: dims = DIMS.map((d) => ({ ...d, value: query[d.key] || '' })).filter((d) => d.value);
   $: qInput = q;
 
   $: queryKey = JSON.stringify({
+    mode,
     status,
     page,
     sort,
     group,
     q,
-    shelf: query.shelf || '',
     author: query.author || '',
     series: query.series || '',
     tag: query.tag || '',
@@ -167,7 +173,7 @@
   function apply(patch, { resetPage = true } = {}) {
     const next = { ...$route.query, ...patch };
     if (resetPage) delete next.page;
-    navigate(buildPath('/library', next));
+    navigate(buildPath(basePath, next));
   }
 
   function submitSearch(e) {
@@ -192,13 +198,13 @@
   }
 
   function clearAll() {
-    navigate('/library');
+    navigate(basePath);
   }
 
   function goPage(p) {
     if (p < 1 || (pages && p > pages) || p === page) return;
     const next = { ...$route.query, page: p === 1 ? undefined : p };
-    navigate(buildPath('/library', next));
+    navigate(buildPath(basePath, next));
   }
 
   function toggleView() {
@@ -228,6 +234,7 @@
     selected = checked ? [...new Set([...selected, url])] : selected.filter((x) => x !== url);
   }
 
+  // 单本借阅 / 归还：借阅 = 加入当前账号书架，归还 = 移出书架（保留馆藏与阅读记录）
   function selectPage() {
     selected = items.map((b) => b.book_url);
   }
@@ -288,7 +295,7 @@
         failures.push(`${b.name || b.book_url}：${e.message}`);
       }
     }
-    batchMsg = `加入书架：成功 ${ok} 本` + (failures.length ? `，失败 ${failures.length} 本` : '');
+    batchMsg = `借阅：成功 ${ok} 本` + (failures.length ? `，失败 ${failures.length} 本` : '');
     batchFailures = failures.slice(0, 20);
     batchBusy = '';
     await load();
@@ -322,17 +329,17 @@
   async function batchRemove() {
     const targets = selectedOnShelf;
     if (!targets.length) return;
-    if (!confirm(`从书架移除选中的 ${targets.length} 本书？\n不会删除阅读记录与正文缓存；馆藏内容不受影响。`)) return;
+    if (!confirm(`从书架归还选中的 ${targets.length} 本书？\n不会删除阅读记录与正文缓存；馆藏内容不受影响。`)) return;
     batchBusy = 'remove';
     batchMsg = '';
     batchErr = '';
     batchFailures = [];
     try {
       const r = await api.shelfBatch('remove', targets.map((b) => b.book_url));
-      applyBatchResult(`移除 ${targets.length} 本`, r);
+      applyBatchResult(`归还 ${targets.length} 本`, r);
       await load();
     } catch (e) {
-      batchErr = `批量移除失败：${e.message}`;
+      batchErr = `批量归还失败：${e.message}`;
     } finally {
       batchBusy = '';
     }
@@ -413,51 +420,57 @@
 </script>
 
 <div class="page-head">
-  <h2>图书馆</h2>
-  <span class="page-count">{data ? `${total} 本` : ''}</span>
+  <h2>{isShelf ? '我的书架' : '图书馆'}</h2>
+  <span class="page-count">{data ? (isShelf ? `${total} 本在书架` : `${total} 本`) : ''}</span>
   <div class="page-actions">
-    <a class="ghost-link" href={href('/browse')}>浏览维度</a>
+    {#if !isShelf}
+      <a class="ghost-link" href={href('/browse')}>浏览维度</a>
+    {/if}
     <button class="ghost" on:click={toggleSelectMode}>{selectMode ? '退出多选' : '批量管理'}</button>
-    <button class="ghost" on:click={openGroups}>分组管理</button>
+    {#if isShelf}
+      <button class="ghost" on:click={openGroups}>分组管理</button>
+    {/if}
     <button class="ghost" on:click={load} disabled={loading}>{loading ? '读取中…' : '刷新'}</button>
   </div>
 </div>
 
-<div class="seg status-tabs">
-  {#each STATUS_TABS as t (t.id)}
-    <button class:on={status === t.id} on:click={() => setStatus(t.id)}>{t.label}</button>
-  {/each}
-</div>
+{#if isShelf}
+  <div class="seg status-tabs">
+    {#each STATUS_TABS as t (t.id)}
+      <button class:on={status === t.id} on:click={() => setStatus(t.id)}>{t.label}</button>
+    {/each}
+  </div>
+{/if}
 
 <div class="toolbar">
   <form class="search-form" on:submit={submitSearch}>
-    <input bind:value={qInput} placeholder="搜索书名、作者、系列、标签" aria-label="搜索馆藏" />
+    <input
+      bind:value={qInput}
+      placeholder={isShelf ? '搜索我的书架' : '搜索书名、作者、系列、标签'}
+      aria-label={isShelf ? '搜索书架' : '搜索馆藏'}
+    />
   </form>
   <select value={sort} on:change={(e) => setSort(e.currentTarget.value)} aria-label="排序">
     {#each SORTS as s (s.id)}
       <option value={s.id}>{s.label}</option>
     {/each}
   </select>
-  <select value={group} on:change={(e) => setGroup(e.currentTarget.value)} aria-label="分组">
-    <option value="all">全部分组</option>
-    <option value="ungrouped">未分组</option>
-    {#each groupOptions as g}
-      <option value={g}>{g}</option>
-    {/each}
-  </select>
+  {#if isShelf}
+    <select value={group} on:change={(e) => setGroup(e.currentTarget.value)} aria-label="分组">
+      <option value="all">全部分组</option>
+      <option value="ungrouped">未分组</option>
+      {#each groupOptions as g}
+        <option value={g}>{g}</option>
+      {/each}
+    </select>
+  {/if}
   <button class="ghost view-toggle" on:click={toggleView}>{view === 'grid' ? '列表' : '网格'}</button>
-  <button class="ghost view-toggle" class:on={shelfOnly} on:click={() => apply({ shelf: shelfOnly ? undefined : '1' })}>
-    {shelfOnly ? '只看书架 ✓' : '只看书架'}
-  </button>
 </div>
 
-{#if dims.length || q || shelfOnly}
+{#if dims.length || q}
   <div class="active-filters">
     {#if q}
       <button class="chip on" on:click={() => apply({ q: undefined })}>搜索：{q}<span class="x">×</span></button>
-    {/if}
-    {#if shelfOnly}
-      <button class="chip on" on:click={() => apply({ shelf: undefined })}>只看书架<span class="x">×</span></button>
     {/if}
     {#each dims as d (d.key)}
       <button class="chip on" on:click={() => clearDim(d.key)}>{d.label}：{d.value}<span class="x">×</span></button>
@@ -474,23 +487,28 @@
       <button class="ghost mini" on:click={selectPage} disabled={!items.length}>全选本页</button>
       <button class="ghost mini" on:click={clearSelection} disabled={!selected.length}>清空</button>
     </div>
+    {#if isShelf}
+      <div class="batch-line">
+        <span class="muted">状态</span>
+        <button class="ghost mini" on:click={() => batchStatus('want')} disabled={!selected.length || !!batchBusy}>想读</button>
+        <button class="ghost mini" on:click={() => batchStatus('reading')} disabled={!selected.length || !!batchBusy}>在读</button>
+        <button class="ghost mini" on:click={() => batchStatus('finished')} disabled={!selected.length || !!batchBusy}>已读</button>
+        <button class="ghost mini" on:click={() => batchStatus('')} disabled={!selected.length || !!batchBusy}>清除状态</button>
+      </div>
+    {/if}
     <div class="batch-line">
-      <span class="muted">状态</span>
-      <button class="ghost mini" on:click={() => batchStatus('want')} disabled={!selected.length || !!batchBusy}>想读</button>
-      <button class="ghost mini" on:click={() => batchStatus('reading')} disabled={!selected.length || !!batchBusy}>在读</button>
-      <button class="ghost mini" on:click={() => batchStatus('finished')} disabled={!selected.length || !!batchBusy}>已读</button>
-      <button class="ghost mini" on:click={() => batchStatus('')} disabled={!selected.length || !!batchBusy}>清除状态</button>
-    </div>
-    <div class="batch-line">
-      <button class="ghost mini" on:click={batchAddShelf} disabled={!selectedOffShelf.length || !!batchBusy}>加入书架</button>
-      <select bind:value={moveTarget} aria-label="目标分组" class="batch-group">
-        <option value="">未分组</option>
-        {#each groupOptions as g}
-          <option value={g}>{g}</option>
-        {/each}
-      </select>
-      <button class="ghost mini" on:click={batchMove} disabled={!selectedOnShelf.length || !!batchBusy}>移到分组</button>
-      <button class="danger mini" on:click={batchRemove} disabled={!selectedOnShelf.length || !!batchBusy}>移出书架</button>
+      {#if isShelf}
+        <select bind:value={moveTarget} aria-label="目标分组" class="batch-group">
+          <option value="">未分组</option>
+          {#each groupOptions as g}
+            <option value={g}>{g}</option>
+          {/each}
+        </select>
+        <button class="ghost mini" on:click={batchMove} disabled={!selectedOnShelf.length || !!batchBusy}>移到分组</button>
+        <button class="danger mini" on:click={batchRemove} disabled={!selectedOnShelf.length || !!batchBusy}>归还选中</button>
+      {:else}
+        <button class="ghost mini" on:click={batchAddShelf} disabled={!selectedOffShelf.length || !!batchBusy}>借阅选中</button>
+      {/if}
     </div>
   </div>
 {/if}
@@ -665,8 +683,9 @@
     font-size: 14px;
   }
   .list { display: grid; gap: 10px; }
-  .list-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px; }
-  .pick { width: auto; margin-top: 4px; }
+  .list-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+  .pick { width: auto; margin: 0; }
+  .mini { padding: 6px 10px; font-size: 12px; min-height: 32px; line-height: 1; }
   .thumb {
     position: relative;
     flex: 0 0 54px;
@@ -696,9 +715,16 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    min-height: 32px;
+    padding: 6px 10px;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    background: transparent;
     text-decoration: none;
     border-radius: 8px;
+    line-height: 1;
   }
+  .link-btn:hover { background: var(--accent-weak, rgba(179, 57, 47, 0.08)); }
   .small { font-size: 12px; }
   .pager { margin: 14px 0 4px; text-align: center; }
   .pager button { margin: 0 4px; }

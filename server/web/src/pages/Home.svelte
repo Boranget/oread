@@ -51,19 +51,19 @@
       <span class="stat-num">{stats.collection}</span>
       <span class="stat-label">全部馆藏</span>
     </a>
-    <a class="stat" href={href('/library?status=reading')}>
+    <a class="stat" href={href('/shelf?status=reading')}>
       <span class="stat-num">{stats.reading}</span>
       <span class="stat-label">在读</span>
     </a>
-    <a class="stat" href={href('/library?status=want')}>
+    <a class="stat" href={href('/shelf?status=want')}>
       <span class="stat-num">{stats.want}</span>
       <span class="stat-label">想读</span>
     </a>
-    <a class="stat" href={href('/library?status=finished')}>
+    <a class="stat" href={href('/shelf?status=finished')}>
       <span class="stat-num">{stats.finished}</span>
       <span class="stat-label">已读</span>
     </a>
-    <a class="stat" href={href('/library?shelf=1')}>
+    <a class="stat" href={href('/shelf')}>
       <span class="stat-num">{stats.shelf}</span>
       <span class="stat-label">在书架</span>
     </a>
@@ -87,7 +87,7 @@
     <section class="section">
       <div class="section-head">
         <h3>继续阅读</h3>
-        <a class="more" href={href('/library?status=reading')}>全部在读</a>
+        <a class="more" href={href('/shelf?status=reading')}>全部在读</a>
       </div>
       {#if data.continue.length}
         <div class="strip">
@@ -122,7 +122,7 @@
       <section class="section">
         <div class="section-head">
           <h3>想读</h3>
-          <a class="more" href={href('/library?status=want')}>全部想读</a>
+          <a class="more" href={href('/shelf?status=want')}>全部想读</a>
         </div>
         <div class="grid auto">
           {#each data.want as book (book.book_url)}
