@@ -11,21 +11,25 @@
     ? 'shelf'
     : path.startsWith('/library') || path.startsWith('/browse')
       ? 'library'
-      : path.startsWith('/stats')
-        ? 'stats'
-        : path.startsWith('/admin')
-          ? 'admin'
-          : path.startsWith('/me')
-            ? 'me'
-            : '';
+      : path.startsWith('/acquire')
+        ? 'acquire'
+        : path.startsWith('/stats')
+          ? 'stats'
+          : path.startsWith('/admin')
+            ? 'admin'
+            : path.startsWith('/me')
+              ? 'me'
+              : '';
 
   $: mainNav = [
     { id: 'library', label: '图书馆', to: '/library' },
+    ...(isAdmin ? [{ id: 'acquire', label: '入馆 / 采购', to: '/acquire', sub: true }] : []),
     { id: 'shelf', label: '书架', to: '/shelf' },
     { id: 'stats', label: '统计', to: '/stats' },
     { id: 'me', label: '我的', to: '/me' },
     ...(isAdmin ? [{ id: 'admin', label: '管理', to: '/admin' }] : []),
   ];
+  $: bottomNav = mainNav.filter((item) => !item.sub);
 </script>
 
 <div class="shell">
@@ -37,7 +41,7 @@
 
     <nav class="nav-main" aria-label="主导航">
       {#each mainNav as item (item.id)}
-        <a class="nav-item" class:on={active === item.id} href={href(item.to)}>
+        <a class="nav-item" class:on={active === item.id} class:sub={item.sub} href={href(item.to)}>
           <span>{item.label}</span>
           {#if item.id === 'admin' && $searchJobs.active > 0}
             <span class="nav-badge" aria-label={`${$searchJobs.active} 个搜索任务运行中`}>{$searchJobs.active}</span>
@@ -63,7 +67,7 @@
   </div>
 
   <nav class="bottom" aria-label="主导航">
-    {#each mainNav as item (item.id)}
+    {#each bottomNav as item (item.id)}
       <a class="bottom-item" class:on={active === item.id} href={href(item.to)}>
         <span>{item.label}</span>
         {#if item.id === 'admin' && $searchJobs.active > 0}
@@ -122,6 +126,16 @@
   .nav-item:hover { background: var(--soft-bg, #f0f0f2); }
   .nav-item.on { background: var(--accent); color: var(--on-accent, #fff); font-weight: 600; }
   .nav-item.on:hover { background: var(--accent-d); }
+  /* 入馆是图书馆下的二级入口：缩进 + 左侧竖线，桌面侧栏才显示 */
+  .nav-item.sub {
+    margin-left: 14px;
+    min-height: 36px;
+    padding-left: 14px;
+    border-left: 2px solid var(--border);
+    border-radius: 0 9px 9px 0;
+    font-size: 13px;
+  }
+  .nav-item.sub.on { border-left-color: var(--accent); }
   .nav-badge {
     min-width: 16px;
     padding: 0 5px;

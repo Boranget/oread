@@ -97,6 +97,25 @@ async fn settings_pool_with_line_height(v: &str) -> SqlitePool {
     pool
 }
 
+#[tokio::test]
+async fn purify_skips_imported_books_without_origin() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("memory db");
+    let (title, content) = purify(
+        &pool,
+        "本地导入的书",
+        "",
+        Some("站点广告标题".into()),
+        Some("站点广告正文".into()),
+    )
+    .await;
+    assert_eq!(title.as_deref(), Some("站点广告标题"));
+    assert_eq!(content.as_deref(), Some("站点广告正文"));
+}
+
 // 旧默认行距 1.8 只归一化一次；其它值（1.7/1.75/1.9/2.0）一律不动
 #[tokio::test]
 async fn legacy_line_height_migrates_once_and_only_exact_default() {

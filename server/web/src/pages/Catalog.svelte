@@ -3,6 +3,7 @@
   import { api } from '../lib/api.js';
   import { route, navigate, href, buildPath } from '../lib/router.js';
   import BookCard from '../lib/BookCard.svelte';
+  import BookCover from '../lib/BookCover.svelte';
 
   const dispatch = createEventDispatcher();
   function dispatchRead(book) {
@@ -427,6 +428,9 @@
   <div class="page-actions">
     {#if !isShelf}
       <a class="ghost-link" href={href('/browse')}>浏览维度</a>
+      {#if isAdmin}
+        <a class="ghost-link" href={href('/acquire')}>入馆 / 采购</a>
+      {/if}
     {/if}
     <button class="ghost" on:click={toggleSelectMode}>{selectMode ? '退出多选' : '批量管理'}</button>
     {#if isShelf}
@@ -540,7 +544,7 @@
       <b>馆藏还是空的</b>
       <p class="muted">馆藏是所有人共享的内容层。管理员导入 EPUB 后，这里会出现全部书籍。</p>
       {#if isAdmin}
-        <a class="btn-link" href={href('/admin?tab=collection')}>去导入</a>
+        <a class="btn-link" href={href('/acquire?tab=local')}>去导入</a>
       {:else}
         <p class="muted">请联系管理员导入书籍。</p>
       {/if}
@@ -574,9 +578,7 @@
         {/if}
         <a class="thumb" href={href(`/book?url=${encodeURIComponent(book.book_url)}`)}>
           <span class="thumb-ph">{(book.name || '?').slice(0, 2)}</span>
-          {#if book.cover_url}
-            <img src={book.cover_url} alt="" loading="lazy" referrerpolicy="no-referrer" on:error={(e) => (e.currentTarget.style.visibility = 'hidden')} />
-          {/if}
+          <BookCover url={book.cover_url} imgClass="cover" />
         </a>
         <div class="row-main">
           <a class="row-title" href={href(`/book?url=${encodeURIComponent(book.book_url)}`)}>{book.name || book.book_url}</a>

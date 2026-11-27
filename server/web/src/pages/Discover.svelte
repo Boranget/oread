@@ -71,7 +71,7 @@
   }
   // 空态引导：切到管理区的「书源」页
   function goSources() {
-    navigate('/admin?tab=sources');
+    navigate('/acquire?tab=online&sub=sources');
   }
   let requestedScope = 'all'; // 本次请求携带的 scope（用户意图）
   let searchScope = 'all'; // 后端实际使用的 scope

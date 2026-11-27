@@ -1,6 +1,7 @@
 <script>
   import { createEventDispatcher } from 'svelte';
   import { href } from '../lib/router.js';
+  import BookCover from './BookCover.svelte';
 
   export let book;
   export let compact = false;
@@ -36,16 +37,7 @@
   <a class="cover-link" href={detailHref} aria-label="查看《{title}》详情">
     <span class="cover-wrap">
       <span class="cover-ph" aria-hidden="true">{(title || '?').slice(0, 2)}</span>
-      {#if book.cover_url}
-        <img
-          class="cover"
-          src={book.cover_url}
-          alt=""
-          loading="lazy"
-          referrerpolicy="no-referrer"
-          on:error={(e) => (e.currentTarget.style.visibility = 'hidden')}
-        />
-      {/if}
+      <BookCover url={book.cover_url} imgClass="cover" />
       {#if status}
         <span class="status-badge">{STATUS_LABEL[status] || status}</span>
       {/if}

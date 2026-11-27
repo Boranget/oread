@@ -193,6 +193,10 @@ pub(crate) async fn builtin_clean_enabled(db: &SqlitePool) -> bool {
 }
 
 /// 正文输出前的统一净化入口：读取用户规则并应用到标题/正文。
+///
+/// 替换规则只服务于在线书源：本地导入的 EPUB / CBZ 已经过归一化解析，
+/// 再跑一遍针对站点广告的正则既没有收益，也可能误伤正文。`origin` 为空
+/// 即表示这本书没有在线书源。
 pub async fn purify(
     db: &SqlitePool,
     book: &str,
@@ -200,7 +204,7 @@ pub async fn purify(
     title: Option<String>,
     content: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    if !replace_rule_enabled(db).await {
+    if origin.trim().is_empty() || !replace_rule_enabled(db).await {
         return (title, content);
     }
     let rules = active_rules(db).await;
@@ -234,7 +238,11 @@ pub async fn active_rules(db: &SqlitePool) -> Vec<ReplaceRule> {
 
 /// 目录标题净化：规则只加载一次，按 `scope_title` 逐章应用。
 /// 只影响返回给用户的标题，`library_chapters` 缓存保持原文，开关可随时切换。
+/// 与正文一致，只作用于有在线书源的书；本地导入书直接跳过。
 pub async fn purify_titles(db: &SqlitePool, book: &str, origin: &str, titles: &mut [String]) {
+    if origin.trim().is_empty() {
+        return;
+    }
     let rules = active_rules(db).await;
     if rules.is_empty() {
         return;

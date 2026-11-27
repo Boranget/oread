@@ -65,11 +65,18 @@
   详情目录与 `/api/book/toc` 一致。
 
 - 个人图书馆信息架构：一级导航固定为图书馆 / 书架 / 统计 / 我的，管理区只对管理员出现；
-  书架是独立页面（已借阅 + 个人状态），个人状态（想读 / 在读 / 已读）只作用于书架，不做归档状态。
-  首页已移除，登录默认落在书架；顶部全局搜索/退出通栏也已移除，搜索留在图书馆与书架页内。
-  前端改为 hash 路由（`#/library`、`#/shelf`、`#/book?url=...`、`#/admin?tab=...`），书卡统一进详情页，
-  阅读器仍为全屏 overlay。后端新增只读聚合 `GET /api/library/{catalog,book,facets,home}` 与
-  `POST /api/bookshelf/status`；个人状态落独立表 `reading_status`，不改动馆藏落盘结构。
+  管理员在「图书馆」下看到「入馆 / 采购」二级入口（`#/acquire`），入馆、书源、发现与替换规则
+  统一收在这里，管理页只保留总览、用户与系统状态。书架是独立页面（已借阅 + 个人状态），
+  个人状态（想读 / 在读 / 已读）只作用于书架，不做归档状态。首页已移除，登录默认落在书架；
+  顶部全局搜索/退出通栏也已移除，搜索留在图书馆与书架页内。前端改为 hash 路由
+  （`#/library`、`#/shelf`、`#/book?url=...`、`#/acquire?tab=...`、`#/admin?tab=...`），
+  书卡统一进详情页，阅读器仍为全屏 overlay。后端新增只读聚合
+  `GET /api/library/{catalog,book,facets,home}` 与 `POST /api/bookshelf/status`；个人状态落独立表
+  `reading_status`，不改动馆藏落盘结构。
+- 封面显示：馆藏 EPUB / CBZ 的封面是 `oread-img://` 本地地址，统一由 `lib/BookCover.svelte`
+  走带 Bearer 的图片代理取 Blob 后渲染；在线书源的 http(s) 封面继续直连。
+- 替换规则作用域：归一化后只服务在线书源正文（站点广告 / 水印 / 反爬提示）；本地导入的
+  EPUB / CBZ 没有 `origin`，不再经过替换规则，避免误伤正文。
 
 - 正文语义块（标题 / 段落 / 列表 / 代码块 / 图片 / 表格 / 公式）：服务端解析、章节 XHTML
   读写、`/api/book/content` 的 `blocks`、Web 阅读器按块渲染、`/k` 按行预算分页且插图单独

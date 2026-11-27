@@ -2,8 +2,9 @@
   import { onMount, onDestroy } from 'svelte';
   import { api, getRole } from '../../lib/api.js';
   import { describeFailure } from '../../lib/apiErrors.js';
-  import { href } from '../../lib/router.js';
   import BookEditor from '../../lib/BookEditor.svelte';
+
+  export let embedded = false;
 
   // 入馆 / 移出 / 删除 / 回收临时缓存都要管理员；浏览与占用所有登录账号可读。
   const isAdmin = getRole() === 'admin';
@@ -48,16 +49,6 @@
   let jobsErr = '';
   let jobsLoading = false;
   let pollTimer = null;
-  // 本地 EPUB / CBZ 导入：inspect（上传+解压+查重）→ 用户确认 → commit。
-  let fileInput = null;
-  let importing = false;
-  let committing = false;
-  let importProgress = null;
-  let importErr = '';
-  let importToken = '';
-  let importBook = null;
-  let importDups = [];
-  let importTarget = '';
 
   onMount(() => {
     loadStats();
@@ -358,117 +349,17 @@
       error = describeFailure(e, '取消采购单');
     }
   }
-
-  function pickBook() {
-    importErr = '';
-    fileInput?.click();
-  }
-
-  async function onBookChosen(ev) {
-    const file = ev.currentTarget.files?.[0];
-    ev.currentTarget.value = '';
-    if (!file) return;
-    const isCbz = /\.cbz$/i.test(file.name);
-    if (!isCbz && !/\.epub$/i.test(file.name)) {
-      importErr = '请选择 .epub 或 .cbz 文件';
-      return;
-    }
-    importErr = '';
-    importing = true;
-    importProgress = { loaded: 0, total: file.size || 0 };
-    importToken = '';
-    importBook = null;
-    importDups = [];
-    importTarget = '';
-    try {
-      const upload = isCbz ? api.libraryImportCbz : api.libraryImportEpub;
-      const res = await upload(file, (loaded, total) => {
-        importProgress = { loaded, total };
-      });
-      importToken = res.token;
-      importBook = res.book;
-      importDups = res.duplicates || [];
-      importTarget = importDups[0]?.book_url || '';
-    } catch (e) {
-      if (!e.aborted) importErr = describeFailure(e, isCbz ? '导入 CBZ' : '导入 EPUB');
-    } finally {
-      importing = false;
-      importProgress = null;
-    }
-  }
-
-  function dupKind(kind) {
-    if (kind === 'file') return '同一文件';
-    if (kind === 'content') return '正文相同';
-    return '书名作者相同';
-  }
-
-  async function commitImport(mode) {
-    if (!importToken) return;
-    committing = true;
-    importErr = '';
-    try {
-      const res = await api.libraryImportCommit({
-        token: importToken,
-        mode,
-        ...(mode === 'overwrite' ? { target_book_url: importTarget } : {}),
-      });
-      if (res.cancelled) {
-        closeImport();
-        return;
-      }
-      const errs = (res.check?.issues || []).filter((i) => i.severity === 'error').length;
-      const title = importBook?.title || '未命名';
-      notice = `已导入《${title}》${errs ? `，体检发现 ${errs} 个错误（可在编辑器里运行 Check book）` : ''}`;
-      closeImport();
-      await reload();
-      loadStats();
-    } catch (e) {
-      importErr = describeFailure(e, '保存导入');
-    } finally {
-      committing = false;
-    }
-  }
-
-  async function cancelImport() {
-    const token = importToken;
-    closeImport();
-    if (token) {
-      // 取消只是清理服务端暂存；失败也不打扰用户。
-      api.libraryImportCommit({ token, mode: 'cancel' }).catch(() => {});
-    }
-  }
-
-  function closeImport() {
-    importToken = '';
-    importBook = null;
-    importDups = [];
-    importTarget = '';
-    importErr = '';
-    importProgress = null;
-  }
-
-  function importPercent() {
-    if (!importProgress?.total) return null;
-    return Math.min(100, Math.round((importProgress.loaded * 100) / importProgress.total));
-  }
 </script>
 
-<div class="page-head">
-  <h2>馆藏</h2>
-  <div class="page-actions">
-    {#if isAdmin}
-      <input
-        type="file"
-        accept=".epub,.cbz,application/epub+zip,application/vnd.comicbook+zip"
-        bind:this={fileInput}
-        on:change={onBookChosen}
-        hidden
-      />
-    {/if}
-    <button class="ghost" on:click={() => { loadStats(); loadPage(true); }} disabled={loading}>刷新</button>
+{#if !embedded}
+  <div class="page-head">
+    <h2>馆藏维护</h2>
+    <span class="page-count">{tier === 'collection' ? '永久馆藏' : tier === 'temp' ? '临时缓存' : '全部'}</span>
+    <div class="page-actions">
+      <button class="ghost" on:click={() => { loadStats(); loadPage(true); }} disabled={loading}>刷新</button>
+    </div>
   </div>
-</div>
+{/if}
 
 {#if statsErr}
   <p class="err">{statsErr}</p>
@@ -501,34 +392,6 @@
   {#if Number(stats.temp.expired_books) > 0}
     <p class="muted tiny-note">有 {stats.temp.expired_books} 本临时缓存已超过 TTL，等待定期回收或手动回收。</p>
   {/if}
-{/if}
-
-{#if isAdmin}
-  <div class="card entry-group">
-    <div class="entry-head">
-      <h3 style="margin:0">入馆入口</h3>
-      <span class="muted tiny-note">永久入馆仅管理员</span>
-    </div>
-    <div class="entry-grid">
-      <div class="entry">
-        <b>本地文件</b>
-        <p class="muted tiny-note">EPUB / CBZ。先解析查重，确认后才写入馆藏。</p>
-        <button class="ghost" on:click={pickBook} disabled={importing}>
-          {importing ? '导入中…' : '选择 EPUB / CBZ'}
-        </button>
-      </div>
-      <div class="entry">
-        <b>在线书源</b>
-        <p class="muted tiny-note">在发现页搜索并打开书，阅读产生临时缓存后，可转为永久馆藏。</p>
-        <a class="ghost-link" href={href('/admin?tab=discover')}>去发现搜书</a>
-      </div>
-      <div class="entry">
-        <b>临时缓存转馆藏</b>
-        <p class="muted tiny-note">在下方临时缓存列表点「入馆」，即可永久保存；也可先清空过期缓存。</p>
-        <button class="ghost" on:click={() => setTier('temp')} disabled={tier === 'temp'}>查看临时缓存</button>
-      </div>
-    </div>
-  </div>
 {/if}
 
 <div class="seg lib-tabs">
@@ -567,7 +430,7 @@
   <p class="loading">加载中…</p>
 {:else if items.length === 0}
   <div class="empty">
-    {tier === 'collection' ? '馆藏还是空的。用上方「入馆入口」导入本地 EPUB / CBZ，或把临时缓存转为馆藏。' : '没有符合条件的书。'}
+    {tier === 'collection' ? '馆藏还是空的。去「本地导入」上传 EPUB / CBZ，或把临时缓存转为馆藏。' : '没有符合条件的书。'}
   </div>
 {:else}
   <div class="lib-list">
@@ -629,83 +492,6 @@
   />
 {/if}
 
-{#if importing || importBook || importErr}
-  <div class="modal-mask" on:click|self={() => (importBook ? cancelImport() : closeImport())}>
-    <div class="modal" role="dialog" aria-modal="true" aria-label="导入书籍">
-      <h3>导入书籍</h3>
-      {#if importing}
-        <p class="muted tiny-note">正在上传并解析，完成后会先查重，不会直接写入馆藏。</p>
-        {#if importPercent() != null}
-          <div class="lib-meter" aria-hidden="true"><div style={`width:${importPercent()}%`}></div></div>
-          <p class="muted tiny-note">
-            {fmtBytes(importProgress.loaded)} / {fmtBytes(importProgress.total)}
-          </p>
-        {/if}
-      {:else if importBook}
-        <p>
-          <b>{importBook.title || '未命名'}</b>
-          {#if importBook.author}<span class="muted"> · {importBook.author}</span>{/if}
-        </p>
-        <p class="muted tiny-note">
-          {#if importBook.kind === 'comic'}
-            {importBook.chapter_count} 章 · {importBook.page_count} 页
-          {:else}
-            {importBook.chapter_count} 章 · {importBook.image_count} 张插图
-            {#if importBook.has_cover} · 有封面{/if}
-          {/if}
-          {#if importBook.file_name} · {importBook.file_name}{/if}
-        </p>
-        {#if importBook.warnings?.length}
-          <div class="warn-box">
-            <div class="warn-title">导入提示</div>
-            {#each importBook.warnings as w}
-              <div class="warn-item">{w}</div>
-            {/each}
-          </div>
-        {/if}
-        {#if importDups.length}
-          <div class="dup-box">
-            <p>馆藏里已有相似的书：</p>
-            <ul>
-              {#each importDups as d}
-                <li>
-                  <label>
-                    <input type="radio" bind:group={importTarget} value={d.book_url} />
-                    <span class="badge">{dupKind(d.kind)}</span>
-                    {d.name || d.book_url}{#if d.author}<span class="muted"> · {d.author}</span>{/if}
-                  </label>
-                </li>
-              {/each}
-            </ul>
-            <p class="muted tiny-note">
-              覆盖会沿用原书号与书架位置，修订号递增；选择「新增一本」则保留两本。
-            </p>
-          </div>
-        {/if}
-        <div class="import-actions">
-          {#if importDups.length}
-            <button on:click={() => commitImport('overwrite')} disabled={committing || !importTarget}>
-              {committing ? '写入中…' : '覆盖选中的书'}
-            </button>
-            <button class="ghost" on:click={() => commitImport('new')} disabled={committing}>新增一本</button>
-          {:else}
-            <button on:click={() => commitImport('new')} disabled={committing}>
-              {committing ? '写入中…' : '导入'}
-            </button>
-          {/if}
-          <button class="ghost" on:click={cancelImport} disabled={committing}>取消</button>
-        </div>
-      {/if}
-      {#if importErr}
-        <p class="err">{importErr}</p>
-        <div class="import-actions">
-          <button class="ghost" on:click={closeImport}>关闭</button>
-        </div>
-      {/if}
-    </div>
-  </div>
-{/if}
-
 {#if isAdmin}
   <div class="card lib-jobs">
     <div class="row" style="margin-bottom:8px">
@@ -750,13 +536,6 @@
     gap: 12px;
     margin-bottom: 12px;
   }
-  .entry-group { margin-bottom: 12px; }
-  .entry-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-  .entry-head .tiny-note { margin: 0; }
-  .entry-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
-  .entry { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
-  .entry .tiny-note { margin: 0 0 4px; }
-  .entry .ghost-link { padding: 6px 12px; border: 1px solid var(--accent); border-radius: 8px; color: var(--accent); text-decoration: none; font-size: 14px; }
   .src-badge { font-weight: 600; }
   .badge.ok { border-color: var(--accent); color: var(--accent); }
   .lib-stat { padding: 14px 16px; }
@@ -790,22 +569,6 @@
   .lib-job:first-child { border-top: 0; }
   .lib-job-main { flex: 1; min-width: 0; display: grid; gap: 4px; }
   .readonly { margin-bottom: 12px; }
-  .dup-box {
-    margin: 10px 0;
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .dup-box ul { margin: 6px 0; padding-left: 18px; display: grid; gap: 6px; }
-  .dup-box li { list-style: none; }
-  .dup-box label { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; cursor: pointer; }
-  .import-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-    flex-wrap: wrap;
-    margin-top: 12px;
-  }
   @media (max-width: 560px) {
     .lib-book, .lib-job { flex-direction: column; }
     .lib-book-actions { justify-content: flex-start; }

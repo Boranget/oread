@@ -12,19 +12,11 @@
 
   const TABS = [
     { id: 'overview', label: '总览' },
-    { id: 'collection', label: '馆藏维护' },
-    { id: 'sources', label: '书源' },
-    { id: 'replace', label: '替换规则' },
     { id: 'users', label: '用户' },
-    { id: 'discover', label: '发现搜书' },
   ];
 
   const LOADERS = {
-    collection: () => import('./CollectionAdmin.svelte'),
-    sources: () => import('../Sources.svelte'),
-    replace: () => import('../ReplaceRules.svelte'),
     users: () => import('./Users.svelte'),
-    discover: () => import('../Discover.svelte'),
   };
 
   let comps = {};
@@ -106,7 +98,7 @@
   <div class="seg admin-tabs">
     {#each TABS as t (t.id)}
       <button class:on={tab === t.id} on:click={() => setTab(t.id)}>
-        {t.label}{#if t.id === 'discover' && $searchJobs.active > 0}<span class="tab-badge">{$searchJobs.active}</span>{/if}
+        {t.label}
       </button>
     {/each}
   </div>
@@ -117,12 +109,12 @@
       <p class="loading">读取中…</p>
     {:else}
       <div class="overview-grid">
-        <a class="card ov-card" href={href('/admin?tab=collection')}>
+        <a class="card ov-card" href={href('/acquire?tab=collection')}>
           <span class="ov-label">馆藏</span>
           <span class="ov-num">{stats ? stats.collection.books : '—'} 本</span>
           <span class="muted small">{stats ? `${stats.collection.chapters} 章 · ${fmtBytes(stats.collection.bytes)}` : ''}</span>
         </a>
-        <a class="card ov-card" href={href('/admin?tab=collection')}>
+        <a class="card ov-card" href={href('/acquire?tab=collection')}>
           <span class="ov-label">临时缓存</span>
           <span class="ov-num">{stats ? stats.temp.books : '—'} 本</span>
           <span class="muted small">{stats ? `${fmtBytes(stats.temp.bytes)} · ${stats.temp.ttl_days} 天回收` : ''}</span>
@@ -132,7 +124,7 @@
           <span class="ov-num">{stats && stats.disk.free_mb != null ? fmtBytes(stats.disk.free_bytes) : '未知'}</span>
           <span class="muted small">{stats ? `安全阀 ${stats.disk.floor_mb} MB` : ''}</span>
         </div>
-        <a class="card ov-card" href={href('/admin?tab=discover')}>
+        <a class="card ov-card" href={href('/acquire?tab=online&sub=discover')}>
           <span class="ov-label">搜索任务</span>
           <span class="ov-num">{$searchJobs.active} 个运行中</span>
           <span class="muted small">共 {$searchJobs.jobs.length} 条记录</span>
@@ -163,13 +155,10 @@
       {/if}
 
       <div class="card">
-        <h3>管理入口</h3>
+        <h3>系统入口</h3>
         <div class="quick-links">
-          <button class="ghost" on:click={() => setTab('collection')}>馆藏维护（入馆 / 导入 / 清理）</button>
-          <button class="ghost" on:click={() => setTab('sources')}>书源管理</button>
-          <button class="ghost" on:click={() => setTab('replace')}>替换规则</button>
+          <a class="ghost-link" href={href('/acquire')}>入馆 / 采购</a>
           <button class="ghost" on:click={() => setTab('users')}>用户</button>
-          <button class="ghost" on:click={() => setTab('discover')}>发现搜书</button>
         </div>
       </div>
 

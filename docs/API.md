@@ -1621,7 +1621,7 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
   - **`book_url` 回填链**（依次尝试，任一命中即用）：① 抓取结果自带；② 请求参数 `book_url`；③ `SELECT book_url FROM library_chapters WHERE url = chapter_url`。都为空 → 返回 `400 {"error":"missing_book_url","message":"缺少书籍地址，请从书架重新打开"}`，不再返回空 `book_url`。
   - **`title` 回填链**：① 抓取结果；② 请求参数 `title`；③ 按 `chapter_url` 反查 `library_chapters.title`；都无则为 `null`。前端无需自行补 `book_url`，`title` 仅用于展示，缺失不影响正文。
   - 正文抓取支持 `nextContentUrl` 拼接（最多 10 页）；`sourceRegex` → `replaceRegex` 先源清洗后可读性替换。
-  - **每次都执行用户替换规则**（包括目录命中）：若 `use_replace_rule` 未关闭，按 `replace_rules.order,id` 应用；标题受 `scope_title` 控制，正文受 `scope_content` 控制；`scope`/`exclude_scope` 每行一个书名或书源域名，命中任一即生效（[replace.rs](../server/src/routes/replace.rs#L335-L359)）。
+  - **有在线书源时每次都执行用户替换规则**（包括目录命中）：本地导入的 EPUB / CBZ（`origin` 为空）跳过替换规则，避免归一化后的正文被站点广告正则误伤。若 `use_replace_rule` 未关闭，按 `replace_rules.order,id` 应用；标题受 `scope_title` 控制，正文受 `scope_content` 控制；`scope`/`exclude_scope` 每行一个书名或书源域名，命中任一即生效（[replace.rs](../server/src/routes/replace.rs#L335-L359)）。
   - 书名取自馆藏书目（`library_books.name`），读时用当前账号的 `book_meta` 覆盖；回填成功（即响应 `book_url` 非空）时书名作用域规则可正常匹配，回填失败已直接 400，不会带着空书名执行规则。
   - 随后按用户 `image_style` 改写 `<img>`：`0` 原样、`1` 追加 `max-width:100%;height:auto;`、`2` 追加 `display:block;margin:0 auto;`、`3` 删除图片标签（[replace.rs](../server/src/routes/replace.rs#L229-L255)）。
   - 抓取成功后**书目录已存在**时写入章节文件（`save_text_prefer_dir`）；目录不存在时本次只返回结果、不落盘，等目录同步后下一次再写。目录是正文唯一副本，不再写 `library_content`。
@@ -3189,6 +3189,8 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 ## 8. 替换规则
 
 > 数据在用户库 `replace_rules`，按用户隔离。规则按 `order` 升序执行（`purify` 中为 `ORDER BY "order", id`）。
+>
+> 作用范围：只处理**有在线书源**的正文与目录标题。归一化解析负责标题 / 段落 / 列表 / 表格 / 公式 / 图片结构；替换规则只负责在线书源里的站点广告、水印与反爬提示。本地导入的 EPUB / CBZ（`origin` 为空）不经过替换规则。
 > 规则只在 `GET /api/book/content` 输出时生效，不修改缓存里的原始正文。
 
 ### 8.1 `GET /api/replace-rules`

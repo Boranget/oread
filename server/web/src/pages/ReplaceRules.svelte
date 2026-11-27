@@ -252,7 +252,8 @@
 </script>
 
 <div class="page-head">
-  <h2>替换规则</h2>
+  <h2>正文替换</h2>
+  <span class="page-count">仅在线书源</span>
   <div class="page-actions">
     <button on:click={openNew}>新建规则</button>
     <button class="ghost" on:click={openPreview}>预览</button>
@@ -260,6 +261,13 @@
       {exportBusy ? '导出中…' : '导出'}
     </button>
   </div>
+</div>
+
+<div class="card rule-scope">
+  <p class="muted tiny-note">
+    归一化解析已经处理标题、段落、列表、表格、公式与图片结构；这里只负责在线书源正文里的站点广告、水印和反爬提示。
+    本地导入的 EPUB / CBZ 不再经过替换规则，避免误伤正文。
+  </p>
 </div>
 
 {#if error}<p class="err">{error}</p>{/if}

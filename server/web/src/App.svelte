@@ -23,6 +23,7 @@
     stats: () => import('./pages/Stats.svelte'),
     me: () => import('./pages/Account.svelte'),
     admin: () => import('./pages/admin/Admin.svelte'),
+    acquire: () => import('./pages/Acquire.svelte'),
   };
   let comps = {};
   let errs = {};
@@ -36,13 +37,13 @@
   let readerLoading = null;
 
   $: page = pageOf($route.path);
-  $: if (loggedIn && LAZY[page] && !(page === 'admin' && role !== 'admin')) ensure(page);
+  $: if (loggedIn && LAZY[page] && !((page === 'admin' || page === 'acquire') && role !== 'admin')) ensure(page);
 
   function pageOf(path) {
     if (!path || path === '/') return 'shelf';
     if (path === '/library') return 'library';
     if (path === '/shelf') return 'shelf';
-    if (path === '/browse' || path === '/book' || path === '/stats' || path === '/me' || path === '/admin') {
+    if (path === '/browse' || path === '/book' || path === '/stats' || path === '/me' || path === '/admin' || path === '/acquire') {
       return path.slice(1);
     }
     return 'notfound';
@@ -279,7 +280,7 @@
       <Catalog {role} on:read={(e) => openReader(e.detail)} />
     {:else if page === 'shelf'}
       <Catalog {role} mode="shelf" on:read={(e) => openReader(e.detail)} />
-    {:else if page === 'admin' && role !== 'admin'}
+    {:else if (page === 'admin' || page === 'acquire') && role !== 'admin'}
       <div class="card">
         <p class="err">需要管理员权限。</p>
         <a class="ghost-link" href="#/shelf">返回书架</a>

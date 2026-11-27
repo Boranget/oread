@@ -32,6 +32,9 @@ html[data-vp='sm'] .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap
 html[data-vp='sm'] .toolbar > * { width: 100%; min-width: 0; }
 html[data-vp='sm'] .toolbar > .wide { grid-column: 1 / -1; }
 html[data-vp='sm'] .toolbar > .spacer { display: none; }
+/* 页面标题右侧操作：手机上两列排布，单个按钮仍占满整行 */
+html[data-vp='sm'] .page-actions { width: 100%; margin-left: 0; }
+html[data-vp='sm'] .page-actions > * { flex: 1 1 calc(50% - 4px); min-width: 0; }
 /* 书源页：手机上「导入/新建」「导出范围」「导出/检查更新」各占一行，主次清楚 */
 html[data-vp='sm'] .source-actions .new-source { order: 0; margin-left: 0; }
 

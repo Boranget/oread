@@ -3,6 +3,7 @@
   import { api } from '../lib/api.js';
   import { route, href, buildPath } from '../lib/router.js';
   import BookEditor from '../lib/BookEditor.svelte';
+  import BookCover from '../lib/BookCover.svelte';
   import ExportDialog from '../lib/ExportDialog.svelte';
 
   export let role = 'user';
@@ -149,15 +150,7 @@
   <div class="card hero">
     <div class="cover-wrap">
       <span class="cover-ph">{(book.name || '?').slice(0, 2)}</span>
-      {#if book.cover_url}
-        <img
-          class="cover"
-          src={book.cover_url}
-          alt=""
-          referrerpolicy="no-referrer"
-          on:error={(e) => (e.currentTarget.style.visibility = 'hidden')}
-        />
-      {/if}
+      <BookCover url={book.cover_url} imgClass="cover" lazy={false} />
     </div>
 
     <div class="info">
