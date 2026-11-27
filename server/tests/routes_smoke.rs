@@ -250,12 +250,13 @@ async fn cache_usage_and_trim_are_admin_only() {
         "未删除时前后占用应一致: {body}"
     );
 
-    // 普通用户不能清理全局缓存，也不能回收临时缓存。
+    // 普通用户不能清理全局缓存、回收临时缓存，也不能发起整本抓取。
     let user = register(&app, "cacheuser").await;
     for (uri, payload) in [
         ("/api/book/cache/trim", "{}"),
         ("/api/book/cache/clear", "{}"),
         ("/api/book/cache/clear", r#"{"book_id":"book-1"}"#),
+        ("/api/book/cache-all", r#"{"book_url":"book-1"}"#),
     ] {
         let resp = app
             .clone()
@@ -264,6 +265,18 @@ async fn cache_usage_and_trim_are_admin_only() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri} {payload}");
     }
+
+    // 管理员可以进入整本抓取流程；空目录应返回业务错误而不是 403。
+    let resp = app
+        .clone()
+        .oneshot(authed_post(
+            "/api/book/cache-all",
+            r#"{"book_url":"book-1"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let _ = std::fs::remove_dir_all(dir);
 }

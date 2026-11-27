@@ -1,7 +1,6 @@
 <script>
   import { onMount } from 'svelte';
   import Login from './pages/Login.svelte';
-  import Home from './pages/Home.svelte';
   import Catalog from './pages/Catalog.svelte';
   import AppShell from './layout/AppShell.svelte';
   import { api, getToken, getRole, clearToken } from './lib/api.js';
@@ -17,7 +16,7 @@
   // 阅读器通过 {bookUrl, sourceId, name, author, coverUrl, intro, bookType} 打开。
   let reader = null;
 
-  // 首屏只留首页与图书馆；其余页面按需 import()，不进首屏包。
+  // 首屏只留书架与图书馆；其余页面按需 import()，不进首屏包。
   const LAZY = {
     browse: () => import('./pages/Browse.svelte'),
     book: () => import('./pages/BookDetail.svelte'),
@@ -40,7 +39,7 @@
   $: if (loggedIn && LAZY[page] && !(page === 'admin' && role !== 'admin')) ensure(page);
 
   function pageOf(path) {
-    if (!path || path === '/') return 'home';
+    if (!path || path === '/') return 'shelf';
     if (path === '/library') return 'library';
     if (path === '/shelf') return 'shelf';
     if (path === '/browse' || path === '/book' || path === '/stats' || path === '/me' || path === '/admin') {
@@ -131,7 +130,7 @@
       // 任务列表与登录态解耦：关掉页面/重新登录后仍能看到后端仍在跑的任务。
       startSearchJobsPolling();
     }
-    if (!location.hash) navigate('/', { replace: true });
+    if (!location.hash) navigate('/shelf', { replace: true });
     return () => {
       stopRouter();
       window.removeEventListener('error', onWindowError);
@@ -153,7 +152,7 @@
     reader = null;
     applyTheme('light');
     stopSearchJobsPolling();
-    navigate('/', { replace: true });
+    navigate('/shelf', { replace: true });
   }
 
   function loadComicReader() {
@@ -276,21 +275,19 @@
   {/key}
 {:else}
   <AppShell {role} onLogout={onLogout}>
-    {#if page === 'home'}
-      <Home {role} on:read={(e) => openReader(e.detail)} />
-    {:else if page === 'library'}
-      <Catalog on:read={(e) => openReader(e.detail)} />
+    {#if page === 'library'}
+      <Catalog {role} on:read={(e) => openReader(e.detail)} />
     {:else if page === 'shelf'}
-      <Catalog mode="shelf" on:read={(e) => openReader(e.detail)} />
+      <Catalog {role} mode="shelf" on:read={(e) => openReader(e.detail)} />
     {:else if page === 'admin' && role !== 'admin'}
       <div class="card">
         <p class="err">需要管理员权限。</p>
-        <a class="ghost-link" href="#/">返回首页</a>
+        <a class="ghost-link" href="#/shelf">返回书架</a>
       </div>
     {:else if page === 'notfound'}
       <div class="card">
         <p>页面不存在。</p>
-        <a class="ghost-link" href="#/">返回首页</a>
+        <a class="ghost-link" href="#/shelf">返回书架</a>
       </div>
     {:else if comps[page]}
       <svelte:component
@@ -298,6 +295,7 @@
         {role}
         on:read={(e) => openReader(e.detail)}
         on:open={(e) => openReader(e.detail)}
+        on:logout={onLogout}
       />
     {:else if errs[page]}
       <div class="card">

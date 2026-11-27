@@ -11,7 +11,9 @@
 
   // library = 全部馆藏（找书/借阅）；shelf = 我的书架（已借阅的书 + 个人阅读状态）
   export let mode = 'library';
+  export let role = 'user';
   $: isShelf = mode === 'shelf';
+  $: isAdmin = role === 'admin';
   $: basePath = isShelf ? '/shelf' : '/library';
 
   const STATUS_TABS = [
@@ -537,7 +539,11 @@
     {:else}
       <b>馆藏还是空的</b>
       <p class="muted">馆藏是所有人共享的内容层。管理员导入 EPUB 后，这里会出现全部书籍。</p>
-      <a class="btn-link" href={href('/admin?tab=collection')}>去导入</a>
+      {#if isAdmin}
+        <a class="btn-link" href={href('/admin?tab=collection')}>去导入</a>
+      {:else}
+        <p class="muted">请联系管理员导入书籍。</p>
+      {/if}
     {/if}
   </div>
 {:else if view === 'grid'}

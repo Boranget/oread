@@ -1794,8 +1794,9 @@ Rust 结构体凡未标注 `skip_serializing_if` 的 `Option<T>` 字段，**JSON
 
 ### 6.8 `POST /api/book/cache-all`
 
-- 鉴权：登录
-- 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B3，4/4）：`limit` 截断 `limited=true attempted=2 cached=2`；全量缓存单章失败 `cached=3 failed=1`，失败项定位到 `b1-c3`，整体 `ok=true`（**逐章失败隔离已验证**）；无目录/空 `book_url` 400。
+- 鉴权：管理员
+- 验证状态：**已验证**（回归报告 `report-20261103-1108.md` B3，4/4）：`limit` 截断 `limited=true attempted=2 cached=2`；全量缓存单章失败 `cached=3 failed=1`，失败项定位到 `b1-c3`，整体 `ok=true`（**逐章失败隔离已验证**）；无目录/空 `book_url` 400；普通账号 403。
+- 说明：整本抓取会占用全局临时缓存与书源配额，属于管理端运维操作，不再对普通账号开放。
 - 请求体：
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
@@ -2693,7 +2694,7 @@ OPF 改名为 `OEBPS/content.opf` 并重写 `container.xml`。只重写 OPF mani
 - 错误：`400`（文件无效 / 查重后目标不存在 / 覆盖非馆藏书 / 类型不匹配 / token 过期）、
   `401`、`403`。
 
-### 6.12.15 个人图书馆读接口（目录 / 详情 / 分面 / 首页，登录）
+### 6.12.15 个人图书馆读接口（目录 / 详情 / 分面 / 总览，登录）
 
 > 内容层仍是全局 `library.db`，个人状态（`reading_status`、`bookshelf`、`reading_progress`、
 > `book_stats`）在用户库。服务端先读个人状态到内存，再与馆藏行合并、过滤、排序、分页；
@@ -2766,7 +2767,7 @@ OPF 改名为 `OEBPS/content.opf` 并重写 `container.xml`。只重写 OPF mani
 
 #### `GET /api/library/home`
 
-首页聚合：`{ok, stats:{collection,shelf,want,reading,finished}, continue[], recent[], want[]}`。
+管理总览 / 书架聚合：`{ok, stats:{collection,shelf,want,reading,finished}, continue[], recent[], want[]}`。首页已移除，管理总览用它显示阅读统计；`continue` / `recent` / `want` 保留给后续书架顶部复用。
 
 - `continue`：有进度且未标记 `finished`，按 `reading_progress.updated_at DESC` 取 8 本。
 - `recent`：最近入藏的 12 本（`collected_at DESC`）。
@@ -3895,7 +3896,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 46 | POST | `/api/admin/users/status` | JWT | **是** | `user_id,disabled` | `{ok,user_id,disabled}` |
 | 47 | POST | `/api/book/toc/batch` | JWT | 否 | `book_urls`（别名 `book_ids`）`,source?` | `{ok,total,updated,failed,skipped,results[],elapsed_ms}` |
 | 48 | GET | `/api/book/search` | JWT | 否 | `book_id,q,limit?` | `{ok,book_id,query,limit,truncated,hits[],total_chapters,cached_chapters,uncached_chapters,complete,note,elapsed_ms}` |
-| 49 | POST | `/api/book/cache-all` | JWT | 否 | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/limited/...`） |
+| 49 | POST | `/api/book/cache-all` | JWT | **是** | `book_url`（别名 `book_id`）`,source?,limit?` | 缓存统计对象（`cached/failed/limited/...`） |
 | 50 | POST | `/api/book/cache/clear` | JWT | **是** | `book_id?`（别名 `book_url`） | `{ok,scope,book_id,deleted,bytes_freed,trashed}`（只清临时层，目录移回收站） |
 | 51 | GET | `/api/bookmarks` | JWT | 否 | `book_id?` | `Bookmark[]`（裸数组） |
 | 52 | POST | `/api/bookmarks` | JWT | 否 | `book_id,chapter_index?,position?,chapter_title?,note?` | `Bookmark` |
@@ -3933,7 +3934,7 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | 84 | GET | `/api/library/catalog` | JWT | 否 | `status?,group?,shelf?,author?,series?,tag?,publisher?,language?,q?,sort?,page?,limit?` | `{ok,items[],total,page,pages,limit,sort,status,group}` |
 | 85 | GET | `/api/library/book` | JWT | 否 | `book_url`（别名 `url`） | `{ok,book{...toc[]}}` |
 | 86 | GET | `/api/library/facets` | JWT | 否 | — | `{ok,authors[],series[],tags[],publishers[],languages[]}` |
-| 87 | GET | `/api/library/home` | JWT | 否 | — | `{ok,stats,continue[],recent[],want[]}` |
+| 87 | GET | `/api/library/home` | JWT | 否 | — | `{ok,stats,continue[],recent[],want[]}`（管理总览 / 书架聚合；首页已移除） |
 | 88 | POST | `/api/bookshelf/status` | JWT | 否 | `book_id?/book_ids?,status` | `{ok,updated,status}` |
 
 ---

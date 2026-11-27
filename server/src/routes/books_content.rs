@@ -524,10 +524,12 @@ pub(super) enum CacheOutcome {
 
 pub(super) async fn cache_all(
     State(s): State<AppState>,
-    _u: AuthUser,
+    u: AuthUser,
     _db: UserDb,
     Json(q): Json<CacheAllQ>,
 ) -> AppResult<Json<serde_json::Value>> {
+    // 整本抓取会占用全局临时缓存与书源配额，属于管理端运维操作。
+    crate::auth::ensure_admin(&u)?;
     let started = Instant::now();
     let book_url = q.book_url.trim().to_string();
     if book_url.is_empty() {

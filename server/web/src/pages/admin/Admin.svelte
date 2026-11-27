@@ -100,7 +100,7 @@
 {#if !isAdmin}
   <div class="card">
     <p class="err">需要管理员权限。</p>
-    <a class="ghost-link" href={href('/')}>返回首页</a>
+    <a class="ghost-link" href={href('/shelf')}>返回书架</a>
   </div>
 {:else}
   <div class="seg admin-tabs">

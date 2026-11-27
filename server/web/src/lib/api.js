@@ -603,7 +603,7 @@ export const api = {
   // /api/healthz：进程指标 + 馆藏/临时缓存占用（只读）
   healthz: () => request('GET', '/healthz'),
 
-  // ---- 个人图书馆读接口（目录 / 详情 / 分面 / 首页）----
+  // ---- 个人图书馆读接口（目录 / 详情 / 分面 / 管理总览统计）----
   // 目录：status=all|want|reading|finished|none，group=all|ungrouped|<分组名>，
   // 维度 author/series/tag/publisher/language 为精确匹配，q 为模糊搜索。
   libraryCatalog: (opts = {}) =>
