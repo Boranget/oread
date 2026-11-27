@@ -1304,6 +1304,23 @@ async fn cbz_import_creates_readable_comic() {
     assert!(opened.dir.join("oread.json").is_file());
     assert!(opened.dir.join("ComicInfo.xml").is_file());
 
+    // 馆藏漫画没有书源：前端会省略 source，目录接口仍须可用（回归：缺 source 报 400）。
+    let toc_uri = format!(
+        "/api/book/toc?{}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("book_url", &book_url)
+            .finish()
+    );
+    let resp = app
+        .clone()
+        .oneshot(authed_get(&toc_uri, &admin))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let toc = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{toc}");
+    assert_eq!(toc.as_array().map(Vec::len), Some(1), "{toc}");
+
     let encoded = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("book_url", &book_url)
         .finish();

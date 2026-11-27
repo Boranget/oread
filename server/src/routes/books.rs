@@ -129,6 +129,8 @@ pub struct CategoryQ {
 }
 #[derive(Deserialize)]
 pub struct BookQ {
+    /// 书源 id；馆藏导入书没有书源，前端会省略该参数，按空串处理。
+    #[serde(default)]
     pub(super) source: String,
     pub(super) book_url: String,
     /// 搜索结果带入的字段：详情规则为空/未命中时沿用（Legado 语义），避免被写成 null
@@ -147,6 +149,8 @@ pub struct BookQ {
 }
 #[derive(Deserialize)]
 pub struct ContentQ {
+    /// 书源 id；馆藏导入书没有书源，前端会省略该参数，按空串处理。
+    #[serde(default)]
     pub(super) source: String,
     pub(super) chapter_url: String,
     /// 显式传入书籍 URL：用于按书名匹配替换规则，并回填到响应
