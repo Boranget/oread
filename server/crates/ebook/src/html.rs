@@ -362,6 +362,10 @@ fn walk(node: NodeRef<'_, Node>, b: &mut Builder) {
                 }
                 return;
             }
+            if name == "sub" || name == "sup" {
+                b.push(&shift_script(&inline_text(&node), name == "sub"));
+                return;
+            }
             let block = is_block(name);
             if block {
                 b.flush();
@@ -401,6 +405,10 @@ fn inline_text<'a>(node: &NodeRef<'a, Node>) -> String {
                     out.push_str(&math_text(n));
                     continue;
                 }
+                if name == "sub" || name == "sup" {
+                    out.push_str(&shift_script(&inline_text(&n), name == "sub"));
+                    continue;
+                }
                 let children: Vec<_> = n.children().collect();
                 stack.extend(children.into_iter().rev());
             }
@@ -429,6 +437,10 @@ fn list_item_text(node: &NodeRef<'_, Node>) -> String {
                 }
                 if name == "math" {
                     out.push_str(&math_text(n));
+                    continue;
+                }
+                if name == "sub" || name == "sup" {
+                    out.push_str(&shift_script(&inline_text(&n), name == "sub"));
                     continue;
                 }
                 let children: Vec<_> = n.children().collect();
@@ -501,6 +513,46 @@ fn is_skip(name: &str) -> bool {
         name,
         "script" | "style" | "noscript" | "iframe" | "video" | "audio" | "source" | "rt" | "rp"
     )
+}
+
+/// `<sub>` / `<sup>` 的纯文本降级：数字与常见运算符映射成 Unicode 上下标。
+/// 字母保持原样，避免破坏搜索（`1st` 不会变成 `1ˢᵗ`）。
+fn shift_script(text: &str, sub: bool) -> String {
+    text.chars()
+        .map(|c| match (sub, c) {
+            (false, '0') => '⁰',
+            (false, '1') => '¹',
+            (false, '2') => '²',
+            (false, '3') => '³',
+            (false, '4') => '⁴',
+            (false, '5') => '⁵',
+            (false, '6') => '⁶',
+            (false, '7') => '⁷',
+            (false, '8') => '⁸',
+            (false, '9') => '⁹',
+            (false, '+') => '⁺',
+            (false, '-') => '⁻',
+            (false, '=') => '⁼',
+            (false, '(') => '⁽',
+            (false, ')') => '⁾',
+            (true, '0') => '₀',
+            (true, '1') => '₁',
+            (true, '2') => '₂',
+            (true, '3') => '₃',
+            (true, '4') => '₄',
+            (true, '5') => '₅',
+            (true, '6') => '₆',
+            (true, '7') => '₇',
+            (true, '8') => '₈',
+            (true, '9') => '₉',
+            (true, '+') => '₊',
+            (true, '-') => '₋',
+            (true, '=') => '₌',
+            (true, '(') => '₍',
+            (true, ')') => '₎',
+            _ => c,
+        })
+        .collect()
 }
 
 /// SVG 里只关心 `<image>` 与 `<text>`；`defs` 等定义树不参与正文。
@@ -1642,5 +1694,34 @@ mod tests {
             ]
         );
         assert_eq!(super::blocks_to_text(&blocks), "上\n———\n下");
+    }
+
+    #[test]
+    fn sub_and_sup_degrade_to_unicode_digits() {
+        let blocks = to_blocks(
+            "<p>H<sub>2</sub>O、x<sup>2</sup>、10<sup>-3</sup>，1<sup>st</sup> 保持原样。</p>\
+             <h2>E=mc<sup>2</sup></h2>\
+             <ul><li>CO<sub>2</sub></li></ul>",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph("H₂O、x²、10⁻³，1st 保持原样。".into()),
+                Block::Heading(2, "E=mc²".into()),
+                Block::List(vec![super::ListItem {
+                    level: 0,
+                    ordered: false,
+                    text: "CO₂".into(),
+                }]),
+            ]
+        );
+    }
+
+    #[test]
+    fn self_closing_pagebreak_does_not_swallow_following_text() {
+        // HTML 解析器不认非空元素的 `/>`：页码标记会把后续文字吞进自己的子树。
+        // 因此不能按 `epub:type` 整块跳过，只能保留内容。
+        let blocks = to_blocks("<p>甲<span role=\"doc-pagebreak\" id=\"p2\"/>乙</p>");
+        assert_eq!(blocks, vec![Block::Paragraph("甲乙".into())]);
     }
 }

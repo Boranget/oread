@@ -3661,9 +3661,13 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
   "ok": true,
   "rss_bytes": 52428800,
   "rss_mb": 50.0,
+  "disk_write_bytes": 10485760,
+  "disk_write_mb": 10.0,
   "open_user_dbs": 2,
   "js": { "enabled": true, "last_ms": 12, "max_ms": 48, "budget_ms": 200 },
-  "http": { "concurrency": 3, "timeout_secs": 15, "max_body_mb": 5 }
+  "http": { "concurrency": 3, "timeout_secs": 15, "max_body_mb": 5 },
+  "content_cache": { "hits": 120, "misses": 30, "hit_rate": 0.8, "saves": 30, "evictions": 0, "evicted_rows": 0 },
+  "image_cache": { "bytes": 2097152, "mb": 2.0, "items": 12, "limit_mb": 64, "hits": 80, "misses": 20, "hit_rate": 0.8 }
 }
 ```
 
@@ -3672,6 +3676,10 @@ Cookie、本地 BLOB 优先、墨水屏可转码）。相对封面地址按 `boo
 | `ok` | boolean | 否 | 恒 true |
 | `rss_bytes` | integer | 是 | Linux `/proc/self/statm`、Windows `GetProcessMemoryInfo`；其他平台 null |
 | `rss_mb` | number | 是 | 保留 2 位小数；`rss_bytes` 为 null 时 null |
+| `disk_write_bytes` | integer | 是 | 进程累计写盘字节；Linux 读 `/proc/self/io`，其他平台 null |
+| `disk_write_mb` | number | 是 | 保留 2 位小数；`disk_write_bytes` 为 null 时 null |
+| `content_cache` | object | 否 | 正文缓存进程内累计：`hits` / `misses` / `hit_rate` / `saves` / `evictions` / `evicted_rows` |
+| `image_cache` | object | 否 | 图片 LRU：`bytes` / `mb` / `items` / `limit_mb`，以及命中计数 `hits` / `misses` / `hit_rate` |
 | `open_user_dbs` | integer | 否 | 当前缓存中的用户连接池数 |
 | `js.enabled` | boolean | 否 | `JS_ENABLED` |
 | `js.last_ms` | integer | 否 | 最近一次 JS 规则耗时；未执行过 0 |

@@ -14,11 +14,31 @@ struct Entry {
     seq: u64,
 }
 
+/// 图片缓存命中计数（进程生命周期内累计）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl ImageCacheStats {
+    /// 命中率（0.0–1.0，保留三位小数）；无流量时为 0。
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            return 0.0;
+        }
+        (self.hits as f64 / total as f64 * 1000.0).round() / 1000.0
+    }
+}
+
 /// 可独立测试的 LRU 实现。
 pub struct ImageLru {
     limit: usize,
     used: usize,
     seq: u64,
+    hits: u64,
+    misses: u64,
     entries: HashMap<String, Entry>,
     /// 淘汰顺序：记录 (key, seq)。seq 不匹配的旧记录直接跳过（惰性清理）。
     order: VecDeque<(String, u64)>,
@@ -30,6 +50,8 @@ impl ImageLru {
             limit,
             used: 0,
             seq: 0,
+            hits: 0,
+            misses: 0,
             entries: HashMap::new(),
             order: VecDeque::new(),
         }
@@ -38,7 +60,11 @@ impl ImageLru {
     pub fn get(&mut self, key: &str) -> Option<(Vec<u8>, String)> {
         self.seq += 1;
         let seq = self.seq;
-        let entry = self.entries.get_mut(key)?;
+        let Some(entry) = self.entries.get_mut(key) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
         entry.seq = seq;
         let out = (entry.data.clone(), entry.content_type.clone());
         let k = key.to_string();
@@ -102,6 +128,13 @@ impl ImageLru {
         (self.used, self.entries.len(), self.limit)
     }
 
+    pub fn hit_stats(&self) -> ImageCacheStats {
+        ImageCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+
     /// 仅供单测重置全局 LRU；生产路径不调用（进程重启即清空）。
     #[allow(dead_code)]
     pub fn clear(&mut self) {
@@ -139,6 +172,11 @@ pub fn stats() -> (usize, usize, usize) {
     global().lock().map(|c| c.stats()).unwrap_or((0, 0, 0))
 }
 
+/// 进程级图片缓存命中/未命中计数。
+pub fn hit_stats() -> ImageCacheStats {
+    global().lock().map(|c| c.hit_stats()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +210,17 @@ mod tests {
         c.put("k", vec![0; 5], "image/gif".into());
         assert_eq!(c.stats().0, 5);
         assert_eq!(c.get("k").unwrap().1, "image/gif");
+    }
+
+    #[test]
+    fn hit_stats_count_hits_and_misses() {
+        let mut c = ImageLru::new(100);
+        assert!(c.get("missing").is_none());
+        c.put("k", vec![0; 4], "image/png".into());
+        assert!(c.get("k").is_some());
+        assert!(c.get("k").is_some());
+        let stats = c.hit_stats();
+        assert_eq!((stats.hits, stats.misses), (2, 1));
+        assert_eq!(stats.hit_rate(), 0.667);
     }
 }

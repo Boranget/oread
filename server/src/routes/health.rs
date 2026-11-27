@@ -80,6 +80,19 @@ pub fn rss_bytes() -> Option<u64> {
     None
 }
 
+/// 进程累计写盘字节数；Linux 读 `/proc/self/io`，其他平台返回 `null`。
+#[cfg(target_os = "linux")]
+pub fn disk_write_bytes() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/self/io").ok()?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("write_bytes:")?.trim().parse().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn disk_write_bytes() -> Option<u64> {
+    None
+}
+
 /// 按书占用（前 5 本），用于定位馆藏空间被谁占住。
 /// 直接读 `library_books` 的冗余统计，避免每次健康检查都扫整张正文表。
 async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
@@ -95,14 +108,19 @@ async fn cache_usage_by_book(pool: &SqlitePool) -> Vec<(String, String, i64)> {
 
 fn base_metrics(state: &AppState) -> serde_json::Value {
     let rss = rss_bytes();
+    let disk_write = disk_write_bytes();
     let (js_last, js_max) = crate::rule_engine::js_metrics();
     let (img_bytes, img_items, img_limit) = crate::image_cache::stats();
+    let img_hits = crate::image_cache::hit_stats();
     let cache = crate::cache_metrics::stats();
     json!({
         // 当前运行的服务版本，前端设置页直接展示
         "version": env!("CARGO_PKG_VERSION"),
         "rss_bytes": rss,
         "rss_mb": rss.map(|b| (b as f64 / MB as f64 * 100.0).round() / 100.0),
+        // 进程累计写盘字节（Linux；其他平台为 null）
+        "disk_write_bytes": disk_write,
+        "disk_write_mb": disk_write.map(|b| (b as f64 / MB as f64 * 100.0).round() / 100.0),
         "open_user_dbs": state.user_pools.lock().map(|c| c.len()).unwrap_or(0),
         // 容量上限已废弃：馆藏永久保存，只报实际占用（见下方 cache.bytes）。
         "js": {
@@ -155,6 +173,9 @@ fn base_metrics(state: &AppState) -> serde_json::Value {
             "mb": (img_bytes as f64 / MB as f64 * 100.0).round() / 100.0,
             "items": img_items,
             "limit_mb": img_limit / (1024 * 1024),
+            "hits": img_hits.hits,
+            "misses": img_hits.misses,
+            "hit_rate": img_hits.hit_rate(),
         },
     })
 }

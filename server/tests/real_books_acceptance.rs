@@ -719,3 +719,189 @@ async fn real_books_import_and_read() {
     assert_eq!(totals.content_failures, 0, "存在导入/正文失败，见上方日志");
     assert_eq!(totals.image_failures, 0, "存在图片读取失败，见上方日志");
 }
+
+fn is_cbz_image(name: &str) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "avif" | "bmp"
+    )
+}
+
+/// 真实 CBZ 验收：按“手工放入的漫画目录”读取（无 `oread.json`，从文件名/ComicInfo 反推）。
+///
+/// 这里不做 CBZ 导入（导入管线只接受 EPUB）；只验证解压后的目录能被漫画读路径识别、
+/// 页表数量正确，并且图片代理能实际读出图片。
+#[tokio::test]
+#[ignore = "需要 BORANLIB_BOOKS_DIR 指向真实 CBZ 目录"]
+async fn real_cbz_comics_read_from_directory() {
+    let Ok(books_dir) = std::env::var("BORANLIB_BOOKS_DIR") else {
+        eprintln!("跳过：未设置 BORANLIB_BOOKS_DIR");
+        return;
+    };
+    let books_dir = PathBuf::from(books_dir);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&books_dir)
+        .expect("读取 BORANLIB_BOOKS_DIR")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .map(|e| e.eq_ignore_ascii_case("cbz"))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "{} 下没有 CBZ", books_dir.display());
+
+    let (app, pool, dir) = test_app("real-cbz").await;
+    let store = Store::new(&dir);
+    let token = register_admin(&app, &pool).await;
+    let mut total_pages = 0usize;
+
+    println!("\n=== 读取 {} 本 CBZ ===", files.len());
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let book_url = format!("local:cbz:{name}");
+        let book_dir = store.dir_for(boranlib::library_store::Tier::Collection, &book_url);
+        std::fs::create_dir_all(&book_dir).expect("创建漫画目录");
+
+        let mut archive =
+            zip::ZipArchive::new(std::fs::File::open(path).expect("打开 CBZ")).expect("解析 CBZ");
+        let mut images = 0usize;
+        let mut comic_info: Option<Vec<u8>> = None;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).expect("读取 ZIP 条目");
+            if entry.is_dir() {
+                continue;
+            }
+            let entry_name = entry.name().expect("ZIP 条目名").to_string();
+            let base = entry_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(entry_name.as_str())
+                .to_string();
+            if base.is_empty() || base.starts_with('.') {
+                continue;
+            }
+            if base.eq_ignore_ascii_case("ComicInfo.xml") {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut buf).expect("读取 ComicInfo");
+                comic_info = Some(buf);
+                continue;
+            }
+            if !is_cbz_image(&base) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf).expect("读取图片");
+            // 不同子目录可能有同名文件：加序号前缀避免互相覆盖。
+            let file_name = if book_dir.join(&base).exists() {
+                format!("{i:04}-{base}")
+            } else {
+                base
+            };
+            std::fs::write(book_dir.join(file_name), buf).expect("写入图片");
+            images += 1;
+        }
+        assert!(images > 0, "{name} 没有图片");
+        match comic_info {
+            Some(bytes) => std::fs::write(book_dir.join("ComicInfo.xml"), bytes).unwrap(),
+            None => std::fs::write(
+                book_dir.join("ComicInfo.xml"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+                     <ComicInfo><Title>{}</Title></ComicInfo>",
+                    boranlib_ebook::xml::xml_escape(name.trim_end_matches(".cbz"))
+                ),
+            )
+            .unwrap(),
+        }
+
+        let opened = store
+            .open_comic(&book_url)
+            .await
+            .expect("打开漫画目录")
+            .unwrap_or_else(|| panic!("{name} 未被识别为漫画"));
+        let pages: usize = opened.meta.chapters.iter().map(|c| c.pages.len()).sum();
+        assert_eq!(pages, images, "{name} 页表与图片数不一致");
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get(
+                &format!(
+                    "/api/comic/source?{}",
+                    query(&[("book_url", book_url.as_str())])
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "漫画源探测 {name}");
+        let body = body_json(resp).await;
+        assert_eq!(body["local"], true, "{name} 应走本地漫画目录");
+        assert_eq!(body["comic"], true, "{name} 应识别为漫画");
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get(
+                &format!(
+                    "/api/comic/chapter?{}",
+                    query(&[("book_url", book_url.as_str()), ("index", "1")])
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "漫画章节 {name}: {body}");
+        let urls = body["images"].as_array().cloned().unwrap_or_default();
+        assert_eq!(urls.len(), images, "{name} 章节图片数不一致");
+        assert!(
+            urls.iter().any(|v| v["width"].as_u64().unwrap_or(0) > 0),
+            "{name} 至少应解析出一张图的宽度"
+        );
+
+        let first = urls[0]["url"].as_str().expect("图片 URL");
+        let resp = app
+            .clone()
+            .oneshot(authed_get(
+                &format!(
+                    "/api/book/image?{}",
+                    query(&[("url", first), ("book_url", book_url.as_str())])
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), MAX_JSON)
+            .await
+            .unwrap();
+        assert!(
+            status == StatusCode::OK && ctype.starts_with("image/") && !bytes.is_empty(),
+            "{name} 首图读取失败：{status} {ctype} {} bytes",
+            bytes.len()
+        );
+
+        println!(
+            "  {name}: 图片={images} 页={pages} 章节={} 首图={} {} bytes",
+            opened.meta.chapters.len(),
+            ctype,
+            bytes.len()
+        );
+        total_pages += pages;
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("=== CBZ 汇总：{} 本，{} 页 ===", files.len(), total_pages);
+}

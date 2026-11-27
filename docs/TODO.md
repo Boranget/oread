@@ -30,9 +30,15 @@
 4. 真实馆藏界面目视验收：接口级验收已覆盖导入 / 目录 / 正文 / 详情 / 分面 / 首页 / 状态、
    图片代理实际出图，以及 SVG 正文 / 封面、真表格、独立公式的块级断言；剩余
    `data/library/collection` 的界面目视验收，导入 2–3 本后在真实馆藏上走一遍。
-5. 可选：导出产物缓存、AZW3 生成/推送、PDF 导入（后期）。
+5. 暂不排期：导出产物缓存、AZW3 生成/推送、PDF 导入（理由见第五节）。
 
 ## 三、已完成（保留记录，避免重复设计）
+
+- EPUB 归一化收尾：`<sub>` / `<sup>` 的数字与运算符降级为 Unicode 上下标（字母保持原样，
+  避免 `1st` 变成 `1ˢᵗ` 破坏搜索）；`epub:type="pagebreak"` **不整块跳过**——HTML 解析器
+  不认非空元素的自闭合写法，整块跳过会把后续文字一起吞掉，页码标记按空内容保留。
+  真实 CBZ 验收：4 本 / 81 页，目录反推页表、章节图片列表与首图代理均通过。
+  `/healthz` 补进程累计写盘量（Linux）与图片 LRU 命中率。
 
 - 表格 / MathML / SVG 正文（P0/P1/P2）：新增 `Block::Table`（`caption` / 行 / 单元格
   `colspan` / `rowspan` / 表头）、`Block::Math { mathml, text }` 与 `Block::Divider`；
@@ -94,7 +100,11 @@
 ## 五、工程改进（可选）
 
 - 拆 Rust workspace：`rule_engine` / `entities` 独立 crate，减少整包重编。
-- 增加进程级 RSS、磁盘写入量、缓存命中率指标。
+- 进程 RSS、图片 LRU 命中率、累计写盘量（Linux）已接入 `/healthz`。
+- 明确不排期：
+  - AZW3 生成 / 推送：需要 kindlegen / calibre，不符合纯 Rust 单二进制约束。
+  - PDF 导入：需要 MuPDF / Poppler 等 C 依赖，与 musl 交叉编译和无 C 工具链约束冲突。
+  - 导出产物缓存：EPUB / CBZ 已是目录原样打包，命中缓存需处理修订失效与磁盘占用，收益不足。
 
 ## 六、环境事实（不是本项目 bug）
 
